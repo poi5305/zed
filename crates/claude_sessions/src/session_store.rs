@@ -18,7 +18,7 @@ use gpui::{Context, SharedString, Task};
 use util::ResultExt as _;
 
 use crate::{
-    session_registry::{RegisteredSession, TailProgress, TailState, pane_target},
+    session_registry::{RegisteredSession, SubagentSummary, TailProgress, TailState, pane_target},
     session_source::{SessionInput, SessionListing, SessionSource},
     transcript::{Transcript, parse_record},
 };
@@ -41,6 +41,24 @@ enum ErrorSource {
     Send,
 }
 
+/// Which of the selected session's conversations is being followed.
+///
+/// A session's own conversation and each of its subagents' are separate files, and only
+/// one of them is read at a time — the transcript the store holds is the one the panel
+/// draws, so following a second file would mean interleaving two conversations into it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TranscriptTarget {
+    #[default]
+    Main,
+    Subagent {
+        agent_id: String,
+        /// `Some` for an agent belonging to a `Workflow` run, whose transcript lives one
+        /// directory deeper. The same agent id appears in both layouts, so the run id is
+        /// part of naming the file rather than extra detail about it.
+        workflow_run_id: Option<String>,
+    },
+}
+
 pub struct ClaudeSessionStore {
     source: Arc<dyn SessionSource>,
     project_root: Option<PathBuf>,
@@ -55,23 +73,43 @@ pub struct ClaudeSessionStore {
     /// rather than being looked for here.
     transcript_paths: HashMap<u32, PathBuf>,
     selected_process_id: Option<u32>,
-    transcript: Transcript,
-    /// Counts how often the transcript has been thrown away and started again, so that a
-    /// caller caching anything derived from it can tell that its keys mean something
-    /// else now.
-    transcript_generation: u64,
-    tail: Option<TranscriptTail>,
+    /// The subagent conversations of the selected session, as the last scan of it found
+    /// them. Empty while nothing is selected: only the selected session is scanned, so
+    /// there is nothing to report about the others.
+    subagents: Vec<SubagentSummary>,
+    transcript_target: TranscriptTarget,
+    /// The `sessionId` both conversations are read under, or `None` while no session is
+    /// selected — which is what keeps an unselected session from being read at all. It
+    /// identifies the conversation rather than the process: Claude Code writes a new
+    /// `sessionId` when the user runs `/clear`, and that is the signal to start over.
+    followed_session_id: Option<String>,
+    /// The selected session's own conversation, followed whether or not it is the one on
+    /// screen. An agent's transcript never records the agent returning, so the session's
+    /// own thread is the only place the state of an agent can be read off, and it is
+    /// also where a `/clear` becomes visible.
+    main_conversation: FollowedConversation,
+    /// The agent conversation followed beside the session's own, and `None` whenever
+    /// [`Self::transcript_target`] is [`TranscriptTarget::Main`].
+    subagent_conversation: Option<FollowedConversation>,
+    /// Counts every time either transcript has been thrown away and started again. Both
+    /// conversations take their generation from this one counter, so that switching
+    /// between them always reads as a change to a caller caching by record uuid: a
+    /// counter per conversation would hand out the same number for both the first time
+    /// each was started.
+    transcript_resets: u64,
     error: Option<(ErrorSource, SharedString)>,
     _registry_poll: Task<()>,
     _transcript_poll: Task<()>,
 }
 
-/// Where reading of the selected session's transcript has got to. Recreated from scratch
-/// whenever the selection changes or the selected session starts a new conversation.
-struct TranscriptTail {
-    /// Identifies the conversation, not the process: Claude Code writes a new
-    /// `sessionId` when the user runs `/clear`, and that is the signal to start over.
-    session_id: String,
+/// One conversation being followed: the records absorbed so far, and where reading of
+/// the file has got to. Recreated from scratch whenever the file it names changes —
+/// another session selected, `/clear`, another agent opened.
+struct FollowedConversation {
+    transcript: Transcript,
+    /// The value [`ClaudeSessionStore::transcript_resets`] had when this transcript was
+    /// started, which is what a caller caching anything derived from it keys on.
+    generation: u64,
     /// `None` until the file appears. A session that has only just started is listed
     /// with no transcript rather than hidden.
     path: Option<PathBuf>,
@@ -79,6 +117,26 @@ struct TranscriptTail {
     /// Bytes read after the last newline. Kept as bytes because a read can stop in the
     /// middle of a multi-byte character, which cannot be held as a `String`.
     pending: Vec<u8>,
+}
+
+impl FollowedConversation {
+    fn new(transcript: Transcript, generation: u64) -> Self {
+        Self {
+            transcript,
+            generation,
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    fn state(&self) -> TailState {
+        TailState {
+            path: self.path.clone(),
+            offset: self.offset,
+            pending: self.pending.clone(),
+        }
+    }
 }
 
 impl ClaudeSessionStore {
@@ -94,9 +152,12 @@ impl ClaudeSessionStore {
             home_directory: None,
             transcript_paths: HashMap::default(),
             selected_process_id: None,
-            transcript: Transcript::new(),
-            transcript_generation: 0,
-            tail: None,
+            subagents: Vec::new(),
+            transcript_target: TranscriptTarget::Main,
+            followed_session_id: None,
+            main_conversation: FollowedConversation::new(Transcript::new(), 0),
+            subagent_conversation: None,
+            transcript_resets: 0,
             error: None,
             _registry_poll: Task::ready(()),
             _transcript_poll: Task::ready(()),
@@ -128,23 +189,111 @@ impl ClaudeSessionStore {
         self.selected_process_id = Some(process_id);
         // A send that failed for the session being left says nothing about this one.
         self.take_error_from(ErrorSource::Send);
-        self.restart_tail();
+        self.follow_this_sessions_main_conversation();
         cx.notify();
     }
 
+    /// The conversation on screen: the selected session's own, or the agent's while one
+    /// is being read.
     pub fn transcript(&self) -> &Transcript {
-        &self.transcript
+        &self.viewed_conversation().transcript
     }
 
+    /// The selected session's own conversation, whichever one is on screen. Read by a
+    /// caller asking something only the session's own thread answers — whether an agent
+    /// it spawned has returned — rather than by one drawing the conversation.
+    pub fn main_transcript(&self) -> &Transcript {
+        &self.main_conversation.transcript
+    }
+
+    /// The subagent conversations of the selected session, ordered as the scan found
+    /// them: by run id and then agent id, so rows do not move between polls.
+    pub fn subagents(&self) -> &[SubagentSummary] {
+        &self.subagents
+    }
+
+    pub fn transcript_target(&self) -> &TranscriptTarget {
+        &self.transcript_target
+    }
+
+    /// Follows another of the selected session's conversations.
+    ///
+    /// An agent's conversation is started from scratch and read from the beginning of
+    /// its file — the records of two agents must never end up in the same transcript,
+    /// and a caller caching anything derived from it learns that its keys mean something
+    /// else now from [`Self::transcript_generation`]. The session's own conversation is
+    /// left alone, because it goes on being followed either way.
+    pub fn select_transcript_target(&mut self, target: TranscriptTarget, cx: &mut Context<Self>) {
+        if self.transcript_target == target {
+            return;
+        }
+        self.transcript_target = target;
+        self.subagent_conversation = match &self.transcript_target {
+            TranscriptTarget::Main => None,
+            // Read as one agent's own conversation: every line of such a file carries
+            // `isSidechain`, so the reading that keeps an agent out of a main thread
+            // would leave nothing of it at all.
+            TranscriptTarget::Subagent { .. } => {
+                let generation = self.start_transcript();
+                Some(FollowedConversation::new(
+                    Transcript::for_sidechain(),
+                    generation,
+                ))
+            }
+        };
+        cx.notify();
+    }
+
+    /// The generation of the conversation on screen; see
+    /// [`FollowedConversation::generation`].
     pub fn transcript_generation(&self) -> u64 {
-        self.transcript_generation
+        self.viewed_conversation().generation
     }
 
-    /// `None` while the selected session has no transcript file yet, which is normal for
-    /// a session that has only just started.
+    /// The file the conversation on screen is being read from, or `None` while there is
+    /// none — no selection, or a session that has only just started and has not written
+    /// its transcript yet.
     pub fn transcript_path(&self) -> Option<&Path> {
-        let process_id = self.selected_process_id?;
-        self.transcript_paths.get(&process_id).map(PathBuf::as_path)
+        match &self.transcript_target {
+            TranscriptTarget::Main => {
+                let process_id = self.selected_process_id?;
+                self.transcript_paths.get(&process_id).map(PathBuf::as_path)
+            }
+            // The scan reports the session's transcript, never an agent's, so the only
+            // answer for an agent is the file its own reads have resolved.
+            TranscriptTarget::Subagent { .. } => {
+                self.subagent_conversation.as_ref()?.path.as_deref()
+            }
+        }
+    }
+
+    fn viewed_conversation(&self) -> &FollowedConversation {
+        self.conversation_for(&self.transcript_target)
+            .unwrap_or(&self.main_conversation)
+    }
+
+    fn conversation_for(&self, target: &TranscriptTarget) -> Option<&FollowedConversation> {
+        match target {
+            TranscriptTarget::Main => Some(&self.main_conversation),
+            TranscriptTarget::Subagent { .. } => self.subagent_conversation.as_ref(),
+        }
+    }
+
+    fn conversation_for_mut(
+        &mut self,
+        target: &TranscriptTarget,
+    ) -> Option<&mut FollowedConversation> {
+        match target {
+            TranscriptTarget::Main => Some(&mut self.main_conversation),
+            TranscriptTarget::Subagent { .. } => self.subagent_conversation.as_mut(),
+        }
+    }
+
+    /// The generation to give a transcript that is being started, counted across both
+    /// conversations so that no two of them ever carry the same one.
+    fn start_transcript(&mut self) -> u64 {
+        self.transcript_resets = self.transcript_resets.saturating_add(1);
+        self.transcript_resets
     }
 
     pub fn error(&self) -> Option<&SharedString> {
@@ -214,6 +363,11 @@ impl ClaudeSessionStore {
             .find(|session| session.process_id == process_id)
     }
 
+    fn selected_session_id(&self) -> Option<String> {
+        self.selected_session()
+            .map(|session| session.session_id.clone())
+    }
+
     fn spawn_registry_poll(&self, cx: &mut Context<Self>) -> Task<()> {
         let source = self.source.clone();
         let project_root = self.project_root.clone();
@@ -230,6 +384,25 @@ impl ClaudeSessionStore {
                     break;
                 }
 
+                // Only the selected session's agents are looked for. Listing them costs a
+                // walk of that session's directory, and no other session's agents are on
+                // screen to be worth one.
+                let Ok(session_id) = this.read_with(cx, |this, _| this.selected_session_id())
+                else {
+                    break;
+                };
+                if let Some(session_id) = session_id {
+                    let subagents = source.list_subagents(session_id.clone()).await;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.apply_subagent_scan(&session_id, subagents, cx)
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
                 cx.background_executor().timer(REGISTRY_POLL_INTERVAL).await;
             }
         })
@@ -239,22 +412,39 @@ impl ClaudeSessionStore {
         let source = self.source.clone();
 
         cx.spawn(async move |this, cx| {
-            loop {
+            'poll: loop {
                 // The only exit: the store has been dropped, so nothing is left to update.
-                let Ok(request) = this.read_with(cx, |this, _| this.tail_read_request()) else {
+                let Ok(requests) = this.read_with(cx, |this, _| this.tail_read_requests()) else {
                     break;
                 };
 
-                if let Some((session_id, state)) = request {
-                    let progress = source.tail_transcript(session_id.clone(), state).await;
+                for (target, session_id, state) in requests {
+                    let progress = match &target {
+                        TranscriptTarget::Main => {
+                            source.tail_transcript(session_id.clone(), state).await
+                        }
+                        TranscriptTarget::Subagent {
+                            agent_id,
+                            workflow_run_id,
+                        } => {
+                            source
+                                .tail_subagent(
+                                    session_id.clone(),
+                                    agent_id.clone(),
+                                    workflow_run_id.clone(),
+                                    state,
+                                )
+                                .await
+                        }
+                    };
 
                     if this
                         .update(cx, |this, cx| {
-                            this.apply_tail_progress(&session_id, progress, cx)
+                            this.apply_tail_progress(&session_id, &target, progress, cx)
                         })
                         .is_err()
                     {
-                        break;
+                        break 'poll;
                     }
                 }
 
@@ -265,18 +455,45 @@ impl ClaudeSessionStore {
         })
     }
 
-    /// `None` when no session is selected, which is what keeps an unselected session from
-    /// being tailed.
+    /// The read that would be issued for the conversation on screen, or `None` when no
+    /// session is selected.
+    ///
+    /// Only a test asks: the poll issues both conversations' reads together through
+    /// [`Self::tail_read_requests`], and this is how a test captures the read that is
+    /// about to happen so that it can be landed by hand afterwards.
+    #[cfg(test)]
     fn tail_read_request(&self) -> Option<(String, TailState)> {
-        let tail = self.tail.as_ref()?;
-        Some((
-            tail.session_id.clone(),
-            TailState {
-                path: tail.path.clone(),
-                offset: tail.offset,
-                pending: tail.pending.clone(),
-            },
-        ))
+        let session_id = self.followed_session_id.clone()?;
+        Some((session_id, self.viewed_conversation().state()))
+    }
+
+    /// Every read one turn of the poll issues: the session's own conversation always,
+    /// and the agent's as well while one is on screen. Each state is carried with the
+    /// target it belongs to, so a read is never issued for one conversation with the
+    /// other's offset — both start at zero, and nothing further down could tell them
+    /// apart afterwards.
+    fn tail_read_requests(&self) -> Vec<(TranscriptTarget, String, TailState)> {
+        let Some(session_id) = self.followed_session_id.clone() else {
+            return Vec::new();
+        };
+
+        let mut requests = vec![(
+            TranscriptTarget::Main,
+            session_id.clone(),
+            self.main_conversation.state(),
+        )];
+        if let Some(conversation) = self
+            .subagent_conversation
+            .as_ref()
+            .filter(|_| matches!(self.transcript_target, TranscriptTarget::Subagent { .. }))
+        {
+            requests.push((
+                self.transcript_target.clone(),
+                session_id,
+                conversation.state(),
+            ));
+        }
+        requests
     }
 
     fn apply_registry_scan(&mut self, scan: Result<SessionListing>, cx: &mut Context<Self>) {
@@ -326,15 +543,15 @@ impl ClaudeSessionStore {
             // A different `sessionId` on the same pid means the user ran `/clear`, so the
             // old conversation must be dropped rather than appended to.
             Some(session_id) => {
-                if self.tail.as_ref().map(|tail| tail.session_id.as_str()) != Some(&session_id) {
-                    self.restart_tail();
+                if self.followed_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.follow_this_sessions_main_conversation();
                     changed = true;
                 }
             }
             None => {
                 if self.selected_process_id.is_some() {
                     self.selected_process_id = None;
-                    self.restart_tail();
+                    self.follow_this_sessions_main_conversation();
                     changed = true;
                 }
             }
@@ -345,34 +562,81 @@ impl ClaudeSessionStore {
         }
     }
 
-    fn reset_transcript(&mut self) {
-        self.transcript = Transcript::new();
-        self.transcript_generation = self.transcript_generation.saturating_add(1);
+    fn apply_subagent_scan(
+        &mut self,
+        session_id: &str,
+        scan: Result<Vec<SubagentSummary>>,
+        cx: &mut Context<Self>,
+    ) {
+        // The selection can move while the scan is in flight, and the agents of the
+        // session that was left are not the ones to show for the one selected now.
+        if self.selected_session_id().as_deref() != Some(session_id) {
+            return;
+        }
+
+        let subagents = match scan {
+            Ok(subagents) => subagents,
+            Err(error) => {
+                // The session list and the transcript are unaffected, so only the
+                // message changes.
+                self.error = Some((
+                    ErrorSource::Poll,
+                    format!("Listing subagents: {error:#}").into(),
+                ));
+                cx.notify();
+                return;
+            }
+        };
+
+        // The scan runs every second whether or not the session spawned anything, so the
+        // view is only marked dirty when this one actually changed the list.
+        if self.subagents != subagents {
+            self.subagents = subagents;
+            cx.notify();
+        }
     }
 
-    fn restart_tail(&mut self) {
-        self.reset_transcript();
-        self.tail = self
+    /// Starts over on the session's own conversation, dropping what was known about
+    /// another one.
+    ///
+    /// Every reason reading is rebuilt from outside a deliberate switch of target — the
+    /// user selecting another session, `/clear` giving this pid a new conversation, the
+    /// selected session disappearing — invalidates the subagents as well: their ids name
+    /// files under a session directory that is no longer the one being read.
+    fn follow_this_sessions_main_conversation(&mut self) {
+        self.transcript_target = TranscriptTarget::Main;
+        self.subagents.clear();
+        self.subagent_conversation = None;
+
+        let generation = self.start_transcript();
+        self.main_conversation = FollowedConversation::new(Transcript::new(), generation);
+        self.followed_session_id = self
             .selected_process_id
             .and_then(|process_id| {
                 self.sessions
                     .iter()
                     .find(|session| session.process_id == process_id)
             })
-            .map(|session| TranscriptTail {
-                session_id: session.session_id.clone(),
-                path: None,
-                offset: 0,
-                pending: Vec::new(),
-            });
+            .map(|session| session.session_id.clone());
     }
 
     fn apply_tail_progress(
         &mut self,
         session_id: &str,
+        target: &TranscriptTarget,
         progress: Result<TailProgress>,
         cx: &mut Context<Self>,
     ) {
+        // An agent's read belongs to the agent that was on screen when it was issued, and
+        // once the user has moved on there is nothing left for it to be absorbed into:
+        // every conversation starts its reading at offset zero, so the offset guard below
+        // cannot tell one agent's read from another's. The session's own conversation is
+        // followed whichever one is on screen, so a read of it is never stale this way.
+        if matches!(target, TranscriptTarget::Subagent { .. }) && &self.transcript_target != target
+        {
+            return;
+        }
+
         let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
@@ -388,27 +652,36 @@ impl ClaudeSessionStore {
 
         // The selection can change while a read is in flight, in which case this progress
         // describes a file the store is no longer following.
-        let Some(tail) = self
-            .tail
-            .as_ref()
-            .filter(|tail| tail.session_id == session_id)
-        else {
+        if self.followed_session_id.as_deref() != Some(session_id) {
+            return;
+        }
+
+        let Some(conversation) = self.conversation_for(target) else {
             return;
         };
 
-        // The tail can also be restarted from the beginning while a read is in flight —
+        // Reading can also be restarted from the beginning while a read is in flight —
         // by the selection moving away and back — and the same `sessionId` then names a
         // conversation that is being read again from the start. Absorbing a read that
         // began further into the file would move the offset past everything before it,
         // and those records would never be read.
-        if progress.start_offset != tail.offset {
+        if progress.start_offset != conversation.offset {
             return;
         }
 
-        let path_changed = tail.path != progress.path;
+        let path_changed = conversation.path != progress.path;
 
         if progress.restarted {
-            self.reset_transcript();
+            // Counted before the transcript is borrowed: the counter is shared by both
+            // conversations and lives beside them.
+            let generation = self.start_transcript();
+            let transcript = match target {
+                TranscriptTarget::Main => Transcript::new(),
+                TranscriptTarget::Subagent { .. } => Transcript::for_sidechain(),
+            };
+            if let Some(conversation) = self.conversation_for_mut(target) {
+                *conversation = FollowedConversation::new(transcript, generation);
+            }
         }
 
         // A line that cannot be parsed is logged and skipped: a transcript read while it
@@ -420,13 +693,14 @@ impl ClaudeSessionStore {
             .filter_map(|line| parse_record(line).log_err().flatten())
             .collect();
         let absorbed_any = !records.is_empty();
-        self.transcript.absorb(records);
 
-        if let Some(tail) = self.tail.as_mut() {
-            tail.path = progress.path;
-            tail.offset = progress.offset;
-            tail.pending = progress.pending;
-        }
+        let Some(conversation) = self.conversation_for_mut(target) else {
+            return;
+        };
+        conversation.transcript.absorb(records);
+        conversation.path = progress.path;
+        conversation.offset = progress.offset;
+        conversation.pending = progress.pending;
 
         if absorbed_any || progress.restarted || path_changed {
             cx.notify();
@@ -446,8 +720,9 @@ mod tests {
 
     use crate::{
         session_registry::{
-            HEARTBEAT_CUTOFF_MILLIS, SessionSummary, find_transcript, normalize_whitespace,
-            now_millis, read_registrations, read_transcript_tail, visible_sessions,
+            HEARTBEAT_CUTOFF_MILLIS, SessionSummary, find_transcript, list_subagents,
+            normalize_whitespace, now_millis, read_registrations, read_subagent_transcript_tail,
+            read_transcript_tail, visible_sessions,
         },
         session_source::{FileContents, read_file_prefix},
     };
@@ -500,6 +775,20 @@ mod tests {
         Escape { pane_target: String },
     }
 
+    /// What the store asked the source to read, recorded so that a test can tell a read
+    /// of the main conversation from a read of one agent's.
+    #[derive(Debug, PartialEq, Eq)]
+    enum TailedConversation {
+        Main {
+            session_id: String,
+        },
+        Subagent {
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+        },
+    }
+
     /// Serves the fixtures written under `home_directory` through the same registry and
     /// transcript functions the local source uses, with the process lookup injected:
     /// `ps` is never invoked, so nothing in these tests depends on real time passing or
@@ -509,6 +798,7 @@ mod tests {
         process_starts: HashMap<u32, String>,
         sent_inputs: Mutex<Vec<SentInput>>,
         send_failure: Option<String>,
+        tailed_conversations: Mutex<Vec<TailedConversation>>,
     }
 
     impl FakeSource {
@@ -518,7 +808,15 @@ mod tests {
                 process_starts,
                 sent_inputs: Mutex::new(Vec::new()),
                 send_failure: None,
+                tailed_conversations: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The reads the store has issued, most recent last.
+        fn tailed_conversations(&self) -> std::sync::MutexGuard<'_, Vec<TailedConversation>> {
+            self.tailed_conversations
+                .lock()
+                .expect("reading the recorded reads")
         }
 
         fn failing_to_send(mut self, message: &str) -> Self {
@@ -570,9 +868,43 @@ mod tests {
             session_id: String,
             state: TailState,
         ) -> Task<Result<TailProgress>> {
+            self.tailed_conversations().push(TailedConversation::Main {
+                session_id: session_id.clone(),
+            });
             Task::ready(read_transcript_tail(
                 &self.home_directory,
                 &session_id,
+                state,
+            ))
+        }
+
+        fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
+            // The listing does no awaiting of its own, so blocking on it here reads the
+            // fixtures the same way the local source's background task would.
+            Task::ready(smol::block_on(list_subagents(
+                &self.home_directory,
+                &session_id,
+            )))
+        }
+
+        fn tail_subagent(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.tailed_conversations()
+                .push(TailedConversation::Subagent {
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                    workflow_run_id: workflow_run_id.clone(),
+                });
+            Task::ready(read_subagent_transcript_tail(
+                &self.home_directory,
+                &session_id,
+                &agent_id,
+                workflow_run_id.as_deref(),
                 state,
             ))
         }
@@ -793,7 +1125,7 @@ mod tests {
 
         // The read that was in flight before the restart now lands.
         store.update(cx, |store, cx| {
-            store.apply_tail_progress(&session_id, progress, cx)
+            store.apply_tail_progress(&session_id, &TranscriptTarget::Main, progress, cx)
         });
 
         cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
@@ -1370,6 +1702,623 @@ mod tests {
                 store.error(),
                 None,
                 "the failure must not follow the user to another session"
+            );
+        });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// Writes one subagent's sidecar and transcript into the layout the run id selects,
+    /// and returns the transcript's path. The sidecar is what the scan is driven off, so
+    /// an agent without one is not an agent.
+    fn write_subagent(
+        home_directory: &Path,
+        session_id: &str,
+        workflow_run_id: Option<&str>,
+        agent_id: &str,
+        transcript_contents: &str,
+    ) -> PathBuf {
+        let mut directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-some-slug")
+            .join(session_id)
+            .join("subagents");
+        if let Some(workflow_run_id) = workflow_run_id {
+            directory = directory.join("workflows").join(workflow_run_id);
+        }
+        write_file(
+            directory.join(format!("agent-{agent_id}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"round 2","spawnDepth":1}"#,
+        );
+        let transcript_path = directory.join(format!("agent-{agent_id}.jsonl"));
+        write_file(transcript_path.clone(), transcript_contents);
+        transcript_path
+    }
+
+    const FLAT_AGENT_ID: &str = "a0000e203ec41bc73";
+    const WORKFLOW_AGENT_ID: &str = "a1111e203ec41bc73";
+    const WORKFLOW_RUN_ID: &str = "wf_b529a29d-562";
+
+    /// The whole of what this round adds to the store: the selected session's agents are
+    /// listed, one of them can be followed instead of the session's own conversation, and
+    /// the switch is reversible without either conversation leaking into the other.
+    #[gpui::test]
+    async fn test_the_selected_sessions_subagents_are_listed_and_followed_on_their_own(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("subagents");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("71.json"),
+            &registration_json(71, "agent-session"),
+        );
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("72.json"),
+            &registration_json(72, "other-session"),
+        );
+        write_transcript(
+            &home_directory,
+            "agent-session",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+        write_transcript(
+            &home_directory,
+            "other-session",
+            "{\"type\":\"user\",\"uuid\":\"o1\"}\n",
+        );
+        // Every line of a real subagent transcript carries `isSidechain`, which is what
+        // keeps an agent's turns out of the session's own thread.
+        let flat_agent_contents = "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n";
+        let flat_agent_transcript = write_subagent(
+            &home_directory,
+            "agent-session",
+            None,
+            FLAT_AGENT_ID,
+            flat_agent_contents,
+        );
+        write_subagent(
+            &home_directory,
+            "agent-session",
+            Some(WORKFLOW_RUN_ID),
+            WORKFLOW_AGENT_ID,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"w1\"}\n",
+        );
+
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![71, 72]),
+        ));
+        let store = cx.new(|cx| ClaudeSessionStore::new(source.clone(), None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.subagents().is_empty(),
+                "no session is selected, so no session's agents may be scanned for"
+            );
+            assert_eq!(store.transcript_target(), &TranscriptTarget::Main);
+        });
+
+        store.update(cx, |store, cx| store.select(71, cx));
+        // One more scan interval: the agents of a session are only looked for once it is
+        // the selected one.
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        let uuids = |store: &ClaudeSessionStore| -> Vec<Option<String>> {
+            store
+                .transcript()
+                .active_path()
+                .iter()
+                .map(|record| record.uuid.clone())
+                .collect()
+        };
+
+        let generation_on_main = store.read_with(cx, |store, _| {
+            let listed: Vec<(&str, Option<&str>)> = store
+                .subagents()
+                .iter()
+                .map(|subagent| {
+                    (
+                        subagent.agent_id.as_str(),
+                        subagent.workflow_run_id.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    (FLAT_AGENT_ID, None),
+                    (WORKFLOW_AGENT_ID, Some(WORKFLOW_RUN_ID)),
+                ],
+                "both layouts must be listed, ordered by run id and then agent id"
+            );
+            assert_eq!(
+                store.subagents()[0].meta.agent_type,
+                "general-purpose",
+                "the sidecar's fields must reach the store, not just the agent's id"
+            );
+            assert_eq!(
+                uuids(store),
+                vec![Some("m1".to_string())],
+                "the session's own conversation is what a fresh selection follows"
+            );
+            store.transcript_generation()
+        });
+
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(
+                TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                },
+                cx,
+            )
+        });
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.transcript_target(),
+                &TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                }
+            );
+            assert!(
+                store.transcript_generation() > generation_on_main,
+                "the transcript was thrown away, so a caller caching by record uuid has \
+                 to be told; generation stayed at {}",
+                store.transcript_generation()
+            );
+            let (session_id, state) = store
+                .tail_read_request()
+                .expect("the agent's conversation must be being followed");
+            assert_eq!(session_id, "agent-session");
+            assert_eq!(
+                state.path.as_deref(),
+                Some(flat_agent_transcript.as_path()),
+                "the file being followed must be the agent's own"
+            );
+            assert_eq!(
+                state.offset,
+                flat_agent_contents.len() as u64,
+                "the whole of the agent's transcript must have been read"
+            );
+            assert!(
+                !store.transcript().is_empty(),
+                "the agent's records must have been absorbed into the transcript the \
+                 panel draws"
+            );
+            // Written when a sidechain record could not be drawn at all, so an empty
+            // path stood in for "the session's own conversation is not here". The
+            // agent's records are the conversation now, which is what the assertion
+            // was always about.
+            assert_eq!(
+                uuids(store),
+                vec![Some("f1".to_string())],
+                "the agent's own records are the conversation, and the session's own \
+                 must not be left underneath them"
+            );
+        });
+
+        let last_read = source.tailed_conversations().pop();
+        assert_eq!(
+            last_read,
+            Some(TailedConversation::Subagent {
+                session_id: "agent-session".to_string(),
+                agent_id: FLAT_AGENT_ID.to_string(),
+                workflow_run_id: None,
+            }),
+            "the read has to go through the source's subagent tail, which is the only \
+             one that names the agent's file from its ids"
+        );
+
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(TranscriptTarget::Main, cx)
+        });
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.transcript_target(), &TranscriptTarget::Main);
+            assert_eq!(
+                uuids(store),
+                vec![Some("m1".to_string())],
+                "going back must read the session's conversation again from the start"
+            );
+            assert_eq!(
+                store.subagents().len(),
+                2,
+                "the agents of the session being read are still its agents"
+            );
+        });
+
+        // Another session's agents are its own, and the agent ids of the one being left
+        // name files under a directory that is no longer being read.
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(
+                TranscriptTarget::Subagent {
+                    agent_id: WORKFLOW_AGENT_ID.to_string(),
+                    workflow_run_id: Some(WORKFLOW_RUN_ID.to_string()),
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        store.update(cx, |store, cx| store.select(72, cx));
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.transcript_target(),
+                &TranscriptTarget::Main,
+                "selecting another session must go back to its own conversation rather \
+                 than look for an agent id that belongs to the session just left"
+            );
+            assert!(
+                store.subagents().is_empty(),
+                "the agents listed must be the selected session's, and this scan has not \
+                 happened yet; got {:?}",
+                store
+                    .subagents()
+                    .iter()
+                    .map(|subagent| subagent.agent_id.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                uuids(store),
+                vec![Some("o1".to_string())],
+                "the newly selected session's conversation is what must be followed"
+            );
+        });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// The chips above the conversation say which of a session's agents are still
+    /// working, and that answer is only in the session's own conversation: an agent's
+    /// transcript never records the agent returning. So the session's own conversation is
+    /// followed whether or not it is the one on screen, and the two must not leak into
+    /// each other.
+    #[gpui::test]
+    async fn test_the_sessions_own_conversation_is_still_read_while_an_agents_is_on_screen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("both-conversations");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("101.json"),
+            &registration_json(101, "dual-session"),
+        );
+        let main_transcript = write_transcript(
+            &home_directory,
+            "dual-session",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+        let agent_transcript = write_subagent(
+            &home_directory,
+            "dual-session",
+            None,
+            FLAT_AGENT_ID,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n",
+        );
+
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![101]),
+        ));
+        let store = cx.new(|cx| ClaudeSessionStore::new(source.clone(), None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        store.update(cx, |store, cx| store.select(101, cx));
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        let uuids = |transcript: &Transcript| -> Vec<Option<String>> {
+            transcript
+                .active_path()
+                .iter()
+                .map(|record| record.uuid.clone())
+                .collect()
+        };
+
+        let generation_on_main = store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store.main_transcript()),
+                vec![Some("m1".to_string())],
+                "the session's own conversation must be the one reported while it is the \
+                 one on screen"
+            );
+            store.transcript_generation()
+        });
+
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(
+                TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                },
+                cx,
+            )
+        });
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        let generation_on_agent = store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store.transcript()),
+                vec![Some("f1".to_string())],
+                "an agent's transcript is a file of nothing but sidechain records, and \
+                 reading it as a main thread leaves the panel blank"
+            );
+            assert_eq!(
+                uuids(store.main_transcript()),
+                vec![Some("m1".to_string())],
+                "the session's own conversation must still be there to read the agents' \
+                 states off"
+            );
+            assert_eq!(
+                store.transcript_path(),
+                Some(agent_transcript.as_path()),
+                "the path reported must be the conversation on screen"
+            );
+            store.transcript_generation()
+        });
+        assert_ne!(
+            generation_on_agent, generation_on_main,
+            "a caller caching by record uuid must be told the keys mean something else now"
+        );
+
+        // Both files grow while the agent's conversation is the one on screen.
+        std::fs::write(
+            &main_transcript,
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n\
+             {\"type\":\"assistant\",\"uuid\":\"m2\",\"parentUuid\":\"m1\"}\n",
+        )
+        .expect("appending to the session's own transcript");
+        std::fs::write(
+            &agent_transcript,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n\
+             {\"type\":\"assistant\",\"isSidechain\":true,\"uuid\":\"f2\",\"parentUuid\":\"f1\"}\n",
+        )
+        .expect("appending to the agent's transcript");
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store.transcript()),
+                vec![Some("f1".to_string()), Some("f2".to_string())],
+                "the agent's conversation must keep being followed"
+            );
+            assert_eq!(
+                uuids(store.main_transcript()),
+                vec![Some("m1".to_string()), Some("m2".to_string())],
+                "and the session's own must be followed at the same time, or a chip \
+                 stays pulsing after the agent it names has returned"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(TranscriptTarget::Main, cx)
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store.transcript()),
+                vec![Some("m1".to_string()), Some("m2".to_string())],
+                "going back must show what the session wrote while the agent was on \
+                 screen, not read the file over again"
+            );
+            assert_eq!(
+                store.transcript_path(),
+                Some(main_transcript.as_path()),
+                "and the path reported goes back with it"
+            );
+            assert_ne!(
+                store.transcript_generation(),
+                generation_on_agent,
+                "the records behind the transcript have changed, so the generation must too"
+            );
+        });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A read of one conversation that lands after the user has switched to another must
+    /// be dropped. Both tails start at offset zero, so the offset guard cannot tell them
+    /// apart: without the target on the progress, the session's own lines are absorbed
+    /// into the agent's transcript.
+    #[gpui::test]
+    async fn test_a_main_conversation_read_that_lands_after_switching_to_an_agent_is_dropped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("subagent-stale-read");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("81.json"),
+            &registration_json(81, "switching-session"),
+        );
+        write_transcript(
+            &home_directory,
+            "switching-session",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+        write_subagent(
+            &home_directory,
+            "switching-session",
+            None,
+            FLAT_AGENT_ID,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n",
+        );
+
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![81]),
+        ));
+        let store = cx.new(|cx| ClaudeSessionStore::new(source, None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        store.update(cx, |store, cx| store.select(81, cx));
+        cx.run_until_parked();
+
+        // The read the poll is about to perform on the session's own conversation,
+        // captured while it is still in flight.
+        let (session_id, state) = store
+            .read_with(cx, |store, _| store.tail_read_request())
+            .expect("the selected session must be tailed");
+        let progress = read_transcript_tail(&home_directory, &session_id, state);
+        assert_eq!(
+            progress
+                .as_ref()
+                .map(|progress| progress.lines.len())
+                .unwrap_or_default(),
+            1,
+            "the read has to have found the session's own line for the test to mean \
+             anything"
+        );
+
+        // Meanwhile the user opens an agent's conversation.
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(
+                TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                },
+                cx,
+            )
+        });
+
+        // The read that was in flight before the switch now lands.
+        store.update(cx, |store, cx| {
+            store.apply_tail_progress(&session_id, &TranscriptTarget::Main, progress, cx)
+        });
+
+        store.read_with(cx, |store, _| {
+            let uuids: Vec<Option<String>> = store
+                .transcript()
+                .active_path()
+                .iter()
+                .map(|record| record.uuid.clone())
+                .collect();
+            assert_eq!(
+                uuids,
+                Vec::<Option<String>>::new(),
+                "the session's own line must not reach the agent's transcript"
+            );
+            assert!(
+                store.transcript().is_empty(),
+                "nothing of the session's own conversation may be absorbed once an \
+                 agent's is the one being read"
+            );
+        });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A subagent conversation is something to read, never something to type into. What
+    /// the user sends goes to the session's pane whichever conversation is on screen,
+    /// because the session is the only thing there is to type into.
+    #[gpui::test]
+    async fn test_send_input_reaches_the_session_while_an_agents_conversation_is_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("subagent-send");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("91.json"),
+            &registration_json_with_tmux(91, "typing-session", "a session:@3.%7"),
+        );
+        write_transcript(
+            &home_directory,
+            "typing-session",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+        write_subagent(
+            &home_directory,
+            "typing-session",
+            None,
+            FLAT_AGENT_ID,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n",
+        );
+
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![91]),
+        ));
+        let store = store_with_selection(cx, source.clone(), 91).await;
+        store.update(cx, |store, cx| {
+            store.select_transcript_target(
+                TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                },
+                cx,
+            )
+        });
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.pane_target(),
+                Some("%7".to_string()),
+                "the pane to type into is the session's, whatever is being read"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store
+                .send_input(SessionInput::Text("hello".to_string()), cx)
+                .detach()
+        });
+        store.update(cx, |store, cx| {
+            store.send_input(SessionInput::Escape, cx).detach()
+        });
+        cx.run_until_parked();
+
+        let sent_inputs = source.sent_inputs.lock().expect("reading the sends");
+        assert_eq!(
+            *sent_inputs,
+            vec![
+                SentInput::Text {
+                    pane_target: "%7".to_string(),
+                    text: "hello".to_string(),
+                },
+                SentInput::Escape {
+                    pane_target: "%7".to_string(),
+                },
+            ],
+            "both sends must reach the session's pane, unchanged by the conversation \
+             being read"
+        );
+        drop(sent_inputs);
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.error(), None);
+            assert_eq!(
+                store.transcript_target(),
+                &TranscriptTarget::Subagent {
+                    agent_id: FLAT_AGENT_ID.to_string(),
+                    workflow_run_id: None,
+                },
+                "sending must not move the user off the conversation being read"
             );
         });
 

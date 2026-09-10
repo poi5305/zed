@@ -1422,7 +1422,10 @@ mod tests {
             "the search examines exactly {LOCAL_PORT_SEARCH_LIMIT} port numbers"
         );
         assert_eq!(probed.first().copied(), Some(4000));
-        assert_eq!(probed.last().copied(), Some(4000 + LOCAL_PORT_SEARCH_LIMIT - 1));
+        assert_eq!(
+            probed.last().copied(),
+            Some(4000 + LOCAL_PORT_SEARCH_LIMIT - 1)
+        );
     }
 
     #[test]

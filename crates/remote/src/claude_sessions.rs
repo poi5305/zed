@@ -334,14 +334,7 @@ pub fn read_transcript_tail(
         Some(path) => path,
         None => {
             let Some(path) = find_transcript(home_directory, session_id) else {
-                return Ok(TailProgress {
-                    path: None,
-                    start_offset,
-                    offset: 0,
-                    pending: Vec::new(),
-                    lines: Vec::new(),
-                    restarted: state.offset > 0 || !state.pending.is_empty(),
-                });
+                return Ok(tail_of_no_file(&state));
             };
             // Either the file has only just appeared, or the one being followed was
             // replaced; in both cases it has to be read from the beginning.
@@ -352,6 +345,57 @@ pub fn read_transcript_tail(
         }
     };
 
+    read_appended_lines(path, state, start_offset, restarted)
+}
+
+/// Follows one subagent's conversation, naming the file by the three ids on every read.
+///
+/// Separate from [`read_transcript_tail`] rather than a path handed to it, because that
+/// function reads a path it cannot open as "the session has started a new conversation"
+/// and looks the session's own transcript up instead. For an agent that fallback is a
+/// disclosure rather than a recovery: the main conversation's lines would be handed back
+/// under the agent's name, and the caller has no way to tell. An agent whose transcript
+/// cannot be named — a deleted file, or an id that could name something outside the
+/// session's own directory — therefore reports no file and no lines.
+pub fn read_subagent_transcript_tail(
+    home_directory: &Path,
+    session_id: &str,
+    agent_id: &str,
+    workflow_run_id: Option<&str>,
+    state: TailState,
+) -> Result<TailProgress> {
+    // Resolved here rather than taken from `state.path`, so that the three ids go through
+    // the same boundary on every read and no path can be followed that they do not name.
+    let Some(path) =
+        subagent_transcript_path(home_directory, session_id, agent_id, workflow_run_id)
+    else {
+        return Ok(tail_of_no_file(&state));
+    };
+
+    let start_offset = state.offset;
+    read_appended_lines(path, state, start_offset, false)
+}
+
+/// The answer to a read whose file cannot be named at all: nothing was read, and anything
+/// the caller has absorbed so far belongs to a file that is no longer there.
+fn tail_of_no_file(state: &TailState) -> TailProgress {
+    TailProgress {
+        path: None,
+        start_offset: state.offset,
+        offset: 0,
+        pending: Vec::new(),
+        lines: Vec::new(),
+        restarted: state.offset > 0 || !state.pending.is_empty(),
+    }
+}
+
+/// Reads whatever `path` has grown by since `state.offset` and splits it into whole lines.
+fn read_appended_lines(
+    path: PathBuf,
+    mut state: TailState,
+    start_offset: u64,
+    mut restarted: bool,
+) -> Result<TailProgress> {
     let size = fs::metadata(&path)
         .with_context(|| format!("reading metadata of {}", path.display()))?
         .len();
@@ -2485,5 +2529,224 @@ mod tests {
             Some("wf_b529a29d-562"),
             "a value the boundary rejects is not a run id, so the search continues"
         );
+    }
+
+    /// The tail of an agent whose transcript is gone must answer with nothing, and above
+    /// all not with the session's own conversation: a path `read_transcript_tail` cannot
+    /// open sends it looking for the main transcript, which would hand the main
+    /// conversation's lines back under this agent's name.
+    #[test]
+    fn a_subagent_tail_never_answers_with_the_main_conversation() -> Result<()> {
+        let home_directory = temporary_directory("subagent-tail-no-fallback");
+        write_transcript(
+            &home_directory,
+            REAL_SESSION_ID,
+            "{\"type\":\"user\",\"uuid\":\"main-only\"}\n",
+        );
+        let agent_transcript = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"agent-1\"}\n",
+        );
+        std::fs::remove_file(&agent_transcript)?;
+
+        // The path is passed in as well, the way a client that read it from a listing
+        // would send it back, so that following it is ruled out rather than untested.
+        let progress = read_subagent_transcript_tail(
+            &home_directory,
+            REAL_SESSION_ID,
+            REAL_AGENT_ID,
+            None,
+            TailState {
+                path: Some(agent_transcript),
+                offset: 0,
+                pending: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(
+            progress.lines,
+            Vec::<String>::new(),
+            "the tail of agent {REAL_AGENT_ID}, whose transcript is gone, must report no \
+             lines, but it reported {:?} from {:?}",
+            progress.lines,
+            progress.path
+        );
+        assert_eq!(
+            progress.path, None,
+            "the tail must name no file, but it named {:?}",
+            progress.path
+        );
+        assert_eq!(progress.offset, 0);
+        assert!(
+            !progress.restarted,
+            "nothing had been read yet, so there is nothing for the caller to discard"
+        );
+
+        // The same read once the agent has absorbed something: what it has is stale, so
+        // the restart has to be reported.
+        let after_absorbing = read_subagent_transcript_tail(
+            &home_directory,
+            REAL_SESSION_ID,
+            REAL_AGENT_ID,
+            None,
+            TailState {
+                path: None,
+                offset: 64,
+                pending: Vec::new(),
+            },
+        )?;
+        assert!(
+            after_absorbing.restarted,
+            "64 bytes had been read from a file that is gone, so the caller must be told \
+             to discard them"
+        );
+        assert_eq!(after_absorbing.lines, Vec::<String>::new());
+        assert_eq!(after_absorbing.path, None);
+
+        Ok(())
+    }
+
+    /// The same boundary as the one on `subagent_transcript_path`, applied where the ids
+    /// arrive as a tail request: an id that names more than one entry must answer with
+    /// nothing rather than with whatever it happens to reach.
+    #[test]
+    fn no_id_can_make_a_subagent_tail_read_another_file() -> Result<()> {
+        let home_directory = temporary_directory("subagent-tail-boundary");
+        write_transcript(
+            &home_directory,
+            REAL_SESSION_ID,
+            "{\"type\":\"user\",\"uuid\":\"main-only\"}\n",
+        );
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"agent-1\"}\n",
+        );
+
+        for rejected in IDS_THAT_NAME_MORE_THAN_ONE_ENTRY {
+            for (label, session_id, agent_id, workflow_run_id) in [
+                ("session id", rejected, REAL_AGENT_ID, None),
+                ("agent id", REAL_SESSION_ID, rejected, None),
+                (
+                    "workflow run id",
+                    REAL_SESSION_ID,
+                    REAL_AGENT_ID,
+                    Some(rejected),
+                ),
+            ] {
+                let progress = read_subagent_transcript_tail(
+                    &home_directory,
+                    session_id,
+                    agent_id,
+                    workflow_run_id,
+                    TailState {
+                        path: None,
+                        offset: 0,
+                        pending: Vec::new(),
+                    },
+                )?;
+                assert_eq!(
+                    progress.path, None,
+                    "a {label} of {rejected:?} must name no file, but it named {:?}",
+                    progress.path
+                );
+                assert_eq!(
+                    progress.lines,
+                    Vec::<String>::new(),
+                    "a {label} of {rejected:?} must read nothing, but it read {:?}",
+                    progress.lines
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// What the no-fallback rule must not kill: an agent whose transcript is there is
+    /// still followed, incrementally, in both on-disk layouts.
+    #[test]
+    fn a_subagent_tail_reads_the_agents_own_lines_as_they_are_appended() -> Result<()> {
+        let home_directory = temporary_directory("subagent-tail-incremental");
+        write_transcript(
+            &home_directory,
+            REAL_SESSION_ID,
+            "{\"type\":\"user\",\"uuid\":\"main-only\"}\n",
+        );
+        let first_line = "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"agent-1\"}\n";
+        let agent_transcript = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            REAL_AGENT_ID,
+            SUBAGENT_META_WORKFLOW,
+            first_line,
+        );
+
+        let tail_from = |state: TailState| {
+            read_subagent_transcript_tail(
+                &home_directory,
+                REAL_SESSION_ID,
+                REAL_AGENT_ID,
+                Some(REAL_WORKFLOW_RUN_ID),
+                state,
+            )
+        };
+
+        let first = tail_from(TailState {
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+        })?;
+        assert_eq!(
+            first.lines,
+            vec![first_line.trim_end().to_string()],
+            "the agent's own line is the one to read, not the main conversation's"
+        );
+        assert_eq!(first.path.as_deref(), Some(agent_transcript.as_path()));
+        assert_eq!(first.offset, first_line.len() as u64);
+        assert!(!first.restarted);
+
+        let second_line = "{\"type\":\"assistant\",\"isSidechain\":true,\"uuid\":\"agent-2\"}\n";
+        std::fs::write(
+            &agent_transcript,
+            format!("{first_line}{second_line}").as_bytes(),
+        )?;
+
+        let second = tail_from(TailState {
+            path: first.path,
+            offset: first.offset,
+            pending: first.pending,
+        })?;
+        assert_eq!(
+            second.lines,
+            vec![second_line.trim_end().to_string()],
+            "only the appended line belongs to this read"
+        );
+        assert!(!second.restarted);
+
+        // A shorter file at the same path is a different conversation, and the caller has
+        // to be told that what it holds is stale.
+        std::fs::write(&agent_transcript, b"{\"uuid\":\"agent-9\"}\n")?;
+        let third = tail_from(TailState {
+            path: second.path,
+            offset: second.offset,
+            pending: second.pending,
+        })?;
+        assert!(
+            third.restarted,
+            "a file of {} bytes read from offset {} must report a restart",
+            std::fs::metadata(&agent_transcript)?.len(),
+            second.offset
+        );
+        assert_eq!(third.lines, vec!["{\"uuid\":\"agent-9\"}".to_string()]);
+
+        Ok(())
     }
 }

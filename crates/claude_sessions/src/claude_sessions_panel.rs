@@ -28,7 +28,10 @@ use gpui::{
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
-use ui::{Button, Disclosure, Divider, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, SelectableButton as _,
+    TintColor, Tooltip, prelude::*,
+};
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
     Workspace,
@@ -37,7 +40,8 @@ use workspace::{
 
 use crate::{
     ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, RegisteredSession, SendMessage,
-    ToggleFocus, TranscriptRecord,
+    SubagentSummary, ToggleFocus, TranscriptRecord, TranscriptTarget,
+    session_registry::workflow_run_id_in_tool_result,
     session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
 };
 
@@ -106,6 +110,47 @@ const TOOL_TARGET_CHARACTERS: usize = 40;
 /// its own icons at.
 const PULSE_PERIOD: Duration = Duration::from_secs(1);
 
+/// How many lines of a tool's output are drawn before the rest is put behind a
+/// disclosure. A build log or a test run is thousands of lines, and one of them drawn
+/// whole leaves no room in the panel for the conversation around it.
+const MAX_UNCLAMPED_OUTPUT_LINES: usize = 12;
+
+/// The one tool whose input is a command rather than a description of one, so the
+/// command itself is what is drawn, in the shell's own syntax.
+const BASH_TOOL_NAME: &str = "Bash";
+
+/// The tools that carry the text of the file they are about, and the field of their
+/// input it sits in. That text is what the call is, so it is what is drawn, in the
+/// language of the file it names.
+///
+/// `Read` is deliberately absent: its input names a path and carries none of the file, so
+/// there is nothing of the file to draw and its input is JSON however the file is
+/// written.
+const FILE_TOOL_CONTENT_FIELDS: [(&str, &str); 3] = [
+    ("Write", "content"),
+    ("Edit", "new_string"),
+    ("NotebookEdit", "new_source"),
+];
+
+/// The two tools that start conversations of their own: one agent, and a run of several.
+const AGENT_TOOL_NAME: &str = "Agent";
+const WORKFLOW_TOOL_NAME: &str = "Workflow";
+
+/// How much of an agent's id a chip carries when the agent recorded no description of
+/// what it was asked to do. Enough to tell two agents apart without the id taking the
+/// whole chip.
+const AGENT_ID_CHIP_CHARACTERS: usize = 6;
+
+const MAIN_CONVERSATION_CHIP: &str = "Main";
+const AGENT_READ_ONLY_NOTE: &str =
+    "This is an agent's conversation, and can only be read. Switch to Main to reply.";
+
+const NO_OUTPUT_NOTE: &str = "(no output)";
+
+/// How much of the speaker's own color the rail beside a message carries. Full strength
+/// beside every message competes with the text for attention.
+const ROLE_RAIL_OPACITY: f32 = 0.5;
+
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -132,6 +177,11 @@ pub struct ClaudeSessionsPanel {
     /// What the selected session is doing, as of the last change to its transcript; see
     /// [`activity`].
     activity: Activity,
+    /// The calls in the conversation on screen that started conversations of their own,
+    /// keyed by the entry each is drawn as; see [`agent_calls`]. Rebuilt with the entries
+    /// rather than cached with them, because the state of what a call started changes
+    /// while the call's own record never does.
+    agent_calls: HashMap<SharedString, AgentCall>,
     list_state: ListState,
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
@@ -442,12 +492,14 @@ impl MessageRole {
         }
     }
 
+    /// Each speaker keeps a color of its own, because the panel is often narrow enough
+    /// that a label is truncated and the color is what is left to tell the rows apart.
     fn color(self) -> Color {
         match self {
-            Self::User => Color::Muted,
+            Self::User => Color::Info,
             Self::Assistant => Color::Accent,
             Self::Other => Color::Muted,
-            Self::CompactSummary => Color::Accent,
+            Self::CompactSummary => Color::Warning,
         }
     }
 }
@@ -516,6 +568,7 @@ impl ClaudeSessionsPanel {
                 entries: Vec::new(),
                 pending_sends: PendingSends::default(),
                 activity: Activity::Idle,
+                agent_calls: HashMap::default(),
                 list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
                 session_list_expanded: true,
                 unread_below: UnreadBelow::default(),
@@ -534,15 +587,32 @@ impl ClaudeSessionsPanel {
     }
 
     fn select_session(&mut self, process_id: u32, cx: &mut Context<Self>) {
-        // Whether the previous conversation had been compacted says nothing about this
-        // one, so the history toggle starts closed again.
-        self.show_full_history = false;
-        // The reader is looking at another conversation now, and what they are shown of
-        // it is its newest end — not the place they had scrolled the last one to.
-        self.unread_below.reset();
-        self.list_state.scroll_to_end();
+        self.show_the_newest_of_another_conversation();
         self.store
             .update(cx, |store, cx| store.select(process_id, cx));
+    }
+
+    /// What is owed to a reader who has been moved to another conversation, whichever
+    /// gesture moved them: whether the last one had been compacted says nothing about
+    /// this one, so the history toggle starts closed; and what they are shown of it is
+    /// its newest end, not the place they had scrolled the last one to, so nothing of it
+    /// is owed to them as unread either.
+    fn show_the_newest_of_another_conversation(&mut self) {
+        self.show_full_history = false;
+        self.unread_below.reset();
+        self.list_state.scroll_to_end();
+    }
+
+    /// Follows another of the selected session's conversations, from a chip or from the
+    /// card under the call that started it.
+    ///
+    /// Everything the reader is owed about the conversation they are leaving is settled
+    /// the same way selecting another session settles it: another conversation is another
+    /// thing to read, and what they are shown of it is its newest end.
+    fn select_transcript_target(&mut self, target: TranscriptTarget, cx: &mut Context<Self>) {
+        self.show_the_newest_of_another_conversation();
+        self.store
+            .update(cx, |store, cx| store.select_transcript_target(target, cx));
     }
 
     fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
@@ -586,7 +656,7 @@ impl ClaudeSessionsPanel {
         // Moved out for the duration of the build so that the transcript can be borrowed
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
-        let (mut new_entries, activity) = {
+        let (mut new_entries, activity, agent_calls) = {
             let store = self.store.read(cx);
             let home_directory = store.home_directory();
             let transcript = store.transcript();
@@ -601,10 +671,12 @@ impl ClaudeSessionsPanel {
             (
                 build_entries(&path, home_directory, &mut cache),
                 activity(&path),
+                agent_calls(&path),
             )
         };
         self.entry_cache = cache;
         self.activity = activity;
+        self.agent_calls = agent_calls;
 
         // Paired against the entries the transcript itself produced, before the pending
         // ones are appended: a pending message must never be paired with another pending
@@ -707,10 +779,21 @@ impl ClaudeSessionsPanel {
         let mut keys = HashSet::default();
         for entry in &self.entries {
             keys.insert(entry.key.clone());
-            if let EntryKind::Attachments { items } = &entry.kind {
-                for item in items {
-                    keys.insert(item.key.clone());
+            match &entry.kind {
+                // An output is clamped behind an expansion key of its own, which has to
+                // survive the rebuild that runs on every change to the transcript, or an
+                // output the reader has opened closes itself four times a second while
+                // the session is answering.
+                EntryKind::ToolResult { .. } => {
+                    keys.insert(output_expansion_key(&entry.key));
                 }
+                EntryKind::Attachments { items } => {
+                    for item in items {
+                        keys.insert(item.key.clone());
+                        keys.insert(output_expansion_key(&item.key));
+                    }
+                }
+                _ => {}
             }
         }
         keys
@@ -976,6 +1059,202 @@ impl ClaudeSessionsPanel {
             .on_click(cx.listener(move |this, _, _, cx| this.select_session(process_id, cx)))
     }
 
+    /// The row of conversations the selected session has to offer: its own, then one chip
+    /// per agent it has spawned.
+    ///
+    /// `None` when there is nothing to choose between — no session, or a session that has
+    /// spawned nothing — so that the row does not take a line of the panel from the
+    /// conversation for the sake of a single chip.
+    fn render_agent_chips(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Read out whole before any listener is built: the store's borrow and the
+        // `cx.listener` calls below cannot be held at the same time.
+        let (subagents, target, states) = {
+            let store = self.store.read(cx);
+            store.selected()?;
+            let subagents = store.subagents().to_vec();
+            // The states come off the session's own conversation, which is followed
+            // whichever one is on screen, so a chip stays truthful while its own agent's
+            // records are the ones being drawn.
+            let main_path = store.main_transcript().active_path();
+            let states: Vec<AgentState> = subagents
+                .iter()
+                .map(|summary| agent_state(summary, &main_path))
+                .collect();
+            (subagents, store.transcript_target().clone(), states)
+        };
+
+        if subagents.is_empty() && target == TranscriptTarget::Main {
+            return None;
+        }
+
+        let mut row = h_flex()
+            .id("claude-session-agent-chips")
+            .w_full()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            // The chips are as many as the session has spawned, which is more than fits
+            // across a side panel; scrolling them keeps the panel its own width.
+            .overflow_x_scroll()
+            .child(self.render_agent_chip(
+                "main",
+                SharedString::from(MAIN_CONVERSATION_CHIP),
+                None,
+                target == TranscriptTarget::Main,
+                false,
+                TranscriptTarget::Main,
+                cx,
+            ));
+
+        for (index, summary) in subagents.iter().enumerate() {
+            let chip_target = TranscriptTarget::Subagent {
+                agent_id: summary.agent_id.clone(),
+                workflow_run_id: summary.workflow_run_id.clone(),
+            };
+            let is_selected = target == chip_target;
+            let is_running = states.get(index).copied() == Some(AgentState::Running);
+            row = row.child(self.render_agent_chip(
+                &format!("agent-{index}"),
+                agent_chip_label(summary),
+                Some(agent_chip_tooltip(summary)),
+                is_selected,
+                is_running,
+                chip_target,
+                cx,
+            ));
+        }
+
+        Some(row.into_any_element())
+    }
+
+    /// One chip. An agent that has returned stays on the row rather than being taken off
+    /// it — its conversation is the thing worth reading afterwards — and says so by being
+    /// the quiet one.
+    fn render_agent_chip(
+        &self,
+        id: &str,
+        label: SharedString,
+        tooltip: Option<SharedString>,
+        is_selected: bool,
+        is_running: bool,
+        target: TranscriptTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = Button::new(
+            SharedString::from(format!("claude-session-chip-{id}")),
+            label,
+        )
+        .label_size(LabelSize::XSmall)
+        .color(if is_running {
+            Color::Default
+        } else {
+            Color::Muted
+        })
+        .toggle_state(is_selected)
+        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+        .when_some(tooltip, |this, tooltip| {
+            this.tooltip(Tooltip::text(tooltip))
+        })
+        .on_click(
+            cx.listener(move |this, _, _, cx| this.select_transcript_target(target.clone(), cx)),
+        );
+
+        if !is_running {
+            return button.into_any_element();
+        }
+
+        // Wrapped so that the pulse applies to the element: the icon itself carries a
+        // colour rather than an opacity.
+        let indicator = div()
+            .child(
+                Icon::new(IconName::Indicator)
+                    .size(IconSize::XSmall)
+                    .color(Color::Success),
+            )
+            .with_animation(
+                SharedString::from(format!("claude-session-chip-pulse-{id}")),
+                Animation::new(PULSE_PERIOD)
+                    .repeat()
+                    .with_easing(pulsating_between(0.2, 0.8)),
+                |indicator, delta| indicator.opacity(delta),
+            );
+
+        h_flex()
+            .flex_none()
+            .gap_0p5()
+            .child(indicator)
+            .child(button)
+            .into_any_element()
+    }
+
+    /// The agents one call started, as the card under that call draws them. Empty for a
+    /// call this panel cannot pair with anything on disk: a card saying nothing about an
+    /// agent is worse than no card.
+    fn agent_cards(&self, key: &SharedString, cx: &Context<Self>) -> Vec<AgentCardRow> {
+        let Some(call) = self.agent_calls.get(key) else {
+            return Vec::new();
+        };
+
+        let store = self.store.read(cx);
+        let main_path = store.main_transcript().active_path();
+        subagents_of_call(call, store.subagents(), &main_path)
+            .into_iter()
+            .map(|summary| AgentCardRow {
+                label: agent_chip_label(summary),
+                state: agent_state(summary, &main_path),
+                target: TranscriptTarget::Subagent {
+                    agent_id: summary.agent_id.clone(),
+                    workflow_run_id: summary.workflow_run_id.clone(),
+                },
+            })
+            .collect()
+    }
+
+    fn render_agent_card(
+        &self,
+        key: &SharedString,
+        index: usize,
+        card: AgentCardRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (state_note, state_color) = match card.state {
+            AgentState::Running => ("Running", Color::Success),
+            AgentState::Finished => ("Finished", Color::Muted),
+        };
+        let target = card.target;
+
+        h_flex()
+            .w_full()
+            .px_2()
+            .pb_1()
+            .gap_1()
+            .justify_between()
+            .child(
+                v_flex()
+                    .overflow_hidden()
+                    .child(Label::new(card.label).size(LabelSize::XSmall).single_line())
+                    .child(
+                        Label::new(state_note)
+                            .size(LabelSize::XSmall)
+                            .color(state_color),
+                    ),
+            )
+            .child(
+                Button::new(
+                    SharedString::from(format!("claude-session-open-agent-{key}-{index}")),
+                    "Open",
+                )
+                .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
+                .label_size(LabelSize::XSmall)
+                .tooltip(Tooltip::text("Read this agent's conversation"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_transcript_target(target.clone(), cx)
+                })),
+            )
+            .into_any_element()
+    }
+
     fn render_transcript_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
         let has_selection = store.selected().is_some();
@@ -1087,11 +1366,22 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
+    /// Whether a reply can be typed at all.
+    ///
+    /// There has to be a pane to type into, and the conversation on screen has to be the
+    /// session's own. An agent's conversation is something to read: the session's pane is
+    /// the only thing there is to type into, so a reply sent from under an agent's records
+    /// would arrive in a conversation the reader is not looking at.
+    fn can_send(&self, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        store.pane_target().is_some() && *store.transcript_target() == TranscriptTarget::Main
+    }
+
     /// A session Zed has no pane to type into can only be read, and so can no session at
     /// all; the input is disabled in both cases rather than hidden, so that the reason is
     /// visible where the reply would be typed.
     fn sync_input_availability(&mut self, cx: &mut Context<Self>) {
-        let read_only = self.store.read(cx).pane_target().is_none();
+        let read_only = !self.can_send(cx);
         self.message_editor.update(cx, |editor, cx| {
             if editor.read_only(cx) != read_only {
                 editor.set_read_only(read_only);
@@ -1103,7 +1393,7 @@ impl ClaudeSessionsPanel {
     /// Only ever reached from a user gesture — the Send button, or the binding on the
     /// input's `enter`.
     fn send_message(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.read(cx).pane_target().is_none() {
+        if !self.can_send(cx) {
             return;
         }
 
@@ -1160,7 +1450,7 @@ impl ClaudeSessionsPanel {
     }
 
     fn interrupt_session(&mut self, _: &Interrupt, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.read(cx).pane_target().is_none() {
+        if !self.can_send(cx) {
             return;
         }
 
@@ -1172,16 +1462,12 @@ impl ClaudeSessionsPanel {
     }
 
     fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_send = self.can_send(cx);
         let store = self.store.read(cx);
         let has_selection = store.selected().is_some();
-        let can_send = store.pane_target().is_some();
-        let note = if can_send {
-            None
-        } else if has_selection {
-            Some(READ_ONLY_NOTE)
-        } else {
-            Some(SELECT_A_SESSION_TO_REPLY)
-        };
+        let is_reading_an_agent =
+            matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
+        let note = input_note(can_send, is_reading_an_agent, has_selection);
 
         v_flex()
             .w_full()
@@ -1263,6 +1549,8 @@ impl ClaudeSessionsPanel {
                     .px_2()
                     .py_1()
                     .gap_0p5()
+                    .border_l_2()
+                    .border_color(role.color().color(cx).opacity(ROLE_RAIL_OPACITY))
                     .child(
                         h_flex()
                             .gap_1()
@@ -1274,7 +1562,7 @@ impl ClaudeSessionsPanel {
                             .child(
                                 Label::new(role.label())
                                     .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
+                                    .color(role.color()),
                             ),
                     )
                     .child(
@@ -1316,18 +1604,19 @@ impl ClaudeSessionsPanel {
             }
 
             EntryKind::ToolUse { name, input } => {
+                let display = tool_input_display(&name, &input);
                 let header = self.render_disclosure_header(
                     index,
                     &key,
                     IconName::ToolHammer,
-                    Color::Muted,
+                    Color::Success,
                     name,
-                    Some(first_line(&input)),
+                    Some(first_line(&display.text)),
                     is_expanded,
                     cx,
                 );
                 let body = if is_expanded {
-                    let markdown = self.markdown_for(&key, fenced_code(&input, "json"), cx);
+                    let markdown = self.markdown_for(&key, display.code_block(), cx);
                     Some(
                         div()
                             .w_full()
@@ -1338,11 +1627,15 @@ impl ClaudeSessionsPanel {
                 } else {
                     None
                 };
-                v_flex()
-                    .w_full()
-                    .child(header)
-                    .children(body)
-                    .into_any_element()
+                // Drawn whether or not the call is expanded: what the call started, and
+                // whether it is still going, is the part of an `Agent` call worth seeing
+                // without opening anything.
+                let cards = self.agent_cards(&key, cx);
+                let mut element = v_flex().w_full().child(header).children(body);
+                for (card_index, card) in cards.into_iter().enumerate() {
+                    element = element.child(self.render_agent_card(&key, card_index, card, cx));
+                }
+                element.into_any_element()
             }
 
             EntryKind::ToolResult {
@@ -1385,12 +1678,12 @@ impl ClaudeSessionsPanel {
                 let rendered_body = if is_expanded {
                     Some(match body {
                         ToolResultBody::Inline(text) => {
-                            let markdown = self.markdown_for(&key, fenced_code(&text, ""), cx);
+                            let output = self.render_tool_output(index, &key, &text, window, cx);
                             div()
                                 .w_full()
                                 .px_2()
                                 .pb_1()
-                                .child(MarkdownElement::new(markdown, markdown_style(window, cx)))
+                                .child(output)
                                 .into_any_element()
                         }
                         ToolResultBody::Persisted(persisted) => {
@@ -1451,6 +1744,13 @@ impl ClaudeSessionsPanel {
                 .px_2()
                 .py_1()
                 .gap_0p5()
+                .border_l_2()
+                .border_color(
+                    MessageRole::User
+                        .color()
+                        .color(cx)
+                        .opacity(ROLE_RAIL_OPACITY),
+                )
                 .child(
                     h_flex()
                         .gap_1()
@@ -1462,7 +1762,7 @@ impl ClaudeSessionsPanel {
                         .child(
                             Label::new(MessageRole::User.label())
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                                .color(MessageRole::User.color()),
                         ),
                 )
                 // Drawn as code rather than as prose: what the user typed was a command
@@ -1481,6 +1781,13 @@ impl ClaudeSessionsPanel {
                     .px_2()
                     .py_1()
                     .gap_0p5()
+                    .border_l_2()
+                    .border_color(
+                        MessageRole::User
+                            .color()
+                            .color(cx)
+                            .opacity(ROLE_RAIL_OPACITY),
+                    )
                     .child(
                         h_flex()
                             .w_full()
@@ -1711,8 +2018,6 @@ impl ClaudeSessionsPanel {
             Some(OutputLoad::Loaded(text)) => text.clone(),
             _ => persisted.preview.clone(),
         };
-        let markdown = self.markdown_for(key, fenced_code(&displayed_text, ""), cx);
-
         let path_label = SharedString::from(persisted.path.to_string_lossy().into_owned());
         let load_key = key.clone();
         let load_path = persisted.path.clone();
@@ -1747,6 +2052,7 @@ impl ClaudeSessionsPanel {
             }
             None => None,
         };
+        let output = self.render_tool_output(entry_index, key, &displayed_text, window, cx);
 
         v_flex()
             .w_full()
@@ -1764,8 +2070,75 @@ impl ClaudeSessionsPanel {
                     .color(Color::Muted)
                     .single_line(),
             )
-            .child(MarkdownElement::new(markdown, markdown_style(window, cx)))
+            .child(output)
             .children(action)
+            .into_any_element()
+    }
+
+    /// The framed card a tool's output is drawn in: clamped to its first lines, with a
+    /// disclosure for the rest, when the output is long.
+    fn render_tool_output(
+        &mut self,
+        entry_index: usize,
+        key: &SharedString,
+        text: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let card = div()
+            .w_full()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().editor_background);
+
+        if text.trim().is_empty() {
+            return card
+                .px_1p5()
+                .py_1()
+                .child(
+                    Label::new(NO_OUTPUT_NOTE)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        let output_key = output_expansion_key(key);
+        let is_expanded = self.expanded.contains(&output_key);
+        let is_clamped = output_is_clamped(text, MAX_UNCLAMPED_OUTPUT_LINES);
+        let shown = if is_clamped && !is_expanded {
+            SharedString::from(clamped_output(text, MAX_UNCLAMPED_OUTPUT_LINES).to_string())
+        } else {
+            text.clone()
+        };
+        let markdown = self.markdown_for(key, fenced_code(&shown, ""), cx);
+        let disclosure = is_clamped.then(|| {
+            let title = if is_expanded {
+                "Show less"
+            } else {
+                "Show the whole output"
+            };
+            self.render_disclosure_header(
+                entry_index,
+                &output_key,
+                IconName::Ellipsis,
+                Color::Muted,
+                title.into(),
+                None,
+                is_expanded,
+                cx,
+            )
+        });
+
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(card.child(MarkdownElement::new(
+                markdown,
+                tool_output_markdown_style(window, cx),
+            )))
+            .children(disclosure)
             .into_any_element()
     }
 
@@ -1784,7 +2157,10 @@ impl ClaudeSessionsPanel {
         let toggle_key = key.clone();
         let click_key = key.clone();
 
-        ListItem::new(SharedString::from(format!("entry-{entry_index}")))
+        // Identified by the entry's key rather than by its position, so that the row a
+        // reader is hovering keeps its state as the conversation grows above it, and so
+        // that an output's own disclosure is not the same element as its entry's header.
+        ListItem::new(SharedString::from(format!("entry-{key}")))
             .spacing(ListItemSpacing::Sparse)
             .toggle(is_expanded)
             .on_toggle(cx.listener(move |this, _, _, cx| {
@@ -1817,6 +2193,7 @@ impl Render for ClaudeSessionsPanel {
             .size_full()
             .child(self.render_session_section(cx))
             .child(Divider::horizontal())
+            .children(self.render_agent_chips(cx))
             .child(self.render_transcript_section(cx))
             .children(self.render_activity())
             .child(self.render_input(cx))
@@ -2216,6 +2593,240 @@ fn tool_target(block: &Value) -> SharedString {
     SharedString::from(truncate_and_trailoff(target.trim(), TOOL_TARGET_CHARACTERS))
 }
 
+/// Whether one of the selected session's agents is still working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentState {
+    Running,
+    Finished,
+}
+
+/// A `tool_use` block that spawned conversations of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentCall {
+    tool_use_id: SharedString,
+    is_workflow: bool,
+}
+
+/// One agent as the card under the call that spawned it draws it.
+struct AgentCardRow {
+    label: SharedString,
+    state: AgentState,
+    target: TranscriptTarget,
+}
+
+/// Whether one of the selected session's agents is still working.
+///
+/// Read off the session's own conversation, never the agent's: an agent's transcript
+/// ends when the agent stops writing and records nothing about having returned. The one
+/// place the end of an agent is written down is the result of the call that spawned it.
+fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> AgentState {
+    if let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() {
+        let answered = main_path
+            .iter()
+            .any(|record| tool_result_ids(record).contains(&tool_use_id));
+        return if answered {
+            AgentState::Finished
+        } else {
+            AgentState::Running
+        };
+    }
+
+    // A `Workflow` run's agents record no tool use id, so the end of the run is the only
+    // thing that says they are over, and the run announces itself by id in the result of
+    // the `Workflow` call.
+    if let Some(workflow_run_id) = summary.workflow_run_id.as_deref() {
+        return if workflow_run_is_announced_as_over(workflow_run_id, main_path) {
+            AgentState::Finished
+        } else {
+            AgentState::Running
+        };
+    }
+
+    // Neither id, so nothing in the conversation pairs with this agent at all. A chip
+    // that pulses for the rest of the session is worse than one that never pulses.
+    AgentState::Finished
+}
+
+fn workflow_run_is_announced_as_over(
+    workflow_run_id: &str,
+    main_path: &[&TranscriptRecord],
+) -> bool {
+    main_path.iter().any(|record| {
+        tool_result_texts(record).into_iter().any(|(_, text)| {
+            workflow_run_id_in_tool_result(&text).as_deref() == Some(workflow_run_id)
+        })
+    })
+}
+
+/// Every `tool_result` block a record holds, as the id of the call it answers and the
+/// text of the answer.
+fn tool_result_texts(record: &TranscriptRecord) -> Vec<(&str, String)> {
+    let Some(blocks) = record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some(TOOL_RESULT_BLOCK_TYPE))
+        .filter_map(|block| {
+            let tool_use_id = block.get("tool_use_id").and_then(Value::as_str)?;
+            Some((tool_use_id, block_content_text(block.get("content"))))
+        })
+        .collect()
+}
+
+/// What a chip says the agent is: what it was asked to do, or failing that which agent it
+/// is. A description of nothing but whitespace is no label at all.
+fn agent_chip_label(summary: &SubagentSummary) -> SharedString {
+    if let Some(description) = summary
+        .meta
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        return SharedString::from(description.to_string());
+    }
+
+    // Taken by characters rather than bytes: agent ids are hexadecimal in practice, but
+    // slicing an id that is not would panic partway through a character.
+    let short_id: String = summary
+        .agent_id
+        .chars()
+        .take(AGENT_ID_CHIP_CHARACTERS)
+        .collect();
+    SharedString::from(format!("{} {short_id}", summary.meta.agent_type))
+}
+
+/// What the chip's tooltip adds to its label: only the fields the agent actually
+/// recorded, because a line reading `model: unknown` says less than no line.
+fn agent_chip_tooltip(summary: &SubagentSummary) -> SharedString {
+    let mut lines = vec![summary.meta.agent_type.clone()];
+    if let Some(model) = summary.meta.model.as_deref() {
+        lines.push(model.to_string());
+    }
+    lines.push(format!("depth {}", summary.meta.spawn_depth));
+    if let Some(workflow_phase) = summary.meta.workflow_phase.as_deref() {
+        lines.push(workflow_phase.to_string());
+    }
+    SharedString::from(lines.join("\n"))
+}
+
+/// The calls in a conversation that started conversations of their own, keyed by the
+/// entry each call is drawn as, so that the card offering what it started can be hung
+/// under exactly that row.
+///
+/// Keyed the way [`build_entries`] keys a block's entry; the two must agree or the card
+/// lands under the wrong call.
+fn agent_calls(path: &[&TranscriptRecord]) -> HashMap<SharedString, AgentCall> {
+    let mut calls = HashMap::default();
+
+    for (path_index, record) in path.iter().enumerate() {
+        let Some(blocks) = record
+            .raw
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let base_key = match record.uuid.as_ref() {
+            Some(uuid) => SharedString::from(uuid.clone()),
+            None => SharedString::from(format!("path-{path_index}")),
+        };
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.get("type").and_then(Value::as_str) != Some(TOOL_USE_BLOCK_TYPE) {
+                continue;
+            }
+            let is_workflow = match block.get("name").and_then(Value::as_str) {
+                Some(AGENT_TOOL_NAME) => false,
+                Some(WORKFLOW_TOOL_NAME) => true,
+                _ => continue,
+            };
+            let Some(tool_use_id) = block.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            calls.insert(
+                SharedString::from(format!("{base_key}#{block_index}")),
+                AgentCall {
+                    tool_use_id: SharedString::from(tool_use_id.to_string()),
+                    is_workflow,
+                },
+            );
+        }
+    }
+
+    calls
+}
+
+/// The agents one call spawned, as the scan of the session's directory found them.
+///
+/// An `Agent` call is paired by the `tool_use_id` its agent's sidecar records. A
+/// `Workflow` call spawns a run of agents that record no tool use id at all, so they are
+/// paired through the run id the tool's own result announces — and until that result
+/// arrives nothing links the two, which is why an unannounced run pairs with nothing
+/// rather than with every agent of every run.
+fn subagents_of_call<'summaries>(
+    call: &AgentCall,
+    subagents: &'summaries [SubagentSummary],
+    main_path: &[&TranscriptRecord],
+) -> Vec<&'summaries SubagentSummary> {
+    if !call.is_workflow {
+        return subagents
+            .iter()
+            .filter(|summary| {
+                summary.meta.tool_use_id.as_deref() == Some(call.tool_use_id.as_ref())
+            })
+            .collect();
+    }
+
+    let Some(workflow_run_id) = announced_workflow_run_id(&call.tool_use_id, main_path) else {
+        return Vec::new();
+    };
+    subagents
+        .iter()
+        .filter(|summary| summary.workflow_run_id.as_deref() == Some(workflow_run_id.as_str()))
+        .collect()
+}
+
+/// The run id the `Workflow` call's own result announces.
+fn announced_workflow_run_id(tool_use_id: &str, main_path: &[&TranscriptRecord]) -> Option<String> {
+    main_path.iter().find_map(|record| {
+        tool_result_texts(record)
+            .into_iter()
+            .filter(|(id, _)| *id == tool_use_id)
+            .find_map(|(_, text)| workflow_run_id_in_tool_result(&text))
+    })
+}
+
+/// Why the input is disabled, or `None` when it is not.
+///
+/// An agent's conversation is named before the missing pane is, because it is the reason
+/// the reader can act on: the way back is one chip away, whereas a session outside tmux
+/// is nothing they can do anything about from here.
+fn input_note(
+    can_send: bool,
+    is_reading_an_agent: bool,
+    has_selection: bool,
+) -> Option<&'static str> {
+    if can_send {
+        return None;
+    }
+    if is_reading_an_agent {
+        return Some(AGENT_READ_ONLY_NOTE);
+    }
+    if has_selection {
+        return Some(READ_ONLY_NOTE);
+    }
+    Some(SELECT_A_SESSION_TO_REPLY)
+}
+
 /// The line drawn above the input for an activity, or `None` for one that is not worth a
 /// line.
 fn activity_label(activity: &Activity) -> Option<SharedString> {
@@ -2244,6 +2855,16 @@ fn dock_position(dock: DockSide) -> DockPosition {
 
 fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+}
+
+/// A tool's output is drawn inside the panel's own framed card, so the code block that
+/// carries the text must not draw a second frame inside that one.
+fn tool_output_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = markdown_style(window, cx);
+    style.code_block.border_widths = Default::default();
+    style.code_block.margin = Default::default();
+    style.code_block.background = None;
+    style
 }
 
 /// Flattens a conversation path into the items the list draws, deriving each record's
@@ -2925,6 +3546,117 @@ fn fenced_code(text: &str, language: &str) -> SharedString {
     ))
 }
 
+/// How a tool call's input is drawn: the text to show as code, and the language it is
+/// highlighted in. An empty language leaves the text as plain code.
+struct ToolInputDisplay {
+    text: SharedString,
+    language: &'static str,
+}
+
+impl ToolInputDisplay {
+    fn code_block(&self) -> SharedString {
+        fenced_code(&self.text, self.language)
+    }
+}
+
+/// The language a file is written in, taken from its extension. An extension this panel
+/// has no name for is left empty, which draws the text as plain code rather than
+/// highlighting it as the wrong language.
+fn language_for_path(path: &str) -> &'static str {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    match extension {
+        "rs" => "rust",
+        "py" => "python",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "js" => "javascript",
+        "jsx" => "jsx",
+        "json" => "json",
+        "md" => "markdown",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "sh" | "bash" => "bash",
+        "go" => "go",
+        "html" => "html",
+        "css" => "css",
+        _ => "",
+    }
+}
+
+/// The field of a tool's input holding the text of the file the call is about, for the
+/// tools that carry one; see [`FILE_TOOL_CONTENT_FIELDS`].
+fn file_tool_content_field(tool_name: &str) -> Option<&'static str> {
+    FILE_TOOL_CONTENT_FIELDS
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, field)| *field)
+}
+
+/// The input of a tool call as it is drawn. The entry carries the input as the JSON the
+/// transcript holds, which is read back here rather than at build time so that how a
+/// call is drawn stays out of the cached entries.
+///
+/// The language is only ever the file's when the text being drawn is the file's: a call
+/// drawn as its own JSON has to be labelled as JSON, or a `Read` of a Rust file is shown
+/// as a paragraph of Rust that is really JSON.
+fn tool_input_display(tool_name: &str, input: &str) -> ToolInputDisplay {
+    let parsed = serde_json::from_str::<Value>(input).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|parsed| parsed.get(name))
+            .and_then(Value::as_str)
+    };
+
+    if tool_name == BASH_TOOL_NAME {
+        return ToolInputDisplay {
+            text: SharedString::from(field("command").unwrap_or(input).to_string()),
+            language: "bash",
+        };
+    }
+
+    // A call whose usual field is not there — an `Edit` that only sets `old_string`, a
+    // call read while it was still being written — has nothing but its input left to show.
+    if let Some(text) = file_tool_content_field(tool_name).and_then(field) {
+        return ToolInputDisplay {
+            text: SharedString::from(text.to_string()),
+            language: field("file_path").map_or("", language_for_path),
+        };
+    }
+
+    ToolInputDisplay {
+        text: SharedString::from(input.to_string()),
+        language: "json",
+    }
+}
+
+/// Whether an output has more lines than are drawn before the rest is put behind a
+/// disclosure. Counted lazily because an output can be megabytes and this runs on every
+/// frame the entry is on screen.
+fn output_is_clamped(text: &str, line_limit: usize) -> bool {
+    text.lines().nth(line_limit).is_some()
+}
+
+/// The first `line_limit` lines of an output, taken as a prefix of the text rather than
+/// as lines rejoined, so that what is drawn is exactly what the output starts with.
+fn clamped_output(text: &str, line_limit: usize) -> &str {
+    let end: usize = text
+        .split_inclusive('\n')
+        .take(line_limit)
+        .map(str::len)
+        .sum();
+    text.get(..end).unwrap_or(text)
+}
+
+/// The expansion key of the output inside an entry. It is a key of its own so that
+/// unclamping an output does not close the entry the output sits in.
+fn output_expansion_key(key: &SharedString) -> SharedString {
+    SharedString::from(format!("{key}#output"))
+}
+
 /// Whether the panel will read this path back.
 ///
 /// The path comes out of a file format that is private to Claude Code, so it is treated
@@ -3132,6 +3864,8 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::SubagentMeta;
     use crate::transcript::parse_record;
 
     fn record(json: &str) -> TranscriptRecord {
@@ -3765,6 +4499,466 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_language_of_a_tool_call_follows_the_file_it_names() {
+        for (path, language) in [
+            ("/a/b/main.rs", "rust"),
+            ("/a/b/migrate.py", "python"),
+            ("/a/b/panel.ts", "typescript"),
+            ("/a/b/settings.json", "json"),
+            ("/a/b/README.md", "markdown"),
+        ] {
+            assert_eq!(
+                language_for_path(path),
+                language,
+                "the language {path} is drawn in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_with_no_extension_this_panel_knows_is_left_as_plain_text() {
+        assert_eq!(language_for_path("/a/b/notes.xyz"), "");
+        assert_eq!(language_for_path("/a/b/Makefile"), "");
+        assert_eq!(language_for_path(""), "");
+    }
+
+    #[test]
+    fn a_bash_call_is_drawn_as_the_command_it_runs() {
+        let input = json_text(&serde_json::json!({
+            "command": "cd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply",
+            "description": "Run the migration",
+        }));
+        let display = tool_input_display(BASH_TOOL_NAME, &input);
+
+        assert_eq!(
+            display.text.as_ref(),
+            "cd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply",
+            "the command itself is what the call is"
+        );
+        assert_eq!(
+            display.code_block().as_ref(),
+            "```bash\ncd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply\n```",
+            "a command is handed to the markdown element as shell, not as the JSON around it"
+        );
+    }
+
+    /// A file tool's input is drawn as the file content it carries, in that file's
+    /// language. `Read` carries no content — only the path — so it keeps its input, and
+    /// that input is JSON rather than the named file's language.
+    #[test]
+    fn a_file_tool_is_drawn_in_the_language_of_the_file_it_names() {
+        let written = "fn main() {}\n";
+        let input = json_text(&serde_json::json!({
+            "file_path": "/a/b/session_store.rs",
+            "content": written,
+        }));
+        let display = tool_input_display("Write", &input);
+
+        assert_eq!(display.language, "rust");
+        assert_eq!(
+            display.text.as_ref(),
+            written,
+            "what a write call is, is the content it writes"
+        );
+        assert_eq!(
+            display.code_block().lines().next().unwrap_or_default(),
+            "```rust",
+            "the fence of {:?}",
+            display.code_block()
+        );
+
+        let read_input = json_text(&serde_json::json!({ "file_path": "/a/b/session_store.rs" }));
+        let read_display = tool_input_display("Read", &read_input);
+        assert_eq!(
+            read_display.language, "json",
+            "a `Read` call holds a path and no content, so drawing its input as Rust \
+             labels JSON as Rust"
+        );
+        assert_eq!(read_display.text.as_ref(), read_input.as_str());
+    }
+
+    #[test]
+    fn each_file_tool_is_drawn_as_the_text_it_carries() {
+        for (tool_name, field) in [
+            ("Write", "content"),
+            ("Edit", "new_string"),
+            ("NotebookEdit", "new_source"),
+        ] {
+            let carried = "print('hi')\n";
+            let input = json_text(&serde_json::json!({
+                "file_path": "/a/b/script.py",
+                field: carried,
+            }));
+            let display = tool_input_display(tool_name, &input);
+
+            assert_eq!(
+                display.text.as_ref(),
+                carried,
+                "{tool_name} must be drawn as its `{field}`"
+            );
+            assert_eq!(
+                display.language, "python",
+                "{tool_name} keeps the language of the file it names"
+            );
+        }
+    }
+
+    /// The field a tool usually carries is not always there — an `Edit` that only sets
+    /// `old_string`, a half-written call read mid-write — and the whole input is the only
+    /// honest thing left to draw.
+    #[test]
+    fn a_file_tool_missing_its_content_falls_back_to_the_whole_input() {
+        let input = json_text(&serde_json::json!({
+            "file_path": "/a/b/main.rs",
+            "old_string": "let a = 1;",
+        }));
+        let display = tool_input_display("Edit", &input);
+
+        assert_eq!(
+            display.text.as_ref(),
+            input.as_str(),
+            "with nothing to draw as the file's language, the input itself is what there is"
+        );
+        assert_eq!(
+            display.language, "json",
+            "and it must be labelled as the JSON it is"
+        );
+    }
+
+    #[test]
+    fn every_other_tool_keeps_its_input_as_json() {
+        let input = json_text(&serde_json::json!({ "pattern": "TODO" }));
+        let display = tool_input_display("Grep", &input);
+
+        assert_eq!(display.language, "json");
+        assert_eq!(display.text.as_ref(), input.as_str());
+    }
+
+    fn subagent(
+        agent_id: &str,
+        workflow_run_id: Option<&str>,
+        tool_use_id: Option<&str>,
+    ) -> SubagentSummary {
+        SubagentSummary {
+            agent_id: agent_id.to_string(),
+            workflow_run_id: workflow_run_id.map(str::to_string),
+            meta: SubagentMeta {
+                agent_type: "general-purpose".to_string(),
+                description: None,
+                tool_use_id: tool_use_id.map(str::to_string),
+                spawn_depth: 1,
+                model: None,
+                workflow_phase: None,
+            },
+            transcript_path: PathBuf::from("/nowhere/agent.jsonl"),
+            size: 0,
+        }
+    }
+
+    fn state_of(summary: &SubagentSummary, json_lines: &[&str]) -> AgentState {
+        let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        agent_state(summary, &path)
+    }
+
+    fn tool_result_line_with_content(uuid: &str, tool_use_id: &str, content: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": tool_use_id, "content": content },
+            ] },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_agent_whose_call_has_not_been_answered_yet_is_running() {
+        let summary = subagent("a0", None, Some("toolu_01"));
+
+        assert_eq!(
+            state_of(
+                &summary,
+                &[
+                    &user_message_line("m1", "go"),
+                    &tool_use_line("m2", "toolu_01", "Agent", serde_json::json!({})),
+                ],
+            ),
+            AgentState::Running,
+            "nothing in the conversation answers `toolu_01`, so the agent is still working"
+        );
+    }
+
+    #[test]
+    fn an_agent_whose_call_has_been_answered_is_finished() {
+        let summary = subagent("a0", None, Some("toolu_01"));
+
+        assert_eq!(
+            state_of(
+                &summary,
+                &[
+                    &user_message_line("m1", "go"),
+                    &tool_use_line("m2", "toolu_01", "Agent", serde_json::json!({})),
+                    &tool_result_line("m3", "toolu_01"),
+                ],
+            ),
+            AgentState::Finished,
+            "the result of the call that spawned the agent is the agent having returned"
+        );
+    }
+
+    /// A `Workflow` run's agents carry no `tool_use_id` of their own, so the only thing
+    /// pairing them with the conversation is the run id the tool result announces.
+    #[test]
+    fn a_workflow_agent_runs_until_its_run_id_is_announced_as_answered() {
+        let summary = subagent("a1", Some("wf_b529a29d-562"), None);
+        let call = tool_use_line("m2", "toolu_09", "Workflow", serde_json::json!({}));
+
+        assert_eq!(
+            state_of(&summary, &[&user_message_line("m1", "go"), &call]),
+            AgentState::Running,
+            "the run has not been announced as over, so its agents are still working"
+        );
+
+        let answer = tool_result_line_with_content(
+            "m3",
+            "toolu_09",
+            "Workflow complete.\nRun ID: wf_b529a29d-562\n3 agents finished.",
+        );
+        assert_eq!(
+            state_of(&summary, &[&user_message_line("m1", "go"), &call, &answer]),
+            AgentState::Finished,
+            "the run id in the tool result is the run having ended"
+        );
+
+        let other_run = tool_result_line_with_content(
+            "m3",
+            "toolu_09",
+            "Workflow complete.\nRun ID: wf_something-else",
+        );
+        assert_eq!(
+            state_of(
+                &summary,
+                &[&user_message_line("m1", "go"), &call, &other_run]
+            ),
+            AgentState::Running,
+            "another run ending says nothing about this one"
+        );
+    }
+
+    /// Neither id, so nothing in the conversation pairs with this agent at all. Drawing
+    /// it as running would be a guess presented as a fact, and a chip that pulses forever
+    /// is worse than one that does not pulse.
+    #[test]
+    fn an_agent_with_neither_id_is_not_claimed_to_be_running() {
+        let summary = subagent("a2", None, None);
+
+        assert_eq!(
+            state_of(&summary, &[&user_message_line("m1", "go")]),
+            AgentState::Finished
+        );
+        assert_eq!(state_of(&summary, &[]), AgentState::Finished);
+    }
+
+    #[test]
+    fn a_chip_is_labelled_with_what_the_agent_was_asked_to_do() {
+        let mut described = subagent("a0000e203ec41bc73", None, None);
+        described.meta.description = Some("round 2 review".to_string());
+        assert_eq!(agent_chip_label(&described).as_ref(), "round 2 review");
+
+        // Without a description there is nothing to say but which agent it is, and the
+        // whole id is longer than the chip row can carry.
+        let plain = subagent("a0000e203ec41bc73", None, None);
+        assert_eq!(agent_chip_label(&plain).as_ref(), "general-purpose a0000e");
+    }
+
+    /// An id shorter than the six characters a chip shows must not be sliced through, and
+    /// a description of nothing but spaces is not a label.
+    #[test]
+    fn a_chip_label_survives_a_short_id_and_a_blank_description() {
+        let mut short = subagent("a0", None, None);
+        assert_eq!(agent_chip_label(&short).as_ref(), "general-purpose a0");
+
+        short.meta.description = Some("   ".to_string());
+        assert_eq!(
+            agent_chip_label(&short).as_ref(),
+            "general-purpose a0",
+            "a blank description leaves the chip with no label at all"
+        );
+    }
+
+    #[test]
+    fn a_chip_tooltip_names_only_the_fields_the_agent_records() {
+        let bare = subagent("a0", None, None);
+        assert_eq!(
+            agent_chip_tooltip(&bare).as_ref(),
+            "general-purpose\ndepth 1"
+        );
+
+        let mut full = subagent("a1", Some("wf_1"), None);
+        full.meta.model = Some("opus".to_string());
+        full.meta.spawn_depth = 2;
+        full.meta.workflow_phase = Some("review".to_string());
+        assert_eq!(
+            agent_chip_tooltip(&full).as_ref(),
+            "general-purpose\nopus\ndepth 2\nreview"
+        );
+    }
+
+    /// An agent's conversation is read-only, and the reader has to be told why the input
+    /// under it is dead — with the one reason they can act on first.
+    #[test]
+    fn reading_an_agent_disables_the_input_and_says_which_chip_to_go_back_to() {
+        assert_eq!(
+            input_note(false, true, true),
+            Some(AGENT_READ_ONLY_NOTE),
+            "the way back is one chip away, so that is the reason to give"
+        );
+        assert!(
+            AGENT_READ_ONLY_NOTE.contains("Main"),
+            "the note has to name the chip that takes the reader back, got {AGENT_READ_ONLY_NOTE:?}"
+        );
+
+        assert_eq!(
+            input_note(false, false, true),
+            Some(READ_ONLY_NOTE),
+            "a session outside tmux keeps its own reason"
+        );
+        assert_eq!(
+            input_note(false, false, false),
+            Some(SELECT_A_SESSION_TO_REPLY)
+        );
+        assert_eq!(
+            input_note(true, false, true),
+            None,
+            "a session that can be typed into is owed no explanation"
+        );
+    }
+
+    /// The card under a call is only drawn for a call this panel can pair with an agent
+    /// on disk; an empty card would say less than no card at all.
+    #[test]
+    fn only_agent_and_workflow_calls_are_offered_as_conversations_to_open() {
+        let lines = [
+            user_message_line("m1", "go"),
+            tool_use_line(
+                "m2",
+                "toolu_01",
+                "Agent",
+                serde_json::json!({ "prompt": "look" }),
+            ),
+            tool_use_line(
+                "m3",
+                "toolu_02",
+                "Bash",
+                serde_json::json!({ "command": "ls" }),
+            ),
+            tool_use_line("m4", "toolu_03", "Workflow", serde_json::json!({})),
+        ];
+        let records: Vec<TranscriptRecord> = lines.iter().map(|line| record(line)).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let calls = agent_calls(&path);
+
+        let mut keys: Vec<(String, String)> = calls
+            .iter()
+            .map(|(key, call)| (key.to_string(), call.tool_use_id.to_string()))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("m2#0".to_string(), "toolu_01".to_string()),
+                ("m4#0".to_string(), "toolu_03".to_string()),
+            ],
+            "only the two calls that spawn conversations may carry a card, keyed by the \
+             entry the call is drawn as"
+        );
+    }
+
+    #[test]
+    fn a_call_is_paired_with_the_agent_it_spawned() {
+        let by_tool_use_id = subagent("a0", None, Some("toolu_01"));
+        let by_run_id = subagent("a1", Some("wf_b529a29d-562"), None);
+        let subagents = vec![by_tool_use_id, by_run_id];
+
+        let agent_call = AgentCall {
+            tool_use_id: SharedString::from("toolu_01"),
+            is_workflow: false,
+        };
+        assert_eq!(
+            subagents_of_call(&agent_call, &subagents, &[])
+                .iter()
+                .map(|summary| summary.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a0"],
+            "an `Agent` call is paired by the tool use id its agent records"
+        );
+
+        // A `Workflow` run's agents are paired through the run id its result announces.
+        let workflow_call = AgentCall {
+            tool_use_id: SharedString::from("toolu_09"),
+            is_workflow: true,
+        };
+        let announcement = record(&tool_result_line_with_content(
+            "m3",
+            "toolu_09",
+            "Run ID: wf_b529a29d-562",
+        ));
+        let path = vec![&announcement];
+        assert_eq!(
+            subagents_of_call(&workflow_call, &subagents, &path)
+                .iter()
+                .map(|summary| summary.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1"]
+        );
+        assert!(
+            subagents_of_call(&workflow_call, &subagents, &[]).is_empty(),
+            "a run whose id the conversation has not announced yet pairs with nothing, \
+             and an empty card is worse than none"
+        );
+    }
+
+    #[test]
+    fn output_no_longer_than_the_clamp_is_drawn_whole() {
+        let output = "one\ntwo\nthree";
+        assert!(!output_is_clamped(output, 12), "three lines fit");
+        assert_eq!(clamped_output(output, 12), output);
+
+        let at_the_limit = (0..12)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !output_is_clamped(&at_the_limit, 12),
+            "twelve lines is not more than twelve"
+        );
+        assert_eq!(clamped_output(&at_the_limit, 12), at_the_limit.as_str());
+    }
+
+    #[test]
+    fn output_past_the_clamp_keeps_only_its_first_lines() {
+        let output = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clamped = clamped_output(&output, 12);
+        assert_eq!(
+            clamped.lines().count(),
+            12,
+            "the clamp keeps twelve of the forty lines, got {clamped:?}"
+        );
+        assert_eq!(
+            output_is_clamped(&output, 12),
+            output.lines().count() > 12,
+            "forty lines is past a clamp of twelve"
+        );
+        assert_eq!(clamped.lines().next(), Some("line 0"));
+        assert_eq!(clamped.lines().last(), Some("line 11"));
     }
 
     #[test]

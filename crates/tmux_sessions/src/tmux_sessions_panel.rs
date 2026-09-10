@@ -18,8 +18,7 @@ use crate::{ToggleFocus, tmux_attach_command};
 
 const TMUX_SESSIONS_PANEL_KEY: &str = "TmuxSessionsPanel";
 
-const NOT_REMOTE: &str =
-    "Open a remote project to list the tmux sessions running on that host.";
+const NOT_REMOTE: &str = "Open a remote project to list the tmux sessions running on that host.";
 
 const TMUX_MISSING: &str = "No tmux binary was found on the remote host.";
 
@@ -250,15 +249,13 @@ impl TmuxSessionsPanel {
                     )))
                     .spacing(ListItemSpacing::Sparse)
                     .indent_level(1)
-                    .start_slot(
-                        Icon::new(IconName::Screen)
-                            .size(IconSize::Small)
-                            .color(if tmux_window.active {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            }),
-                    )
+                    .start_slot(Icon::new(IconName::Screen).size(IconSize::Small).color(
+                        if tmux_window.active {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
+                    ))
                     .child(
                         h_flex()
                             .gap_1()
@@ -388,9 +385,7 @@ impl Panel for TmuxSessionsPanel {
 
     /// Hidden on a local project, which has no remote host to list tmux on.
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        self.remote_client
-            .as_ref()
-            .map(|_| IconName::TerminalAlt)
+        self.remote_client.as_ref().map(|_| IconName::TerminalAlt)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

@@ -23,11 +23,11 @@ pub use claude_sessions_panel::ClaudeSessionsPanel;
 // run them without depending on this crate's UI. The alias keeps the path this crate's
 // own modules and tests use pointing at the one implementation.
 pub use remote::claude_sessions as session_registry;
-pub use session_registry::RegisteredSession;
+pub use session_registry::{RegisteredSession, SubagentMeta, SubagentSummary};
 pub use session_source::{
     FileContents, LocalSource, RemoteSource, SessionInput, SessionListing, SessionSource,
 };
-pub use session_store::ClaudeSessionStore;
+pub use session_store::{ClaudeSessionStore, TranscriptTarget};
 pub use transcript::{CompactMetadata, Transcript, TranscriptRecord};
 
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that

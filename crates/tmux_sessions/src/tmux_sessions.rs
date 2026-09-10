@@ -95,10 +95,7 @@ mod tests {
             "tmux attach -t '=$(id)'",
             "command substitution does not happen inside single quotes"
         );
-        assert_eq!(
-            tmux_attach_command("`id`", None),
-            "tmux attach -t '=`id`'"
-        );
+        assert_eq!(tmux_attach_command("`id`", None), "tmux attach -t '=`id`'");
         assert_eq!(
             tmux_attach_command("a'; rm -rf /; #", None),
             "tmux attach -t '=a'\\''; rm -rf /; #'",
