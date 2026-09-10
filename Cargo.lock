@@ -6652,6 +6652,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "forward_ports"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "editor",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "menu",
+ "parking_lot",
+ "project",
+ "recent_projects",
+ "remote",
+ "rpc",
+ "settings",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "fraction"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13983,6 +14006,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures 0.3.32",
+ "gpui",
+ "paths",
+ "percent-encoding",
+ "project",
+ "recent_projects",
+ "remote",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "serde_json_lenient",
+ "settings",
+ "shellexpand",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "project_panel"
 version = "0.1.0"
 dependencies = [
@@ -18619,6 +18669,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tmux_sessions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "rpc",
+ "task",
+ "terminal_view",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "tokio"
 version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22798,6 +22863,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "forward_ports",
  "fs",
  "futures 0.3.32",
  "git",
@@ -22848,6 +22914,7 @@ dependencies = [
  "pretty_assertions",
  "profiling",
  "project",
+ "project_manager",
  "project_panel",
  "project_symbols",
  "prompt_store",
@@ -22892,6 +22959,7 @@ dependencies = [
  "time",
  "time_format",
  "title_bar",
+ "tmux_sessions",
  "toolchain_selector",
  "tracing",
  "ui",

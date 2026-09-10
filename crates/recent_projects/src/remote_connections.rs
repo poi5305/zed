@@ -15,7 +15,10 @@ use remote::{
     SshConnectionOptions,
 };
 pub use settings::SshConnection;
-use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
+use settings::{
+    AutoForwardPortsContent, DevContainerConnection, ExtendingVec, RegisterSetting, Settings,
+    WslConnection,
+};
 use util::paths::PathWithPosition;
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
@@ -31,8 +34,12 @@ pub use remote_connection::{
 pub struct RemoteSettings {
     pub ssh_connections: ExtendingVec<SshConnection>,
     pub wsl_connections: ExtendingVec<WslConnection>,
+    pub dev_container_connections: ExtendingVec<DevContainerConnection>,
     /// Whether to read ~/.ssh/config for ssh connection sources.
     pub read_ssh_config: bool,
+    /// What to do about a port that starts listening on the remote host after
+    /// the connection was made.
+    pub auto_forward_ports: AutoForwardPortsContent,
 }
 
 impl RemoteSettings {
@@ -42,6 +49,12 @@ impl RemoteSettings {
 
     pub fn wsl_connections(&self) -> impl Iterator<Item = WslConnection> + use<> {
         self.wsl_connections.clone().0.into_iter()
+    }
+
+    pub fn dev_container_connections(
+        &self,
+    ) -> impl Iterator<Item = DevContainerConnection> + use<> {
+        self.dev_container_connections.clone().0.into_iter()
     }
 
     pub fn fill_connection_options_from_settings(&self, options: &mut SshConnectionOptions) {
@@ -120,7 +133,13 @@ impl Settings for RemoteSettings {
         Self {
             ssh_connections: remote.ssh_connections.clone().unwrap_or_default().into(),
             wsl_connections: remote.wsl_connections.clone().unwrap_or_default().into(),
+            dev_container_connections: remote
+                .dev_container_connections
+                .clone()
+                .unwrap_or_default()
+                .into(),
             read_ssh_config: remote.read_ssh_config.unwrap(),
+            auto_forward_ports: remote.auto_forward_ports.unwrap_or_default(),
         }
     }
 }

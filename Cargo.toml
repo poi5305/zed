@@ -79,6 +79,7 @@ members = [
     "crates/feedback",
     "crates/file_finder",
     "crates/file_icons",
+    "crates/forward_ports",
     "crates/fs",
     "crates/fs_benchmarks",
     "crates/fuzzy",
@@ -164,6 +165,7 @@ members = [
     "crates/prettier",
     "crates/project",
     "crates/project_benchmarks",
+    "crates/project_manager",
     "crates/project_panel",
     "crates/project_symbols",
     "crates/prompt_store",
@@ -219,6 +221,7 @@ members = [
     "crates/theme_settings",
     "crates/time_format",
     "crates/title_bar",
+    "crates/tmux_sessions",
     "crates/toolchain_selector",
     "crates/ui",
     "crates/ui_input",
@@ -348,6 +351,7 @@ feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
+forward_ports = { path = "crates/forward_ports" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
@@ -432,6 +436,7 @@ picker_preview = { path = "crates/picker_preview" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 prettier = { path = "crates/prettier" }
 project = { path = "crates/project" }
+project_manager = { path = "crates/project_manager" }
 project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
@@ -485,6 +490,7 @@ theme_selector = { path = "crates/theme_selector" }
 theme_settings = { path = "crates/theme_settings" }
 time_format = { path = "crates/time_format" }
 title_bar = { path = "crates/title_bar" }
+tmux_sessions = { path = "crates/tmux_sessions" }
 toolchain_selector = { path = "crates/toolchain_selector" }
 ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }

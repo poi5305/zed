@@ -31,6 +31,7 @@ use project::{
     trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
     worktree_store::{WorktreeIdCounter, WorktreeStore},
 };
+use remote::PortForwardStore;
 use rpc::{
     AnyProtoClient, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PEER_ID, REMOTE_SERVER_PROJECT_ID},
@@ -73,6 +74,7 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    pub port_forwards: Entity<PortForwardStore>,
 }
 
 pub struct HeadlessAppState {
@@ -291,11 +293,18 @@ impl HeadlessProject {
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &agent_server_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &context_server_store);
 
+        let port_forwards =
+            cx.new(|_| PortForwardStore::new(REMOTE_SERVER_PROJECT_ID, session.clone()));
+        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &port_forwards);
+        PortForwardStore::init_remote(&session);
+
         session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_listening_ports);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_tmux_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -361,6 +370,7 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            port_forwards,
         }
     }
 
@@ -1320,6 +1330,62 @@ impl HeadlessProject {
         processes.sort_by_key(|p| p.name.clone());
 
         Ok(proto::GetProcessesResponse { processes })
+    }
+
+    async fn handle_get_listening_ports(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetListeningPorts>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetListeningPortsResponse> {
+        // Scanning reads files on Linux but shells out on the other platforms,
+        // so it is kept off the thread that serves the rest of the session.
+        let ports = cx
+            .background_spawn(async move { remote::listening_ports::scan_listening_ports().await })
+            .await?;
+
+        Ok(proto::GetListeningPortsResponse {
+            ports: ports
+                .into_iter()
+                .map(|port| proto::ListeningPort {
+                    host: port.host,
+                    port: u32::from(port.port),
+                })
+                .collect(),
+        })
+    }
+
+    async fn handle_list_tmux_sessions(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::ListTmuxSessions>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListTmuxSessionsResponse> {
+        // Listing shells out twice, so it is kept off the thread that serves
+        // the rest of the session.
+        let listing = cx
+            .background_spawn(async move { remote::tmux_sessions::list_tmux_sessions().await })
+            .await?;
+
+        Ok(proto::ListTmuxSessionsResponse {
+            tmux_available: listing.tmux_available,
+            sessions: listing
+                .sessions
+                .into_iter()
+                .map(|session| proto::TmuxSession {
+                    name: session.name,
+                    attached: session.attached,
+                    window_count: session.window_count,
+                    windows: session
+                        .windows
+                        .into_iter()
+                        .map(|window| proto::TmuxWindow {
+                            index: window.index,
+                            name: window.name,
+                            active: window.active,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
     }
 
     async fn handle_get_remote_profiling_data(

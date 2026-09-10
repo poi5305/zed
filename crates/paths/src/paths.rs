@@ -310,6 +310,12 @@ pub fn tasks_file() -> &'static PathBuf {
     TASKS_FILE.get_or_init(|| config_dir().join("tasks.json"))
 }
 
+/// Returns the path to the `projects.json` file.
+pub fn projects_file() -> &'static PathBuf {
+    static PROJECTS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    PROJECTS_FILE.get_or_init(|| config_dir().join("projects.json"))
+}
+
 /// Returns the path to the `debug.json` file.
 pub fn debug_scenarios_file() -> &'static PathBuf {
     static DEBUG_SCENARIOS_FILE: OnceLock<PathBuf> = OnceLock::new();

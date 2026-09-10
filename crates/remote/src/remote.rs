@@ -1,10 +1,18 @@
 pub mod json_log;
+pub mod listening_ports;
+pub mod port_forward;
 pub mod protocol;
 pub mod proxy;
 pub mod remote_client;
 pub mod remote_identity;
+pub mod tmux_sessions;
 mod transport;
 
+pub use listening_ports::{ListeningPort, ScanTimings, is_forwardable_host, scan_listening_ports};
+pub use port_forward::{
+    PORT_TUNNEL_CHUNK_SIZE, PORT_TUNNEL_WINDOW_SIZE, PortForwardStatus, PortForwardStore,
+    TunnelFlowControl,
+};
 #[cfg(target_os = "windows")]
 pub use remote_client::OpenWslPath;
 pub use remote_client::{

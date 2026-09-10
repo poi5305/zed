@@ -1,0 +1,50 @@
+syntax = "proto3";
+package zed.messages;
+
+// Byte tunnels used to forward a local TCP port to the remote host over the
+// existing remote RPC channel, so that forwarding works on every platform and
+// transport rather than only where `ssh -O forward` is available.
+
+message OpenPortTunnel {
+  uint64 project_id = 1;
+  uint64 tunnel_id = 2;
+  string remote_host = 3;
+  uint32 remote_port = 4;
+}
+
+message PortTunnelData {
+  uint64 project_id = 1;
+  uint64 tunnel_id = 2;
+  bytes data = 3;
+}
+
+// Sent once the bytes have actually been written to the socket, which is what
+// gives the sender back its credit.
+message PortTunnelAck {
+  uint64 project_id = 1;
+  uint64 tunnel_id = 2;
+  uint64 bytes_consumed = 3;
+}
+
+// An empty `error` means the sender's socket reached EOF, which half-closes the
+// tunnel. A non-empty `error` tears the whole tunnel down.
+message ClosePortTunnel {
+  uint64 project_id = 1;
+  uint64 tunnel_id = 2;
+  string error = 3;
+}
+
+// Detection of the ports that are listening on the remote host, so that a new
+// server started there can be offered for forwarding.
+message GetListeningPorts {
+  uint64 project_id = 1;
+}
+
+message GetListeningPortsResponse {
+  repeated ListeningPort ports = 1;
+}
+
+message ListeningPort {
+  string host = 1;
+  uint32 port = 2;
+}

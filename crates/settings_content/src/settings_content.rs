@@ -1358,6 +1358,28 @@ pub struct RemoteSettingsContent {
     ///
     /// Default: null (auto-detect)
     pub dev_container_use_buildkit: Option<bool>,
+    /// What to do when a new server starts listening on the remote host.
+    ///
+    /// Default: "notify"
+    pub auto_forward_ports: Option<AutoForwardPortsContent>,
+}
+
+/// What the forward ports panel does about a port that starts listening on the
+/// remote host after the connection was made.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoForwardPortsContent {
+    /// Offer the forward and wait for the user to accept it.
+    #[default]
+    Notify,
+    /// Forward straight away without saying anything.
+    Silent,
+    /// Forward straight away and open the result in the browser.
+    OpenBrowser,
+    /// Leave new ports alone.
+    Ignore,
 }
 
 #[with_fallible_options]
@@ -1371,6 +1393,9 @@ pub struct DevContainerConnection {
     pub use_podman: bool,
     pub extension_ids: Vec<String>,
     pub remote_env: BTreeMap<String, String>,
+    /// Ports on the dev container to make reachable on this machine, tunnelled
+    /// over the connection Zed already has to it.
+    pub port_forwards: Option<Vec<SshPortForwardOption>>,
 }
 
 #[with_fallible_options]
@@ -1403,6 +1428,9 @@ pub struct WslConnection {
     pub user: Option<String>,
     #[serde(default)]
     pub projects: BTreeSet<RemoteProject>,
+    /// Ports inside the WSL distribution to make reachable on this machine,
+    /// tunnelled over the connection Zed already has to it.
+    pub port_forwards: Option<Vec<SshPortForwardOption>>,
 }
 
 #[with_fallible_options]

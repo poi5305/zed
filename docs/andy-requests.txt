@@ -1,0 +1,4 @@
+1. https://marketplace.visualstudio.com/items?itemName=alefragnani.project-manager 我要有一個 project manager 功能 能夠json編輯 要一樣UI和功能，我希望做在左下角的 project search icon 的右邊 點一下可以打開左邊 sider bar 可以做設定 和編輯 就叫做 project manager
+2. 我要做和 vscode 一模一樣的 forward port 功能 (remote mode) ，icon 放在 project manager 右邊 就叫做 forwart ports 可以跟 vscode 一樣自動 forward, 支援 windows, macos, linux, docker, wsl
+3. 我要在做一個新功能 "tmux sessions" 可以把 remote 機器的 tmux sessions 列出來 點擊就可以打開 terminal 並且自動進入 session，最好也可以把 session 裡面的 window 列出來 (兩層結構 像是 folder 裡面有 files 一樣) 一樣點擊就可以開 terminal 然後 進入session 自動跳到指定 window
+(UI 都抄 vscode 可以去看 vscode 的 source code)
