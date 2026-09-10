@@ -542,7 +542,9 @@ message Envelope {
     TailClaudeTranscriptResponse tail_claude_transcript_response = 507;
     ReadClaudeFile read_claude_file = 508;
     ReadClaudeFileResponse read_claude_file_response = 509;
-    SendClaudeInput send_claude_input = 510; // current max
+    SendClaudeInput send_claude_input = 510;
+    ListClaudeSubagents list_claude_subagents = 511;
+    ListClaudeSubagentsResponse list_claude_subagents_response = 512; // current max
   }
 
   reserved 87 to 88;

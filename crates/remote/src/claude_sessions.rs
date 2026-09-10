@@ -273,24 +273,33 @@ pub fn find_transcript(home_directory: &Path, session_id: &str) -> Option<PathBu
     None
 }
 
-/// The name a session's transcript file has, or `None` when the session id could name
-/// something other than a file inside one project's directory.
+/// `name` when it can only ever name one entry inside whichever directory it is joined
+/// onto, and `None` otherwise.
 ///
-/// A session id reaches the search from a registration file and, for a remote project,
-/// straight out of a request, so it is untrusted text. Joined onto the projects directory
-/// unchecked, an id carrying separators or a parent component would name a file outside
-/// it, and the tail hands whatever it opens back to its caller line by line.
-fn transcript_file_name(session_id: &str) -> Option<String> {
-    let file_name = format!("{session_id}.jsonl");
-    let mut components = Path::new(&file_name).components();
+/// Every id this module joins onto a path is untrusted text: session ids arrive from a
+/// registration file and, for a remote project, straight out of a request, while agent
+/// and workflow run ids come out of a transcript's JSON. Joined unchecked, an id carrying
+/// a separator or a parent component names something outside the projects directory, and
+/// what this module opens is handed back to its caller line by line — the sibling
+/// `<home>/.claude/sessions` holds the credentials for the sessions' messaging sockets.
+fn single_path_component(name: &str) -> Option<&str> {
+    let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(std::path::Component::Normal(only_component)), None)
-            if only_component == std::ffi::OsStr::new(&file_name) =>
+            if only_component == std::ffi::OsStr::new(name) =>
         {
-            Some(file_name)
+            Some(name)
         }
         _ => None,
     }
+}
+
+/// The name a session's transcript file has, or `None` when the session id could name
+/// something other than a file inside one project's directory.
+fn transcript_file_name(session_id: &str) -> Option<String> {
+    // Appending a suffix to a lone normal component cannot introduce a component of its
+    // own, so the composed name stays inside one project's directory.
+    Some(format!("{}.jsonl", single_path_component(session_id)?))
 }
 
 #[derive(Clone)]
@@ -457,6 +466,267 @@ pub async fn list_sessions(
         .collect())
 }
 
+const SUBAGENTS_DIRECTORY: &str = "subagents";
+const WORKFLOWS_DIRECTORY: &str = "workflows";
+const SUBAGENT_FILE_PREFIX: &str = "agent-";
+const SUBAGENT_META_SUFFIX: &str = ".meta.json";
+const SUBAGENT_TRANSCRIPT_SUFFIX: &str = ".jsonl";
+const WORKFLOW_RUN_ID_LABEL: &str = "Run ID:";
+
+/// The `agent-<agentId>.meta.json` sidecar written beside a subagent's transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SubagentMeta {
+    /// Free-form text rather than a closed set: beside `general-purpose` and
+    /// `workflow-subagent`, this machine holds `fork`, `Explore` and locally defined
+    /// types, so a value this version has never seen has to survive the parse.
+    #[serde(rename = "agentType")]
+    pub agent_type: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Absent on most agents — including some spawned by the `Task` tool — so it cannot
+    /// be relied on to pair an agent with the tool call that spawned it.
+    #[serde(rename = "toolUseId", default)]
+    pub tool_use_id: Option<String>,
+    #[serde(rename = "spawnDepth", default = "default_spawn_depth")]
+    pub spawn_depth: u32,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(rename = "workflowPhase", default)]
+    pub workflow_phase: Option<String>,
+}
+
+/// An agent whose meta records no depth was spawned by the session itself.
+fn default_spawn_depth() -> u32 {
+    1
+}
+
+/// Parses one subagent's meta sidecar. Unknown fields are ignored, because the writer
+/// ships independently of this reader and adds fields between releases.
+pub fn parse_subagent_meta(contents: &str) -> anyhow::Result<SubagentMeta> {
+    let meta = serde_json::from_str(contents)?;
+    Ok(meta)
+}
+
+/// A subagent conversation as the machine that ran it sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSummary {
+    pub agent_id: String,
+    /// `Some` for an agent belonging to a `Workflow` run, which keeps its agents one
+    /// level deeper, in a directory named after the run.
+    pub workflow_run_id: Option<String>,
+    pub meta: SubagentMeta,
+    pub transcript_path: PathBuf,
+    pub size: u64,
+}
+
+/// Every subagent conversation a session has spawned.
+///
+/// The two on-disk layouts — `subagents/agent-<id>.jsonl` and
+/// `subagents/workflows/<runId>/agent-<id>.jsonl` — are both scanned, and the result is
+/// ordered by run id and then agent id so that a caller rendering it does not see rows
+/// move around between polls: directory enumeration is in no particular order.
+pub async fn list_subagents(
+    home_directory: &Path,
+    session_id: &str,
+) -> Result<Vec<SubagentSummary>> {
+    let Some(session_directory) = find_session_directory(home_directory, session_id) else {
+        // A session that has written nothing of its own leaves no directory behind, which
+        // means it has spawned no subagents rather than that the scan failed.
+        return Ok(Vec::new());
+    };
+    let subagents_directory = session_directory.join(SUBAGENTS_DIRECTORY);
+
+    let mut subagents = Vec::new();
+    read_subagents_in(&subagents_directory, None, &mut subagents)?;
+
+    let workflows_directory = subagents_directory.join(WORKFLOWS_DIRECTORY);
+    match fs::read_dir(&workflows_directory) {
+        Ok(directory_entries) => {
+            for directory_entry in directory_entries {
+                let Some(directory_entry) = directory_entry.log_err() else {
+                    continue;
+                };
+                // Only the run directories hold agents; anything else `workflows` may
+                // contain names none.
+                if !directory_entry.path().is_dir() {
+                    continue;
+                }
+                let Ok(run_directory_name) = directory_entry.file_name().into_string() else {
+                    continue;
+                };
+                let Some(workflow_run_id) = single_path_component(&run_directory_name) else {
+                    continue;
+                };
+                read_subagents_in(
+                    &directory_entry.path(),
+                    Some(workflow_run_id),
+                    &mut subagents,
+                )?;
+            }
+        }
+        // Most sessions run no workflows at all, so a missing directory is the common
+        // case and not a failure. Any other error is real and belongs to the caller.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading {}", workflows_directory.display()));
+        }
+    }
+
+    subagents.sort_by(|left, right| {
+        (&left.workflow_run_id, &left.agent_id).cmp(&(&right.workflow_run_id, &right.agent_id))
+    });
+
+    Ok(subagents)
+}
+
+/// Appends every subagent whose meta sidecar sits directly in `directory`.
+///
+/// The scan is driven off the sidecars rather than the transcripts, because a transcript
+/// on its own says nothing about which agent wrote it, and because a run directory keeps
+/// a `journal.jsonl` beside its agents that pairs with no sidecar.
+fn read_subagents_in(
+    directory: &Path,
+    workflow_run_id: Option<&str>,
+    subagents: &mut Vec<SubagentSummary>,
+) -> Result<()> {
+    let directory_entries = match fs::read_dir(directory) {
+        Ok(directory_entries) => directory_entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", directory.display()));
+        }
+    };
+
+    for directory_entry in directory_entries {
+        let Some(directory_entry) = directory_entry.log_err() else {
+            continue;
+        };
+        // Agent ids are hexadecimal, so a name that is not UTF-8 is not one of ours.
+        let Ok(file_name) = directory_entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(agent_id) = file_name
+            .strip_prefix(SUBAGENT_FILE_PREFIX)
+            .and_then(|remainder| remainder.strip_suffix(SUBAGENT_META_SUFFIX))
+        else {
+            continue;
+        };
+        // The id is read back out of a file name here, but it is also what a later
+        // request names an agent by, so it goes through the same boundary as the rest.
+        let Some(agent_id) = single_path_component(agent_id) else {
+            continue;
+        };
+
+        // One half-written or unreadable sidecar must not hide every other agent the
+        // session spawned, so each failure is logged and that agent alone is skipped.
+        let Some(contents) = fs::read_to_string(directory_entry.path()).log_err() else {
+            continue;
+        };
+        let Some(meta) = parse_subagent_meta(&contents).log_err() else {
+            continue;
+        };
+
+        let transcript_path = directory.join(format!(
+            "{SUBAGENT_FILE_PREFIX}{agent_id}{SUBAGENT_TRANSCRIPT_SUFFIX}"
+        ));
+        // An agent whose transcript cannot be measured — not written yet, or replaced
+        // between the two reads — is still an agent worth listing, so the size falls
+        // back to zero instead of dropping the row.
+        let size = fs::metadata(&transcript_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        subagents.push(SubagentSummary {
+            agent_id: agent_id.to_string(),
+            workflow_run_id: workflow_run_id.map(str::to_string),
+            meta,
+            transcript_path,
+            size,
+        });
+    }
+
+    Ok(())
+}
+
+/// The path of one subagent's transcript, or `None` when it does not exist or one of the
+/// ids could name something outside the session's own directory.
+///
+/// `workflow_run_id` is required for an agent belonging to a workflow run, because the
+/// two layouts put the same agent id in different directories and only the caller knows
+/// which one it read the id from.
+pub fn subagent_transcript_path(
+    home_directory: &Path,
+    session_id: &str,
+    agent_id: &str,
+    workflow_run_id: Option<&str>,
+) -> Option<PathBuf> {
+    let agent_id = single_path_component(agent_id)?;
+    let mut directory =
+        find_session_directory(home_directory, session_id)?.join(SUBAGENTS_DIRECTORY);
+    if let Some(workflow_run_id) = workflow_run_id {
+        let workflow_run_id = single_path_component(workflow_run_id)?;
+        directory = directory.join(WORKFLOWS_DIRECTORY).join(workflow_run_id);
+    }
+
+    let path = directory.join(format!(
+        "{SUBAGENT_FILE_PREFIX}{agent_id}{SUBAGENT_TRANSCRIPT_SUFFIX}"
+    ));
+    path.is_file().then_some(path)
+}
+
+/// Locates `<home>/.claude/projects/*/<sessionId>/`.
+///
+/// Searched rather than computed for the same reason [`find_transcript`] searches: the
+/// directory under `projects` is a slug derived from the session's working directory by
+/// an undocumented rule.
+fn find_session_directory(home_directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let projects_directory = home_directory.join(".claude").join("projects");
+    let session_id = single_path_component(session_id)?;
+
+    for directory_entry in fs::read_dir(projects_directory).ok()? {
+        let Some(directory_entry) = directory_entry.log_err() else {
+            continue;
+        };
+        let candidate = directory_entry.path().join(session_id);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// The run id a `Workflow` tool result announces, which is the only thing linking a
+/// workflow's agents on disk — stored under the run id — to the tool call that started
+/// them, whose `tool_use_id` pairs it with the assistant message.
+///
+/// The value becomes a path component, so a run id that could name a directory other
+/// than one run's own is treated as no run id at all.
+pub fn workflow_run_id_in_tool_result(text: &str) -> Option<String> {
+    text.match_indices(WORKFLOW_RUN_ID_LABEL)
+        .filter_map(|(index, label)| {
+            let remainder = text.get(index + label.len()..)?;
+            let candidate = remainder
+                .trim_start_matches([' ', '\t'])
+                .split(char::is_whitespace)
+                .next()?;
+            workflow_run_id(candidate)
+        })
+        .next()
+        .map(str::to_string)
+}
+
+fn workflow_run_id(candidate: &str) -> Option<&str> {
+    // The separator of the machine that wrote the text is unknown, so a backslash is
+    // rejected here as well, even though this side would treat it as an ordinary
+    // character in a name.
+    if candidate.contains(['/', '\\']) || candidate.contains("..") {
+        return None;
+    }
+    single_path_component(candidate)
+}
+
 /// The pane a registration's `tmux` field names, as a target `tmux` accepts.
 ///
 /// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. Only the pane id
@@ -477,6 +747,20 @@ pub fn pane_target(tmux_field: &str) -> Option<String> {
 /// of another that is still in flight.
 static PASTE_BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the send of `text` has to travel as a bracketed paste.
+///
+/// Bracketed paste exists to keep the newlines of a multi-line message from being read as
+/// submissions, so a message without one has nothing for it to protect — and asking for it
+/// anyway is not free. The sequence that opens a bracketed paste puts the pane's TUI into
+/// paste mode, where everything arriving is accumulated as pasted content rather than
+/// shown as it is typed, and only the closing sequence takes it out again. A pane left in
+/// that state swallows what its user types next: the characters reach Claude Code but
+/// never appear on screen. A single line goes without it, so the common case never enters
+/// that state at all.
+fn needs_bracketed_paste(text: &str) -> bool {
+    text.contains('\n')
+}
+
 /// The arguments of the one tmux invocation a send performs.
 ///
 /// Loading the buffer, pasting it and submitting it travel as a single tmux command list,
@@ -485,8 +769,11 @@ static PASTE_BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// three invocations there is a gap between them for a concurrent send to slip into:
 /// load, paste, load, paste, Enter, Enter submits both messages as one and then submits
 /// an empty line.
-fn send_text_arguments(buffer_name: &str, pane_target: &str) -> Vec<String> {
-    [
+///
+/// `bracketed` adds the `-p` that pastes as a bracketed paste; see
+/// [`needs_bracketed_paste`] for why only a multi-line message asks for it.
+fn send_text_arguments(buffer_name: &str, pane_target: &str, bracketed: bool) -> Vec<String> {
+    let mut arguments = vec![
         // `-` is where load-buffer reads the buffer from, and it means standard input.
         "load-buffer",
         "-b",
@@ -494,11 +781,14 @@ fn send_text_arguments(buffer_name: &str, pane_target: &str) -> Vec<String> {
         "-",
         ";",
         // `-d` deletes the buffer once it has been pasted, so that the text is not left
-        // behind for the next paste to pick up. `-p` is the bracketed paste that makes a
-        // multi-line message arrive as one message.
+        // behind for the next paste to pick up.
         "paste-buffer",
         "-d",
-        "-p",
+    ];
+    if bracketed {
+        arguments.push("-p");
+    }
+    arguments.extend([
         "-b",
         buffer_name,
         "-t",
@@ -508,9 +798,9 @@ fn send_text_arguments(buffer_name: &str, pane_target: &str) -> Vec<String> {
         "-t",
         pane_target,
         "Enter",
-    ]
-    .map(str::to_string)
-    .to_vec()
+    ]);
+
+    arguments.into_iter().map(str::to_string).collect()
 }
 
 /// Types `text` into the pane and submits it.
@@ -530,7 +820,7 @@ pub async fn send_text(pane_target: &str, text: &str) -> Result<()> {
         PASTE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
 
-    let arguments = send_text_arguments(&buffer_name, pane_target);
+    let arguments = send_text_arguments(&buffer_name, pane_target, needs_bracketed_paste(text));
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     // A command that fails makes tmux abandon the rest of the command list, so a paste
     // that fails — the pane is gone, most likely — never reaches the deletion that
@@ -1501,7 +1791,7 @@ mod tests {
 
     #[test]
     fn a_send_runs_one_tmux_command_list_so_two_sends_cannot_interleave() {
-        let arguments = send_text_arguments("zed-claude-1-0", "%12");
+        let arguments = send_text_arguments("zed-claude-1-0", "%12", true);
 
         let separators = arguments
             .iter()
@@ -1535,6 +1825,151 @@ mod tests {
             ],
             "the three steps have to stay in this order within the one command list"
         );
+    }
+
+    /// Bracketed paste puts the pane's TUI into paste mode until the closing sequence
+    /// lands, and a message with no newline in it has nothing for that mode to protect.
+    #[test]
+    fn only_a_multi_line_send_asks_tmux_for_a_bracketed_paste() {
+        let asked_for: Vec<(&str, bool)> = ["one line", "line one\nline two", "trailing\n"]
+            .into_iter()
+            .map(|text| (text, needs_bracketed_paste(text)))
+            .collect();
+        assert_eq!(
+            asked_for,
+            vec![
+                // No newline to protect, so the pane is never put into paste mode.
+                ("one line", false),
+                ("line one\nline two", true),
+                ("trailing\n", true),
+            ],
+            "bracketed paste is what keeps a newline from submitting the message early, \
+             and only a message that has one needs it"
+        );
+
+        let single_line = send_text_arguments("zed-claude-1-0", "%12", false);
+        assert!(
+            !single_line.iter().any(|argument| argument == "-p"),
+            "a single-line send must not ask for a bracketed paste, but it runs {single_line:?}"
+        );
+        assert_eq!(
+            single_line,
+            vec![
+                "load-buffer",
+                "-b",
+                "zed-claude-1-0",
+                "-",
+                ";",
+                "paste-buffer",
+                "-d",
+                "-b",
+                "zed-claude-1-0",
+                "-t",
+                "%12",
+                ";",
+                "send-keys",
+                "-t",
+                "%12",
+                "Enter",
+            ],
+            "dropping `-p` must be the only difference: one command list, `-d` kept, \
+             the three steps in the same order"
+        );
+    }
+
+    /// Sends into a pane this test creates and kills, never into a pane a real Claude
+    /// Code session is running in. `cat` has not asked for bracketed paste, so tmux
+    /// leaves the paste sequences out either way and what lands in the file is the
+    /// message itself: this is about the text and its newlines arriving intact, while
+    /// [`only_a_multi_line_send_asks_tmux_for_a_bracketed_paste`] is what pins the flag.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_line_and_a_multi_line_send_both_arrive_verbatim() {
+        let _tmux_server = tmux_server_lock();
+        smol::block_on(async {
+            let session_name = format!("zed-claude-send-shapes-test-{}", std::process::id());
+            let output_path = std::env::temp_dir().join(format!("{session_name}.out"));
+            std::fs::remove_file(&output_path).ok();
+
+            let mut new_session = util::command::new_command("tmux");
+            new_session.args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                &format!("cat >> '{}'", output_path.display()),
+            ]);
+            // A machine with no tmux binary, or one that cannot start a server, has no
+            // pane for this to send into.
+            match new_session.output().await {
+                Err(_) => return,
+                Ok(output) if !output.status.success() => return,
+                Ok(_) => {}
+            }
+
+            let received = async {
+                let mut list_panes = util::command::new_command("tmux");
+                list_panes.args(["list-panes", "-t", &session_name, "-F", "#{pane_id}"]);
+                let panes = list_panes
+                    .output()
+                    .await
+                    .context("listing the panes of the test session")?;
+                let pane_target = String::from_utf8_lossy(&panes.stdout).trim().to_string();
+                anyhow::ensure!(
+                    !pane_target.is_empty(),
+                    "the test session reported no pane to send to"
+                );
+
+                // The pane's `cat` appends, so the file accumulates both sends and the
+                // tail of it is what says the send being waited on has arrived.
+                let await_tail = |tail: &'static str| {
+                    let output_path = output_path.clone();
+                    async move {
+                        for _ in 0..100 {
+                            let received =
+                                std::fs::read_to_string(&output_path).unwrap_or_default();
+                            if received.ends_with(tail) {
+                                return anyhow::Ok(received);
+                            }
+                            // Sleeping the thread rather than awaiting a timer, because
+                            // what this waits for is another process writing a file.
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        anyhow::bail!(
+                            "the pane never received a line ending in {tail:?}, only `{}`",
+                            std::fs::read_to_string(&output_path).unwrap_or_default()
+                        )
+                    }
+                };
+
+                send_text(&pane_target, "a single line").await?;
+                let after_single_line = await_tail("a single line\n").await?;
+
+                send_text(&pane_target, "line one\nline two").await?;
+                let after_multi_line = await_tail("line two\n").await?;
+
+                anyhow::Ok((after_single_line, after_multi_line))
+            }
+            .await;
+
+            // Killed before the assertions, so that a failing run leaves no session and
+            // no file behind.
+            let mut kill_session = util::command::new_command("tmux");
+            kill_session.args(["kill-session", "-t", &session_name]);
+            kill_session.output().await.log_err();
+            std::fs::remove_file(&output_path).ok();
+
+            let (after_single_line, after_multi_line) =
+                received.expect("the sends into the test's own pane must succeed");
+            assert_eq!(
+                after_single_line, "a single line\n",
+                "a single-line send has to arrive as that line, submitted once"
+            );
+            assert_eq!(
+                after_multi_line, "a single line\nline one\nline two\n",
+                "the multi-line send that follows it has to arrive whole, submitted once"
+            );
+        });
     }
 
     /// Sends into a pane this test creates and kills, never into a pane a real Claude
@@ -1614,5 +2049,441 @@ mod tests {
                 "both lines have to arrive as one message, submitted once"
             );
         });
+    }
+
+    /// Both sidecars are verbatim rows from this machine's `subagents` directories.
+    const SUBAGENT_META_GENERAL_PURPOSE: &str = r#"{"agentType":"general-purpose",
+ "description":"Phase B adversarial review round 2",
+ "toolUseId":"toolu_01BEgVRSnksoz6YAyUWEEdeQ","spawnDepth":1,
+ "requestShape":"background","requestNonInteractive":true,"model":"opus"}"#;
+
+    const SUBAGENT_META_WORKFLOW: &str = r#"{"agentType":"workflow-subagent",
+ "description":"R2:send-atomicity","workflowPhase":"Wave 5","spawnDepth":1,
+ "requestShape":"foreground","requestNonInteractive":false,"model":"opus"}"#;
+
+    const REAL_SESSION_ID: &str = "4e2e3600-89c0-4cd5-9994-525c708559ab";
+    const REAL_AGENT_ID: &str = "af090e203ec41bc73";
+    const REAL_WORKFLOW_RUN_ID: &str = "wf_b529a29d-562";
+
+    /// Ids that must never reach a path, whichever of the three they are given as.
+    const IDS_THAT_NAME_MORE_THAN_ONE_ENTRY: [&str; 6] = [
+        "",
+        ".",
+        "..",
+        "../..",
+        "a/b",
+        "-some-slug/4e2e3600-89c0-4cd5-9994-525c708559ab",
+    ];
+
+    /// Writes one subagent's sidecar and transcript into the layout the run id selects,
+    /// and returns the transcript's path.
+    fn write_subagent(
+        home_directory: &Path,
+        session_id: &str,
+        workflow_run_id: Option<&str>,
+        agent_id: &str,
+        meta_contents: &str,
+        transcript_contents: &str,
+    ) -> PathBuf {
+        let mut directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-some-slug")
+            .join(session_id)
+            .join("subagents");
+        if let Some(workflow_run_id) = workflow_run_id {
+            directory = directory.join("workflows").join(workflow_run_id);
+        }
+        std::fs::create_dir_all(&directory).expect("creating the subagents directory");
+        std::fs::write(
+            directory.join(format!("agent-{agent_id}.meta.json")),
+            meta_contents,
+        )
+        .expect("writing the subagent meta");
+        let transcript_path = directory.join(format!("agent-{agent_id}.jsonl"));
+        std::fs::write(&transcript_path, transcript_contents).expect("writing the transcript");
+        transcript_path
+    }
+
+    /// Without the field renames every one of these reads back empty or fails to parse,
+    /// so each field is asserted rather than the parse merely succeeding.
+    #[test]
+    fn subagent_meta_of_a_background_agent_keeps_every_recorded_field() -> Result<()> {
+        let meta = parse_subagent_meta(SUBAGENT_META_GENERAL_PURPOSE)?;
+        assert_eq!(meta.agent_type, "general-purpose");
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Phase B adversarial review round 2")
+        );
+        assert_eq!(
+            meta.tool_use_id.as_deref(),
+            Some("toolu_01BEgVRSnksoz6YAyUWEEdeQ")
+        );
+        assert_eq!(meta.spawn_depth, 1);
+        assert_eq!(meta.model.as_deref(), Some("opus"));
+        assert_eq!(
+            meta.workflow_phase, None,
+            "an agent spawned by the Task tool belongs to no workflow phase"
+        );
+        Ok(())
+    }
+
+    /// A workflow's agents record a phase and, on this machine, never a `toolUseId`, so
+    /// treating either as required loses 270 of the 394 sidecars here.
+    #[test]
+    fn subagent_meta_of_a_workflow_agent_keeps_its_phase_without_a_tool_use_id() -> Result<()> {
+        let meta = parse_subagent_meta(SUBAGENT_META_WORKFLOW)?;
+        assert_eq!(meta.agent_type, "workflow-subagent");
+        assert_eq!(meta.description.as_deref(), Some("R2:send-atomicity"));
+        assert_eq!(meta.tool_use_id, None);
+        assert_eq!(meta.workflow_phase.as_deref(), Some("Wave 5"));
+        assert_eq!(meta.spawn_depth, 1);
+        assert_eq!(meta.model.as_deref(), Some("opus"));
+        Ok(())
+    }
+
+    /// The agent type is the one field a caller cannot do without, so its absence has to
+    /// be an error rather than an empty string that renders as an unnamed agent.
+    #[test]
+    fn subagent_meta_without_an_agent_type_is_an_error() {
+        let without_agent_type = r#"{"description":"Phase B","spawnDepth":1,"model":"opus"}"#;
+        assert!(parse_subagent_meta(without_agent_type).is_err());
+    }
+
+    /// The writer ships independently of this reader, so a field added between releases
+    /// must not take the whole row down with it.
+    #[test]
+    fn subagent_meta_ignores_a_field_this_version_does_not_know() -> Result<()> {
+        let with_future_field = r#"{"agentType":"fork","spawnDepth":2,
+ "futureField":{"nested":[1,2,3]}}"#;
+        let meta = parse_subagent_meta(with_future_field)?;
+        assert_eq!(
+            meta.agent_type, "fork",
+            "the agent type is free-form text, not a closed set of known kinds"
+        );
+        assert_eq!(meta.spawn_depth, 2);
+        Ok(())
+    }
+
+    /// Reading an absent depth as zero would claim the agent has no spawner at all,
+    /// where every sidecar without the field describes an agent the session spawned.
+    #[test]
+    fn subagent_meta_without_a_spawn_depth_reads_as_one() -> Result<()> {
+        let meta = parse_subagent_meta(r#"{"agentType":"Explore"}"#)?;
+        assert_eq!(meta.spawn_depth, 1);
+        assert_eq!(meta.description, None);
+        assert_eq!(meta.tool_use_id, None);
+        assert_eq!(meta.model, None);
+        assert_eq!(meta.workflow_phase, None);
+        Ok(())
+    }
+
+    /// Asserts both halves of the boundary. Without the checks the decoy files written
+    /// below resolve: a session id of `../..` reaches `<home>/.claude`, next door to the
+    /// `sessions` directory holding the sessions' socket credentials; an agent id with a
+    /// separator reaches any file under `subagents`; and a workflow run id of `..`
+    /// silently answers with a different agent's transcript.
+    #[test]
+    fn no_id_can_lead_a_subagent_path_out_of_the_directory_it_belongs_to() -> Result<()> {
+        let home_directory = temporary_directory("subagent-id-boundary");
+        let plain_transcript = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+        let workflow_transcript = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            REAL_AGENT_ID,
+            SUBAGENT_META_WORKFLOW,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+
+        assert_eq!(
+            subagent_transcript_path(&home_directory, REAL_SESSION_ID, REAL_AGENT_ID, None),
+            Some(plain_transcript.clone()),
+            "the shapes a real session and agent id have must still resolve, or the \
+             boundary has eaten the only thing it exists to let through"
+        );
+        assert_eq!(
+            subagent_transcript_path(
+                &home_directory,
+                REAL_SESSION_ID,
+                REAL_AGENT_ID,
+                Some(REAL_WORKFLOW_RUN_ID)
+            ),
+            Some(workflow_transcript),
+            "a real workflow run id must still resolve"
+        );
+
+        // `<home>/.claude/projects/-some-slug/<sessionId>` is two levels below `.claude`,
+        // so two parent components in a session id land a lookup right beside the
+        // `sessions` directory this module must never read.
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("subagents")
+                .join(format!("agent-{REAL_AGENT_ID}.jsonl")),
+            "{\"secret\":\"not a subagent transcript\"}\n",
+        );
+        write_file(
+            plain_transcript
+                .with_file_name("agent-nested")
+                .join("secret.jsonl"),
+            "{\"secret\":\"not a subagent transcript\"}\n",
+        );
+
+        assert_eq!(
+            subagent_transcript_path(&home_directory, "../..", REAL_AGENT_ID, None),
+            None,
+            "a session id of `../..` must not reach a file beside the sessions directory"
+        );
+        assert_eq!(
+            subagent_transcript_path(&home_directory, REAL_SESSION_ID, "nested/secret", None),
+            None,
+            "an agent id carrying a separator must not reach a file that is not an \
+             agent transcript"
+        );
+        assert_eq!(
+            subagent_transcript_path(&home_directory, REAL_SESSION_ID, REAL_AGENT_ID, Some("..")),
+            None,
+            "a workflow run id of `..` must not answer with the transcript of the \
+             agent that belongs to no run"
+        );
+
+        for rejected in IDS_THAT_NAME_MORE_THAN_ONE_ENTRY {
+            let session_id_rejected =
+                subagent_transcript_path(&home_directory, rejected, REAL_AGENT_ID, None);
+            assert_eq!(
+                session_id_rejected, None,
+                "a session id of {rejected:?} must not resolve, but it resolved to \
+                 {session_id_rejected:?}"
+            );
+            let agent_id_rejected =
+                subagent_transcript_path(&home_directory, REAL_SESSION_ID, rejected, None);
+            assert_eq!(
+                agent_id_rejected, None,
+                "an agent id of {rejected:?} must not resolve, but it resolved to \
+                 {agent_id_rejected:?}"
+            );
+            let run_id_rejected = subagent_transcript_path(
+                &home_directory,
+                REAL_SESSION_ID,
+                REAL_AGENT_ID,
+                Some(rejected),
+            );
+            assert_eq!(
+                run_id_rejected, None,
+                "a workflow run id of {rejected:?} must not resolve, but it resolved to \
+                 {run_id_rejected:?}"
+            );
+
+            let listed = smol::block_on(list_subagents(&home_directory, rejected))?;
+            assert!(
+                listed.is_empty(),
+                "a session id of {rejected:?} must list no subagents, but it listed {}",
+                listed.len()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Without the workflow scan the third row is missing; without the sort the rows
+    /// arrive in whatever order the directory happens to enumerate; and without the
+    /// per-row skip the broken sidecar takes the whole listing with it.
+    #[test]
+    fn list_subagents_reads_both_layouts_and_orders_them_stably() -> Result<()> {
+        let home_directory = temporary_directory("subagent-listing");
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        let first = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            "a0000e203ec41bc73",
+            SUBAGENT_META_GENERAL_PURPOSE,
+            transcript_contents,
+        );
+        let second = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            transcript_contents,
+        );
+        // Sorts between the two rows above, so its absence from the result is what shows
+        // a half-written sidecar costs only its own row.
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            "ab000e203ec41bc73",
+            "{\"agentType\":",
+            transcript_contents,
+        );
+        let workflow = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        // A run directory keeps a journal beside its agents, and it names no agent.
+        write_file(
+            workflow.with_file_name("journal.jsonl"),
+            "{\"event\":\"wave-started\"}\n",
+        );
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        let listed: Vec<(Option<&str>, &str, &Path)> = subagents
+            .iter()
+            .map(|subagent| {
+                (
+                    subagent.workflow_run_id.as_deref(),
+                    subagent.agent_id.as_str(),
+                    subagent.transcript_path.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (None, "a0000e203ec41bc73", first.as_path()),
+                (None, REAL_AGENT_ID, second.as_path()),
+                (
+                    Some(REAL_WORKFLOW_RUN_ID),
+                    "a1111e203ec41bc73",
+                    workflow.as_path()
+                ),
+            ]
+        );
+
+        let workflow_subagent = subagents
+            .last()
+            .expect("the workflow agent must be listed last");
+        assert_eq!(workflow_subagent.meta.agent_type, "workflow-subagent");
+        assert_eq!(
+            workflow_subagent.meta.workflow_phase.as_deref(),
+            Some("Wave 5")
+        );
+        assert_eq!(
+            workflow_subagent.size,
+            transcript_contents.len() as u64,
+            "the size has to be the transcript's, so a caller can tail from it"
+        );
+
+        Ok(())
+    }
+
+    /// A transcript that has not been flushed yet must not drop the agent from the
+    /// listing, because its sidecar is written first and the panel has to show the agent
+    /// as soon as it exists.
+    #[test]
+    fn a_subagent_whose_transcript_is_missing_is_listed_with_no_size() -> Result<()> {
+        let home_directory = temporary_directory("subagent-unflushed");
+        let transcript = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "",
+        );
+        std::fs::remove_file(&transcript)?;
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        assert_eq!(subagents.len(), 1);
+        let subagent = subagents
+            .first()
+            .expect("the agent whose sidecar exists must be listed");
+        assert_eq!(subagent.agent_id, REAL_AGENT_ID);
+        assert_eq!(subagent.size, 0);
+        assert_eq!(subagent.transcript_path, transcript);
+
+        Ok(())
+    }
+
+    /// A session with no subagents at all is the common case, so it has to answer with an
+    /// empty listing rather than an error the caller would have to classify.
+    #[test]
+    fn a_session_with_no_subagent_directory_lists_no_subagents() -> Result<()> {
+        let home_directory = temporary_directory("subagent-none");
+        assert!(
+            smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?.is_empty(),
+            "a home directory with no projects at all must not fail the listing"
+        );
+
+        write_transcript(&home_directory, REAL_SESSION_ID, "{\"type\":\"user\"}\n");
+        assert!(
+            smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?.is_empty(),
+            "a session that has written a transcript but spawned no agents must list none"
+        );
+
+        Ok(())
+    }
+
+    /// The run id is the only link from a workflow's tool call to the directory holding
+    /// its agents, and it arrives inside prose, so the label has to be located rather
+    /// than the whole result parsed.
+    #[test]
+    fn a_workflow_tool_result_yields_the_run_id_it_announces() {
+        let tool_result = "Workflow run started.\nRun ID: wf_b529a29d-562\nTo resume after \
+                           editing the script, pass resumeFromRunId.";
+        assert_eq!(
+            workflow_run_id_in_tool_result(tool_result).as_deref(),
+            Some("wf_b529a29d-562")
+        );
+        assert_eq!(
+            workflow_run_id_in_tool_result("no workflow ran here"),
+            None,
+            "a result that announces no run must not produce a run id"
+        );
+        assert_eq!(
+            workflow_run_id_in_tool_result("Run ID: wf_first-001\nRun ID: wf_second-002\n")
+                .as_deref(),
+            Some("wf_first-001"),
+            "the first run id a result announces is the run it started"
+        );
+        assert_eq!(
+            workflow_run_id_in_tool_result("Run ID:\nwf_b529a29d-562\n"),
+            None,
+            "a label with nothing after it on the line names no run"
+        );
+    }
+
+    /// The extracted value is joined onto a path, so this is the same boundary as the one
+    /// above, applied where the text is untrusted rather than the caller. Without the
+    /// backslash check the middle case passes on this platform, where a backslash is an
+    /// ordinary character in a name but a separator on the machine that wrote the text.
+    #[test]
+    fn a_run_id_that_could_name_another_directory_is_not_a_run_id() {
+        for text in [
+            "Run ID: ../../../etc\n",
+            "Run ID: wf_a\\..\\..\\etc\n",
+            "Run ID: wf_a/wf_b\n",
+            "Run ID: ..\n",
+            "Run ID: .\n",
+            "Run ID:   \n",
+        ] {
+            let extracted = workflow_run_id_in_tool_result(text);
+            assert_eq!(
+                extracted, None,
+                "{text:?} must yield no run id, but it yielded {extracted:?}"
+            );
+        }
+
+        assert_eq!(
+            workflow_run_id_in_tool_result("Run ID: ../../../etc\nRun ID: wf_b529a29d-562\n")
+                .as_deref(),
+            Some("wf_b529a29d-562"),
+            "a value the boundary rejects is not a run id, so the search continues"
+        );
     }
 }

@@ -144,6 +144,8 @@ impl SessionSource for RemoteSource {
             path: state.path.as_deref().map(path_to_wire),
             offset: state.offset,
             pending: state.pending,
+            agent_id: None,
+            workflow_run_id: None,
         });
 
         self.executor

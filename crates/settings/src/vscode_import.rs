@@ -187,6 +187,7 @@ impl VsCodeSettings {
             auto_update: None,
             base_keymap: Some(BaseKeymapContent::VSCode),
             calls: None,
+            claude_sessions: None,
             collaboration_panel: None,
             command_palette: self
                 .read_u64("workbench.commandPalette.history")

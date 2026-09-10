@@ -14,26 +14,30 @@
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use collections::{HashMap, HashSet};
 use editor::Editor;
+use fs::Fs;
 use gpui::{
-    AnyElement, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Image,
-    ImageFormat, ListAlignment, ListSizingBehavior, ListState, Render, Subscription, Task,
-    WeakEntity, img, list,
+    Animation, AnimationExt as _, AnyElement, AsyncWindowContext, Entity, EventEmitter,
+    FocusHandle, Focusable, Image, ImageFormat, ListAlignment, ListSizingBehavior, ListState,
+    Render, Subscription, Task, WeakEntity, img, list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
-use ui::{Button, Divider, ListItem, ListItemSpacing, Tooltip, prelude::*};
-use util::ResultExt as _;
+use settings::{DockSide, Settings as _};
+use ui::{Button, Disclosure, Divider, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
 use crate::{
-    ClaudeSessionStore, Interrupt, RegisteredSession, SendMessage, ToggleFocus, TranscriptRecord,
+    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, RegisteredSession, SendMessage,
+    ToggleFocus, TranscriptRecord,
     session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
 };
 
@@ -43,6 +47,21 @@ const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 const LOCAL_COMMAND_SUBTYPE: &str = "local_command";
 const ATTACHMENT_RECORD_TYPE: &str = "attachment";
 const ATTACHMENTS_ENTRY_KEY: &str = "context-attachments";
+
+/// The blocks Claude Code injects into the text of a user record: context it assembled
+/// itself, not words the user typed. A real message often carries one of these appended to
+/// its tail, and a record is sometimes nothing but one, so they are cut out of the text
+/// rather than the record being dropped whole.
+const INJECTED_WRAPPERS: [&str; 6] = [
+    "system-reminder",
+    "task-notification",
+    "persisted-output",
+    "codegraph_context",
+    "local-command-stdout",
+    // Claude Code's note to itself that the user ran the command rather than the model,
+    // written alongside the output. Like the output, it is nothing the user typed.
+    "local-command-caveat",
+];
 
 const PERSISTED_OUTPUT_MARKER: &str = "<persisted-output>";
 const PERSISTED_OUTPUT_PATH_PREFIX: &str = "Full output saved to: ";
@@ -62,11 +81,37 @@ const EMPTY_TRANSCRIPT: &str = "This conversation has no messages yet.";
 const READ_ONLY_NOTE: &str = "This session is not running inside tmux, so it can only be read.";
 const SELECT_A_SESSION_TO_REPLY: &str = "Select a session to reply to it.";
 const MESSAGE_PLACEHOLDER: &str = "Message this session…";
+const SENDING_NOTE: &str = "Sending…";
+const THINKING_NOTE: &str = "Thinking…";
+
+const ASSISTANT_RECORD_TYPE: &str = "assistant";
+const USER_RECORD_TYPE: &str = "user";
+const THINKING_BLOCK_TYPE: &str = "thinking";
+const TOOL_USE_BLOCK_TYPE: &str = "tool_use";
+const TOOL_RESULT_BLOCK_TYPE: &str = "tool_result";
+
+/// The two blocks Claude Code writes into a user record for a slash command. Unlike
+/// [`INJECTED_WRAPPERS`] these are not cut out: what is inside them is the command the
+/// user ran and the arguments they typed after it.
+const COMMAND_NAME_WRAPPER: &str = "command-name";
+const COMMAND_ARGS_WRAPPER: &str = "command-args";
+
+/// How much of a running tool's target is shown beside its name. Counted in characters:
+/// a `Bash` command is often a whole pipeline, and the head of it is what says which
+/// call is running.
+const TOOL_TARGET_CHARACTERS: usize = 40;
+
+/// One cycle of the pulse that marks something as still in progress — a message that has
+/// not arrived, a session that is answering. Matches the period the agent panel pulses
+/// its own icons at.
+const PULSE_PERIOD: Duration = Duration::from_secs(1);
 
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
-    position: DockPosition,
+    /// Only used to write the dock side back to the settings file, which is where it
+    /// lives so that it survives a restart.
+    fs: Arc<dyn Fs>,
     store: Entity<ClaudeSessionStore>,
     /// The same source the store reads through, kept here for the one read the panel
     /// performs on its own behalf: a persisted tool output.
@@ -80,7 +125,19 @@ pub struct ClaudeSessionsPanel {
     /// transcript whenever the store reports a change, and spliced into `list_state` so
     /// that the items which did not move keep their measured height.
     entries: Vec<Entry>,
+    /// The messages that have left for the selected session but have not appeared in its
+    /// transcript yet. Drawn after the entries built from the transcript, and never
+    /// mixed into them: see [`PendingSends`].
+    pending_sends: PendingSends,
+    /// What the selected session is doing, as of the last change to its transcript; see
+    /// [`activity`].
+    activity: Activity,
     list_state: ListState,
+    /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
+    /// panel to the conversation, which is what the user is here to read.
+    session_list_expanded: bool,
+    /// See [`UnreadBelow`].
+    unread_below: UnreadBelow,
     /// Keys of the entries — and of the attachments nested inside the context section —
     /// the user has opened.
     expanded: HashSet<SharedString>,
@@ -135,6 +192,17 @@ enum EntryKind {
         media_type: SharedString,
     },
     LocalCommand {
+        text: SharedString,
+    },
+    /// The slash command a user record holds instead of words the user typed; see
+    /// [`rewrite_slash_commands`].
+    SlashCommand {
+        text: SharedString,
+    },
+    /// A message that has left for the session but has not appeared in its transcript
+    /// yet; see [`PendingSends`]. The only entry that does not come from a record.
+    Pending {
+        id: u64,
         text: SharedString,
     },
     CompactBoundary {
@@ -221,6 +289,29 @@ impl EntryCache {
         kind
     }
 
+    /// The same as [`Self::kind`] for a derivation that may decide the record has nothing
+    /// to show. Nothing is cached for such a record: the answer is a scan of the record's
+    /// own text rather than an artifact, and there is no entry to cache it under.
+    fn optional_kind(
+        &mut self,
+        key: Option<&SharedString>,
+        derive: impl FnOnce() -> Option<EntryKind>,
+    ) -> Option<EntryKind> {
+        if let Some(kind) = key.and_then(|key| self.kinds.get(key)) {
+            return Some(kind.clone());
+        }
+
+        #[cfg(test)]
+        {
+            self.derived += 1;
+        }
+        let kind = derive()?;
+        if let Some(key) = key {
+            self.kinds.insert(key.clone(), kind.clone());
+        }
+        Some(kind)
+    }
+
     fn attachment(
         &mut self,
         key: Option<&SharedString>,
@@ -273,6 +364,48 @@ enum MessageRole {
     /// The record compaction writes in the user's place, which carries `"type":"user"`
     /// but was not typed by the user.
     CompactSummary,
+}
+
+/// How many entries have arrived since the reader was last at the bottom of the
+/// conversation.
+///
+/// The list follows the tail only while it is already at the bottom, because a reader who
+/// has scrolled up is reading something and must not be yanked away from it. That leaves
+/// the case this counts: new messages landing below the window, out of sight, which is
+/// what makes a session that is streaming look like a session that has stopped.
+#[derive(Default)]
+struct UnreadBelow {
+    count: usize,
+}
+
+impl UnreadBelow {
+    /// `at_bottom` is where the list sat *before* the new entries were spliced in, which
+    /// is what decides whether they were scrolled into view or landed below the window.
+    fn entries_arrived(&mut self, added: usize, at_bottom: bool) {
+        if at_bottom {
+            self.count = 0;
+        } else {
+            self.count = self.count.saturating_add(added);
+        }
+    }
+
+    /// Called with where the list sits now: the count is what has arrived since the
+    /// reader was last at the bottom, so being there again is having read it.
+    fn scrolled(&mut self, at_bottom: bool) {
+        if at_bottom {
+            self.count = 0;
+        }
+    }
+
+    /// A different session is a different conversation, and the reader is shown the
+    /// newest of it, so nothing is owed to them from the one they left.
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
 }
 
 #[derive(Clone)]
@@ -336,6 +469,7 @@ impl ClaudeSessionsPanel {
     ) -> Entity<Self> {
         let workspace_handle = workspace.weak_handle();
         let project = workspace.project().clone();
+        let fs = workspace.app_state().fs.clone();
 
         cx.new(|cx| {
             let project_root = project
@@ -374,13 +508,17 @@ impl ClaudeSessionsPanel {
             Self {
                 workspace: workspace_handle,
                 focus_handle: cx.focus_handle(),
-                position: DockPosition::Right,
+                fs,
                 store,
                 source,
                 message_editor,
                 project_root,
                 entries: Vec::new(),
+                pending_sends: PendingSends::default(),
+                activity: Activity::Idle,
                 list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+                session_list_expanded: true,
+                unread_below: UnreadBelow::default(),
                 expanded: HashSet::default(),
                 show_full_history: false,
                 markdowns: HashMap::default(),
@@ -399,8 +537,25 @@ impl ClaudeSessionsPanel {
         // Whether the previous conversation had been compacted says nothing about this
         // one, so the history toggle starts closed again.
         self.show_full_history = false;
+        // The reader is looking at another conversation now, and what they are shown of
+        // it is its newest end — not the place they had scrolled the last one to.
+        self.unread_below.reset();
+        self.list_state.scroll_to_end();
         self.store
             .update(cx, |store, cx| store.select(process_id, cx));
+    }
+
+    fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
+        self.session_list_expanded = !self.session_list_expanded;
+        cx.notify();
+    }
+
+    /// Takes the reader to the newest of the conversation, which is what the count of
+    /// what arrived below their window offers.
+    fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.list_state.scroll_to_end();
+        self.unread_below.reset();
+        cx.notify();
     }
 
     fn toggle_full_history(&mut self, cx: &mut Context<Self>) {
@@ -409,6 +564,7 @@ impl ClaudeSessionsPanel {
         // none of the measured heights line up with the new indices.
         self.entries.clear();
         self.list_state.reset(0);
+        self.unread_below.reset();
         self.rebuild_entries(cx);
         cx.notify();
     }
@@ -430,7 +586,7 @@ impl ClaudeSessionsPanel {
         // Moved out for the duration of the build so that the transcript can be borrowed
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
-        let new_entries = {
+        let (mut new_entries, activity) = {
             let store = self.store.read(cx);
             let home_directory = store.home_directory();
             let transcript = store.transcript();
@@ -439,9 +595,24 @@ impl ClaudeSessionsPanel {
             } else {
                 transcript.active_path()
             };
-            build_entries(&path, home_directory, &mut cache)
+            // Derived here, where the path has already been walked: the panel is drawn
+            // far more often than the transcript changes, and this is the only place the
+            // transcript is read.
+            (
+                build_entries(&path, home_directory, &mut cache),
+                activity(&path),
+            )
         };
         self.entry_cache = cache;
+        self.activity = activity;
+
+        // Paired against the entries the transcript itself produced, before the pending
+        // ones are appended: a pending message must never be paired with another pending
+        // message, and nothing derived from one may reach the entry cache.
+        self.pending_sends
+            .retain_session(self.store.read(cx).selected());
+        self.pending_sends.pair_with(&new_entries);
+        new_entries.extend(self.pending_sends.entries());
 
         let old_length = self.entries.len();
         let new_length = new_entries.len();
@@ -473,6 +644,13 @@ impl ClaudeSessionsPanel {
 
         // Captured before the splice, which itself moves the scroll position.
         let was_scrolled_to_end = self.list_state.is_scrolled_to_end().unwrap_or(true);
+
+        // What arrived is counted against where the reader was sitting: at the bottom it
+        // is scrolled into view below, and anywhere else it lands out of sight, which is
+        // what makes a session that is still answering look like one that has stopped.
+        let arrived = new_length.saturating_sub(old_length);
+        self.unread_below
+            .entries_arrived(arrived, was_scrolled_to_end);
 
         self.entries = new_entries;
         self.list_state.splice(changed_old, changed_count);
@@ -631,7 +809,17 @@ impl ClaudeSessionsPanel {
         let sessions = store.sessions().to_vec();
         let selected_process_id = store.selected();
         let error = store.error().cloned();
-        let session_count = sessions.len();
+        let selected_name = sessions
+            .iter()
+            .find(|session| selected_process_id == Some(session.process_id))
+            .map(|session| {
+                session
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| session.session_id.clone())
+            });
+        let summary = collapsed_sessions_summary(sessions.len(), selected_name.as_deref());
+        let is_expanded = self.session_list_expanded;
 
         v_flex()
             .child(
@@ -640,14 +828,29 @@ impl ClaudeSessionsPanel {
                     .gap_1()
                     .justify_between()
                     .child(
-                        Label::new("Claude Sessions")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(
+                                Disclosure::new("claude-sessions-list-disclosure", is_expanded)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_session_list(cx)),
+                                    ),
+                            )
+                            .child(
+                                Label::new("Claude Sessions")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     )
+                    // Collapsed, this line is all that is left of the list, so it carries
+                    // what the rows were saying: how many are running and which one the
+                    // conversation below belongs to.
                     .child(
-                        Label::new(format!("{session_count}"))
+                        Label::new(summary)
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .single_line(),
                     ),
             )
             .when_some(error, |this, error| {
@@ -659,25 +862,27 @@ impl ClaudeSessionsPanel {
                     ),
                 )
             })
-            .child(
-                v_flex()
-                    .id("claude-sessions-list")
-                    .max_h(px(200.))
-                    .overflow_y_scroll()
-                    .when(sessions.is_empty(), |this| {
-                        this.child(
-                            div().p_2().child(
-                                Label::new(NO_SESSIONS)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                    })
-                    .children(sessions.iter().enumerate().map(|(index, session)| {
-                        let is_selected = selected_process_id == Some(session.process_id);
-                        self.render_session_row(index, session, is_selected, cx)
-                    })),
-            )
+            .when(is_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .id("claude-sessions-list")
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .when(sessions.is_empty(), |this| {
+                            this.child(
+                                div().p_2().child(
+                                    Label::new(NO_SESSIONS)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                        })
+                        .children(sessions.iter().enumerate().map(|(index, session)| {
+                            let is_selected = selected_process_id == Some(session.process_id);
+                            self.render_session_row(index, session, is_selected, cx)
+                        })),
+                )
+            })
     }
 
     fn render_session_row(
@@ -700,18 +905,34 @@ impl ClaudeSessionsPanel {
         let tmux_target = session.tmux_target.clone().map(SharedString::from);
         let is_bridged = session.bridge_session_id.is_some();
 
+        // Wrapped so that the pulse can be applied to the element: the icon itself
+        // carries a colour rather than an opacity.
+        let indicator = div().child(Icon::new(IconName::Indicator).size(IconSize::XSmall).color(
+            if is_busy {
+                Color::Success
+            } else {
+                Color::Hidden
+            },
+        ));
+        // A still dot says a session is busy; a pulsing one says it is busy right now.
+        let indicator = if is_busy {
+            indicator
+                .with_animation(
+                    SharedString::from(format!("claude-session-indicator-{index}")),
+                    Animation::new(PULSE_PERIOD)
+                        .repeat()
+                        .with_easing(pulsating_between(0.2, 0.8)),
+                    |indicator, delta| indicator.opacity(delta),
+                )
+                .into_any_element()
+        } else {
+            indicator.into_any_element()
+        };
+
         ListItem::new(SharedString::from(format!("claude-session-{index}")))
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(is_selected)
-            .start_slot(
-                Icon::new(IconName::Indicator)
-                    .size(IconSize::XSmall)
-                    .color(if is_busy {
-                        Color::Success
-                    } else {
-                        Color::Hidden
-                    }),
-            )
+            .start_slot(indicator)
             .child(
                 v_flex()
                     .gap_0p5()
@@ -772,13 +993,86 @@ impl ClaudeSessionsPanel {
             });
         }
 
-        list(
-            self.list_state.clone(),
-            cx.processor(|this, index: usize, window, cx| this.render_entry(index, window, cx)),
+        // Arriving back at the bottom is having read what landed there, and this is where
+        // a scroll that got there is noticed: the list notifies this view on every
+        // scroll, so the panel is drawn again with the answer below already updated.
+        // `None` — a list whose new items have not been measured yet, which is exactly
+        // what a splice leaves behind — is not an answer, and clearing the count on it
+        // would throw away the arrival that caused the splice.
+        if self.list_state.is_scrolled_to_end() == Some(true) {
+            self.unread_below.scrolled(true);
+        }
+        let unread_below = self.unread_below.count();
+
+        v_flex()
+            .flex_grow_1()
+            .overflow_hidden()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, index: usize, window, cx| {
+                        this.render_entry(index, window, cx)
+                    }),
+                )
+                .with_sizing_behavior(ListSizingBehavior::Auto)
+                .flex_grow_1(),
+            )
+            // A reader who has scrolled up is not followed to the tail, so the messages
+            // that arrive land out of sight and the session looks like it has stopped.
+            // This is the only sign that it has not.
+            .when(unread_below > 0, |this| {
+                this.child(
+                    h_flex().w_full().px_2().pb_1().justify_center().child(
+                        Button::new(
+                            "claude-session-scroll-to-latest",
+                            // Counted in entries rather than messages, because one
+                            // reply arrives as several of them: thinking, a tool call,
+                            // its result, then the text. Saying "messages" would name a
+                            // number the reader cannot match to what they scroll past.
+                            if unread_below == 1 {
+                                "1 new below".to_string()
+                            } else {
+                                format!("{unread_below} new below")
+                            },
+                        )
+                        .end_icon(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text("Jump to the newest message"))
+                        .on_click(cx.listener(|this, _, _, cx| this.scroll_to_latest(cx))),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The one line above the input that says what the session is doing, or nothing at
+    /// all for a session that is not doing anything: a line that is sometimes there and
+    /// sometimes not would move the input under the reader's hands at the end of every
+    /// turn. Read-only — the reader is being told something, not offered anything.
+    fn render_activity(&self) -> Option<AnyElement> {
+        let note = activity_label(&self.activity)?;
+
+        Some(
+            h_flex()
+                .w_full()
+                .px_2()
+                .pb_1()
+                .gap_1()
+                .child(
+                    Label::new(note)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line()
+                        .with_animation(
+                            "claude-session-activity",
+                            Animation::new(PULSE_PERIOD)
+                                .repeat()
+                                .with_easing(pulsating_between(0.4, 0.8)),
+                            |note, delta| note.alpha(delta),
+                        ),
+                )
+                .into_any_element(),
         )
-        .with_sizing_behavior(ListSizingBehavior::Auto)
-        .flex_grow_1()
-        .into_any_element()
     }
 
     fn render_placeholder(message: &'static str) -> AnyElement {
@@ -818,6 +1112,12 @@ impl ClaudeSessionsPanel {
             return;
         }
 
+        // Nothing to send to means nothing to draw the message against; `pane_target`
+        // has already answered that there is a session here.
+        let Some(process_id) = self.store.read(cx).selected() else {
+            return;
+        };
+
         let send = self.store.update(cx, |store, cx| {
             store.send_input(SessionInput::Text(text.clone()), cx)
         });
@@ -825,17 +1125,38 @@ impl ClaudeSessionsPanel {
         // another machine away, and the input has to be usable again at once.
         self.message_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
+        // Drawn from here rather than when the send is answered: the CLI writes the
+        // user's record only when it starts the turn, so on a busy session the text
+        // would be nowhere at all for as long as that turn takes.
+        let pending_send = self
+            .pending_sends
+            .remember(process_id, &text, &self.entries);
+        self.rebuild_entries(cx);
+        cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
             let outcome = send.await;
             this.update_in(cx, |this, window, cx| {
+                this.pending_sends.resolve(pending_send, &outcome);
+                this.rebuild_entries(cx);
                 apply_send_outcome(&this.message_editor, &text, outcome, window, cx);
+                cx.notify();
             })
             .log_err();
         })
         // Detached rather than held in a field: dropping it would cancel the send
         // itself, and a second send must not cut the first one short.
         .detach();
+    }
+
+    /// Takes down one pending message. Reached only from the button on that message: a
+    /// message that never turns up in the transcript is left where it is until the user
+    /// says otherwise, because dropping it on a timer is the very thing that made the
+    /// text look lost in the first place.
+    fn dismiss_pending_send(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.pending_sends.dismiss(id);
+        self.rebuild_entries(cx);
+        cx.notify();
     }
 
     fn interrupt_session(&mut self, _: &Interrupt, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1125,6 +1446,92 @@ impl ClaudeSessionsPanel {
                     .into_any_element()
             }
 
+            EntryKind::SlashCommand { text } => v_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(MessageRole::User.icon())
+                                .size(IconSize::XSmall)
+                                .color(MessageRole::User.color()),
+                        )
+                        .child(
+                            Label::new(MessageRole::User.label())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                // Drawn as code rather than as prose: what the user typed was a command
+                // to the CLI, and the rest of the record was Claude Code's markup for it.
+                .child(
+                    Label::new(text)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .inline_code(cx),
+                )
+                .into_any_element(),
+
+            EntryKind::Pending { id, text } => {
+                v_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(MessageRole::User.icon())
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(SENDING_NOTE)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .with_animation(
+                                        SharedString::from(format!("pending-send-{id}")),
+                                        Animation::new(PULSE_PERIOD)
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.4, 0.8)),
+                                        |header, delta| header.opacity(delta),
+                                    ),
+                            )
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("dismiss-pending-send-{id}")),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Remove this message"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.dismiss_pending_send(id, cx),
+                                )),
+                            ),
+                    )
+                    // A plain label rather than markdown: nothing about a message that has
+                    // not arrived is worth deriving, and the record that replaces it is
+                    // where the rendered form belongs.
+                    .child(
+                        Label::new(text)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .italic(),
+                    )
+                    .into_any_element()
+            }
+
             EntryKind::CompactBoundary {
                 trigger,
                 pre_tokens,
@@ -1411,6 +1818,7 @@ impl Render for ClaudeSessionsPanel {
             .child(self.render_session_section(cx))
             .child(Divider::horizontal())
             .child(self.render_transcript_section(cx))
+            .children(self.render_activity())
             .child(self.render_input(cx))
     }
 }
@@ -1436,22 +1844,31 @@ impl Panel for ClaudeSessionsPanel {
         self.focus_handle.clone()
     }
 
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        self.position
+    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
+        dock_position(ClaudeSessionsSettings::get_global(cx).dock)
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
+    /// Written to the settings file rather than kept here, which is what makes the side
+    /// the user dragged the panel to still be its side after a restart.
     fn set_position(
         &mut self,
         position: DockPosition,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.position = position;
-        cx.notify();
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            let dock = match position {
+                DockPosition::Left => DockSide::Left,
+                // `position_is_valid` refuses the bottom dock, so this is only reached by
+                // a caller that ignored it; the right-hand side is the default.
+                DockPosition::Right | DockPosition::Bottom => DockSide::Right,
+            };
+            settings.claude_sessions.get_or_insert_default().dock = Some(dock);
+        });
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
@@ -1501,6 +1918,328 @@ fn apply_send_outcome(
     }
 
     message_editor.update(cx, |editor, cx| editor.set_text(sent_text, window, cx));
+}
+
+/// One message that has left for a session and has not appeared in its transcript yet.
+#[derive(Clone, PartialEq)]
+struct PendingSend {
+    id: u64,
+    /// The session it was sent to. A pending message belongs to that conversation and
+    /// does not follow the reader to another one.
+    process_id: u32,
+    /// Trimmed, because that is the form it is compared in: Claude Code appends its own
+    /// context to the text it records, and [`user_visible_text`] hands back what is left
+    /// of it trimmed.
+    text: SharedString,
+    /// The records that were already showing this same text when the send left. One of
+    /// them cannot be the record this send will become, and this is what stops a message
+    /// sent twice from being paired with the first record both times.
+    preexisting_keys: HashSet<SharedString>,
+}
+
+/// The messages the panel is drawing on its own behalf, because the transcript has
+/// nothing for them yet.
+///
+/// Claude Code writes the user's record when it *starts* the turn, not when the text
+/// reaches its input, so on a busy session a sent message is in the terminal's input
+/// queue and nowhere in the transcript for seconds or minutes. Without this the panel
+/// showed nothing at all in that window, and the message looked like it had been
+/// swallowed.
+///
+/// Nothing here is a timer: a pending message is taken down when the record it was sent
+/// as arrives, when the send comes back a failure, when the reader leaves the session, or
+/// when the reader dismisses it — never after a wait, because a message quietly vanishing
+/// is the problem this solves.
+#[derive(Default)]
+struct PendingSends {
+    sends: Vec<PendingSend>,
+    next_id: u64,
+}
+
+impl PendingSends {
+    /// Draws `text` as sent to `process_id`, against the conversation `entries` was built
+    /// from, and reports the id that addresses it.
+    fn remember(&mut self, process_id: u32, text: &str, entries: &[Entry]) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+
+        let text = SharedString::from(text.trim().to_string());
+        // Noted now rather than looked for later: these records are already in the
+        // conversation, so none of them can be the one this send will be written as, and
+        // a second send of the same text must not be paired with the first send's record.
+        let preexisting_keys = user_messages(entries)
+            .into_iter()
+            .filter(|(_, source)| source.trim() == text.as_ref())
+            .map(|(key, _)| key)
+            .collect();
+
+        self.sends.push(PendingSend {
+            id,
+            process_id,
+            text,
+            preexisting_keys,
+        });
+        id
+    }
+
+    /// Takes down the message the user dismissed, and only that one: two sends of the
+    /// same text are two messages, and the button belongs to the one it sits on.
+    fn dismiss(&mut self, id: u64) {
+        self.sends.retain(|send| send.id != id);
+    }
+
+    /// A send that arrived is waiting for its record to be written. A send that failed
+    /// never will have one, so its message comes down; the text itself goes back to the
+    /// input, which is [`apply_send_outcome`]'s job.
+    fn resolve(&mut self, id: u64, outcome: &anyhow::Result<()>) {
+        if outcome.is_ok() {
+            return;
+        }
+        self.dismiss(id);
+    }
+
+    /// Drops the messages sent to a session that is no longer the one being read.
+    fn retain_session(&mut self, selected_process_id: Option<u32>) {
+        self.sends
+            .retain(|send| Some(send.process_id) == selected_process_id);
+    }
+
+    /// Takes down the messages whose records have turned up in `entries`.
+    ///
+    /// The record carries nothing that ties it back to a send, so the pairing is by text
+    /// and by order: the oldest send that is still waiting takes the oldest record it
+    /// could be, which is what makes two sends of the same text come down as their two
+    /// records arrive rather than both at the first one.
+    fn pair_with(&mut self, entries: &[Entry]) {
+        // Walking the conversation for arrivals costs the length of the transcript, and
+        // there is nothing waiting for them the overwhelming majority of the time.
+        if self.is_empty() {
+            return;
+        }
+
+        let arrivals = user_messages(entries);
+        let mut claimed: HashSet<SharedString> = HashSet::default();
+        let mut paired: HashSet<u64> = HashSet::default();
+
+        for send in &self.sends {
+            let arrival = arrivals.iter().find(|(key, source)| {
+                source.trim() == send.text.as_ref()
+                    && !send.preexisting_keys.contains(key)
+                    && !claimed.contains(key)
+            });
+            if let Some((key, _)) = arrival {
+                claimed.insert(key.clone());
+                paired.insert(send.id);
+            }
+        }
+
+        self.sends.retain(|send| !paired.contains(&send.id));
+    }
+
+    fn entries(&self) -> Vec<Entry> {
+        self.sends
+            .iter()
+            .map(|send| Entry {
+                // Keyed outside the transcript's namespace: a record is keyed by its
+                // uuid, and nothing derived from a pending message may be cached under
+                // one.
+                key: SharedString::from(format!("pending-{}", send.id)),
+                kind: EntryKind::Pending {
+                    id: send.id,
+                    text: send.text.clone(),
+                },
+            })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sends.is_empty()
+    }
+}
+
+/// The user's own messages in the conversation, keyed as the entries are and in the order
+/// they appear: what a pending message is waiting to be replaced by.
+fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Message {
+                role: MessageRole::User,
+                source,
+            } => Some((entry.key.clone(), source.clone())),
+            // A slash command is the user's message too, and it is what a send of
+            // `/compact` turns into.
+            EntryKind::SlashCommand { text } => Some((entry.key.clone(), text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the selected session is doing, as far as its transcript says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Activity {
+    Thinking,
+    RunningTool {
+        name: SharedString,
+        target: SharedString,
+    },
+    Idle,
+}
+
+/// Reads off what a session is doing from the conversation it has written.
+///
+/// The registry's `status` field is not used for this. It is rewritten only when the
+/// status changes, so a session that stopped an hour ago still carries whatever it last
+/// wrote there — an idle session reading as `busy` for the rest of the day. The
+/// transcript is the only thing that moves with the model, and reading it needs no clock,
+/// which is what makes this answer testable.
+/// Read backwards from the end of the conversation, because what the session is doing is
+/// whatever the newest record that says anything says — and the first record that does
+/// decides, rather than the whole path being summarised.
+fn activity(path: &[&TranscriptRecord]) -> Activity {
+    // The calls answered by the results written after the record being looked at. A call
+    // is running exactly when nothing further down the conversation answers it.
+    let mut answered: HashSet<&str> = HashSet::default();
+
+    for &record in path.iter().rev() {
+        match record.record_type.as_str() {
+            USER_RECORD_TYPE => {
+                let results = tool_result_ids(record);
+                if results.is_empty() {
+                    // Words the user typed. Whatever the model was doing before them
+                    // belongs to a turn the user has already spoken past, and calling
+                    // that running is the same lie the registry's `status` field tells.
+                    return Activity::Idle;
+                }
+                answered.extend(results);
+            }
+            ASSISTANT_RECORD_TYPE => return assistant_activity(record, &answered),
+            // A compact boundary, an attachment, a `mode` line: none of them say
+            // anything about what the session is doing, so the search reads past them.
+            _ => {}
+        }
+    }
+
+    Activity::Idle
+}
+
+/// What an assistant record says the session is doing.
+///
+/// Only its last block is read. The blocks are written in order, so the last one is what
+/// the model was doing when it stopped writing: a record that thought and then made a
+/// call is doing the call, and a record that ends in prose is a turn that has been
+/// answered.
+fn assistant_activity(record: &TranscriptRecord, answered: &HashSet<&str>) -> Activity {
+    let Some(block) = record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.last())
+    else {
+        return Activity::Idle;
+    };
+
+    match block.get("type").and_then(Value::as_str) {
+        Some(TOOL_USE_BLOCK_TYPE) => {
+            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+            if answered.contains(id) {
+                // The call is over and the model has not written its next record yet.
+                return Activity::Idle;
+            }
+            Activity::RunningTool {
+                name: SharedString::from(
+                    block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Tool")
+                        .to_string(),
+                ),
+                target: tool_target(block),
+            }
+        }
+        Some(THINKING_BLOCK_TYPE) => Activity::Thinking,
+        // Prose, an image, a block this has no rule for: the model has said something,
+        // which is a turn ending rather than work in progress.
+        _ => Activity::Idle,
+    }
+}
+
+/// The `tool_use_id`s of the results a user record holds. Empty for a record that is
+/// words the user typed, which is what tells the two apart.
+fn tool_result_ids(record: &TranscriptRecord) -> Vec<&str> {
+    let Some(blocks) = record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some(TOOL_RESULT_BLOCK_TYPE))
+        .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+        .collect()
+}
+
+/// The words drawn beside a running tool's name to say which call it is.
+///
+/// Empty for a tool with no rule of its own: the inputs are the tool's business, and
+/// reaching into an unknown one for something that looks like a target would put a
+/// misleading line above the input. Naming the tool alone is honest and still useful.
+fn tool_target(block: &Value) -> SharedString {
+    let argument = |key: &str| {
+        block
+            .get("input")
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+    };
+
+    let target = match block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        // The file is what says which read or write this is; the directory it sits in
+        // is the same for most of them and does not fit on the line.
+        "Read" | "Write" | "Edit" | "NotebookEdit" => argument("file_path")
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        // Often a whole pipeline, of which the head is what names the call.
+        "Bash" => argument("command").unwrap_or_default(),
+        _ => "",
+    };
+
+    SharedString::from(truncate_and_trailoff(target.trim(), TOOL_TARGET_CHARACTERS))
+}
+
+/// The line drawn above the input for an activity, or `None` for one that is not worth a
+/// line.
+fn activity_label(activity: &Activity) -> Option<SharedString> {
+    Some(match activity {
+        // Withheld so that the line does not appear and disappear at the end of every
+        // turn, moving the input under the reader's hands.
+        Activity::Idle => return None,
+        Activity::Thinking => SharedString::from(THINKING_NOTE),
+        Activity::RunningTool { name, target } if target.is_empty() => {
+            SharedString::from(format!("Running {name}"))
+        }
+        Activity::RunningTool { name, target } => {
+            SharedString::from(format!("Running {name}: {target}"))
+        }
+    })
+}
+
+/// The panel is a side panel, so the two sides a setting can name are the two positions
+/// it has.
+fn dock_position(dock: DockSide) -> DockPosition {
+    match dock {
+        DockSide::Left => DockPosition::Left,
+        DockSide::Right => DockPosition::Right,
+    }
 }
 
 fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
@@ -1618,11 +2357,16 @@ fn append_record(
     {
         Some(Value::String(text)) => {
             let cache_key = cache_key(record, &base_key);
-            let kind = cache.kind(cache_key.as_ref(), || message_kind(record, text));
-            entries.push(Entry {
-                key: base_key,
-                kind,
-            });
+            // A record with nothing but injected context in it is left out of the
+            // conversation rather than drawn as an empty message.
+            if let Some(kind) =
+                cache.optional_kind(cache_key.as_ref(), || message_kind(record, text))
+            {
+                entries.push(Entry {
+                    key: base_key,
+                    kind,
+                });
+            }
         }
         Some(Value::Array(blocks)) => {
             for (block_index, block) in blocks.iter().enumerate() {
@@ -1632,10 +2376,13 @@ fn append_record(
                 // that named it may itself have come from the cache.
                 register_tool_name(block, tool_names);
                 let cache_key = cache_key(record, &key);
-                let kind = cache.kind(cache_key.as_ref(), || {
+                // The key carries the block's index within the record, so a block that
+                // is left out does not shift the keys of the ones after it.
+                if let Some(kind) = cache.optional_kind(cache_key.as_ref(), || {
                     block_kind(record, block, tool_names, home_directory)
-                });
-                entries.push(Entry { key, kind });
+                }) {
+                    entries.push(Entry { key, kind });
+                }
             }
         }
         _ => {
@@ -1681,33 +2428,58 @@ fn register_tool_name(block: &Value, tool_names: &mut HashMap<String, SharedStri
 /// user or the model, so a marker in it is forged or coincidental, and honouring it would
 /// hand the panel an arbitrary path to read. Claude Code writes the placeholder into the
 /// `tool_result` block, which [`block_kind`] handles.
-fn message_kind(record: &TranscriptRecord, text: &str) -> EntryKind {
-    EntryKind::Message {
-        // The summary compaction leaves behind is recorded as a user message, so the
-        // record type alone would present a machine-written recap of the conversation as
-        // something the user had typed.
-        role: if record.is_compact_summary {
-            MessageRole::CompactSummary
-        } else {
-            MessageRole::from_record_type(&record.record_type)
-        },
-        source: SharedString::from(text.to_string()),
+///
+/// `None` for a user record whose text is nothing but injected context, which has no
+/// message in it to show; see [`user_visible_text`].
+fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
+    // The summary compaction leaves behind is recorded as a user message, so the record
+    // type alone would present a machine-written recap of the conversation as something
+    // the user had typed.
+    let role = if record.is_compact_summary {
+        MessageRole::CompactSummary
+    } else {
+        MessageRole::from_record_type(&record.record_type)
+    };
+
+    // Drawn as the command it was rather than as prose the user wrote: see
+    // [`rewrite_slash_commands`].
+    if role == MessageRole::User {
+        if let Some(command) = rewrite_slash_commands(text) {
+            return Some(EntryKind::SlashCommand {
+                text: SharedString::from(command),
+            });
+        }
     }
+
+    // Only what claims to be the user's own words is filtered: everything else in the
+    // transcript is shown as it was written.
+    let source = if role == MessageRole::User {
+        user_visible_text(text)?
+    } else {
+        text.to_string()
+    };
+
+    Some(EntryKind::Message {
+        role,
+        source: SharedString::from(source),
+    })
 }
 
+/// `None` only for a user text block that is nothing but injected context; see
+/// [`message_kind`].
 fn block_kind(
     record: &TranscriptRecord,
     block: &Value,
     tool_names: &HashMap<String, SharedString>,
     home_directory: Option<&Path>,
-) -> EntryKind {
-    match block.get("type").and_then(Value::as_str) {
+) -> Option<EntryKind> {
+    let kind = match block.get("type").and_then(Value::as_str) {
         Some("text") => {
             let text = block
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            message_kind(record, text)
+            return message_kind(record, text);
         }
 
         Some("thinking") => {
@@ -1781,7 +2553,9 @@ fn block_kind(
             None,
             &without_base64_payload(block),
         ),
-    }
+    };
+
+    Some(kind)
 }
 
 fn image_kind(block: &Value) -> EntryKind {
@@ -1932,6 +2706,194 @@ fn without_base64_payload(block: &Value) -> Value {
         }
     }
     block
+}
+
+/// The one line the session list is reduced to when it is collapsed: how many sessions
+/// are running, and which of them is being read.
+fn collapsed_sessions_summary(session_count: usize, selected_name: Option<&str>) -> SharedString {
+    let sessions = if session_count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{session_count} sessions")
+    };
+
+    SharedString::from(match selected_name {
+        Some(name) => format!("{sessions} · {name}"),
+        None => sessions,
+    })
+}
+
+/// What is left of a user record's text once the blocks Claude Code injected into it are
+/// removed, or `None` when nothing but those blocks was there.
+///
+/// This is a display rule and nothing more: the record keeps its place in the transcript's
+/// tree and its offset in the file, and only the text drawn for it is trimmed.
+fn user_visible_text(text: &str) -> Option<String> {
+    // A slash command is rewritten rather than filtered: the blocks it is recorded as
+    // hold the command the user ran and the words they typed after it, so cutting them
+    // out the way the injected wrappers are cut would drop the message itself.
+    if let Some(command) = rewrite_slash_commands(text) {
+        return Some(command);
+    }
+
+    let mut visible = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(block) = next_injected_block(rest) {
+        visible.push_str(rest.get(..block.start)?);
+        rest = match block.end {
+            Some(end) => rest.get(end..)?,
+            // With no closing tag there is no telling where the block was meant to end,
+            // and assuming it runs to the end of the text would throw away everything
+            // after it — including the rest of a message that is still being written.
+            None => {
+                visible.push_str(rest.get(block.start..block.open_end)?);
+                rest.get(block.open_end..)?
+            }
+        };
+    }
+    visible.push_str(rest);
+
+    let visible = visible.trim();
+    (!visible.is_empty()).then(|| visible.to_string())
+}
+
+/// The line the user typed, rebuilt from the blocks a slash command is recorded as, or
+/// `None` for a record that is not one.
+///
+/// Claude Code does not write `/goal ship the panel` as text. It writes the command into
+/// a [`COMMAND_NAME_WRAPPER`] block and the words after it into a
+/// [`COMMAND_ARGS_WRAPPER`] block, with a `command-message` block of its own in between.
+/// The arguments are the only part of that the user typed, and they are often the whole
+/// point of the message, so the record is rebuilt into the line rather than being hidden
+/// or drawn as a wall of tags.
+fn rewrite_slash_commands(text: &str) -> Option<String> {
+    let name = tag_contents(text, COMMAND_NAME_WRAPPER)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = match find_opening_tag(text, COMMAND_ARGS_WRAPPER, 0) {
+        // The arguments were opened and the closing tag has not been written yet, which
+        // is what a record read while it is being written looks like. Where the
+        // arguments were meant to end is not knowable, and guessing at it would eat the
+        // rest of the record, so nothing is rewritten at all.
+        Some(_) => tag_contents(text, COMMAND_ARGS_WRAPPER)?.trim(),
+        // A command that takes no arguments is sometimes recorded without the block, and
+        // the command is then all there is to show.
+        None => "",
+    };
+
+    Some(match arguments.is_empty() {
+        true => name.to_string(),
+        false => format!("{name} {arguments}"),
+    })
+}
+
+/// What sits between `name`'s opening and closing tags, or `None` when the text holds no
+/// closing tag for it.
+///
+/// The contents are returned verbatim: they are words the user typed, so a `<` in them
+/// opens nothing and is not looked at.
+fn tag_contents<'text>(text: &'text str, name: &str) -> Option<&'text str> {
+    let (_, open_end) = find_opening_tag(text, name, 0)?;
+    let end = find_closing_tag(text, name, open_end)?;
+    // `find_closing_tag` reports the byte after the `>` of `</name>`.
+    text.get(open_end..end.checked_sub(name.len() + "</>".len())?)
+}
+
+/// Where one injected block sits in the text it was found in.
+#[derive(Clone, Copy)]
+struct InjectedBlock {
+    /// The byte the opening tag starts at.
+    start: usize,
+    /// The byte after the opening tag's `>`.
+    open_end: usize,
+    /// The byte after the matching closing tag, or `None` when the text holds no closing
+    /// tag for this block.
+    end: Option<usize>,
+}
+
+/// The first injected block in `text`, whichever wrapper it belongs to.
+fn next_injected_block(text: &str) -> Option<InjectedBlock> {
+    let mut first: Option<(&str, usize, usize)> = None;
+    for name in INJECTED_WRAPPERS {
+        let Some((start, open_end)) = find_opening_tag(text, name, 0) else {
+            continue;
+        };
+        if first.is_none_or(|(_, first_start, _)| start < first_start) {
+            first = Some((name, start, open_end));
+        }
+    }
+
+    let (name, start, open_end) = first?;
+    Some(InjectedBlock {
+        start,
+        open_end,
+        end: find_closing_tag(text, name, open_end),
+    })
+}
+
+/// The opening tag of `name` at or after `from`, as the byte it starts at and the byte
+/// after its `>`.
+///
+/// The tag may carry attributes — `<codegraph_context note="…">` — so the name is only
+/// recognized where the character after it cannot continue a longer name, and the tag
+/// then runs to the first `>`. An opening tag whose `>` was never written ends at the end
+/// of the text, which is what keeps a truncated record from being scanned past its end.
+fn find_opening_tag(text: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+    let opening = format!("<{name}");
+    let mut searched = from;
+
+    loop {
+        let start = searched + text.get(searched..)?.find(&opening)?;
+        let after_name = start + opening.len();
+        match text.get(after_name..).and_then(|rest| rest.chars().next()) {
+            None => return Some((start, text.len())),
+            Some('>') => return Some((start, after_name + 1)),
+            Some(character) if character.is_whitespace() || character == '/' => {
+                let end = match text.get(after_name..).and_then(|rest| rest.find('>')) {
+                    Some(offset) => after_name + offset + 1,
+                    None => text.len(),
+                };
+                return Some((start, end));
+            }
+            // A longer name that merely starts with this one, such as
+            // `<system-reminders>`; the search carries on past it.
+            Some(_) => searched = after_name,
+        }
+    }
+}
+
+/// The byte after the closing tag that matches an opening tag ending at `open_end`, or
+/// `None` when there is none.
+///
+/// A wrapper can hold another of its own kind, so the closing tags are counted against
+/// the opening ones rather than the first closing tag being taken as the match.
+fn find_closing_tag(text: &str, name: &str, open_end: usize) -> Option<usize> {
+    let closing = format!("</{name}>");
+    let mut depth = 1usize;
+    let mut searched = open_end;
+
+    while depth > 0 {
+        let next_closing = searched + text.get(searched..)?.find(&closing)?;
+        let next_opening = find_opening_tag(text, name, searched).map(|(start, _)| start);
+
+        match next_opening {
+            Some(opening_start) if opening_start < next_closing => {
+                depth += 1;
+                // Past the opening tag rather than past its `>`, which is enough to make
+                // progress and cannot land inside the tag's name.
+                searched = opening_start + 1 + name.len();
+            }
+            _ => {
+                depth -= 1;
+                searched = next_closing + closing.len();
+            }
+        }
+    }
+
+    Some(searched)
 }
 
 fn json_text(value: &Value) -> String {
@@ -2190,6 +3152,295 @@ mod tests {
     /// under this machine's home, which is what a local project's scan reports.
     fn entries_of(json_lines: &[&str]) -> Vec<Entry> {
         entries_of_with_home(json_lines, Some(paths::home_dir()))
+    }
+
+    /// One line of JSON for a user record whose whole message is `text`.
+    fn user_message_line(uuid: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "message": { "content": text },
+        })
+        .to_string()
+    }
+
+    fn message_sources(entries: &[Entry]) -> Vec<SharedString> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Message { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The dock side the user dragged the panel to has to be there after a restart, and
+    /// nothing the panel holds itself outlives one. The default stays the right-hand
+    /// dock: the left one already holds the project panel.
+    #[gpui::test]
+    async fn the_dock_side_is_read_from_the_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            assert_eq!(
+                ClaudeSessionsSettings::get_global(cx).dock,
+                DockSide::Right,
+                "the right-hand dock is the only one the project panel is not already in"
+            );
+
+            <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.claude_sessions.get_or_insert_default().dock = Some(DockSide::Left);
+                });
+            });
+
+            assert_eq!(
+                ClaudeSessionsSettings::get_global(cx).dock,
+                DockSide::Left,
+                "the side in the settings is the side the panel opens on"
+            );
+        });
+    }
+
+    #[test]
+    fn only_the_two_side_docks_are_offered() {
+        let positions: Vec<DockPosition> = vec![
+            dock_position(DockSide::Left),
+            dock_position(DockSide::Right),
+        ];
+        assert_eq!(
+            positions,
+            vec![DockPosition::Left, DockPosition::Right],
+            "the panel is a side panel; the bottom dock is not one of its positions"
+        );
+    }
+
+    /// What the count has to be right about for the button to be worth having: it names
+    /// how many messages the reader has not seen, not how many the conversation holds.
+    #[test]
+    fn entries_that_land_below_the_window_are_counted_until_the_reader_gets_there() {
+        let mut unread = UnreadBelow::default();
+
+        unread.entries_arrived(4, true);
+        assert_eq!(
+            unread.count(),
+            0,
+            "at the bottom the list follows the tail, so these were scrolled into view"
+        );
+
+        unread.entries_arrived(2, false);
+        unread.entries_arrived(1, false);
+        assert_eq!(
+            unread.count(),
+            3,
+            "the count is what has arrived since the reader was last at the bottom"
+        );
+
+        unread.scrolled(false);
+        assert_eq!(
+            unread.count(),
+            3,
+            "scrolling that does not reach the bottom has read none of them"
+        );
+
+        unread.scrolled(true);
+        assert_eq!(
+            unread.count(),
+            0,
+            "reaching the bottom is reading them, and the button has nothing left to offer"
+        );
+
+        // What arrives after that is counted from zero again, not from the total.
+        unread.entries_arrived(1, false);
+        assert_eq!(unread.count(), 1);
+    }
+
+    /// A session the reader has just opened shows them the newest of that conversation,
+    /// so nothing about where they were in the previous one carries over.
+    #[test]
+    fn a_new_session_starts_with_nothing_unread() {
+        let mut unread = UnreadBelow::default();
+        unread.entries_arrived(9, false);
+        unread.reset();
+        assert_eq!(
+            unread.count(),
+            0,
+            "the count belongs to the conversation that was being read, not to the panel"
+        );
+    }
+
+    /// Collapsed, the list gives up its rows, so the one line that is left has to say
+    /// what the rows were saying: how many sessions are running, and which one the
+    /// conversation below belongs to.
+    #[test]
+    fn a_collapsed_session_list_keeps_the_count_and_the_name_of_the_open_session() {
+        let summaries: Vec<SharedString> = vec![
+            collapsed_sessions_summary(0, None),
+            collapsed_sessions_summary(1, None),
+            collapsed_sessions_summary(1, Some("alpha")),
+            collapsed_sessions_summary(7, Some("zed panel")),
+        ];
+        assert_eq!(
+            summaries,
+            vec![
+                SharedString::from("0 sessions"),
+                SharedString::from("1 session"),
+                SharedString::from("1 session · alpha"),
+                SharedString::from("7 sessions · zed panel"),
+            ],
+            "the collapsed header is the only place these are visible"
+        );
+    }
+
+    #[test]
+    fn every_injected_wrapper_is_cut_out_of_a_user_message() {
+        let wrappers = [
+            "<system-reminder>never mention this reminder</system-reminder>",
+            "<task-notification>a background task finished</task-notification>",
+            "<persisted-output>the rest went to a file</persisted-output>",
+            // The opening tag of this one carries attributes.
+            "<codegraph_context note=\"Structural context from CodeGraph\">symbols</codegraph_context>",
+            "<local-command-stdout>total 0</local-command-stdout>",
+        ];
+
+        let visible: Vec<Option<String>> = wrappers
+            .iter()
+            .map(|wrapper| user_visible_text(&format!("what I actually typed\n\n{wrapper}")))
+            .collect();
+        assert_eq!(
+            visible,
+            vec![Some("what I actually typed".to_string()); wrappers.len()],
+            "each of {wrappers:#?} is context Claude Code injected, not words the user typed"
+        );
+    }
+
+    #[test]
+    fn a_user_record_of_nothing_but_injected_context_is_not_shown_at_all() {
+        let only_a_wrapper =
+            "<task-notification>\nthe agent you spawned has finished\n</task-notification>";
+        assert_eq!(
+            user_visible_text(only_a_wrapper),
+            None,
+            "there is no message in this record to show"
+        );
+
+        let entries = entries_of(&[
+            &user_message_line("a", only_a_wrapper),
+            &user_message_line("b", "a message of my own"),
+        ]);
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("a message of my own")],
+            "the injected record must be left out of the conversation, not drawn as an \
+             empty bubble"
+        );
+    }
+
+    #[test]
+    fn two_injected_blocks_in_one_message_both_go() {
+        let text = "<system-reminder>first</system-reminder>the middle is mine\
+                    <task-notification>second</task-notification>";
+        assert_eq!(
+            user_visible_text(text).as_deref(),
+            Some("the middle is mine"),
+            "both wrappers have to go, and what sat between them has to stay"
+        );
+
+        // Nested, and nested in one of its own kind: the block ends at the closing tag
+        // that matches its opening tag, not at the first one in the text.
+        let nested = "before<system-reminder>outer<system-reminder>inner</system-reminder>\
+                      still the reminder</system-reminder>after";
+        assert_eq!(
+            user_visible_text(nested).as_deref(),
+            Some("beforeafter"),
+            "a wrapper nested inside one of its own kind must not end the outer one early"
+        );
+    }
+
+    /// A transcript read while it is being written ends in a line that is only partly
+    /// there, so an opening tag whose closing tag has not been written yet is normal.
+    #[test]
+    fn an_injected_block_with_no_closing_tag_takes_nothing_with_it() {
+        let truncated = "what I typed\n<system-reminder>the record ends mid-";
+        assert_eq!(
+            user_visible_text(truncated).as_deref(),
+            Some(truncated),
+            "with no closing tag there is no block to cut out, and guessing where it \
+             would have ended would eat the rest of the record"
+        );
+
+        // What the guard must not kill: a wrapper that is closed is still cut out, even
+        // when an unterminated one sits in front of it.
+        let after_the_truncated_one =
+            "<system-reminder>unterminated<task-notification>closed</task-notification>";
+        assert_eq!(
+            user_visible_text(after_the_truncated_one).as_deref(),
+            Some("<system-reminder>unterminated"),
+            "the closed wrapper has to go even though the one before it never closed"
+        );
+    }
+
+    #[test]
+    fn only_a_user_record_is_filtered() {
+        let reminder = "<system-reminder>this stays</system-reminder> and more";
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "uuid": "a",
+            "message": { "content": [ { "type": "text", "text": reminder } ] },
+        })
+        .to_string();
+        let entries = entries_of(&[&assistant]);
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from(reminder)],
+            "the model's own words are shown as it wrote them"
+        );
+
+        // A tool result is not a message either, and it is where the persisted-output
+        // marker is actually meant to be read.
+        let tool_result = serde_json::json!({
+            "type": "user",
+            "uuid": "c",
+            "message": { "content": [ {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": "<system-reminder>tool output</system-reminder>",
+            } ] },
+        })
+        .to_string();
+        let entries = entries_of(&[TOOL_USE_LINE, &tool_result]);
+        assert_eq!(
+            entries.len(),
+            2,
+            "a tool result must still be shown, got {} entries",
+            entries.len()
+        );
+        assert_eq!(
+            match &entries[1].kind {
+                EntryKind::ToolResult { body, .. } => body.clone(),
+                _ => panic!("expected the second entry to be a tool result"),
+            },
+            ToolResultBody::Inline(SharedString::from(
+                "<system-reminder>tool output</system-reminder>"
+            )),
+            "a tool result is not the user's words and must be shown verbatim"
+        );
+    }
+
+    #[test]
+    fn a_reminder_appended_to_a_user_message_leaves_the_message() {
+        // The shape a real message has: the user's words, then the reminder Claude Code
+        // appended to them.
+        let entries = entries_of(&[&user_message_line(
+            "a",
+            "please read the file\n<system-reminder>The user opened a file.</system-reminder>",
+        )]);
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("please read the file")],
+            "the message is the user's; the reminder appended to it is not"
+        );
     }
 
     #[test]
@@ -3086,6 +4337,536 @@ mod tests {
             input.update(cx, |editor, cx| editor.text(cx)),
             "",
             "a send that worked must leave the emptied input alone"
+        );
+    }
+
+    fn activity_of(json_lines: &[&str]) -> Activity {
+        let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        activity(&path)
+    }
+
+    fn thinking_line(uuid: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": { "content": [ { "type": "thinking", "thinking": "weighing it up" } ] },
+        })
+        .to_string()
+    }
+
+    fn tool_use_line(uuid: &str, id: &str, name: &str, input: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": { "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": input },
+            ] },
+        })
+        .to_string()
+    }
+
+    fn tool_result_line(uuid: &str, tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": tool_use_id, "content": "done" },
+            ] },
+        })
+        .to_string()
+    }
+
+    /// What a session that is thinking looks like: the model's own thinking is the last
+    /// thing written, and it is the only sign the model is moving at all.
+    #[test]
+    fn a_session_whose_last_record_is_thinking_is_thinking() {
+        assert_eq!(
+            activity_of(&[&user_message_line("a", "go on"), &thinking_line("b")]),
+            Activity::Thinking,
+            "the last record is the model's thinking, which nothing has answered yet"
+        );
+    }
+
+    #[test]
+    fn thinking_that_something_else_has_followed_is_not_still_thinking() {
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go on"),
+                &thinking_line("b"),
+                &tool_use_line(
+                    "c",
+                    "t1",
+                    "Bash",
+                    serde_json::json!({ "command": "cargo test -p claude_sessions" }),
+                ),
+            ]),
+            Activity::RunningTool {
+                name: SharedString::from("Bash"),
+                target: SharedString::from("cargo test -p claude_sessions"),
+            },
+            "the thinking is over once the call it led to has been written, and the call \
+             is the more useful thing to say"
+        );
+
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go on"),
+                &thinking_line("b"),
+                &user_message_line("c", "and now this"),
+            ]),
+            Activity::Idle,
+            "a turn the user has spoken into again is not still thinking"
+        );
+    }
+
+    #[test]
+    fn a_call_the_transcript_has_no_result_for_is_running() {
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go"),
+                &tool_use_line(
+                    "b",
+                    "t1",
+                    "Read",
+                    serde_json::json!({
+                        "file_path": "/Users/andy/zed/crates/claude_sessions/src/session_store.rs",
+                    }),
+                ),
+            ]),
+            Activity::RunningTool {
+                name: SharedString::from("Read"),
+                target: SharedString::from("session_store.rs"),
+            },
+            "the file being read is what says which read is running; the path it sits at \
+             does not fit on the line"
+        );
+
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go"),
+                &tool_use_line(
+                    "b",
+                    "t1",
+                    "WebSearch",
+                    serde_json::json!({ "query": "gpui" })
+                ),
+            ]),
+            Activity::RunningTool {
+                name: SharedString::from("WebSearch"),
+                target: SharedString::default(),
+            },
+            "a tool with no rule for naming its target is still worth reporting as running"
+        );
+
+        // A command longer than the line has room for: the head of it is what names the
+        // call, and the tail is cut rather than the whole thing being dropped.
+        let long_command = activity_of(&[
+            &user_message_line("a", "go"),
+            &tool_use_line(
+                "b",
+                "t1",
+                "Bash",
+                serde_json::json!({
+                    "command": "  cargo test -p claude_sessions --all-features -- --nocapture  ",
+                }),
+            ),
+        ]);
+        let Activity::RunningTool { target, .. } = &long_command else {
+            panic!("expected a running tool, got {long_command:?}");
+        };
+        assert!(
+            target.starts_with("cargo test -p claude_sessions"),
+            "the head of the command must survive, got {target:?}"
+        );
+        assert_eq!(
+            target.chars().count(),
+            TOOL_TARGET_CHARACTERS + 1,
+            "{TOOL_TARGET_CHARACTERS} characters and the ellipsis that says there was \
+             more, got {target:?} of {} characters",
+            target.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_call_whose_result_has_arrived_is_not_running() {
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go"),
+                &tool_use_line("b", "t1", "Bash", serde_json::json!({ "command": "ls" })),
+                &tool_result_line("c", "t1"),
+            ]),
+            Activity::Idle,
+            "the result is in the transcript, so the call is over"
+        );
+
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go"),
+                &tool_use_line("b", "t1", "Bash", serde_json::json!({ "command": "ls" })),
+                &tool_result_line("c", "t1"),
+                &tool_use_line(
+                    "d",
+                    "t2",
+                    "Write",
+                    serde_json::json!({ "file_path": "/tmp/notes/plan.md" }),
+                ),
+            ]),
+            Activity::RunningTool {
+                name: SharedString::from("Write"),
+                target: SharedString::from("plan.md"),
+            },
+            "the call that is running is the newest one without a result, not the first \
+             one in the turn"
+        );
+    }
+
+    #[test]
+    fn a_call_left_unanswered_by_a_turn_that_is_over_is_not_running() {
+        assert_eq!(
+            activity_of(&[
+                &user_message_line("a", "go"),
+                &tool_use_line(
+                    "b",
+                    "t1",
+                    "Bash",
+                    serde_json::json!({ "command": "sleep 600" })
+                ),
+                &user_message_line("c", "never mind, do this instead"),
+            ]),
+            Activity::Idle,
+            "a call whose result was never written belongs to a turn the user has already \
+             spoken past; reporting it as running is the same lie the registry's `status` \
+             field tells"
+        );
+    }
+
+    #[test]
+    fn a_conversation_the_model_has_not_answered_yet_is_idle() {
+        assert_eq!(
+            activity_of(&[]),
+            Activity::Idle,
+            "there is no session doing anything here"
+        );
+        assert_eq!(
+            activity_of(&[&user_message_line("a", "hello")]),
+            Activity::Idle,
+            "a message the model has not started answering is not activity"
+        );
+    }
+
+    #[test]
+    fn nothing_is_drawn_above_the_input_for_an_idle_session() {
+        assert_eq!(
+            activity_label(&Activity::Idle),
+            None,
+            "a line that appears and disappears at the end of every turn would move the \
+             input under the reader's hands"
+        );
+
+        assert_eq!(
+            activity_label(&Activity::Thinking).as_deref(),
+            Some(THINKING_NOTE),
+            "the line is only withheld from a session that is doing nothing"
+        );
+        assert_eq!(
+            activity_label(&Activity::RunningTool {
+                name: SharedString::from("Bash"),
+                target: SharedString::from("cargo test -p claude_sessions"),
+            })
+            .as_deref(),
+            Some("Running Bash: cargo test -p claude_sessions")
+        );
+        assert_eq!(
+            activity_label(&Activity::RunningTool {
+                name: SharedString::from("WebSearch"),
+                target: SharedString::default(),
+            })
+            .as_deref(),
+            Some("Running WebSearch"),
+            "a tool whose target has no rule still names the tool"
+        );
+    }
+
+    #[test]
+    fn a_slash_command_is_shown_as_the_line_the_user_typed() {
+        let with_arguments = "<command-name>/goal</command-name>\n            \
+             <command-message>goal</command-message>\n            \
+             <command-args>幫我把 claude session panel 都修好</command-args>";
+        assert_eq!(
+            user_visible_text(with_arguments).as_deref(),
+            Some("/goal 幫我把 claude session panel 都修好"),
+            "the arguments are the words the user typed, so hiding this record whole \
+             would break the conversation exactly where they typed them"
+        );
+
+        let entries = entries_of(&[&user_message_line("a", with_arguments)]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the record is one line of conversation, got {} entries",
+            entries.len()
+        );
+        assert!(
+            matches!(
+                &entries[0].kind,
+                EntryKind::SlashCommand { text }
+                    if text.as_ref() == "/goal 幫我把 claude session panel 都修好"
+            ),
+            "a slash command must be drawn as the command it was, not as prose"
+        );
+    }
+
+    #[test]
+    fn a_slash_command_with_no_arguments_is_shown_on_its_own() {
+        let no_arguments = "<command-name>/compact</command-name>\n            \
+             <command-message>compact</command-message>\n            \
+             <command-args></command-args>";
+        assert_eq!(
+            user_visible_text(no_arguments).as_deref(),
+            Some("/compact"),
+            "a command that takes no arguments still records the empty block, and the \
+             command is all there is to show"
+        );
+    }
+
+    #[test]
+    fn a_record_of_nothing_but_a_local_command_is_not_shown() {
+        for text in [
+            "<local-command-stdout>total 0</local-command-stdout>",
+            "<local-command-caveat>the user ran this command themselves</local-command-caveat>",
+        ] {
+            assert_eq!(
+                user_visible_text(text),
+                None,
+                "{text} is Claude Code's own record of a local command, with no message \
+                 in it to show"
+            );
+        }
+    }
+
+    #[test]
+    fn arguments_holding_a_tag_do_not_swallow_the_rest_of_the_record() {
+        assert_eq!(
+            user_visible_text(
+                "<command-name>/ask</command-name><command-args>why is a < b</command-args>"
+            )
+            .as_deref(),
+            Some("/ask why is a < b"),
+            "the arguments are text the user typed, and a `<` in them starts nothing"
+        );
+
+        // What a record read while it is being written looks like: the arguments were
+        // opened and the closing tag has not been written yet.
+        let truncated = "<command-name>/ask</command-name><command-args>why is a";
+        assert_eq!(
+            user_visible_text(truncated).as_deref(),
+            Some(truncated),
+            "with no closing tag there is nothing to rewrite, and guessing where the \
+             arguments ended would eat the rest of the record"
+        );
+    }
+
+    fn pending_texts(entries: &[Entry]) -> Vec<SharedString> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Pending { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pending_ids(pending_sends: &PendingSends) -> Vec<u64> {
+        pending_sends.sends.iter().map(|send| send.id).collect()
+    }
+
+    /// The conversation as the panel draws it: what the transcript says, then what has
+    /// been sent to it and has not turned up yet.
+    fn shown(entries: &[Entry], pending_sends: &PendingSends) -> Vec<Entry> {
+        let mut shown = entries.to_vec();
+        shown.extend(pending_sends.entries());
+        shown
+    }
+
+    /// The bug this exists for: the CLI writes the user's record when it starts the turn,
+    /// so on a busy session there is nothing in the transcript to draw and the message
+    /// the user just sent looks like it went nowhere.
+    #[test]
+    fn a_sent_message_is_shown_before_the_transcript_has_it() {
+        let entries = entries_of(&[&user_message_line("a", "an earlier message")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "the message I just sent", &entries);
+
+        let shown = shown(&entries, &pending_sends);
+        assert_eq!(
+            pending_texts(&shown),
+            vec![SharedString::from("the message I just sent")],
+            "the message has to be somewhere the moment it is sent"
+        );
+        assert_eq!(
+            message_sources(&shown),
+            vec![SharedString::from("an earlier message")],
+            "and it must not be mixed into what the transcript itself said"
+        );
+    }
+
+    #[test]
+    fn a_pending_message_goes_when_its_record_arrives() {
+        let before = entries_of(&[&user_message_line("a", "an earlier message")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "run the tests", &before);
+        assert_eq!(
+            pending_texts(&shown(&before, &pending_sends)).len(),
+            1,
+            "the message is drawn while the transcript has nothing for it"
+        );
+
+        // The record the CLI writes carries the same text with its own context appended.
+        let after = entries_of(&[
+            &user_message_line("a", "an earlier message"),
+            &user_message_line(
+                "b",
+                "run the tests\n<system-reminder>The user opened a file.</system-reminder>",
+            ),
+        ]);
+        pending_sends.pair_with(&after);
+
+        let shown = shown(&after, &pending_sends);
+        assert_eq!(
+            pending_texts(&shown),
+            Vec::<SharedString>::new(),
+            "the record is the message now, and drawing both would show it twice"
+        );
+        assert_eq!(
+            message_sources(&shown),
+            vec![
+                SharedString::from("an earlier message"),
+                SharedString::from("run the tests"),
+            ],
+            "the message is shown once, by the record that arrived"
+        );
+    }
+
+    #[test]
+    fn a_record_of_other_text_leaves_a_pending_message_alone() {
+        let before = entries_of(&[&user_message_line("a", "an earlier message")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "run the tests", &before);
+        assert_eq!(pending_texts(&shown(&before, &pending_sends)).len(), 1);
+
+        let after = entries_of(&[
+            &user_message_line("a", "an earlier message"),
+            &user_message_line("b", "something else entirely"),
+        ]);
+        pending_sends.pair_with(&after);
+
+        assert_eq!(
+            pending_texts(&shown(&after, &pending_sends)),
+            vec![SharedString::from("run the tests")],
+            "a record of other words is not this message arriving, and taking the \
+             message down for it would lose it"
+        );
+    }
+
+    #[test]
+    fn two_sends_of_the_same_text_are_paired_with_the_two_records_in_order() {
+        // A record already showing this text: it was there before either send, so it
+        // cannot be what either send became.
+        let before = entries_of(&[&user_message_line("a", "keep going")]);
+        let mut pending_sends = PendingSends::default();
+        let first = pending_sends.remember(7, "keep going", &before);
+        let second = pending_sends.remember(7, "keep going", &before);
+
+        pending_sends.pair_with(&before);
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![first, second],
+            "the record that was already there answers neither send"
+        );
+
+        let after_one = entries_of(&[
+            &user_message_line("a", "keep going"),
+            &user_message_line("b", "keep going"),
+        ]);
+        pending_sends.pair_with(&after_one);
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![second],
+            "the first record answers the first send, and the second send is still waiting"
+        );
+
+        let after_two = entries_of(&[
+            &user_message_line("a", "keep going"),
+            &user_message_line("b", "keep going"),
+            &user_message_line("c", "keep going"),
+        ]);
+        pending_sends.pair_with(&after_two);
+        assert!(
+            pending_sends.is_empty(),
+            "both sends have their record now, {:?} left",
+            pending_ids(&pending_sends)
+        );
+    }
+
+    #[test]
+    fn a_send_that_failed_takes_its_pending_message_down() {
+        let mut pending_sends = PendingSends::default();
+        let failed = pending_sends.remember(7, "the message that never arrived", &[]);
+        let arrived = pending_sends.remember(7, "the message that did", &[]);
+        assert_eq!(pending_ids(&pending_sends), vec![failed, arrived]);
+
+        pending_sends.resolve(arrived, &Ok(()));
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![failed, arrived],
+            "a send that arrived is waiting for its record to be written, not finished"
+        );
+
+        pending_sends.resolve(failed, &Err(anyhow::anyhow!("can't find pane %9")));
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![arrived],
+            "a send that failed will never have a record, and the text goes back to the \
+             input instead"
+        );
+    }
+
+    #[test]
+    fn pending_messages_do_not_follow_the_reader_to_another_session() {
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "for the session I was reading", &[]);
+        let nine = pending_sends.remember(9, "for the session I am reading now", &[]);
+        assert_eq!(pending_ids(&pending_sends).len(), 2);
+
+        pending_sends.retain_session(Some(9));
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![nine],
+            "a pending message belongs to the conversation it was sent to"
+        );
+
+        pending_sends.retain_session(None);
+        assert!(
+            pending_sends.is_empty(),
+            "with no session selected there is no conversation to draw it in, {:?} left",
+            pending_ids(&pending_sends)
+        );
+    }
+
+    #[test]
+    fn dismissing_one_pending_message_leaves_the_others() {
+        let mut pending_sends = PendingSends::default();
+        let first = pending_sends.remember(7, "same text", &[]);
+        let second = pending_sends.remember(7, "same text", &[]);
+        let third = pending_sends.remember(7, "another message", &[]);
+        assert_eq!(pending_ids(&pending_sends), vec![first, second, third]);
+
+        pending_sends.dismiss(second);
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![first, third],
+            "the button takes down the message it sits on, not the one that reads the same"
         );
     }
 }

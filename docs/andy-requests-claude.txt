@@ -1729,3 +1729,469 @@ E.15 P3 + P4 交付狀態
       這一輪 review 評估後標 wontfix。
     - R3（remote 上 `display_working_directory` 用本機 home 縮寫）、
       R4（`overwritten_uuids` 無上限）留在 backlog。
+
+
+================================================================================
+附錄 F P2 任務書（2026-09-10 訂，含實機量測）
+================================================================================
+
+--------------------------------------------------------------------------------
+F.0 正文 §4 有一個假設是錯的
+--------------------------------------------------------------------------------
+
+§4 最後一句寫「Workflow 的 `agent()` 產出同樣落在 `subagents/`，所以不需要為
+Workflow 另做一套；同一個機制涵蓋」。**實機量測否證了這句。** 有兩種佈局：
+
+  A. `Agent` tool 起的：`<sessionId>/subagents/agent-<agentId>.{jsonl,meta.json}`
+     meta 有 `toolUseId` → 可以直接對回主對話的 tool_use block。（本機 116 個）
+  B. Workflow 起的：`<sessionId>/subagents/workflows/<runId>/agent-<agentId>.{jsonl,meta.json}`
+     **meta 沒有 `toolUseId`**，改帶 `workflowPhase`；同目錄另有 `journal.jsonl`。
+     （本機 278 個）
+
+  路徑深度只有這兩種（`subagents/` 之後 1 段或 3 段，實測 116 / 278，沒有更深的）。
+
+  B 的連結方式：`Workflow` 的 **tool_result 內文含 `Run ID: wf_xxx`**，
+  用那個 runId 對回目錄名。實測：`wf_b529a29d-562` 的 tool_result 的
+  `tool_use_id` 是 `toolu_01PmRN5V7q41k1VXakxdF3A9`。
+
+--------------------------------------------------------------------------------
+F.1 事實清單（全部實機量測，不要再猜）
+--------------------------------------------------------------------------------
+
+meta.json 的完整欄位（兩個真實樣本）：
+
+  A 型：{"agentType":"general-purpose","description":"Phase B adversarial review round 2",
+         "toolUseId":"toolu_01BEgVRSnksoz6YAyUWEEdeQ","spawnDepth":1,
+         "requestShape":"background","requestNonInteractive":true,"model":"opus"}
+  B 型：{"agentType":"workflow-subagent","description":"R2:send-atomicity",
+         "workflowPhase":"Wave 5","spawnDepth":1,"requestShape":"foreground",
+         "requestNonInteractive":false,"model":"opus"}
+
+  欄位可缺席，實測分佈（全機器 394 個 meta）：
+    242  spawnDepth=1  workflow-subagent  無 toolUseId  無 workflowPhase
+    100  spawnDepth=1  general-purpose    有 toolUseId
+     28  spawnDepth=1  workflow-subagent  無 toolUseId  有 workflowPhase
+      8  spawnDepth=1  general-purpose    **無 toolUseId**   ← 不能假設 A 型一定有
+      4  spawnDepth=2  general-purpose    有 toolUseId
+      3  spawnDepth=3  general-purpose    有 toolUseId
+      其餘：fork / Explore / claude 等 agentType
+  → `toolUseId` 一律 `Option`，`description` / `model` / `workflowPhase` 也是。
+  → `agentType` 是自由字串（`general-purpose` / `workflow-subagent` / `fork` /
+    `Explore` / `claude` / 使用者自定），不得做成 enum。
+
+subagent 的 jsonl 記錄形狀**與主 transcript 完全相同**（實測 keys）：
+  agentId, cwd, entrypoint, gitBranch, isSidechain, message, parentUuid,
+  promptId, sessionId, timestamp, type, userType, uuid, version
+  - `isSidechain: true`、`sessionId` 是**母 session 的 id**、多了 `agentId`。
+  - type 分佈（102 行的樣本）：assistant 41 / attachment 36 / user 25。
+  → **`transcript.rs` 的 `parse_record` 與樹走訪可以原封不動重用**，這是 P2 便宜的原因。
+
+  檔案大小實測：一隻 workflow agent 的 jsonl 有 519 KB（102 行的那隻是小的），
+  所以一律走既有的增量 tail，不要整檔重讀。
+
+`spawnDepth >= 2` 的 `toolUseId` 指向的是**母 agent 的** tool_use，
+但實測那個 id 在主 transcript 檔裡也找得到（母 agent 的記錄以 sidechain 形式
+同時寫進主檔）。所以連結時掃「主檔的所有記錄（含 sidechain）」就夠，
+不需要另外去翻 agent jsonl。
+
+`journal.jsonl`（只有 B 型有）每行一筆，實測 type 有 `launched` / `started` / `result`，
+`started` 帶 {key, agentId, label, phase}，`result` 帶 {key, agentId, result}。
+→ B 型的「跑完了沒」可以直接看有沒有該 agentId 的 `result` 行，比 mtime 準。
+
+`pendingBackgroundAgentCount` **不能當即時徽章**：它掛在
+`{"type":"system","subtype":"turn_duration",...}` 記錄上，是那一輪結束時的統計值
+（實測本機只出現 2 次、值都是 1）。即時數量要自己算：
+有 meta 但主對話還沒出現對應 tool_result 的算 running。
+
+--------------------------------------------------------------------------------
+F.2 WP11 —— 資料層（Opus 5 high）
+--------------------------------------------------------------------------------
+
+全部加在 `crates/remote/src/claude_sessions.rs`（共用層，remote server 也要用）：
+
+  pub struct SubagentMeta {
+      pub agent_type: String,          // "agentType"
+      pub description: Option<String>,
+      pub tool_use_id: Option<String>, // "toolUseId"
+      pub spawn_depth: u32,            // "spawnDepth"，缺席視為 1
+      pub model: Option<String>,
+      pub workflow_phase: Option<String>, // "workflowPhase"
+  }
+  /// 未知欄位忽略（不要 deny_unknown_fields），缺 agentType 回 Err。
+  pub fn parse_subagent_meta(contents: &str) -> anyhow::Result<SubagentMeta>
+
+  pub struct SubagentSummary {
+      pub agent_id: String,
+      pub workflow_run_id: Option<String>,   // B 型才有
+      pub meta: SubagentMeta,
+      pub transcript_path: PathBuf,
+      pub size: u64,                          // 用來當「有沒有在動」的提示
+  }
+  /// 掃 <home>/.claude/projects/*/<sessionId>/subagents/ 的兩種佈局。
+  /// 單一 meta 壞掉只跳過該筆，不得整批失敗。
+  pub async fn list_subagents(home_directory: &Path, session_id: &str) -> anyhow::Result<Vec<SubagentSummary>>
+
+  /// agent transcript 的路徑。**三個 id 都是不可信輸入**（來自 JSON 與 RPC），
+  /// 每一個都必須是單一 path component，否則回 None（規則與 E.13 定的一致）。
+  pub fn subagent_transcript_path(
+      home_directory: &Path, session_id: &str, agent_id: &str,
+      workflow_run_id: Option<&str>,
+  ) -> Option<PathBuf>
+
+  /// Workflow 的 tool_result 內文裡的 `Run ID: wf_xxx`。純函式、要能被測。
+  pub fn workflow_run_id_in_tool_result(text: &str) -> Option<String>
+
+硬性要求：
+  - `session_id` / `agent_id` / `workflow_run_id` 三者都過單一 component 檢查，
+    共用同一個 helper，不要各寫一份。
+  - 不得讀 `~/.claude/sessions/` 底下任何東西。
+  - 排序：先 B 型的 runId、再 agentId，穩定且不得依賴目錄列舉順序。
+
+--------------------------------------------------------------------------------
+F.3 WP12 —— 盲測（Opus 5 medium，禁看實作）
+--------------------------------------------------------------------------------
+
+只給 F.2 的 API 與 F.1 的事實，**不准讀** `crates/remote/src/claude_sessions.rs`
+與 `crates/claude_sessions/src/`。寫成
+`crates/claude_sessions/src/blind_subagent_tests.rs`（大腦負責掛 mod）。
+覆蓋：三個 id 的淨化（`..`、`/`、空字串、`%`、超長）、meta 解析的欄位缺席與未知欄位、
+`workflow_run_id_in_tool_result` 的正反例。
+
+--------------------------------------------------------------------------------
+F.4 之後幾波（順序，細節等前一波落地再定）
+--------------------------------------------------------------------------------
+
+  WP13  source trait 加 `list_subagents` / `tail_subagent` + LocalSource（Opus）
+  WP14  proto + remote_server handler（Gemini，樣板同 E.4）
+        —— `TailClaudeTranscript` 加 `optional agent_id` / `optional workflow_run_id`，
+           或另開一支；server 端三個 id 都要過同一條淨化。
+  WP15  panel UI（Opus high）：頂端 agent chip 列（label 用 description、
+        跑著的加 `●`、結束的灰掉但留著）＋主對話裡 inline 可展開的 agent 卡片，
+        兩個入口都要有；切到某隻 agent 時用**同一條 render pipeline**。唯讀。
+  WP16  review 輪（Opus 乾淨 context）＋ 跨家族安全審查（Gemini，只審新的路徑界限）
+
+--------------------------------------------------------------------------------
+E.16 一個我下錯的結論，與它真正的原因
+--------------------------------------------------------------------------------
+
+**我先寫下的（錯的）結論**：使用者用 dev build 送了幾則訊息之後，回報他的
+Claude Code terminal「打字畫面上看不到，但 Claude 收得到」。我判定是
+`paste-buffer -p` 把 TUI 留在 bracketed paste 狀態，理由是他手動送
+`ESC [ 2 0 1 ~` 之後 terminal 恢復了。我在這份文件裡寫成「已確認的證據」。
+
+**推翻它的觀察**（使用者自己發現）：顯示不出來的那兩則訊息，內容都正好是
+`<task-notification>…</task-notification>` 那一串。**Claude Code 的 TUI 自己就會
+把這種系統標籤的文字藏起來**，所以字打得進去、模型收得到、畫面上不顯示。
+恢復不是結束標記的功勞 —— 那之後他打的是普通文字，本來就會顯示。
+
+**我錯在哪**：拿「做了 X 之後好了」當成「X 是原因」。正確的驗證應該是
+請他在同一個 pane 再打一次那串標籤（會再次不顯示），或打一段普通文字
+（會顯示）—— 兩者都不需要動任何程式碼就能分辨。我沒做這一步就寫進文件。
+
+**對 P3 的影響**：目前**沒有任何證據**顯示送出功能弄壞過使用者的終端機。
+
+**U5 的理由改寫**（施工內容不變）：只有多行才用 `-p` —— 不是因為它修了一個
+已確認的 bug，而是因為 `-p` 的作用只在多行（讓多行不被逐行送出），
+單行送出沒有理由讓終端機進入一個它不需要的模式。這條站得住腳，但它是
+「不要做沒必要的事」，不是「修好了一個災難」。
+
+**取消**原本計畫的「多行送出時額外補一個結束標記」：那是建立在錯誤診斷上的，
+沒有證據支持，而且會往使用者的終端機多送一段沒必要的控制序列。
+
+**對 U1 的補強**：這件事反過來證實 U1 的方向是對的 —— TUI 自己都藏這些區塊，
+panel 沒有理由把它們當成使用者訊息顯示。
+
+--------------------------------------------------------------------------------
+E.17 WP17 —— 「它現在在做什麼」的即時指示（排在 UX 那一輪之後）
+--------------------------------------------------------------------------------
+
+使用者要求：thinking 的時候要有動畫，才知道 Claude 有沒有在動。
+
+**現況**：`render_session_row` 只有一顆靜態的 `IconName::Indicator`，
+綠色的條件是 `session.status == Some("busy")`。而 `status` 來自註冊檔，
+**只在狀態改變時才被改寫**（附錄 D.2 量過：idle 的 session 可以 3336 秒不動），
+所以那顆點既不會動、也不保證準。
+
+**不要用計時器或 `updatedAt` 來判斷「在動」**，用 transcript 自己的內容 ——
+它是唯一真的跟著模型前進的東西，而且純函式可測、不需要時鐘：
+
+  enum Activity { Thinking, RunningTool { name, target }, Idle }
+  /// 由 active path 的尾端推導。純函式、無 IO、無時鐘。
+  fn activity(path: &[&TranscriptRecord]) -> Activity
+
+  判定規則（依序）：
+    1. 尾端是 assistant 記錄且含 `thinking` block、其後沒有 user／tool_result 記錄
+       → Thinking
+    2. 尾端有 `tool_use` 且主對話裡還沒有對應 `tool_use_id` 的 tool_result
+       → RunningTool { name: 那個 tool 的 name,
+                        target: 從 input 取一段短摘要（Bash 取 command 前 ~40 字、
+                                Read/Edit/Write 取 file_path 的檔名、其他留空）}
+    3. 其餘 → Idle
+
+**UI**
+  - session row 的那顆點：`status == "busy"` 時用既有的 `with_animation` 慣用法
+    脈動（樣板：`crates/agent_ui/src/agent_panel.rs:6092`，
+    `Animation::new(Duration::from_secs(1)).repeat().with_easing(pulsating_between(0.2, 0.6))`，
+    closure 收 `|icon, delta| icon.opacity(delta)`）。不得新增 asset。
+  - 選中的 session 在對話區下緣（輸入框上方）多一行狀態：
+      Thinking            → 「Thinking…」+ 脈動
+      RunningTool         → 「Running Bash: cargo test -p …」+ 脈動
+      Idle                → 不顯示這一行（不要留空位跳動）
+  - 這一行是**唯讀指示**，不得有任何按鈕、不得觸發送出。
+
+**測試**：`activity` 的三條規則各兩支（正例 + 邊界），用既有的
+`entries_of` 那種以 JSONL 字串建構的寫法；動畫本身不測（GPUI 動畫沒有可斷言的輸出），
+但要有一支測試釘住「Idle 時不產生那一行」。
+
+--------------------------------------------------------------------------------
+E.18 順序（使用者已回報 subagent / workflow 沒顯示 —— 那就是 P2，還沒做）
+--------------------------------------------------------------------------------
+
+  現在跑著：UX 輪（U1-U5，動 panel 與 remote/claude_sessions.rs）
+  接著並行：WP11 P2 資料層（只動 remote/claude_sessions.rs）
+            WP17 即時指示（只動 panel）
+  然後：    WP13/WP14（source trait + proto + server）
+  最後：    WP15 P2 的 panel UI（agent chip 列 + inline 卡片）—— 必須排在 WP17 之後，
+            兩者動同一個檔。
+  收尾：    WP16 review 輪（Opus 乾淨 context）+ 跨家族安全審查（Gemini）
+
+--------------------------------------------------------------------------------
+E.19 WP18 —— 送出的訊息在 transcript 出現之前要先顯示
+--------------------------------------------------------------------------------
+
+使用者回報：「我打字的時候，如果 claude 還沒處理，panel 不會顯示。」
+
+這是架構的必然，要分兩種情況講清楚：
+
+**(a) 在 terminal 裡打字** —— panel 讀的是 transcript 檔，而 CLI 只在開始處理那一輪
+時才把 user 記錄寫進檔案。所以使用者在終端機裡打了一半、或打完還沒送出的字，
+**panel 在任何情況下都看不到**。要看到只有兩條路，兩條都不做：
+  - `messagingSocketPath` 的本機 IPC（正文 §6.2：協定未文件化，第一版不碰）
+  - `tmux capture-pane -p -t <pane>` 把 pane 畫面抓下來解析輸入框
+    （tmux 官方功能，但要解析 TUI 畫的框線，版本一變就壞）
+  → 這一項的正確處置是**在 UI 上講明白**，不是硬做。
+
+**(b) 從 panel 送出** —— 這個可以修，而且該修。現在送出之後輸入框清空，
+但要等 CLI 把記錄寫進 transcript（可能好幾秒，busy 的 session 更久）才看得到，
+中間使用者不知道自己送出去了沒有。
+
+要做：
+  - 送出時立刻在對話尾端插入一筆 **pending** entry（顯示送出的文字 +
+    「Sending…」或脈動，樣式上明顯不同於已送達的訊息）。
+  - 真正的 user 記錄從 transcript 出現時移除 pending：比對條件是
+    **trim 之後文字相同、且是送出之後才新增的 user 記錄**（第一個相符的就配對）。
+  - 送出失敗（已有的還原路徑，E.9 第 1 項）→ 移除 pending，文字回到輸入框。
+  - 切換 session → 清掉 pending（它屬於原本那個 session）。
+  - pending 不進 entry cache、不影響 transcript 的樹與 offset，
+    也不得讓 `activity()`（E.17）誤判成 Thinking。
+  - **不得**做自動重送、不得用計時器判斷「應該出現了」而把 pending 靜默丟掉：
+    配不上就一直顯示成 pending，那才是誠實的。
+
+測試：送出後 pending 出現；相同文字的 user 記錄到達後 pending 消失且不重複顯示；
+文字不同的 user 記錄到達不會誤配；送出失敗時 pending 消失；切換 session 時 pending 消失。
+
+  **使用者實測補充（提高優先度）**：從 panel 送出後，terminal 那邊看得到
+  （文字已經在 TUI 的輸入框／排隊中），但 panel 看不到，**感覺像字消失了**。
+  這比原本寫的「不知道送出去了沒」嚴重：它讓人不信任這個工具。
+  → WP18 提到下一波的第一件事，與 WP17 併成同一輪（都只動 panel）。
+
+  兩個補充規則：
+    - 同樣的文字連送兩次 → 兩筆 pending，與後續到達的兩筆 user 記錄**依序配對**（FIFO）。
+    - pending 配不上時不用計時器丟掉（那會再一次讓字消失），改成
+      **pending 泡泡上給一個手動關掉的 ×**，由使用者決定它是否已經沒意義。
+
+--------------------------------------------------------------------------------
+E.20 U1 的追加：slash command 的三個標籤（使用者回報）
+--------------------------------------------------------------------------------
+
+實機量測（本機 session transcript）：slash command 的呼叫是 `type:"user"`、
+content 為純字串的記錄，內容形如
+
+  <command-name>/goal</command-name>
+            <command-message>goal</command-message>
+            <command-args>幫我把 claude session panel 都修好 新需求做完</command-args>
+
+各標籤出現次數：`<command-name>` 12、`<command-message` 10、`<command-args>` 7、
+`<local-command-stdout>` 17、`<local-command-caveat>` 2。
+
+**處置不是「整筆藏掉」**：`<command-args>` 裡是使用者真正打的字，藏掉會讓對話斷掉
+（例如這份文件所有的 `/goal` 指示都會消失）。規則：
+
+  <command-name>X</command-name> + <command-args>Y</command-args>
+    → 顯示成一行 slash command：`X Y`（X 已經含 `/`），樣式與一般訊息可區分
+      （例如 Muted 的等寬字），args 為空就只顯示 X
+  <command-message>…</command-message>   → 移除（純內部欄位）
+  <local-command-stdout>…</local-command-stdout> → 移除（指令自己的輸出，
+      例如 "Goal set: …"、`/context` 的整張表）
+  <local-command-caveat>…</local-command-caveat>  → 移除
+
+這一條併進下一波（WP17/WP18 那一輪）施工，因為 U1 的那支
+`user_visible_text` 已經在這一輪落地，追加標籤只是擴充它的清單 + 一條新的顯示規則。
+測試：`/goal` 帶 args、`/compact` 不帶 args、只有 `<local-command-stdout>` 的記錄
+（整筆不顯示）、args 內含 `<` 之類字元不得破壞剝離。
+
+--------------------------------------------------------------------------------
+F.5 規格補洞：subagent 路徑的 <slug> 從哪來（盲測作者提出）
+--------------------------------------------------------------------------------
+
+F.2 把 `subagent_transcript_path` 寫成純函式，但路徑裡有一段 `<slug>`
+（`<home>/.claude/projects/<slug>/<sessionId>/subagents/...`），而簽名沒有 slug 參數。
+盲測作者在不看實作的情況下指出這一點，並把測試寫成能同時容納
+「純函式推導 slug」與「掃目錄找 slug」兩種實作 —— 這是正確的處理。
+
+**定案**：跟 P1 的 `find_transcript` 完全一樣的規則 ——
+**不得自己把 cwd 的 `/` 換成 `-` 去組 slug**（slug 規則未文件化，正文 §2 已經定過），
+一律 glob `<home>/.claude/projects/*/<sessionId>/`（把 sessionId 當成**目錄**名）
+找到 session 目錄，再往下接 `subagents/...`。
+
+因此 `subagent_transcript_path` **會做目錄 IO**，與 `find_transcript` 同一個層級，
+不是純函式。淨化（三個 id 各為單一 path component）仍然抽成獨立的純函式共用，
+那一支才是盲測釘的核心。找不到 session 目錄 → None。
+
+--------------------------------------------------------------------------------
+E.21 WP19 —— 排版與顏色向網頁版對齊（使用者附了截圖）
+--------------------------------------------------------------------------------
+
+使用者：「顏色有點不夠好看、不夠多彩，網頁版的排版顏色都弄得更好。」
+
+**先釘清楚現況，不要重做已經對的東西**：panel 的訊息文字已經走
+`MarkdownStyle::themed(MarkdownFont::Agent, window, cx)`（claude_sessions_panel.rs
+的 `markdown_style`），而且 `Markdown::new(source, language_registry, None, cx)`
+有傳 language registry —— 所以**訊息裡的 markdown 與 fenced code block 本來就有語法高亮**。
+不夠好看的是它周圍的東西。
+
+截圖裡網頁版做到、我們沒做到的（逐項對照）：
+
+  1. **工具呼叫的指令本身沒有語法高亮**：截圖裡 `! cd /Users/... && npx ts-node
+     scripts/migrate-credit-denomination.ts --apply` 是一個有顏色的 shell 程式碼區塊。
+     我們現在把 tool_use 的 input 當成純文字顯示。
+     → 改成把 input 包成 fenced code block 交給 Markdown 渲染：
+       Bash → ```bash（取 `command`）、Read/Edit/Write → 依 `file_path` 的副檔名選語言、
+       其他工具 → ```json（整個 input pretty print）。語言選擇要抽成純函式加測試。
+  2. **工具輸出沒有框**：截圖裡輸出是一個獨立的圓角邊框卡片，
+     `(no output)` 是 Muted 斜體。我們現在是接在同一段文字裡。
+     → tool_result 用 `border_1` + `rounded_sm` + `bg(colors.editor_background)` 的卡片，
+       空輸出顯示 `(no output)`（Muted）。
+  3. **長輸出沒有高度上限**：截圖裡長輸出有固定最大高度 + 右下角展開的 chevron。
+     → 超過約 12 行就夾住並給一個展開/收起的 disclosure（既有的 `render_disclosure_header`
+       已經有這個機制，沿用它，不要另做一套）。
+  4. **inline code 沒有底色**：截圖裡 `.claude/settings.json`、`getMyQuota`、`X-POC-Model`
+     都有淡色底。`MarkdownStyle.inline_code` 是現成欄位，themed 版本應該已經有；
+     如果實際看起來沒有，就在 `markdown_style` 裡覆寫它（用 theme 的
+     `colors().element_background` 之類，**不得寫死顏色**）。
+  5. **角色沒有顏色區分**：assistant / user / summary / 工具 四種在截圖裡是不同的視覺層次。
+     → 每種角色的 icon 與標籤用 theme 既有語意色（`Color::Accent` / `Color::Muted` /
+       `Color::Success` / `Color::Error`），**一律走 theme，不得出現任何 rgb/hex 常數**。
+
+硬性要求：
+  - **不得寫死任何顏色**：全部從 `cx.theme().colors()` / `Color::*` 取，
+    否則換 theme（含淺色）就爛掉。
+  - 不得新增 asset 檔、不得引入新的 icon 檔；IconName 只用既有的。
+  - 不得改動 transcript 解析、offset、界限判斷等非顯示邏輯。
+  - 既有測試（包含四個盲測檔）不得改。
+  - 顏色與框線是視覺，沒辦法斷言；**能測的部分一定要測**：
+    語言選擇的純函式（Bash → bash、`.rs` → rust、`.py` → python、未知副檔名 → 空、
+    其他工具 → json）、以及「輸出超過 N 行才夾住」的判定。
+
+--------------------------------------------------------------------------------
+E.22 UX 輪的驗收與大腦裁定
+--------------------------------------------------------------------------------
+
+交付：163 / 98 / 56 全綠（claude_sessions +12、remote +2），clippy exit 0、fmt clean、
+zed build 綠；另外因為動到共用的 settings crate，加跑 `cargo test -p settings`（37）
+與 `-p settings_ui`（58），都綠。盲測三檔去空白雜湊未變。
+
+我的突變抽查：
+  `user_visible_text` 直接回傳原文（等於沒剝除）→ 5 支測試變紅
+  `needs_bracketed_paste` 改成永遠 true（單行也 `-p`）→ 1 支變紅
+兩處都已還原成 byte-identical。
+
+它回報的六件事，裁定如下：
+
+1. **「沒有結尾標籤」採「完全不刪」**：接受，而且這是比我原本寫的更好的讀法。
+   我寫「不得把後面全部吃掉：只到文字結尾為止」有歧義；照另一種讀法會讓既有測試
+   `a_persisted_output_marker_in_message_text_stays_a_message`（fixture 是無結尾標籤的
+   `<persisted-output>`）變成 0 個 entry 而 index panic，而它不准改既有測試。
+   選「畸形輸入完全不刪」的理由對：**寧可多顯示，不可弄丟使用者的字**。
+   實測五種包裝在真實 user 記錄裡都是成對的，所以實務無差。
+2. U5 既有測試只改呼叫方式（多一個 `true` 參數）、17 行期望 argv 一字未動：接受。
+3. U5 端到端測不出 `-p`（`cat` 沒開 bracketed paste 模式，tmux 就不發那組序列）：
+   接受這個限制，`-p` 由 argv 測試釘住。它為了不動既有測試而付出約 40 行 plumbing 重複，
+   這個取捨是對的。
+4. **U1 的誤殺面**：使用者若在訊息裡成對寫出這些標籤（例如討論這個功能本身），
+   那一段會被隱藏。維持現狀，不加「標籤必須獨占整行」的條件 ——
+   加了會讓貼進來的通知反而不被隱藏（那正是使用者要藏的東西）。記錄在此。
+5. **「N new messages」與計數單位不一致**：它照規格做但同時指出矛盾，是對的。
+   **我自己改掉了**：文案改成「N new below」，並在該處註解說明為什麼不說 messages
+   （一次回覆會是 thinking + tool_use + tool_result + text 好幾個 entry，
+   說 messages 會給出一個讀者對不上的數字）。163 支維持綠、clippy 0。
+6. `blind_subagent_tests.rs` 還沒掛進 crate root：正確，那是大腦的事，
+   要等 WP11 的 API 落地才掛（現在掛會編不過）。
+
+**它自己抓到並修掉的一個 GPUI 陷阱**（`discoveredWhileFixing`）值得記著：
+`ListState::set_scroll_handler` 的 `event.is_following_tail` 只有在
+`FollowState::Tail{is_following:true}` 才為 true，而這個 panel 從未設 `FollowMode::Tail`
+→ 永遠 false，計數永遠不會被清掉；而且 handler 在 `StateInner::scroll` 的
+`borrow_mut()` 裡跑，在裡面呼叫 `is_scrolled_to_end()` 會 RefCell double-borrow panic。
+它改成在 render 時判斷，並且只在 `== Some(true)` 時清空 ——
+`None`（splice 後新 item 還沒量高度）當成 true 會把剛到達的那筆直接抹掉。
+
+--------------------------------------------------------------------------------
+F.6 WP11 驗收與裁定
+--------------------------------------------------------------------------------
+
+交付：`remote` 109 支（claude_sessions 模組 36 → 47），claude_sessions 163、
+remote_server 56 全綠，clippy exit 0、fmt clean、zed build 綠。
+突變證明貼了真實的逃逸路徑（把 `single_path_component` 短路之後，
+session_id `../..`、agent_id 帶分隔符、run_id `..` 三條都真的踩到既存檔案）。
+誤殺檢查：真實 UUID／`af090e203ec41bc73`／`wf_b529a29d-562` 三種形狀都解析到正確路徑。
+
+額外的實機交叉驗證（它自己做的，值得記）：掃過本機**全部 402 個** meta
+（120 flat / 282 workflow，深度只有 1 段與 3 段兩種，flat 層沒有非 `agent-*` 的檔）：
+`agentType` 402/402 是 string、`spawnDepth` 出現時全是 number（1×393、2×6、3×3）、
+四個 optional 欄位沒有任何一筆是 `null`。所以 `parse_subagent_meta` 對現存全部真實檔案都會成功。
+
+**它改了一行既有 code，我覆核後接受**：`transcript_file_name` 的 body 改成
+先過 `single_path_component`。行為差異只有變嚴（session_id 為 `.` / `..` 從
+「回一個找不到檔的名字」變成直接 None），既有測試未改仍綠。
+同一個檔留兩份同類界限是更差的選擇，接受。
+
+四個裁決：
+
+1. **`subagent_transcript_path` 檔案不存在回 None**（它加了 `is_file()`）：**維持**。
+   與同檔 `find_transcript` 同語意。agent 的 transcript 還沒寫出來時，
+   `list_subagents` 仍會列出那隻（`size = 0`，有測試釘住），UI 顯示「還沒有 transcript」
+   —— 與主 session 的處理一致。
+2. **`workflow_run_id_in_tool_result` 第一個被界限擋掉時會找下一個**（「第一個**合法**的」）：
+   **維持**。兩種讀法都安全（擋掉的那個本來就不會被用），它這個讀法比較有用。
+3. **`list_subagents` 對 NotFound 以外的 read_dir 失敗回 Err**：**維持**。
+   照 `read_registrations` 的既有慣例。一個不可讀的 workflows 目錄讓整批失敗，
+   比靜默少列幾隻 agent 好 —— 使用者看得到錯誤訊息。
+4. **`list_subagents` 是 async 但體內沒有 await**：那是我指定的簽名，維持。
+   呼叫端一律放到 background executor（與 `list_sessions` 相同），
+   workflows 目錄多的 session 會有 N+1 次 read_dir —— 記在此，之後量到慢再說。
+
+--------------------------------------------------------------------------------
+F.7 派工瑕疵：兩個範圍之間有一個沒人擁有的檔案
+--------------------------------------------------------------------------------
+
+WP14 在 `TailClaudeTranscript` 加了 `agent_id` / `workflow_run_id` 兩個欄位之後，
+唯一的 client 端呼叫點 `crates/claude_sessions/src/session_source.rs:141` 的
+struct literal 少欄位，`crates/claude_sessions` 整包編不過：
+
+  error[E0063]: missing fields `agent_id` and `workflow_run_id` in initializer
+                of `rpc::proto::TailClaudeTranscript`
+
+而 WP14 的範圍是 `crates/proto` + `crates/remote_server`、同時跑的 panel 那一輪範圍是
+`claude_sessions_panel.rs` + `session_store.rs` —— **`session_source.rs` 不在任何人的範圍內，
+沒有人能修**。這是我切範圍時的疏漏：我按「檔案」切，但沒有檢查改動的 blast radius
+會不會落在切口上。
+
+panel 那一輪的 agent 主動回報阻塞、並且**沒有擅自擴大範圍**（它補了那兩行以便跑自己的 gate，
+同時明說收工前會還原、gate 是在 shim 之下取得的）。那是正確的處理方式。
+
+處置：那兩行是正式的（主對話的 tail 本來就不指定 agent），我接管
+`session_source.rs`，並回覆該 agent 不要還原。之後 WP13 會把 None 換成真正的 subagent 定址。
+
+**規則補充**：改 proto 訊息時，派工要一併點名「所有 struct literal 的呼叫點」，
+或明確指定一個人擁有那些呼叫點。用 codegraph 查該訊息的 blast radius 再切範圍。

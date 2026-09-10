@@ -30,6 +30,29 @@ message ListClaudeSessionsResponse {
   string home_directory = 2;
 }
 
+// One subagent conversation of a session, as the machine it runs on describes it.
+message ClaudeSubagent {
+  string agent_id = 1;
+  optional string workflow_run_id = 2;
+  string agent_type = 3;
+  optional string description = 4;
+  optional string tool_use_id = 5;
+  uint32 spawn_depth = 6;
+  optional string model = 7;
+  optional string workflow_phase = 8;
+  optional string transcript_path = 9;
+  uint64 size = 10;
+}
+
+message ListClaudeSubagents {
+  uint64 project_id = 1;
+  string session_id = 2;
+}
+
+message ListClaudeSubagentsResponse {
+  repeated ClaudeSubagent subagents = 1;
+}
+
 // Request to incrementally read the transcript of a Claude Code session.
 message TailClaudeTranscript {
   uint64 project_id = 1;
@@ -37,6 +60,11 @@ message TailClaudeTranscript {
   optional string path = 3;
   uint64 offset = 4;
   bytes pending = 5;
+  // When agent_id is set, the tail targets that subagent's conversation instead of
+  // the main conversation. When both agent_id and workflow_run_id are present,
+  // the tail targets the subagent conversation of that workflow run.
+  optional string agent_id = 6;
+  optional string workflow_run_id = 7;
 }
 
 // Incremental transcript updates and progress state for a Claude Code session.
