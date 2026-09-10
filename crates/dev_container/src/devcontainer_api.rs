@@ -294,6 +294,7 @@ pub async fn start_dev_container_with_config(
                 remote_user,
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
+                port_forwards: None,
             };
 
             Ok((connection, remote_workspace_folder))

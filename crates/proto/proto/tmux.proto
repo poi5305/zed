@@ -1,0 +1,30 @@
+syntax = "proto3";
+package zed.messages;
+
+// Listing of the tmux server running on the remote host, so that its sessions
+// and windows can be attached to from a Zed terminal.
+
+message TmuxWindow {
+  uint32 index = 1;
+  string name = 2;
+  bool active = 3;
+}
+
+message TmuxSession {
+  string name = 1;
+  bool attached = 2;
+  uint32 window_count = 3;
+  repeated TmuxWindow windows = 4;
+}
+
+message ListTmuxSessions {
+  uint64 project_id = 1;
+}
+
+// `tmux_available` is false only when the remote host has no `tmux` binary. A
+// host that has tmux installed but no server running answers with it true and
+// an empty `sessions`, which is a normal state rather than an error.
+message ListTmuxSessionsResponse {
+  repeated TmuxSession sessions = 1;
+  bool tmux_available = 2;
+}

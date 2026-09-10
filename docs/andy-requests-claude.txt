@@ -1,0 +1,929 @@
+4. Claude Session Viewer —— 在 Zed 裡用「網頁版的顯示品質」看／控制正在跑的 Claude Code session
+
+================================================================================
+0. 動機與目標
+================================================================================
+
+現況：Claude Code 跑在 tmux 裡，用 `--remote-control` 讓手機／網頁可以遠端控制。
+Terminal 只能顯示純文字 + ANSI 顏色，沒有圖片、沒有精緻表格、tool call 無法折疊、
+subagent 在做什麼完全看不到。但網頁與手機 app 顯示得很好。
+
+目標：在 Zed 開一個 panel，接上「已經在跑的」那個 Claude session，用 Zed 既有的
+markdown / diff / image render 能力顯示，並且能送輸入。tmux、手機、網頁、Zed 四邊
+看到的是同一個 session。
+
+非目標（明確排除）：
+  - 不嵌 webview（GPUI 沒有 webview，gpui/gpui_macos 內 `WKWebView` 零命中）。
+  - 不逆向 remote-control bridge 的網路協定。
+  - 不取代 Zed 既有的 Agent Panel（那是 Zed 自己起的 ACP session，與本功能無關）。
+
+--------------------------------------------------------------------------------
+0.1 為什麼可行（已實測）
+--------------------------------------------------------------------------------
+
+Claude Code CLI 把完整結構化對話寫在本機檔案，不管輸入來自 terminal、手機還是網頁，
+都是同一個 process 寫同一份檔。所以只要讀檔就能拿到 100% 的內容，包含 image block、
+thinking block、結構化 tool result。
+
+本文件所有欄位名稱都是在 2026-09-10 於 Claude Code 2.1.263 / 2.1.266 / 2.1.267 的
+實機資料上驗證過的，不是推測。
+
+
+================================================================================
+1. 資料來源（實測）
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 Session 註冊表 —— ~/.claude/sessions/<pid>.json
+--------------------------------------------------------------------------------
+
+每個活著的 claude process 一個檔。這是列舉與追蹤的唯一權威來源。
+
+實例（原文照抄）：
+
+    {
+      "pid": 10064,
+      "sessionId": "4e2e3600-89c0-4cd5-9994-525c708559ab",
+      "cwd": "/Users/andy/go/src/github.com/poi5305/zed",
+      "startedAt": 1789007244364,
+      "procStart": "Thu Sep 10 02:27:23 2026",
+      "version": "2.1.267",
+      "peerProtocol": 1,
+      "peerFeatures": ["notify_idle", "reply_across_default_dirs", "artifact_yield"],
+      "kind": "interactive",
+      "entrypoint": "cli",
+      "pidDomain": "darwin",
+      "tmux": "zed:@6.%8",
+      "messagingSocketPath": "/tmp/cc-socks/10064.sock",
+      "name": "zed-e4",
+      "nameSource": "derived",
+      "nameSince": 1789007244364,
+      "status": "busy",
+      "updatedAt": 1789009278063,
+      "statusUpdatedAt": 1789009278063,
+      "bridgeSessionId": "session_01Tf2BzmxZDH3YKYpdxtSrpD"
+    }
+
+我們用到的欄位：
+  sessionId            → transcript 檔名。**權威來源，不是檔案系統掃描。**
+  cwd                  → 用來過濾「跟目前 Zed project 相關」的 session。
+  tmux                 → "<session_name>:<window_id>.<pane_id>"，直接可當 send-keys target。
+                         **可能不存在**（非 tmux 內啟動的 session，例如被 spawn 的子 session）。
+  pid + procStart      → 判活。兩者都要比對，procStart 用來防 pid 重用。
+  status / statusUpdatedAt → "busy" / 其他；做 UI 上的忙碌指示。
+  updatedAt            → heartbeat；太舊視為 stale。
+  version              → 顯示用，也用來對未知格式做降級。
+  kind                 → "interactive"；非 interactive 的不列。
+  name                 → 顯示名稱（例：zed-e4）。
+  messagingSocketPath  → 見 §6.2，第一版不使用。
+  bridgeSessionId      → 有值代表這個 session 正被 remote-control 接管；UI 上標一個 icon。
+
+旁邊還有 `~/.claude/sessions/<pid>.<sha256>.key`（108 bytes）。
+**視為機密，不得讀取、不得記錄、不得傳輸。** 與 messagingSocketPath 成對，
+是 §6.2 那條未採用的通道的憑證。
+
+註冊檔是 stale 的（實機上看到好幾天前的殘留），一定要判活。
+
+--------------------------------------------------------------------------------
+1.2 主 transcript —— ~/.claude/projects/<slug>/<sessionId>.jsonl
+--------------------------------------------------------------------------------
+
+JSON Lines，append-only。
+
+**不要自己算 <slug>。** 看起來是把 cwd 的 `/` 換成 `-`，但這是未文件化的規則。
+一律用 glob 定位：
+
+    ~/.claude/projects/*/<sessionId>.jsonl
+
+已知的 top-level `type` 值（實測列舉，非窮舉）：
+
+    user                對話中的 user 訊息，或 tool_result 回填
+    assistant           assistant 訊息
+    attachment          系統注入的上下文（見 §1.5）
+    system              系統事件，用 `subtype` 再分（見下）
+    file-history-snapshot
+    mode / permission-mode / bridge-session / atis-latch
+    last-prompt / ai-title / queue-operation
+
+已知的 system `subtype`：
+
+    compact_boundary    壓縮分界（見 §3.2）—— 必須處理
+    bridge_status       remote-control 狀態變化
+    local_command       本機 slash command 的 stdout（含 ANSI escape）
+    away_summary / turn_duration
+
+`message.content` 內的 block type：`text` / `thinking` / `tool_use` / `tool_result` / `image`。
+
+每筆記錄的通用欄位：
+
+    uuid                本筆 id
+    parentUuid          前一筆的 uuid，**null 代表這是一個 root**
+    isSidechain         true 代表這筆屬於 subagent（在主檔內為 false；見 §4）
+    timestamp / sessionId / cwd / gitBranch / version
+    toolUseResult       tool 的**結構化**結果（例：{stdout: ...}）。
+                        比 content block 裡的文字更豐富，rich render 主要靠這個。
+    isMeta / userType / requestId / promptId / effort / perTurnEffort
+
+--------------------------------------------------------------------------------
+1.3 Subagent transcript —— <sessionId>/subagents/agent-<agentId>.{jsonl,meta.json}
+--------------------------------------------------------------------------------
+
+meta.json（原文照抄）：
+
+    {
+      "agentType": "general-purpose",
+      "description": "WP1 forward ports WSL/Docker",
+      "toolUseId": "toolu_01Qv7iieSWkvLp17oyUTbodG",
+      "spawnDepth": 1,
+      "requestShape": "background",
+      "requestNonInteractive": true,
+      "model": "opus"
+    }
+
+  toolUseId   → 對應主 transcript 裡那個 `tool_use` block 的 `id`。
+                **這是 subagent 掛回主對話正確位置的唯一連結。**
+  spawnDepth  → 巢狀層數，支援 subagent 再開 subagent。
+  agentType / description / model / requestShape → 卡片上的顯示資訊。
+
+agent-<agentId>.jsonl 與主檔同格式，差別：
+  - 每筆都有 `isSidechain: true` 與 `agentId`
+  - 自己的 parentUuid 鏈，root 的 parentUuid 為 null
+  - 另有 `attributionAgent`
+
+**這些檔在 subagent 執行期間就持續在寫**（實測：跑到一半的 agent 檔已 689KB 且 mtime
+持續更新）。所以「即時看 agent 在做什麼」不需要任何額外機制，tail 這個檔就是了。
+
+完成訊號：主 transcript 出現對應 `toolUseId` 的 `tool_result`。
+
+--------------------------------------------------------------------------------
+1.4 卸載的大型輸出 —— <sessionId>/tool-results/
+--------------------------------------------------------------------------------
+
+超過門檻的 tool 輸出不會寫進 transcript，而是存成獨立檔，transcript 裡放：
+
+    <persisted-output>
+    Output too large (30.2KB). Full output saved to: <絕對路徑>
+    Preview (first 2KB):
+    ...
+
+檔名兩種：`<9碼隨機>.txt`（tool 輸出）、`hook-<uuid>-stdout.txt`（hook 輸出）。
+
+**這是 Zed 版明顯勝過 terminal 的地方**：terminal 只看得到 2KB preview，
+Zed 可以在展開時 lazy load 整個檔。要 parse 那個 marker 把路徑抓出來。
+
+--------------------------------------------------------------------------------
+1.5 Attachment
+--------------------------------------------------------------------------------
+
+`type: "attachment"` 的記錄帶 `attachment.type`，實測值：
+
+    environment / model / deferred_tools_delta / mcp_instructions_delta
+    hook_success / invoked_skills / prompt_snapshot / queued_command
+    compact_file_reference / edited_text_file / file / opened_file_in_ide
+    selected_lines_in_ide / total_tokens_reminder / agent_listing_delta
+
+多數是雜訊，預設全部收在一個可展開的「context」摺疊區，不要平鋪在對話流裡。
+
+
+================================================================================
+2. Session 探索與列舉
+================================================================================
+
+流程：
+
+  1. 列 `~/.claude/sessions/*.json`，逐檔 parse（單檔壞掉就跳過該檔，不要整批失敗）。
+  2. 判活：pid 存在 **且** `procStart` 相符 **且** `updatedAt` 在合理範圍內。
+  3. 過濾 `kind == "interactive"`。
+  4. 用 glob `~/.claude/projects/*/<sessionId>.jsonl` 定位 transcript；找不到就標成
+     "no transcript" 而不是丟掉（session 可能剛啟動）。
+  5. 依 `cwd` 是否落在目前 Zed project 的 worktree 內，分成「本專案」與「其他」兩組。
+
+**三個實測出來的坑，一定要照做：**
+
+  (a) 不要用 tmux 掃描來偵測 claude。`pane_current_command` 實測顯示的是版本號
+      （`2.1.267`），因為 argv[0] 指到 `~/.local/share/claude/versions/<ver>`，
+      不是 `claude`。反過來要從註冊表的 `tmux` 欄位去對應 pane。
+
+  (b) 不要讀別的 process 的環境變數。macOS 下 `ps eww -p <其他 pid>` 回空
+      （SIP／hardened runtime）；Linux 的 `/proc/<pid>/environ` 才可行。
+      不要寫成只在 Linux 能動的邏輯。
+
+  (c) 不要自己組 project slug 路徑，用 glob。
+
+
+================================================================================
+3. Transcript 模型 —— 這一節做錯會從根上歪
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 它是一棵樹，不是平坦 log
+--------------------------------------------------------------------------------
+
+每筆有 `uuid` + `parentUuid`。檔案是 append-only，但**對話內容是從 leaf 沿
+parentUuid 往回走的那條路徑**，不是檔案的行序。
+
+rewind（Esc Esc）、`--resume` 分支、compact 都會在同一個檔裡留下已被拋棄的分支。
+線性播放會把死掉的分支畫出來。
+
+正確做法：
+  - 維護 `uuid -> record` 的 map，以及目前的 leaf。
+  - 增量 tail 拿到新 record → 塞進 map、更新 leaf、重算 path。
+  - 正常情況 path 只在尾端 append，diff 極小；只有 rewind 才整段換掉。
+
+--------------------------------------------------------------------------------
+3.2 /compact —— 實測結論（在 33 筆歷史 compact 上驗證）
+--------------------------------------------------------------------------------
+
+**compact 不換檔、不換 sessionId。**（掃過全部 294 個歷史 transcript，
+sessionId 與檔名不符的案例：0。）
+
+它在同一個檔裡寫入一筆：
+
+    {
+      "type": "system",
+      "subtype": "compact_boundary",
+      "parentUuid": null,                                   ← 鏈條被刻意切斷
+      "logicalParentUuid": "0be38277-...",                  ← 指回壓縮前的 leaf
+      "content": "Conversation compacted",
+      "level": "info",
+      "compactMetadata": {
+        "trigger": "manual",
+        "preTokens": 792090,
+        "postTokens": 16995,
+        "cumulativeDroppedTokens": 775095,
+        "durationMs": 133856,
+        "preservedSegment": { "headUuid": "...", "anchorUuid": "...", "tailUuid": "..." },
+        "preservedMessages": { "anchorUuid": "...", "uuids": [...], "allUuids": [...] }
+      }
+    }
+
+緊接著是一筆 `user` 記錄，帶 `isCompactSummary: true`，內容是
+"This session is being continued from a previous conversation..." 的摘要。
+
+推論出的規則：
+  - N 次 compact → 檔案裡有 N+1 個 root（實測：boundaries=5 的檔有 6 個 root）。
+  - 從 leaf 往回走會停在最近一個 compact_boundary，這正是「模型現在看得到的
+    上下文」。
+  - 要顯示完整歷史，就在 boundary 處改跟 `logicalParentUuid` 繼續往回走。
+
+UI 要求：
+  - 在 boundary 處畫一條明確的分界，顯示 `trigger` 與 `preTokens -> postTokens`。
+  - 分界以上的歷史**預設折疊**，可展開（這是 terminal 做不到、網頁版也不見得有的優勢）。
+  - `isCompactSummary: true` 那筆要標成「摘要」樣式，不要當成使用者真的打了這段字。
+  - `trigger` 實測只出現過 `"manual"`；對其他值（很可能有 `"auto"`）要容錯，
+    未知值就原樣顯示。
+
+--------------------------------------------------------------------------------
+3.3 /clear 與 resume
+--------------------------------------------------------------------------------
+
+`/clear` 換 sessionId → 換一個新的 transcript 檔，pid 不變。
+
+所以：**主要監看對象是 `~/.claude/sessions/<pid>.json`，不是 transcript 檔。**
+sessionId 一變就切檔、清畫面、重建 map。只 watch transcript 的話，clear 之後
+Zed 會永遠停在舊對話。
+
+舊檔不會被截斷或改寫，所以 byte offset 不會錯亂。但仍要做 sanity check：
+檔案 size < 已記錄的 offset → 從頭重讀。
+
+
+================================================================================
+4. Subagent / Workflow 檢視
+================================================================================
+
+這是本功能相對網頁版與 terminal 的**主要價值**：同時看多個 agent 在做什麼。
+
+--------------------------------------------------------------------------------
+4.1 資料串接
+--------------------------------------------------------------------------------
+
+  1. 主 transcript 出現 `tool_use`，name 為 `Agent`（或其他會 spawn 的 tool）。
+  2. 掃 `<sessionId>/subagents/*.meta.json`，用 `toolUseId` 對回那個 block 的 `id`。
+  3. 對上了就在主對話的那個位置掛一張可展開的 agent 卡片。
+  4. 展開 → tail `agent-<agentId>.jsonl`，用跟主 transcript 完全相同的 render pipeline。
+  5. `spawnDepth > 1` → 巢狀顯示。
+
+狀態判定：
+  running  = 主 transcript 尚無對應 toolUseId 的 tool_result
+  done     = tool_result 已出現
+  進度提示  = agent jsonl 的最後一筆 record（最近一次 tool_use 的名稱／目標）+ mtime
+
+主 transcript 另有 `pendingBackgroundAgentCount` 欄位，可直接當 header 上的計數徽章。
+
+--------------------------------------------------------------------------------
+4.2 UI：agent 切換
+--------------------------------------------------------------------------------
+
+Panel 頂端一列 tab／chip：
+
+    [ Main ]  [ WP1 forward ports WSL/Docker ●]  [ WP3 project_manager fixes ●]  ...
+
+  - 標籤文字用 meta 的 `description`；hover 顯示 `agentType` / `model` / `spawnDepth`。
+  - `●` 表示還在跑（用 mtime + 有無 tool_result 判定）。
+  - 點一下把主檢視切到那個 agent 的 transcript；Main 切回主對話。
+  - 主對話裡對應位置的 agent 卡片也可以就地展開（inline），兩種入口都要有。
+  - agent 已結束的仍要留在列上（灰掉），才能事後回看。
+  - 這是**唯讀**檢視。不提供對 subagent 直接輸入。
+
+Workflow 的 `agent()` 產出同樣落在 `subagents/`（meta 帶 `model` 欄位），
+所以不需要為 Workflow 另做一套；同一個機制涵蓋。
+
+
+================================================================================
+5. UI 與 render
+================================================================================
+
+  - 落點：新的 dock panel，或 workspace item（tab）。**不要動 Zed 既有的 Agent Panel。**
+  - 對話流用 Zed 既有的 markdown render；`ContentBlock::Image` 在
+    crates/acp_thread/src/acp_thread.rs:1746 已經支援圖片，沿用同一條路徑。
+  - `thinking` block：預設折疊。
+  - `tool_use` / `tool_result`：折疊卡片。優先用 top-level `toolUseResult`（結構化）
+    而不是文字 content block 來做 rich render（diff、檔案內容、命令輸出）。
+  - `<persisted-output>` marker：顯示 preview，加一個「載入完整輸出」按鈕（§1.4）。
+  - attachment：全部收進一個折疊的 context 區。
+  - `local_command` 的 content 含 ANSI escape，要先 strip 或轉成樣式。
+  - Header：session name、cwd、version、status、bridge 圖示、tmux target、pending agent 數。
+  - 未知的 record type / block type / attachment type → **降級成 raw JSON 摺疊區顯示，
+    絕對不要丟棄、不要 panic**。格式是私有的，一定會變。
+
+
+================================================================================
+6. 輸入通道
+================================================================================
+
+--------------------------------------------------------------------------------
+6.1 第一版：tmux send-keys
+--------------------------------------------------------------------------------
+
+target 直接來自註冊表的 `tmux` 欄位（例：`zed:@6.%8`），不需要自己找 pane。
+
+要處理：
+  - 多行輸入的送法（bracketed paste）。
+  - Esc 中斷。
+  - 註冊表沒有 `tmux` 欄位的 session → 輸入框停用，只提供唯讀檢視。
+
+--------------------------------------------------------------------------------
+6.2 未採用：本機 IPC socket
+--------------------------------------------------------------------------------
+
+`messagingSocketPath` (`/tmp/cc-socks/<pid>.sock`) 加上 `~/.claude/sessions/<pid>.<sha>.key`
+看起來是一條乾淨的本機 IPC。完全未文件化，協定不明。
+
+**第一版不碰。** 記錄在此供日後評估。key 檔內容任何情況下都不得寫入 log。
+
+
+================================================================================
+7. Remote 支援
+================================================================================
+
+架構上沒有新東西：全部是「讀遠端檔案 + 遠端 tmux」。沿用既有的
+crates/proto/proto/tmux.proto 那條路。
+
+需要新增：
+
+  - RPC：列出遠端的 claude sessions。在 remote_server 上讀 `~/.claude/sessions/*.json`、
+    判活、glob transcript 路徑，回傳**結構化結果**。
+    不要把 raw JSON 丟給 client 解 —— 遠端的 Claude Code 版本可能與本機不同，
+    格式的相容性處理要留在產生端。
+
+  - RPC：tail transcript。輸入 `(path, offset)`，回傳新增的 bytes 與新的 offset。
+    同一支 RPC 也要能 tail subagent jsonl 與讀 tool-results 檔。
+
+  - **第一版用輪詢（約 1 秒），不要做 remote file watch。**
+    這些檔在 worktree 之外，走不到既有的 worktree scanner；而輪詢一個 append-only
+    檔的成本可以忽略，省掉一整套遠端 watch 的生命週期問題。
+
+  - `~` 必須在遠端 resolve，不能用本機 home。
+
+Client 端抽一個 source trait（list / tail / read_blob 三個方法），
+local 直接讀檔、remote 走 proto，UI 層完全不分本地遠端。
+
+
+================================================================================
+8. 風險
+================================================================================
+
+  - 這些檔案格式全是私有且未文件化的，會隨版本變。
+    緩解：唯讀為主；未知欄位一律降級顯示；註冊表的 `version` 欄位可用來做提示。
+    最壞情況是某段 render 不漂亮，不會弄壞任何 session。
+
+  - `.key` 檔與 `messagingSocketPath` 屬敏感資訊，不讀、不記、不傳。
+
+  - transcript 可能很大（實測單檔 2.7MB / 2695 筆），且 subagent 檔在跑的時候
+    分分鐘幾百 KB。要做增量 parse 與虛擬捲動，不要整檔重 parse 重 render。
+
+  - 註冊表有 stale 殘留，判活不能只看檔案存在。
+
+
+================================================================================
+9. 分期
+================================================================================
+
+  P1  本機唯讀：session 列舉 + 主 transcript rich render + compact/clear 正確處理。
+      這一段本身就有價值，且完全無副作用。
+
+  P2  Subagent / workflow 檢視與切換（§4）。
+
+  P3  輸入（tmux send-keys）。
+
+  P4  Remote（§7）。
+
+P1 有兩條必須一開始就做對，其餘都能事後補：
+  (1) 跟註冊表 `<pid>.json` 的 sessionId 走，不跟 transcript 檔名走。
+  (2) 從 leaf 沿 parentUuid 走，遇 compact_boundary 用 logicalParentUuid 續接，
+      不做線性播放。
+
+
+================================================================================
+================================================================================
+附錄 A：P1 任務書（本機唯讀）
+================================================================================
+================================================================================
+
+P1 範圍：本機、唯讀、只有主 transcript。
+明確排除：subagent 檢視（P2）、輸入（P3）、remote（P4）。
+但 WP2 的資料結構必須從一開始就能容納 `isSidechain` 記錄而不崩潰。
+
+新 crate：`crates/claude_sessions/`
+檔案配置（`[lib] path = "src/claude_sessions.rs"`，不使用 mod.rs）：
+
+    src/claude_sessions.rs          crate root、actions、init            (WP0)
+    src/session_registry.rs         純函式：註冊表解析與判活              (WP1)
+    src/transcript.rs               純函式：記錄解析與對話樹              (WP2)
+    src/session_store.rs            非同步：探索、tail、生命週期          (WP3)
+    src/claude_sessions_panel.rs    Panel UI                             (WP4)
+    src/claude_sessions_button.rs   status bar 按鈕                      (WP0)
+
+--------------------------------------------------------------------------------
+A.0 共通規則（每一份派工 prompt 都要帶）
+--------------------------------------------------------------------------------
+
+  - 逐字附上 codegraph 指示段落（見 A.7 派工樣板）。
+  - 禁止 `git stash` / `git checkout` / `git restore` / `git reset`。
+  - 「發現規格自相矛盾、或你正在挑輸入／加資料讓某個測試過，停下來回報，
+    不要換輸入。回報『做不到』是成功的結果。」
+  - 遵守 crates/../CLAUDE.md 的 Rust 規則：不用 `unwrap()`，錯誤用 `?` 傳遞，
+    不用 `let _ =` 吞錯，變數用完整單字，註解只解釋「為什麼」。
+  - 最小差異：不順手格式化、不改既有 public API。
+
+**effort 的派法（2026-09-10 grok 額度用盡後的調整）**
+
+  `Agent` tool 只能換 model，不能指定 effort。凡是本任務書寫「Opus 5 high」或
+  「Opus 5 medium」的工作包，都要包成單隻 `Workflow`，用 `agent()` 的 effort 參數指定，
+  不能直接丟 `Agent` tool（那樣 effort 是預設值，等於沒照表派）。
+  寫「agy `gemini-3.8-flash-*`」的則走 CLI，effort 在 `--model` 字串裡。
+
+
+================================================================================
+A.1 WP0 —— crate 骨架與 wiring
+================================================================================
+
+模型：agy `gemini-3.8-flash-high`（機械性接線）
+相依：無。最先做。
+
+**事實清單**
+
+抄 `crates/tmux_sessions/` 的結構，逐項對應：
+
+  1. `Cargo.toml`（repo root）三處各加一行，維持字母序：
+       - workspace members  ：參考 Cargo.toml:224 `"crates/tmux_sessions",`
+       - workspace deps     ：參考 Cargo.toml:493 `tmux_sessions = { path = "crates/tmux_sessions" }`
+  2. `crates/zed/Cargo.toml`：參考 :223 `tmux_sessions.workspace = true`
+  3. `crates/zed/src/main.rs:745` 附近加 `claude_sessions::init(cx);`
+  4. `crates/zed/src/zed.rs`：
+       - :604  `let claude_sessions_button = cx.new(|_| claude_sessions::ClaudeSessionsButton::new());`
+       - :640  `status_bar.add_left_item(claude_sessions_button, window, cx);`
+       - :790  `let claude_sessions_panel = claude_sessions::ClaudeSessionsPanel::load(workspace_handle.clone(), cx.clone());`
+       - :817  `add_panel_when_ready(claude_sessions_panel, workspace_handle.clone(), cx.clone()),`
+  5. `crates/claude_sessions/Cargo.toml` 抄 `crates/tmux_sessions/Cargo.toml`，
+     `[lib] path = "src/claude_sessions.rs"`，`doctest = false`。
+     額外相依：`serde`、`serde_json`、`fs`、`paths`、`markdown`、`language`、`theme`、`settings`。
+  6. `crates/claude_sessions/LICENSE-GPL` 比照其他新 crate（symlink 或複製，與
+     `crates/tmux_sessions/LICENSE-GPL` 一致）。
+  7. crate root 抄 `crates/tmux_sessions/src/tmux_sessions.rs:1-26` 的形狀：
+     `actions!(claude_sessions, [ToggleFocus])` + `pub fn init(cx: &mut App)`
+     內用 `cx.observe_new` 註冊 `toggle_panel_focus::<ClaudeSessionsPanel>`。
+  8. `claude_sessions_button.rs` 抄 `crates/tmux_sessions/src/tmux_sessions_button.rs`
+     全檔（57 行），只換名稱、`IconName` 與 aria label。
+     圖示用既有 `IconName` 的既有值，**不得新增資產**。
+
+WP0 階段 panel 可以是空殼（`Render` 回一個佔位 div），只要能編譯、能開關。
+
+**驗收**：`./script/clippy` 通過；Zed 啟動後 status bar 出現按鈕、可開關 panel。
+
+
+================================================================================
+A.2 WP1 —— session_registry.rs（純函式）
+================================================================================
+
+模型：agy `gemini-3.8-flash-high`
+理由：規格可以寫死到欄位層級，錯了 typecheck 與測試會紅。
+相依：WP0。
+
+**事實清單**
+
+輸入：`~/.claude/sessions/<pid>.json` 的檔案內容字串。實測樣本（原文照抄）：
+
+    {"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
+     "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,
+     "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","peerProtocol":1,
+     "peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],
+     "kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
+     "tmux":"zed:@6.%8","messagingSocketPath":"/tmp/cc-socks/10064.sock",
+     "name":"zed-e4","nameSource":"derived","nameSince":1789007244364,
+     "status":"busy","updatedAt":1789009278063,"statusUpdatedAt":1789009278063,
+     "bridgeSessionId":"session_01Tf2BzmxZDH3YKYpdxtSrpD"}
+
+第二個實測樣本**沒有 `tmux` 欄位**（子 session）：
+
+    {"pid":17694,"sessionId":"095bcff6-b9a8-4584-a3c6-861f16c9a807",
+     "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789008783382,
+     "procStart":"Thu Sep 10 02:53:02 2026","version":"2.1.267","peerProtocol":1,
+     "peerFeatures":[...],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
+     "messagingSocketPath":"/tmp/cc-socks/17694.sock","name":"zed-28",
+     "nameSource":"derived","nameSince":1789008783382,"status":"busy",
+     "updatedAt":1789009345355,"statusUpdatedAt":1789009345355,
+     "bridgeSessionId":"session_01DzrBq3KnHvrXgSL43UVZgB"}
+
+要交付的東西：
+
+  pub struct RegisteredSession {
+      pub process_id: u32,
+      pub session_id: String,
+      pub working_directory: PathBuf,
+      pub process_start: String,          // 原樣保留，只做字串相等比對
+      pub version: String,
+      pub kind: String,
+      pub name: Option<String>,
+      pub status: Option<String>,
+      pub updated_at: Option<i64>,        // epoch millis
+      pub tmux_target: Option<String>,    // 保留給 P3，P1 只顯示
+      pub bridge_session_id: Option<String>,
+  }
+
+  /// 解析單一註冊檔。未知欄位忽略，缺少必要欄位回 Err。
+  pub fn parse_registered_session(contents: &str) -> anyhow::Result<RegisteredSession>
+
+  pub enum Liveness { Live, StaleHeartbeat, ProcessGone, PidReused }
+
+  /// 判活。process_start_of_pid 是注入的查詢函式，讓這支可以被測。
+  /// 回傳 Live 的條件三者皆須成立：
+  ///   1. process_start_of_pid(pid) 回 Some
+  ///   2. 該值與 session.process_start 字串相等（不相等 → PidReused）
+  ///   3. now_millis - updated_at <= stale_after_millis（超過 → StaleHeartbeat）
+  ///      updated_at 為 None 時視為不 stale（只靠 pid 判定）
+  pub fn liveness(
+      session: &RegisteredSession,
+      now_millis: i64,
+      stale_after_millis: i64,
+      process_start_of_pid: &dyn Fn(u32) -> Option<String>,
+  ) -> Liveness
+
+  /// 只保留 kind == "interactive" 且 Liveness::Live 的項目，
+  /// 依 (working_directory 是否等於或位於 project_root 之下, name) 排序，
+  /// 本專案的排前面。
+  pub fn visible_sessions(...) -> Vec<RegisteredSession>
+
+**硬性要求**
+
+  - `serde` 反序列化必須忽略未知欄位（不要 `deny_unknown_fields`）。
+    格式是私有的，新增欄位不得造成失敗。
+  - 單一檔案解析失敗不得影響其他檔案 —— 呼叫端逐檔處理，這支只負責單檔。
+  - 不得在此模組做任何檔案 I/O、不得取得系統時間、不得查 process。
+    全部由參數注入。這是為了讓它 100% 可測。
+  - **不得讀取、記錄或回傳 `~/.claude/sessions/<pid>.<sha>.key` 的任何內容。**
+    也不得把 `messagingSocketPath` 放進 `RegisteredSession`（P1 用不到，
+    少一個洩漏面）。
+
+**回歸測試（住在套件裡，寫測試的人自己跑）**
+
+  1. 完整樣本解析成功，每個欄位值逐一斷言。
+  2. 缺 `tmux` 的樣本解析成功，`tmux_target` 為 None。
+  3. 樣本加一個沒見過的欄位 `"futureField": 123` 仍解析成功。
+  4. 缺 `sessionId` → Err。
+  5. liveness：pid 不存在 → ProcessGone。
+  6. liveness：pid 存在但 process_start 不同 → PidReused。
+  7. liveness：pid 與 process_start 都對、updated_at 超過門檻 → StaleHeartbeat。
+  8. liveness：三條件都滿足 → Live。
+  9. visible_sessions 過濾掉 `kind != "interactive"`，並把本專案的排在前面。
+
+
+================================================================================
+A.3 WP2 —— transcript.rs（純函式）★ 單點失效處
+================================================================================
+
+模型：Opus 5 high（grok 額度已用盡；xhigh 不用於 code 生成）
+理由：跨概念（樹重建 + compact 語意 + 增量），沒有現成測試守著，做錯整個功能歪掉。
+相依：WP0。可與 WP1 並行。
+
+**事實清單 —— 記錄格式**
+
+JSON Lines，append-only。每筆的通用欄位：
+
+    uuid              String（部分 type 沒有，例如 mode / last-prompt / ai-title）
+    parentUuid        String | null   ← null 代表 root
+    isSidechain       bool
+    type              "user" | "assistant" | "attachment" | "system"
+                      | "file-history-snapshot" | "mode" | "permission-mode"
+                      | "bridge-session" | "atis-latch" | "last-prompt"
+                      | "ai-title" | "queue-operation"
+    subtype           僅 type=="system" 時有意義：
+                      "compact_boundary" | "bridge_status" | "local_command"
+                      | "away_summary" | "turn_duration"
+    timestamp / sessionId / cwd / gitBranch / version
+    message.content   陣列，block.type ∈ {text, thinking, tool_use, tool_result, image}
+                      （亦可能是純字串，見下）
+    toolUseResult     結構化 tool 結果，例：{"stdout": "..."}
+    attachment.type   type=="attachment" 時的子分類
+
+**注意：`message.content` 可能是字串也可能是陣列。** 實測兩種都有
+（`{"role":"user","content":"<local-command-caveat..."}` 是字串）。
+兩種都要能處理。
+
+**事實清單 —— compact（已在 33 筆歷史 compact 上驗證）**
+
+compact **不換檔、不換 sessionId**。掃過 294 個歷史 transcript，
+sessionId 與檔名不符者 0 筆。
+
+boundary 記錄（原文照抄關鍵欄位）：
+
+    {"type":"system","subtype":"compact_boundary",
+     "parentUuid":null,
+     "logicalParentUuid":"0be38277-dafc-4882-8493-ec43fbd0f61c",
+     "content":"Conversation compacted","level":"info",
+     "compactMetadata":{
+       "trigger":"manual","preTokens":792090,"postTokens":16995,
+       "cumulativeDroppedTokens":775095,"durationMs":133856,
+       "preservedSegment":{"headUuid":"...","anchorUuid":"...","tailUuid":"..."},
+       "preservedMessages":{"anchorUuid":"...","uuids":[...],"allUuids":[...]}},
+     "uuid":"366d2d68-af08-445e-be8d-4ddb07a7567f"}
+
+緊接一筆 `type:"user"`、`isCompactSummary: true`、`parentUuid` 指向 boundary 的
+uuid，內容以 "This session is being continued from a previous conversation" 開頭。
+
+已驗證：N 次 compact → 檔案中有 N+1 個 root（實測 boundaries=5 的檔 roots=6）。
+`trigger` 在 33 筆中全為 `"manual"`；**其他值（很可能有 `"auto"`）必須容錯，
+未知值原樣保留字串，不得 panic、不得當成錯誤。**
+
+**要交付的東西**
+
+  pub struct TranscriptRecord {
+      pub uuid: Option<String>,
+      pub parent_uuid: Option<String>,
+      pub logical_parent_uuid: Option<String>,
+      pub is_sidechain: bool,
+      pub record_type: String,
+      pub subtype: Option<String>,
+      pub is_compact_summary: bool,
+      pub compact_metadata: Option<CompactMetadata>,
+      pub raw: serde_json::Value,     // 原始 JSON，供未知型別降級顯示
+  }
+
+  pub struct CompactMetadata {
+      pub trigger: String,            // 未知值原樣保留
+      pub pre_tokens: Option<u64>,
+      pub post_tokens: Option<u64>,
+  }
+
+  /// 解析一行。解析失敗回 Err，呼叫端跳過該行繼續。空行回 Ok(None)。
+  pub fn parse_record(line: &str) -> anyhow::Result<Option<TranscriptRecord>>
+
+  pub struct Transcript { /* uuid -> record、插入序、目前 leaf */ }
+
+  impl Transcript {
+      pub fn new() -> Self;
+
+      /// 依序吸收新的記錄。可重複呼叫（增量 tail）。
+      /// leaf 的更新規則：只要新記錄有 uuid 且 is_sidechain == false，
+      /// 就成為新的 leaf。
+      pub fn absorb(&mut self, records: impl IntoIterator<Item = TranscriptRecord>);
+
+      /// 從目前 leaf 沿 parentUuid 往回走，反轉後回傳。
+      /// 遇到 parentUuid == None 就停止 —— 這正是「模型現在看得到的上下文」。
+      pub fn active_path(&self) -> Vec<&TranscriptRecord>;
+
+      /// 同上，但在 subtype == "compact_boundary" 的記錄處改跟
+      /// logicalParentUuid 繼續往回走，直到真正的檔案起點。
+      /// boundary 記錄本身要留在結果裡（UI 要畫分界）。
+      pub fn full_path(&self) -> Vec<&TranscriptRecord>;
+
+      pub fn compact_boundaries(&self) -> Vec<&TranscriptRecord>;
+  }
+
+**硬性要求**
+
+  - **不得做線性播放。** 顯示順序一律來自 path 走訪。
+  - **`is_sidechain == true` 的記錄要吸收但不得進入 path**（P1 不顯示 subagent，
+    但資料結構要能容納，P2 才不用重寫）。
+  - 環狀 parentUuid（不該發生，但檔案可能損毀）必須有走訪上限或 visited set，
+    **不得無限迴圈**。這一條要有測試。
+  - parentUuid 指向不存在的 uuid（tail 尚未讀到、或檔案損毀）→ 走訪在該處停止，
+    回傳已走到的部分，不得 panic、不得回空。
+  - 未知的 `type` / `subtype` / block type 一律保留在 `raw` 裡，不得丟棄。
+  - 這個模組**不得有任何檔案 I/O**。輸入只有字串與記錄。
+
+**回歸測試**
+
+  1. 線性 5 筆 → active_path 順序正確。
+  2. 分支：uuid A 有兩個 child B、C（C 較晚吸收）→ leaf 為 C，
+     active_path 含 C 不含 B。
+  3. compact：root1 → ... → tail，接 boundary(parentUuid=null,
+     logicalParentUuid=tail)，接 summary(isCompactSummary) → 之後三筆。
+     - active_path 從 boundary 開始，**不含** compact 前的內容。
+     - full_path 含 compact 前的全部內容，且 boundary 記錄在正確位置。
+  4. 兩次 compact（3 個 root）→ full_path 依時序完整、active_path 只到最後一段。
+  5. `trigger` 為 `"auto"` 與為 `"something-new"` 都能解析，字串原樣保留。
+  6. `message.content` 為字串的記錄能解析。
+  7. `isSidechain: true` 的記錄被吸收，但不出現在任何 path 中。
+  8. parentUuid 環狀（A→B→A）→ 走訪終止並回傳有限結果（給明確 timeout）。
+  9. parentUuid 指向不存在的 uuid → 走訪在該處停止，回傳非空的部分路徑。
+ 10. 未知 type `"brand-new-thing"` 解析成功，`raw` 內容完整。
+ 11. 增量：先 absorb 前半、取 path，再 absorb 後半、再取 path，
+     結果與一次 absorb 全部相同。
+
+**盲測**（另一隻，見 A.6）針對 3、4、8、9 這四項，只給上面的 signature 與
+compact 語意描述，不給實作。
+
+
+================================================================================
+A.4 WP3 —— session_store.rs（非同步生命週期）
+================================================================================
+
+模型：Opus 5 high（grok 額度已用盡；xhigh 不用於 code 生成）
+理由：非同步生命週期 + 檔案輪詢 + 狀態切換，規則明訂不給 agy。
+相依：WP1、WP2 完成且測試綠。
+
+**事實清單**
+
+  - 註冊表目錄：`<home>/.claude/sessions/`，逐檔 `*.json`（忽略 `*.key`）。
+  - transcript 定位：**glob `<home>/.claude/projects/*/<sessionId>.jsonl`**。
+    **不得自己把 cwd 的 `/` 換成 `-` 去組路徑**（slug 規則未文件化）。
+    找不到 → 該 session 標為 `transcript: None`，仍要列出來。
+  - home 用 `crates/paths` 既有的 helper 取得，不要自己讀 `$HOME`。
+  - 判活需要 pid 的 process start time。**macOS 讀不到其他 process 的環境變數**
+    （`ps eww -p <其他 pid>` 實測回空），所以只能用 `ps -o lstart= -p <pid>`
+    這類方式取得啟動時間字串，與註冊檔的 `procStart` 做字串比對。
+    Linux 走 `/proc/<pid>/stat` 也可以，但**必須兩個平台都有實作**，
+    不得寫成只在其中一個平台能動。
+
+  - 輪詢（P1 用輪詢，不用 fs.watch，理由見正文 §7）：
+      * 註冊表目錄       每 1000ms 重掃一次
+      * 目前選中的 transcript 每 250ms `metadata()` 看 size 有無變化
+      * 沒有選中的 session 不 tail
+  - 增量讀取：記住 byte offset，只讀新增段落。
+    **sanity check：檔案 size < 已記錄 offset → 丟棄狀態、從頭重讀。**
+    最後一行可能是半行（正在寫入）→ 保留在 buffer，下次補齊再 parse。
+  - **sessionId 變更偵測**：同一個 pid 的註冊檔 `sessionId` 改變（`/clear`）
+    → 清空 Transcript、換檔、offset 歸零、通知 UI。
+    這是主要的切檔訊號；compact **不會**觸發它（已驗證）。
+
+**要交付的東西**
+
+  一個 GPUI entity（`Entity<ClaudeSessionStore>`），內含：
+    - `sessions: Vec<RegisteredSession>`（已判活、已排序）
+    - `selected: Option<u32>`（pid）
+    - `transcript: Transcript`
+    - 兩個輪詢 Task，存在欄位裡（entity drop 即停止）
+    - 狀態改變時 `cx.notify()`
+
+  對 UI 只暴露：`sessions()`、`selected()`、`select(pid)`、`transcript()`。
+
+**硬性要求**
+
+  - 所有 fallible 操作用 `?` 或 `.log_err()`，**不得 `let _ =`**。
+  - 檔案讀取一律在 `cx.background_spawn` 上，不得阻塞前景執行緒。
+  - 單一 session 的檔案讀取失敗不得讓整個列表消失。
+  - 不得讀取 `*.key`，不得把 `messagingSocketPath` 帶進任何結構。
+
+**驗收要回答的兩個問題（review 清單必列）**
+
+  - **終止性**：每個輪詢迴圈的退出條件是什麼？entity 被 drop 時 Task 真的停了嗎？
+  - **錯誤復原**：一行畸形 JSON 會不會吃掉後面全部？半行處理會不會在
+    「剛好切在多位元組 UTF-8 字元中間」時壞掉？（要有測試）
+
+
+================================================================================
+A.5 WP4 —— claude_sessions_panel.rs（一整頁）
+================================================================================
+
+模型：Opus 5 high（grok 額度已用盡）。規則上「任何一整頁」原本派 grok high。
+相依：WP3。
+
+**事實清單**
+
+  - Panel 結構、`Panel` trait 實作、`load()` 的形狀，抄
+    `crates/tmux_sessions/src/tmux_sessions_panel.rs`（413 行）。
+    forward_ports_panel.rs（973 行）是比較複雜的參考。
+  - markdown render 用既有的 `crates/markdown`：
+      `Markdown::new(...)` (markdown.rs:646)
+      `Markdown::new_text(source, cx)` (markdown.rs:712)
+      `Markdown::append(&mut self, text, cx)` (markdown.rs:997)
+      `Markdown::reset(&mut self, source, cx)` (markdown.rs:1042)
+      `MarkdownElement::new(markdown_entity, style)` (markdown.rs:1640)
+  - 圖片：`gpui::Image { format, bytes, id }`（crates/gpui/src/platform.rs:2707）。
+    參考 agent panel 對 `ContentBlock::Image` 的處理
+    （crates/acp_thread/src/acp_thread.rs:1746）。
+  - **只用既有 `IconName` 的值，不得新增圖示資產。**
+
+**畫面**
+
+  上半：session 列表（name、cwd 相對顯示、version、status 點、
+        bridge 圖示（`bridgeSessionId` 有值時）、tmux target 灰字）。
+  下半：選中 session 的對話流，虛擬捲動。
+
+  對話流的 render 規則：
+    - `text` block         → markdown
+    - `thinking` block     → 預設折疊
+    - `tool_use` /
+      `tool_result`        → 折疊卡片。優先用 top-level `toolUseResult`
+                             （結構化）而不是文字 content 做 render。
+    - `<persisted-output>` marker（見正文 §1.4）→ 顯示 preview，
+                             加「載入完整輸出」按鈕，按下才去讀那個絕對路徑。
+    - `attachment`         → 全部收進一個折疊的 context 區，不平鋪在對話流。
+    - `compact_boundary`   → 一條明確分界，顯示 trigger 與
+                             `preTokens -> postTokens`；分界以上的歷史
+                             **預設折疊**，展開時改用 `full_path()`。
+    - `local_command`      → content 含 ANSI escape，**要 strip 後再顯示**。
+    - 未知 type / block    → 降級成 raw JSON 折疊區。**不得丟棄、不得 panic。**
+
+**硬性要求**
+
+  - 唯讀。P1 不放輸入框（或放但停用並標示「P3」）。
+  - 大 transcript（實測單檔 2.7MB / 2695 筆）必須虛擬捲動，
+    不得整份 render。切換 session 時不得整份重 parse。
+
+
+================================================================================
+A.6 盲測
+================================================================================
+
+模型：Opus 5 medium。**不可降。**
+
+  - 只給 WP1 / WP2 的 signature 與語意描述（A.2、A.3 的「要交付的東西」與
+    「硬性要求」兩段，逐字複製），**禁止看實作**。
+  - 寫好之後 held out：**實作者與 fixer 都不准讀、不准跑、不准改。**
+  - 重點涵蓋 WP2 的 3、4、8、9（compact 兩段路徑、環狀、斷鏈）。
+  - 回歸測試才住在套件裡；盲測放在 held-out 位置由大腦跑。
+
+
+================================================================================
+A.7 派工樣板
+================================================================================
+
+（grok 額度用盡後，本任務書只剩兩種派工對象：Workflow 的 `agent()`（Opus）與 agy CLI。
+下面的 `agent` CLI 段落先留著，等額度回來直接可用。）
+
+每一份 subagent / agy / agent prompt 開頭逐字貼：
+
+  第一步先跑 `ToolSearch("select:mcp__codegraph__codegraph_explore")`，再用
+  `codegraph_explore` 查符號定義／回傳形狀／呼叫者／blast radius／測試覆蓋，
+  一次問完。配額用完改走 shell `codegraph explore "<符號>"`。
+  grep 只准用於字串常數、檔案列舉、build 產物。
+
+（agy / agent 這類 CLI 子行程沒有 MCP，改貼：）
+
+  先用 shell `codegraph explore "<符號或問題>"` 查符號定義／回傳形狀／呼叫者／
+  blast radius／測試覆蓋，一次問完。grep 只准用於字串常數、檔案列舉、build 產物。
+
+結尾逐字貼：
+
+  發現規格自相矛盾、或你正在挑輸入／加資料讓某個測試過，停下來回報，
+  不要換輸入。回報「做不到」是成功的結果。
+  禁止 `git stash` / `git checkout` / `git restore` / `git reset`。
+
+
+================================================================================
+A.8 依賴順序與驗收
+================================================================================
+
+    WP0 ──┬── WP1 ──┐
+          └── WP2 ──┴── WP3 ── WP4
+                 └── 盲測（與 WP1/WP2 並行，不同隻，不看實作）
+
+每個 WP 結束跑機械 gate（大腦在主迴圈跑，不派給 agent）：
+
+    ./script/clippy                      ← 不是 cargo clippy
+    cargo test -p claude_sessions
+    codegraph affected <本輪改動的檔案>   ← 跑出來的測試檔也要跑
+
+review loop 依 CLAUDE.md：每輪一隻 agent 從頭做到尾（找缺陷 → 落 RED 測試 →
+修到綠），乾淨 context、對抗立場。
+
+**跨家族 review 這一輪做不到**：grok 額度已用盡，剩下的另一個家族只有
+agy `gemini-3.8-flash-high`，而對抗式 review 不屬於它能勝任的「事實清單寫得死」那格。
+折衷做法：
+
+  - WP2 / WP3 至少各兩輪，兩輪都是 Opus，但**必須**乾淨 context、對抗立場，
+    且第二輪換 effort（第一輪 high、第二輪 medium 走不同的注意力分布）。
+  - 兩輪都不得由實作者本人執行。
+  - 額外補一輪 agy `gemini-3.8-flash-high` 的**機械對帳**（不是 review）：
+    檢查 `git diff` 的每一處 `src/` 改動是否都對得上一條 finding、
+    findings 數／RED 測試數／修正條目數是否對得起來。這是它能做的部分。
+  - grok 額度回來之後，WP2 與 WP3 要補一輪真正的跨家族 review。**這條記在這裡別忘。**
+
+P1 完成的定義：
+  - Zed 能列出本機所有活著的 interactive claude session。
+  - 選一個能看到完整對話，含圖片、markdown 表格、折疊的 tool call。
+  - 對方在 tmux／手機／網頁打字，Zed 這邊即時跟上。
+  - 對方 `/compact`，Zed 畫出分界、預設折疊舊歷史、可展開看完整。
+  - 對方 `/clear`，Zed 自動切到新 session 而不是卡在舊對話。

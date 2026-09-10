@@ -602,6 +602,7 @@ pub fn add_wsl_distro(
                 distro_name,
                 user,
                 projects: BTreeSet::new(),
+                port_forwards: None,
             })
         }
     });

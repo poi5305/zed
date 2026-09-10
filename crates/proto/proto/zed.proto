@@ -13,7 +13,9 @@ import "git.proto";
 import "image.proto";
 import "lsp.proto";
 import "notification.proto";
+import "port_forward.proto";
 import "task.proto";
+import "tmux.proto";
 import "toolchain.proto";
 import "worktree.proto";
 
@@ -524,7 +526,15 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+    OpenPortTunnel open_port_tunnel = 496;
+    PortTunnelData port_tunnel_data = 497;
+    PortTunnelAck port_tunnel_ack = 498;
+    ClosePortTunnel close_port_tunnel = 499;
+    GetListeningPorts get_listening_ports = 500;
+    GetListeningPortsResponse get_listening_ports_response = 501;
+    ListTmuxSessions list_tmux_sessions = 502;
+    ListTmuxSessionsResponse list_tmux_sessions_response = 503; // current max
   }
 
   reserved 87 to 88;

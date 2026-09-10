@@ -190,6 +190,8 @@ messages!(
     (LinkedEditingRangeResponse, Background),
     (ListRemoteDirectory, Background),
     (ListRemoteDirectoryResponse, Background),
+    (ListTmuxSessions, Background),
+    (ListTmuxSessionsResponse, Background),
     (ListToolchains, Foreground),
     (ListToolchainsResponse, Foreground),
     (LoadCommitDiff, Foreground),
@@ -231,6 +233,12 @@ messages!(
     (PerformRename, Background),
     (PerformRenameResponse, Background),
     (Ping, Foreground),
+    (OpenPortTunnel, Background),
+    (PortTunnelData, Background),
+    (PortTunnelAck, Background),
+    (ClosePortTunnel, Background),
+    (GetListeningPorts, Background),
+    (GetListeningPortsResponse, Background),
     (PrepareCallHierarchy, Background),
     (PrepareCallHierarchyResponse, Background),
     (PrepareRename, Background),
@@ -491,6 +499,7 @@ request_messages!(
     (GetTypeDefinition, GetTypeDefinitionResponse),
     (LinkedEditingRange, LinkedEditingRangeResponse),
     (ListRemoteDirectory, ListRemoteDirectoryResponse),
+    (ListTmuxSessions, ListTmuxSessionsResponse),
     (GetUsers, UsersResponse),
     (IncomingCall, Ack),
     (InlayHints, InlayHintsResponse),
@@ -516,6 +525,8 @@ request_messages!(
     (OpenNewBuffer, OpenBufferResponse),
     (PerformRename, PerformRenameResponse),
     (Ping, Ack),
+    (OpenPortTunnel, Ack),
+    (GetListeningPorts, GetListeningPortsResponse),
     (PrepareCallHierarchy, PrepareCallHierarchyResponse),
     (GetIncomingCalls, GetIncomingCallsResponse),
     (GetOutgoingCalls, GetOutgoingCallsResponse),
@@ -908,7 +919,11 @@ entity_messages!(
     FindSearchCandidatesChunk,
     FindSearchCandidatesCancelled,
     DownloadFileByPath,
-    GetRemoteProfilingData
+    GetRemoteProfilingData,
+    OpenPortTunnel,
+    PortTunnelData,
+    PortTunnelAck,
+    ClosePortTunnel
 );
 
 entity_messages!(
