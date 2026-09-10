@@ -927,3 +927,230 @@ P1 完成的定義：
   - 對方在 tmux／手機／網頁打字，Zed 這邊即時跟上。
   - 對方 `/compact`，Zed 畫出分界、預設折疊舊歷史、可展開看完整。
   - 對方 `/clear`，Zed 自動切到新 session 而不是卡在舊對話。
+
+
+================================================================================
+================================================================================
+附錄 B：規格修訂（review 輪 1 之後，由大腦裁決）
+================================================================================
+================================================================================
+
+review 輪 1 升級了三條「規格沒決定」的東西。以下是裁決，實作與盲測都以此為準。
+
+--------------------------------------------------------------------------------
+B.1 修訂（對應 F9）：persisted output 的辨識改用結構化欄位
+--------------------------------------------------------------------------------
+
+**問題**：正文 §1.4 說用 `<persisted-output>` marker 文字去認卸載的大型輸出。
+但實作出來之後，整條路徑在生產環境是死碼——因為 `toolUseResult`（結構化）
+勝過 content block，而 `toolUseResult.stdout` 裡沒有 marker。
+
+**實測資料（2026-09-10，掃全部歷史 transcript）**
+
+    toolUseResult 帶 persisted* 欄位的記錄：86 筆
+      persistedOutputPath：85 筆
+      persistedOutputSize：85 筆
+    tool_result block 的 content 含 <persisted-output> marker：86 筆
+    樣本：
+      persistedOutputPath = ".../tool-results/b7vd9w357.txt"
+      persistedOutputSize = 82585
+      stdout 長度         = 29999   ← 被截在 30000，**不含 marker**
+      resultKeys = [stdout, stderr, interrupted, isImage,
+                    noOutputExpected, persistedOutputPath, persistedOutputSize]
+
+**裁決：不是二選一，兩個都要。** review 輪提的 (a) 保留 stdout 內嵌、
+(b) 改用 marker preview 加載入按鈕——兩者都比正確答案差：
+
+  - 內嵌本文用 `toolUseResult.stdout`（實測 30 KB），**不是** marker 的 2 KB preview。
+    這是使用者立刻看到的東西，30 KB 遠勝 2 KB，也遠勝 terminal。
+  - **同時**，當 `persistedOutputPath` 存在時，顯示「Load full output」按鈕，
+    大小標示用 `persistedOutputSize`（實測 82,585），按下才讀那個路徑。
+  - 也就是說「內嵌 preview」與「可載入完整」是兩件獨立的事，不互斥。
+    原規格把它們綁在一起才產生了死碼。
+
+**路徑淨化（F3 已修的那條，這裡再收緊一次）**
+
+  - 路徑**只能**來自 `toolUseResult.persistedOutputPath`，或
+    `type == "attachment"` 記錄的 marker 文字（hook 輸出走這條）。
+  - **絕對不得**從 `message.content` 的文字（user text、assistant text）解析路徑。
+    實測 marker 從不出現在那裡，任何在那裡的 marker 都是偽造或巧合。
+  - 讀檔前必須驗證：路徑是絕對路徑，且位於
+    `<home>/.claude/projects/` 之下。不符就不顯示按鈕（顯示原文即可），
+    不要顯示一個會失敗的按鈕。
+  - marker 文字解析保留為 fallback（85/86 有結構化欄位，那 1 筆與 attachment 需要它）。
+
+--------------------------------------------------------------------------------
+B.2 修訂（對應 F11）：visible_sessions 的排序平手規則
+--------------------------------------------------------------------------------
+
+**問題**：正文 §2 與附錄 A.2 定義排序 key 為
+`(是否屬於本專案 == false, name 字串序)`，沒有定義平手時怎麼排。
+於是同名（或同為 None）的 session 繼承 `read_dir` 的任意順序，
+每次輪詢都可能互換，UI 列會閃動。
+
+**裁決：加第三段 tiebreaker `process_id` 遞增。**
+
+    排序 key = (是否屬於本專案 == false, name 字串序, process_id 遞增)
+
+理由：`process_id` 在活著的 session 之間唯一、在 session 生命期內不變、
+是數值比較不需要正規化。`session_id` 也唯一但沒有比 pid 更好的性質。
+
+`name` 為 `None` 時排序仍當空字串（原規則不變）。
+
+--------------------------------------------------------------------------------
+B.3 修訂（對應 F8）：對話 entry 要以 record uuid 為鍵快取
+--------------------------------------------------------------------------------
+
+**問題**：正文 §5 與附錄 A.5 只寫了「必須虛擬捲動」「切換 session 時不得整份重
+parse」，沒有寫「同一個 session 收到新資料時不得整份重建」。
+於是實作每次 store 通知都在前景執行緒走完整條 path 重建所有 entry：
+每張圖重新 base64 解碼（貼上的截圖每張約 1.5 MB）、每筆 unknown 記錄重新
+pretty-print JSON，然後再逐位元組比較找出差異。串流中每秒最多 4 次。
+
+**裁決：規格補一條——昂貴的 per-record 產物必須以 record uuid 為鍵快取，
+跨重建存活。**
+
+  - 快取鍵：`record uuid`（+ block index，因為一筆記錄可以有多個 block）。
+  - 必須跨重建存活的產物：base64 解碼後的圖片位元組、pretty-print 的 raw JSON、
+    ANSI strip 後的文字、markdown 來源字串。
+  - 記錄一旦吸收就不會再變（append-only + uuid 覆蓋是罕例），
+    所以快取不需要失效策略；只需要在切 session／transcript restart 時整份丟棄。
+  - 同 uuid 被覆蓋（`absorb` 允許）時要丟該鍵的快取。
+  - 這條**不是**效能優化的建議，是正確性層級的要求：
+    沒有它，本功能在它最該發光的場景（長 session、貼了截圖）會卡。
+
+--------------------------------------------------------------------------------
+B.4 明確留給 P2 的（不在 P1 範圍）
+--------------------------------------------------------------------------------
+
+  - review 輪 1 的 F10（decode_base64 對畸形輸入靜默寬鬆）、F12（registry 與
+    transcript 共用一個 error 欄位，前者成功會清掉後者的訊息）——標 wontfix，
+    嚴重度低於門檻，記錄在此。
+  - grok 額度回來之後，`transcript.rs` 與 `session_store.rs` 要補一輪
+    真正的跨家族 review（見 A.8）。
+
+
+================================================================================
+================================================================================
+附錄 C：P1 完成記錄（2026-09-10）
+================================================================================
+================================================================================
+
+--------------------------------------------------------------------------------
+C.1 交付狀態
+--------------------------------------------------------------------------------
+
+    cargo test -p claude_sessions   140 passed / 0 failed
+                                      ├─ 71 條 held-out 盲測（語意從未被修改，
+                                      │   去空白 hash 與原始副本相同）
+                                      └─ 69 條回歸測試
+    ./script/clippy                 綠（--workspace --release --all-targets
+                                       --all-features -- --deny warnings）
+    cargo build -p zed              綠
+    README.md 的 > [!IMPORTANT] 兩行  完好
+
+crates/claude_sessions/ 共 6366 行（含測試）：
+
+    claude_sessions.rs            35   crate root / actions / init
+    claude_sessions_button.rs     57   status bar 按鈕（IconName::AiClaude）
+    transcript.rs                671   純函式：記錄解析與對話樹
+    session_registry.rs          410   純函式：註冊表解析與判活
+    session_store.rs            1252   非同步：探索、tail、生命週期
+    claude_sessions_panel.rs    2571   Panel UI
+    blind_registry_tests.rs      587   held-out
+    blind_transcript_tests.rs    783   held-out
+
+--------------------------------------------------------------------------------
+C.2 執行過程
+--------------------------------------------------------------------------------
+
+WP0（crate 骨架 + wiring）由大腦在主迴圈完成——碰 Cargo.toml / zed.rs / main.rs
+三個共用檔，風險不外派。
+
+WP1  agy gemini-3.8-flash-high
+WP2  Opus 5 high（Workflow）        ← grok 額度用盡，原表派 grok xhigh
+WP3  Opus 5 high（Workflow）        ← 同上
+WP4  Opus 5 high（Workflow）        ← 原表派 grok high
+盲測  Opus 5 medium（Workflow），派工時 transcript.rs 仍為 placeholder，
+      物理上看不到實作
+review 輪 1        Opus 5 high，乾淨 context、對抗立場
+規格修訂 B.1–B.3   Opus 5 high
+最終 spec 比對     Opus 5 high
+
+findings 對帳：
+
+    review 輪 1     12 條 = fix 7 + wontfix 5   測試 122 → 130
+    規格修訂        3 條（B.1/B.2/B.3）          測試 130 → 137
+    最終 audit      6 條 = fix 3 + wontfix 3     測試 137 → 140
+
+比對表統計：DONE 61、MISSING（已修）2、NO_TEST（wontfix）1、OUT_OF_P1 4。
+
+--------------------------------------------------------------------------------
+C.3 大腦的突變抽查（不採信 agent 回報，自行驗證）
+--------------------------------------------------------------------------------
+
+每一輪交付後，大腦都把「應該被測試釘住的行為」故意改壞，確認測試真的會紅。
+這是唯一能證明測試不是空轉的方法。
+
+    突變                                         結果
+    ─────────────────────────────────────────────────────────────────────
+    full_path 不跟 logicalParentUuid            4 個盲測 + 3 個自有測試變紅  ✓
+    walk 的 sidechain 過濾拿掉                   1 個盲測變紅                 ✓
+    absorb 的 sidechain leaf 守衛拿掉             【122 個測試全綠】← 缺口
+      → 列為 F1 交給 review 輪落成 RED
+      → 補測試後重跑：a_sidechain_record_must_not_become_the_leaf 變紅  ✓
+    忽略 is_compact_summary                      1 個測試變紅                 ✓
+    attachment 不過路徑界限                       1 個測試變紅                 ✓
+
+F1 是整個 P1 唯一一個「實作正確但沒有任何測試守著」的行為，而且它只在
+大腦做突變抽查時才浮現——71 條盲測與 27 條回歸測試都沒抓到，因為 walk 的
+過濾遮蔽了 absorb 的錯誤。review 輪 1 另外實測 828 份真實 transcript，
+證明它的嚴重度比大腦初判的「低」更高：375 份含 sidechain 記錄的 transcript
+全部以 sidechain 結尾，突變下會回傳空 path，45% 的真實 transcript 會顯示「無訊息」。
+
+--------------------------------------------------------------------------------
+C.4 剩餘項（全部有明確歸屬，沒有一項是「P1 沒做完」）
+--------------------------------------------------------------------------------
+
+**效能，非正確性風險（修法都要改 WP3/WP4 的交付形狀，屬設計決定）**
+
+  G4  `Entry` 的 derive `PartialEq` 對 `Arc<Image>` 比值不比指標，
+      所以 rebuild 的 prefix/suffix 掃描會 memcmp 每張已解碼的截圖。
+      修法要手寫 `PartialEq` 讓圖片走 `Arc::ptr_eq`，會動到 splice 邏輯
+      賴以建立的相等語意。
+  G6  新選中的 transcript 第一批在前景執行緒 parse（2.7 MB / 2695 筆）。
+      A.4 的硬性要求是「檔案讀取不得阻塞前景」，那一條沒有違反；
+      這是每次選取一次性的數十毫秒。
+
+**無測試但推導不出錯誤輸出**
+
+  G5  B.3 的「切 session／transcript restart 整份丟棄快取」實作正確但無測試。
+      要釘它得把整個 Workspace + Project 立起來（現有 panel 測試全是
+      build_entries 層的純函式測試）。缺這個 guard 也推導不出錯誤輸出：
+      uuid 全域唯一 + §3.3 保證檔案不被改寫 + retain_keys 已收住記憶體。
+      **這是本 crate 唯一的 NO_TEST，明確記錄在此而非默默放掉。**
+
+**已知殘留**
+
+  - `persisted_output_is_loadable` 不做 `canonicalize`（純函式不做 I/O），
+    所以界限內指向界限外的 symlink 不攔。
+  - F10 `decode_base64` 對畸形輸入靜默寬鬆（合法輸入正確，畸形最後都是空的
+    或被 ImageFormat 拒收）。
+  - F12 registry 與 transcript 共用一個 error 欄位，前者成功會清掉後者的訊息。
+
+**流程上欠的一輪**
+
+  - CLAUDE.md 要求 WP2 / WP3 的第二輪 review 換不同家族的模型。
+    grok 額度用盡，這一輪做不到；effort 換擋只是弱代理，不是等價替換。
+    **額度回來之後 transcript.rs 與 session_store.rs 要補一輪真正的
+    跨家族 review。** 這條不影響 P1 的功能完整性，但它是這次交付
+    唯一沒有滿足的流程要求。
+
+--------------------------------------------------------------------------------
+C.5 下一步
+--------------------------------------------------------------------------------
+
+P2（subagent / workflow 檢視，見正文 §4）的資料層在 P1 已經備好：
+`transcript.rs` 吸收 `isSidechain` 記錄但不讓它進 path，所以 P2 只要
+讀 `<sessionId>/subagents/agent-<id>.{jsonl,meta.json}` 並用 `toolUseId`
+掛回主對話，不需要重寫任何 P1 的東西。
