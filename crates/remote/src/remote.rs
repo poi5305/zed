@@ -1,4 +1,5 @@
 pub mod command;
+pub mod claude_sessions;
 pub mod json_log;
 pub mod listening_ports;
 pub mod port_forward;

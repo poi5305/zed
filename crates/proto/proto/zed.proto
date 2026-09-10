@@ -6,6 +6,7 @@ import "app.proto";
 import "buffer.proto";
 import "call.proto";
 import "channel.proto";
+import "claude_sessions.proto";
 import "core.proto";
 import "debugger.proto";
 import "download.proto";
@@ -534,7 +535,14 @@ message Envelope {
     GetListeningPorts get_listening_ports = 500;
     GetListeningPortsResponse get_listening_ports_response = 501;
     ListTmuxSessions list_tmux_sessions = 502;
-    ListTmuxSessionsResponse list_tmux_sessions_response = 503; // current max
+    ListTmuxSessionsResponse list_tmux_sessions_response = 503;
+    ListClaudeSessions list_claude_sessions = 504;
+    ListClaudeSessionsResponse list_claude_sessions_response = 505;
+    TailClaudeTranscript tail_claude_transcript = 506;
+    TailClaudeTranscriptResponse tail_claude_transcript_response = 507;
+    ReadClaudeFile read_claude_file = 508;
+    ReadClaudeFileResponse read_claude_file_response = 509;
+    SendClaudeInput send_claude_input = 510; // current max
   }
 
   reserved 87 to 88;

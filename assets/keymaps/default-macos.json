@@ -1780,4 +1780,11 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  {
+    "context": "ClaudeSessionsInput > Editor",
+    "bindings": {
+      "enter": "claude_sessions::SendMessage",
+      "shift-enter": "editor::Newline",
+    },
+  },
 ]

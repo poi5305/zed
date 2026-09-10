@@ -46,4 +46,5 @@ util.workspace = true
 which.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

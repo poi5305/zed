@@ -1,0 +1,73 @@
+syntax = "proto3";
+package zed.messages;
+
+// Claude Code session running on the remote machine.
+message ClaudeSession {
+  uint32 process_id = 1;
+  string session_id = 2;
+  string working_directory = 3;
+  string version = 4;
+  optional string name = 5;
+  optional string status = 6;
+  optional int64 updated_at = 7;
+  optional string tmux_target = 8;
+  optional string transcript_path = 9;
+}
+
+// Request to list Claude Code sessions on the remote host.
+message ListClaudeSessions {
+  uint64 project_id = 1;
+  optional string project_root = 2;
+}
+
+// Response containing the list of Claude Code sessions on the remote host.
+message ListClaudeSessionsResponse {
+  repeated ClaudeSession sessions = 1;
+  // Home directory of the machine that produced the paths in this response, which is
+  // the machine the sessions run on rather than the one Zed runs on. Every path the
+  // client checks against a boundary under the home directory has to be checked
+  // against this one.
+  string home_directory = 2;
+}
+
+// Request to incrementally read the transcript of a Claude Code session.
+message TailClaudeTranscript {
+  uint64 project_id = 1;
+  string session_id = 2;
+  optional string path = 3;
+  uint64 offset = 4;
+  bytes pending = 5;
+}
+
+// Incremental transcript updates and progress state for a Claude Code session.
+message TailClaudeTranscriptResponse {
+  optional string path = 1;
+  uint64 start_offset = 2;
+  uint64 offset = 3;
+  bytes pending = 4;
+  repeated string lines = 5;
+  bool restarted = 6;
+}
+
+// Request to read the head of an offloaded tool output file.
+message ReadClaudeFile {
+  uint64 project_id = 1;
+  string path = 2;
+  uint64 max_bytes = 3;
+}
+
+// Response containing file contents up to max_bytes and whether it was truncated.
+message ReadClaudeFileResponse {
+  bytes contents = 1;
+  bool truncated = 2;
+}
+
+// Request to send text or an Escape keypress to a Claude Code session's tmux pane.
+message SendClaudeInput {
+  uint64 project_id = 1;
+  string pane_target = 2;
+  oneof input {
+    string text = 3;
+    bool escape = 4;
+  }
+}
