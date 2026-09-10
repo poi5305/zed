@@ -602,6 +602,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let project_manager_button = cx.new(|_| project_manager::ProjectManagerButton::new());
         let forward_ports_button = cx.new(|_| forward_ports::ForwardPortsButton::new());
         let tmux_sessions_button = cx.new(|_| tmux_sessions::TmuxSessionsButton::new());
+        let claude_sessions_button = cx.new(|_| claude_sessions::ClaudeSessionsButton::new());
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
@@ -638,6 +639,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(project_manager_button, window, cx);
             status_bar.add_left_item(forward_ports_button, window, cx);
             status_bar.add_left_item(tmux_sessions_button, window, cx);
+            status_bar.add_left_item(claude_sessions_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
@@ -788,6 +790,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             forward_ports::ForwardPortsPanel::load(workspace_handle.clone(), cx.clone());
         let tmux_sessions_panel =
             tmux_sessions::TmuxSessionsPanel::load(workspace_handle.clone(), cx.clone());
+        let claude_sessions_panel =
+            claude_sessions::ClaudeSessionsPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
@@ -815,6 +819,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(project_manager_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(forward_ports_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(tmux_sessions_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(claude_sessions_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),

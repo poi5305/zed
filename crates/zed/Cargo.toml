@@ -91,6 +91,7 @@ channel.workspace = true
 chrono.workspace = true
 clap.workspace = true
 cli.workspace = true
+claude_sessions.workspace = true
 client.workspace = true
 clock = { workspace = true, optional = true }
 codestral.workspace = true

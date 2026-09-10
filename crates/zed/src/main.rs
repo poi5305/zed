@@ -743,6 +743,7 @@ fn main() {
         project_manager::init(cx);
         forward_ports::init(cx);
         tmux_sessions::init(cx);
+        claude_sessions::init(cx);
         project_panel::init(cx);
         outline_panel::init(cx);
         tasks_ui::init(cx);

@@ -27,6 +27,7 @@ members = [
     "crates/call_hierarchy",
     "crates/channel",
     "crates/cli",
+    "crates/claude_sessions",
     "crates/client",
     "crates/clock",
     "crates/cloud_api_client",
@@ -303,6 +304,7 @@ call = { path = "crates/call" }
 call_hierarchy = { path = "crates/call_hierarchy" }
 channel = { path = "crates/channel" }
 cli = { path = "crates/cli" }
+claude_sessions = { path = "crates/claude_sessions" }
 client = { path = "crates/client" }
 clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
