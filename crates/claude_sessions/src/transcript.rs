@@ -108,15 +108,37 @@ pub struct Transcript {
     index_by_uuid: HashMap<String, usize>,
     leaf_uuid: Option<String>,
     overwritten_uuids: Vec<String>,
+    /// Whether this transcript is itself one sub-agent's conversation rather than a
+    /// session's own thread; see [`Self::for_sidechain`].
+    reads_sidechain: bool,
 }
 
 impl Transcript {
+    /// A session's own thread, in which a sidechain record belongs to a sub-agent and is
+    /// therefore not part of the conversation being read.
     pub fn new() -> Self {
+        Self::with_reading(false)
+    }
+
+    /// One sub-agent's own conversation.
+    ///
+    /// Every line of such a file carries `isSidechain`, because that is how Claude Code
+    /// marks a record as belonging to an agent rather than to the thread the user is
+    /// talking in. Read as a session's own thread the file therefore has no conversation
+    /// in it at all: the leaf never moves and every record is skipped on the way back.
+    /// This reading takes the file for what it is, and is only ever used on a file that
+    /// is one agent's.
+    pub fn for_sidechain() -> Self {
+        Self::with_reading(true)
+    }
+
+    fn with_reading(reads_sidechain: bool) -> Self {
         Self {
             records: Vec::new(),
             index_by_uuid: HashMap::default(),
             leaf_uuid: None,
             overwritten_uuids: Vec::new(),
+            reads_sidechain,
         }
     }
 
@@ -131,8 +153,10 @@ impl Transcript {
             };
 
             // Sidechain records belong to sub-agent conversations, which are not part of
-            // the main thread the user is watching, so they must not move the leaf.
-            if !record.is_sidechain {
+            // the main thread the user is watching, so they must not move the leaf —
+            // unless the conversation being read is one agent's own, in which case they
+            // are the only records there are.
+            if self.reads_sidechain || !record.is_sidechain {
                 self.leaf_uuid = Some(uuid.clone());
             }
 
@@ -221,9 +245,11 @@ impl Transcript {
                 record.parent_uuid.as_deref()
             };
 
-            // Skipped rather than pushed: sidechain records must never appear in a path,
-            // but their ancestors are still worth keeping if a chain runs through one.
-            if !record.is_sidechain {
+            // Skipped rather than pushed: a sidechain record must never appear in a main
+            // thread's path, but its ancestors are still worth keeping if a chain runs
+            // through one. When the conversation being read is one agent's own, the same
+            // records are the conversation.
+            if self.reads_sidechain || !record.is_sidechain {
                 path.push(record);
             }
 
@@ -486,6 +512,59 @@ mod tests {
             "a trailing sidechain tree must leave the main thread's leaf alone"
         );
         assert_eq!(uuids(&separate.full_path()), expected(&["a", "b"]));
+    }
+
+    /// A subagent's transcript is a file of nothing but sidechain records, so the
+    /// reading that keeps a sub-agent out of the main thread hides the whole of it. The
+    /// mode is the difference between the two readings, and nothing else about it.
+    #[test]
+    fn a_transcript_that_is_itself_one_agents_conversation_walks_its_own_records() {
+        let lines = [
+            r#"{"type":"user","uuid":"s1","parentUuid":null,"isSidechain":true}"#,
+            r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","isSidechain":true}"#,
+            r#"{"type":"user","uuid":"s3","parentUuid":"s2","isSidechain":true}"#,
+        ];
+
+        let mut as_main_thread = Transcript::new();
+        as_main_thread.absorb(lines.iter().map(|line| record(line)));
+        assert_eq!(
+            uuids(&as_main_thread.active_path()),
+            expected(&[]),
+            "read as a main thread these records belong to a sub-agent and must not \
+             appear at all"
+        );
+
+        let mut as_agents_own = Transcript::for_sidechain();
+        as_agents_own.absorb(lines.iter().map(|line| record(line)));
+        assert_eq!(
+            uuids(&as_agents_own.active_path()),
+            expected(&["s1", "s2", "s3"]),
+            "read as the agent's own conversation the whole parentUuid chain is the \
+             conversation"
+        );
+        assert_eq!(
+            uuids(&as_agents_own.full_path()),
+            expected(&["s1", "s2", "s3"])
+        );
+    }
+
+    /// The mode changes which records are a leaf and which are walked; it changes nothing
+    /// about how the chain itself is followed.
+    #[test]
+    fn an_agents_conversation_is_still_read_newest_first_along_parent_uuid() {
+        let mut transcript = Transcript::for_sidechain();
+        transcript.absorb([
+            record(r#"{"type":"user","uuid":"s1","parentUuid":null,"isSidechain":true}"#),
+            // An abandoned branch: the later child of `s1` is the one the agent kept.
+            record(r#"{"type":"assistant","uuid":"dead","parentUuid":"s1","isSidechain":true}"#),
+            record(r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","isSidechain":true}"#),
+        ]);
+
+        assert_eq!(
+            uuids(&transcript.active_path()),
+            expected(&["s1", "s2"]),
+            "the abandoned branch must be left out of an agent's conversation too"
+        );
     }
 
     #[test]

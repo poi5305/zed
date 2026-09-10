@@ -1480,22 +1480,48 @@ impl HeadlessProject {
     ) -> Result<proto::TailClaudeTranscriptResponse> {
         let home_directory = paths::home_dir().to_path_buf();
         let request = envelope.payload;
-        let path = tail_target(&request, &home_directory)?;
-        let tail_state = remote::claude_sessions::TailState {
-            path,
-            offset: request.offset,
-            pending: request.pending,
-        };
 
-        let progress = cx
-            .background_spawn(async move {
-                remote::claude_sessions::read_transcript_tail(
-                    &home_directory,
-                    &request.session_id,
-                    tail_state,
-                )
-            })
-            .await?;
+        // A subagent tail goes through its own function, which names the file from the
+        // three ids on every read. Handing the resolved path to `read_transcript_tail`
+        // instead would answer with the session's main conversation under the agent's
+        // name whenever the agent's file went away between resolving and reading it.
+        let progress = match request.agent_id {
+            Some(agent_id) => {
+                let tail_state = remote::claude_sessions::TailState {
+                    path: None,
+                    offset: request.offset,
+                    pending: request.pending,
+                };
+                let session_id = request.session_id;
+                let workflow_run_id = request.workflow_run_id;
+                cx.background_spawn(async move {
+                    remote::claude_sessions::read_subagent_transcript_tail(
+                        &home_directory,
+                        &session_id,
+                        &agent_id,
+                        workflow_run_id.as_deref(),
+                        tail_state,
+                    )
+                })
+                .await?
+            }
+            None => {
+                let path = tail_target(&request, &home_directory)?;
+                let tail_state = remote::claude_sessions::TailState {
+                    path,
+                    offset: request.offset,
+                    pending: request.pending,
+                };
+                cx.background_spawn(async move {
+                    remote::claude_sessions::read_transcript_tail(
+                        &home_directory,
+                        &request.session_id,
+                        tail_state,
+                    )
+                })
+                .await?
+            }
+        };
 
         Ok(proto::TailClaudeTranscriptResponse {
             path: progress

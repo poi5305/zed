@@ -20,7 +20,8 @@ use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
 
 use crate::session_registry::{
-    self, RegisteredSession, SessionSummary, TailProgress, TailState, read_transcript_tail,
+    self, RegisteredSession, SessionSummary, SubagentMeta, SubagentSummary, TailProgress,
+    TailState, read_subagent_transcript_tail, read_transcript_tail,
 };
 
 /// What the user asked to send to a session. `Escape` carries no text because it is an
@@ -52,6 +53,20 @@ pub trait SessionSource: Send + Sync + 'static {
     fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>>;
 
     fn tail_transcript(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>>;
+
+    /// Every subagent conversation the session has spawned.
+    fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>>;
+
+    /// Follows one subagent's conversation. The three ids name the file rather than a
+    /// path doing it, because only the machine the agent ran on can turn them into one,
+    /// and it has to answer for the boundary they cross on every read.
+    fn tail_subagent(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+    ) -> Task<Result<TailProgress>>;
 
     /// Reads at most `max_bytes` of `path`, reporting whether the file continued past
     /// them.
@@ -92,6 +107,32 @@ impl SessionSource for LocalSource {
         let home_directory = self.home_directory.clone();
         self.executor
             .spawn(async move { read_transcript_tail(&home_directory, &session_id, state) })
+    }
+
+    fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            session_registry::list_subagents(&home_directory, &session_id).await
+        })
+    }
+
+    fn tail_subagent(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+    ) -> Task<Result<TailProgress>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            read_subagent_transcript_tail(
+                &home_directory,
+                &session_id,
+                &agent_id,
+                workflow_run_id.as_deref(),
+                state,
+            )
+        })
     }
 
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
@@ -144,8 +185,49 @@ impl SessionSource for RemoteSource {
             path: state.path.as_deref().map(path_to_wire),
             offset: state.offset,
             pending: state.pending,
+            // The main conversation is what an absent agent id asks for; a subagent is
+            // asked for by `tail_subagent`.
             agent_id: None,
             workflow_run_id: None,
+        });
+
+        self.executor
+            .spawn(async move { Ok(tail_progress_from_proto(request.await?)) })
+    }
+
+    fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
+        let request = self.client.request(proto::ListClaudeSubagents {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+        });
+
+        self.executor.spawn(async move {
+            Ok(request
+                .await?
+                .subagents
+                .into_iter()
+                .map(subagent_summary_from_proto)
+                .collect())
+        })
+    }
+
+    fn tail_subagent(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+    ) -> Task<Result<TailProgress>> {
+        let request = self.client.request(proto::TailClaudeTranscript {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+            // No path is sent at all: the far end names the agent's transcript from the
+            // ids, and a path from this side is not evidence of anything it should open.
+            path: None,
+            offset: state.offset,
+            pending: state.pending,
+            agent_id: Some(agent_id),
+            workflow_run_id,
         });
 
         self.executor
@@ -239,6 +321,36 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
             bridge_session_id: None,
         },
         transcript_path: session.transcript_path.map(PathBuf::from),
+    }
+}
+
+/// Rebuilds one listed subagent from what the far end sent.
+///
+/// The meta arrives field by field rather than as the sidecar's JSON, because the far end
+/// has already parsed it and a second parse here could only disagree with the machine
+/// that holds the file.
+fn subagent_summary_from_proto(subagent: proto::ClaudeSubagent) -> SubagentSummary {
+    SubagentSummary {
+        agent_id: subagent.agent_id,
+        workflow_run_id: subagent.workflow_run_id,
+        meta: SubagentMeta {
+            agent_type: subagent.agent_type,
+            description: subagent.description,
+            tool_use_id: subagent.tool_use_id,
+            spawn_depth: subagent.spawn_depth,
+            model: subagent.model,
+            workflow_phase: subagent.workflow_phase,
+        },
+        // An empty path stands in for one the far end did not name. Nothing on this side
+        // ever opens this path: a subagent's transcript is only ever read through
+        // [`SessionSource::tail_subagent`], which names the file by the three ids on the
+        // machine that holds it. The field is a label the panel may show, so a missing
+        // one costs a label rather than a read.
+        transcript_path: subagent
+            .transcript_path
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        size: subagent.size,
     }
 }
 
@@ -373,6 +485,91 @@ mod tests {
             "an unset home directory must stay empty rather than become this machine's"
         );
         assert!(listing.sessions.is_empty());
+    }
+
+    fn wire_subagent() -> proto::ClaudeSubagent {
+        proto::ClaudeSubagent {
+            agent_id: "af090e203ec41bc73".to_string(),
+            workflow_run_id: Some("wf_b529a29d-562".to_string()),
+            agent_type: "workflow-subagent".to_string(),
+            description: Some("R2:send-atomicity".to_string()),
+            tool_use_id: Some("toolu_01BEgVRSnksoz6YAyUWEEdeQ".to_string()),
+            spawn_depth: 2,
+            model: Some("opus".to_string()),
+            workflow_phase: Some("Wave 5".to_string()),
+            transcript_path: Some(
+                "/home/andy/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
+                    .to_string(),
+            ),
+            size: 4096,
+        }
+    }
+
+    #[test]
+    fn a_listed_subagent_crosses_the_wire_field_for_field() {
+        let summary = subagent_summary_from_proto(wire_subagent());
+
+        assert_eq!(summary.agent_id, "af090e203ec41bc73");
+        assert_eq!(summary.workflow_run_id.as_deref(), Some("wf_b529a29d-562"));
+        assert_eq!(summary.meta.agent_type, "workflow-subagent");
+        assert_eq!(
+            summary.meta.description.as_deref(),
+            Some("R2:send-atomicity")
+        );
+        assert_eq!(
+            summary.meta.tool_use_id.as_deref(),
+            Some("toolu_01BEgVRSnksoz6YAyUWEEdeQ")
+        );
+        assert_eq!(summary.meta.spawn_depth, 2);
+        assert_eq!(summary.meta.model.as_deref(), Some("opus"));
+        assert_eq!(
+            summary.meta.workflow_phase.as_deref(),
+            Some("Wave 5"),
+            "the phase is what pairs a workflow's agents with the wave that spawned them"
+        );
+        assert_eq!(
+            summary.transcript_path,
+            PathBuf::from(
+                "/home/andy/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
+            )
+        );
+        assert_eq!(summary.size, 4096);
+    }
+
+    /// An agent spawned by the `Task` tool belongs to no workflow run, and one whose
+    /// transcript has not been flushed yet is still an agent to list.
+    #[test]
+    fn a_subagent_the_far_end_named_no_transcript_for_keeps_an_empty_path() {
+        let summary = subagent_summary_from_proto(proto::ClaudeSubagent {
+            workflow_run_id: None,
+            description: None,
+            tool_use_id: None,
+            model: None,
+            workflow_phase: None,
+            transcript_path: None,
+            size: 0,
+            ..wire_subagent()
+        });
+
+        assert_eq!(
+            summary.transcript_path,
+            PathBuf::new(),
+            "a path the far end did not name must stay empty rather than become a path \
+             on this machine"
+        );
+        assert_eq!(
+            summary.workflow_run_id, None,
+            "an agent with no run id must not be looked for in a run's directory"
+        );
+        assert_eq!(summary.meta.description, None);
+        assert_eq!(summary.meta.tool_use_id, None);
+        assert_eq!(summary.meta.model, None);
+        assert_eq!(summary.meta.workflow_phase, None);
+        assert_eq!(summary.size, 0);
+        // The fields that are always present still arrive.
+        assert_eq!(summary.agent_id, "af090e203ec41bc73");
+        assert_eq!(summary.meta.agent_type, "workflow-subagent");
+        assert_eq!(summary.meta.spawn_depth, 2);
     }
 
     #[test]

@@ -2195,3 +2195,45 @@ panel 那一輪的 agent 主動回報阻塞、並且**沒有擅自擴大範圍**
 
 **規則補充**：改 proto 訊息時，派工要一併點名「所有 struct literal 的呼叫點」，
 或明確指定一個人擁有那些呼叫點。用 codegraph 查該訊息的 blast radius 再切範圍。
+
+--------------------------------------------------------------------------------
+F.8 WP13 驗收與兩個必須先裁決的發現
+--------------------------------------------------------------------------------
+
+交付：claude_sessions 212、remote 112（+3）、remote_server 59 全綠，clippy exit 0、fmt clean。
+它證實並修掉了我在派工時點出的 fall back 缺陷，RED 是真的：
+
+  a tail of subagent af090e203ec41bc73 whose transcript is gone must report no lines,
+  but it reported ["{\"type\":\"user\",\"uuid\":\"main-only\"}"], which is the main
+  conversation from Some(".../-some-slug/4e2e3600-….jsonl")
+
+修法：`read_subagent_transcript_tail` 每次自己用三個 id 解析路徑、**沒有任何 fall back**，
+解析不到就回 path None / lines 空。handler 的 subagent 分支改呼叫它，主對話那條一字未動。
+
+**發現 1（它抓到的，比 fall back 更重要）：subagent 的對話會畫成空白。**
+  一份真的 agent transcript **496 行全部 `isSidechain: true`**（我自己用 jq 獨立驗過）。
+  而 transcript.rs 的兩處守衛（第 135 行 absorb 的 leaf、第 226 行 walk 的 path）
+  刻意排除 sidechain —— 那對主對話是對的（subagent 的記錄也會以 sidechain 形式寫進主檔），
+  但當 transcript 本身就是一份 subagent 對話時等於把全部內容濾掉。
+  它沒有動 transcript.rs（不在範圍、且被 39 支盲測蓋著），選擇回報。正確。
+
+  **裁定**：給 `Transcript` 一個「這份 transcript 本身就是 sidechain 對話」的模式
+  （`Transcript::for_sidechain()`，內部一個 bool，兩處守衛變成
+  `if self.reads_sidechain || !record.is_sidechain`）。預設行為一個字不變，
+  所以 39 支盲測與 18 支既有測試維持綠。store 在 target 是 Subagent 時建這種 transcript。
+
+**發現 2（我推導出來的）：chip 的狀態需要主對話，但切到 agent 之後主對話已經被換掉。**
+  「跑著沒」要看主對話有沒有對應的 tool_result，而 store 只有一份 transcript。
+  **裁定**：store 同時維持兩份 —— 主對話**永遠**在追（它也是偵測 `/clear` 的依據），
+  另外在有選中 agent 時追那隻。`transcript()` 回現在看的那一份、
+  新增 `main_transcript()` 給狀態判定用，`transcript_generation()` 與 `transcript_path()`
+  都要跟著現在看的那一份走。
+
+其餘四點裁定：
+  - `transcript_path()` 看 subagent 時仍回主路徑 → 併進 WP15 修（見上）。
+  - `headless_project.rs` 的 `tail_target` subagent 分支現在 production 走不到，
+    只剩兩支既有測試在測它 → 留給收尾 commit 一起清掉（動它會改到既有測試斷言）。
+  - 協定行為變更（agent_id 解析不到從 RPC error 變成空 TailProgress）：**接受**，
+    這讓 remote 與 local 對稱（LocalSource 不可能 error）。
+  - `select_transcript_target(Subagent)` 在沒選 session 時留下懸空 target：
+    UI 走不到（chip 來自 `subagents()`，沒選中就是空的），接受。
