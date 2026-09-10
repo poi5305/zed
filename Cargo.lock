@@ -3090,12 +3090,14 @@ name = "claude_sessions"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "collections",
  "gpui",
  "markdown",
  "paths",
  "serde",
  "serde_json",
+ "smol",
  "theme",
  "ui",
  "util",

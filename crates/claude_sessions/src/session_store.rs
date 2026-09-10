@@ -27,10 +27,12 @@ use crate::{
 const REGISTRY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// A session whose heartbeat is older than this is treated as no longer running. Claude
-/// Code refreshes `updatedAt` far more often than this, so the margin only has to absorb
-/// a machine that was asleep or heavily loaded.
-const STALE_HEARTBEAT_MILLIS: i64 = 60_000;
+/// No cutoff is applied to `updatedAt`, because it is not a heartbeat: on this machine
+/// every registration carries `updatedAt == statusUpdatedAt`, so it only moves when the
+/// session changes status. A session sitting idle waiting for its user, or busy on one
+/// long tool call, leaves it untouched for hours while the process is plainly alive.
+/// That makes the process itself the only liveness signal there is.
+const HEARTBEAT_CUTOFF_MILLIS: i64 = i64::MAX;
 
 /// Start times of the given processes, keyed by pid, in the format the registration files
 /// use. Indirected the same way [`visible_sessions`] indirects its own lookup: the
@@ -464,7 +466,7 @@ async fn resolve_visible_sessions(
         sessions,
         project_root,
         now_millis(),
-        STALE_HEARTBEAT_MILLIS,
+        HEARTBEAT_CUTOFF_MILLIS,
         &process_start_of_pid,
     ))
 }
@@ -495,6 +497,10 @@ async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> {
 
     let mut command = util::command::new_command("ps");
     command.args(["-o", "pid=,lstart=", "-p", &pid_argument]);
+    // `lstart` is rendered in the zone `ps` runs in, while Claude Code writes `procStart`
+    // in UTC, so without this the two strings differ by the machine's offset and every
+    // running session compares as a reused pid.
+    command.env("TZ", "UTC");
 
     // A non-zero exit only means none of the pids are running, and the empty map that
     // results says exactly that.
@@ -910,6 +916,84 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A registration's `updatedAt` is rewritten when the session's status changes, not on
+    /// a timer, so a session that is idle waiting for its user goes hours without touching
+    /// it. Reading it as a heartbeat hid every session on a machine running seven of them.
+    #[gpui::test]
+    async fn test_a_session_that_has_not_changed_status_for_an_hour_is_still_listed() {
+        let home_directory = temporary_directory("idle-session");
+        let registry_directory = home_directory.join(".claude").join("sessions");
+        let an_hour_ago = now_millis() - 3_600_000;
+
+        write_file(
+            registry_directory.join("13.json"),
+            &format!(
+                r#"{{"pid":13,"sessionId":"idle-session","cwd":"/tmp",
+"procStart":"{FAKE_PROCESS_START}","version":"2.1.267","kind":"interactive",
+"name":"idle","status":"idle","updatedAt":{an_hour_ago}}}"#
+            ),
+        );
+
+        let sessions = resolve_visible_sessions(
+            read_registrations(&registry_directory),
+            None,
+            &fake_process_start_lookup(vec![13]),
+        )
+        .await
+        .expect("scanning the registry");
+        let session_ids: Vec<&str> = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(
+            session_ids,
+            vec!["idle-session"],
+            "the process is running, so an hour-old status timestamp must not hide it"
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// Claude Code writes `procStart` in UTC. Reading the start time back in the machine's
+    /// own zone reported a time eight hours off on a UTC+8 machine, so every running
+    /// session compared as a reused pid and the panel listed nothing at all.
+    // Awaiting a real `ps` cannot happen under GPUI's deterministic test scheduler, which
+    // forbids parking on anything outside its own queues, so this one drives the future
+    // itself instead of taking a `TestAppContext`.
+    #[cfg(unix)]
+    #[test]
+    fn test_process_start_times_are_reported_in_utc() {
+        let mut command = util::command::new_command("sleep");
+        command.arg("30");
+        command.kill_on_drop(true);
+        let mut child = command.spawn().expect("spawning a process to look up");
+        let spawned_at_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_secs() as i64);
+
+        let start_times = smol::block_on(process_start_times(vec![child.id()]));
+        let reported = start_times
+            .get(&child.id())
+            .cloned()
+            .unwrap_or_else(|| "<no start time reported>".to_string());
+        child.kill().log_err();
+
+        let reported_seconds =
+            match chrono::NaiveDateTime::parse_from_str(&reported, "%a %b %e %H:%M:%S %Y") {
+                Ok(start_time) => start_time.and_utc().timestamp(),
+                Err(error) => panic!(
+                    "`{reported}` is not a start time in the format the registrations use: {error}"
+                ),
+            };
+        let drift_seconds = reported_seconds - spawned_at_seconds;
+        assert!(
+            drift_seconds.abs() <= 5,
+            "the process started just now, so its start time has to read as now in UTC: \
+             got `{reported}` ({reported_seconds}), expected about {spawned_at_seconds}, \
+             which is off by {drift_seconds} seconds"
+        );
     }
 
     #[test]

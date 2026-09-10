@@ -26,4 +26,6 @@ util.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+smol.workspace = true
