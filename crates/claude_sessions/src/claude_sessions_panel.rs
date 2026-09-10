@@ -12,14 +12,12 @@
 //! back from disk) is built only once the record is actually on screen, then cached.
 
 use std::{
-    fs,
-    io::Read as _,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::Context as _;
 use collections::{HashMap, HashSet};
+use editor::Editor;
 use gpui::{
     AnyElement, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Image,
     ImageFormat, ListAlignment, ListSizingBehavior, ListState, Render, Subscription, Task,
@@ -34,7 +32,10 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::{ClaudeSessionStore, RegisteredSession, ToggleFocus, TranscriptRecord};
+use crate::{
+    ClaudeSessionStore, Interrupt, RegisteredSession, SendMessage, ToggleFocus, TranscriptRecord,
+    session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
+};
 
 const CLAUDE_SESSIONS_PANEL_KEY: &str = "ClaudeSessionsPanel";
 
@@ -53,18 +54,26 @@ const PERSISTED_OUTPUT_PREVIEW_PREFIX: &str = "Preview (";
 /// holding an unbounded amount of text in one list item would stall the whole panel.
 const MAX_PERSISTED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
-const NO_SESSIONS: &str = "No Claude Code sessions are running on this machine.";
+const NO_SESSIONS: &str = "No Claude Code sessions are running on this project's host.";
 const SELECT_A_SESSION: &str = "Select a session to read its conversation.";
 const WAITING_FOR_TRANSCRIPT: &str =
     "This session has not written a transcript file yet. It will appear as soon as it does.";
 const EMPTY_TRANSCRIPT: &str = "This conversation has no messages yet.";
-const READ_ONLY_NOTE: &str = "Read-only. Replying from Zed is out of scope for this panel (P3).";
+const READ_ONLY_NOTE: &str = "This session is not running inside tmux, so it can only be read.";
+const SELECT_A_SESSION_TO_REPLY: &str = "Select a session to reply to it.";
+const MESSAGE_PLACEHOLDER: &str = "Message this session…";
 
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     position: DockPosition,
     store: Entity<ClaudeSessionStore>,
+    /// The same source the store reads through, kept here for the one read the panel
+    /// performs on its own behalf: a persisted tool output.
+    source: Arc<dyn SessionSource>,
+    /// What the user is typing to the selected session. Disabled, rather than hidden,
+    /// while there is no pane to type into.
+    message_editor: Entity<Editor>,
     /// Used only to shorten the working directory of sessions opened inside this project.
     project_root: Option<PathBuf>,
     /// The flattened conversation, one entry per rendered item. Rebuilt from the
@@ -85,6 +94,9 @@ pub struct ClaudeSessionsPanel {
     /// The store's transcript generation the cache was filled from. A change means the
     /// transcript was thrown away, and with it everything derived from it.
     cached_transcript_generation: u64,
+    /// The home directory the cache's entries were derived against; see
+    /// [`Self::refresh_entry_cache`].
+    cached_home_directory: Option<PathBuf>,
     /// How many of the transcript's overwritten uuids the cache has already dropped.
     overwrites_dropped: usize,
     loaded_outputs: HashMap<SharedString, OutputLoad>,
@@ -319,7 +331,7 @@ impl ClaudeSessionsPanel {
 
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_handle = workspace.weak_handle();
@@ -331,12 +343,32 @@ impl ClaudeSessionsPanel {
                 .visible_worktrees(cx)
                 .next()
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
-            let store = cx.new(|cx| ClaudeSessionStore::new(project_root.clone(), cx));
+            // The sessions worth showing are the ones on the machine the project is
+            // opened from: on a remote project they are read over that project's
+            // connection, and the panel is otherwise the same on both.
+            let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
+                Some(remote_client) => Arc::new(RemoteSource::new(
+                    remote_client.read(cx).proto_client(),
+                    cx.background_executor().clone(),
+                )),
+                None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+            };
+            let store =
+                cx.new(|cx| ClaudeSessionStore::new(source.clone(), project_root.clone(), cx));
             let store_subscription = cx.observe(&store, |this: &mut Self, _, cx| {
                 this.rebuild_entries(cx);
+                this.sync_input_availability(cx);
                 // The session list changes on scans that leave the conversation
                 // untouched, so the panel is redrawn whether or not entries moved.
                 cx.notify();
+            });
+
+            let message_editor = cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, 8, window, cx);
+                editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
+                // Nothing is selected yet, so there is nothing to type into.
+                editor.set_read_only(true);
+                editor
             });
 
             Self {
@@ -344,6 +376,8 @@ impl ClaudeSessionsPanel {
                 focus_handle: cx.focus_handle(),
                 position: DockPosition::Right,
                 store,
+                source,
+                message_editor,
                 project_root,
                 entries: Vec::new(),
                 list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
@@ -352,6 +386,7 @@ impl ClaudeSessionsPanel {
                 markdowns: HashMap::default(),
                 entry_cache: EntryCache::default(),
                 cached_transcript_generation: 0,
+                cached_home_directory: None,
                 overwrites_dropped: 0,
                 loaded_outputs: HashMap::default(),
                 output_loads: HashMap::default(),
@@ -396,13 +431,15 @@ impl ClaudeSessionsPanel {
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
         let new_entries = {
-            let transcript = self.store.read(cx).transcript();
+            let store = self.store.read(cx);
+            let home_directory = store.home_directory();
+            let transcript = store.transcript();
             let path = if self.show_full_history {
                 transcript.full_path()
             } else {
                 transcript.active_path()
             };
-            build_entries(&path, &mut cache)
+            build_entries(&path, home_directory, &mut cache)
         };
         self.entry_cache = cache;
 
@@ -456,16 +493,24 @@ impl ClaudeSessionsPanel {
     /// transcript has been thrown away and is being read again from the start, and one
     /// record's artifacts when `absorb` has replaced that record.
     fn refresh_entry_cache(&mut self, cx: &mut Context<Self>) {
-        let (generation, overwritten_uuids) = {
+        let (generation, home_directory, overwritten_uuids) = {
             let store = self.store.read(cx);
             (
                 store.transcript_generation(),
+                store.home_directory().map(Path::to_path_buf),
                 store.transcript().overwritten_uuids().to_vec(),
             )
         };
 
-        if generation != self.cached_transcript_generation {
+        // A cached entry carries the decision of whether its persisted output can be
+        // read back, and that decision was made against the home directory known at the
+        // time. The first scan of a remote project turns that from unknown into an
+        // answer, so entries derived before it have to be derived again.
+        if generation != self.cached_transcript_generation
+            || home_directory != self.cached_home_directory
+        {
             self.cached_transcript_generation = generation;
+            self.cached_home_directory = home_directory;
             self.entry_cache = EntryCache::default();
             self.overwrites_dropped = 0;
         }
@@ -527,7 +572,8 @@ impl ClaudeSessionsPanel {
         // The boundary is enforced here as well as where the button is drawn, so that the
         // path is checked on the line before it is opened rather than only where the
         // offer was made.
-        if !persisted_output_is_loadable(&path, paths::home_dir()) {
+        let home_directory = self.store.read(cx).home_directory().map(Path::to_path_buf);
+        if !persisted_output_is_loadable(&path, home_directory.as_deref()) {
             return;
         }
 
@@ -539,14 +585,14 @@ impl ClaudeSessionsPanel {
         }
 
         self.loaded_outputs.insert(key.clone(), OutputLoad::Loading);
-        let read = cx.background_spawn(async move { read_persisted_output(&path) });
+        let read = self.source.read_file(path, MAX_PERSISTED_OUTPUT_BYTES);
         let load = cx.spawn({
             let key = key.clone();
             async move |this, cx| {
                 let result = read.await;
                 this.update(cx, |this, cx| {
                     let load = match result {
-                        Ok(text) => OutputLoad::Loaded(text.into()),
+                        Ok(contents) => OutputLoad::Loaded(persisted_output_text(contents).into()),
                         Err(error) => OutputLoad::Failed(format!("{error:#}").into()),
                     };
                     this.loaded_outputs.insert(key, load);
@@ -747,22 +793,132 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
-    fn render_read_only_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+    /// A session Zed has no pane to type into can only be read, and so can no session at
+    /// all; the input is disabled in both cases rather than hidden, so that the reason is
+    /// visible where the reply would be typed.
+    fn sync_input_availability(&mut self, cx: &mut Context<Self>) {
+        let read_only = self.store.read(cx).pane_target().is_none();
+        self.message_editor.update(cx, |editor, cx| {
+            if editor.read_only(cx) != read_only {
+                editor.set_read_only(read_only);
+                cx.notify();
+            }
+        });
+    }
+
+    /// Only ever reached from a user gesture — the Send button, or the binding on the
+    /// input's `enter`.
+    fn send_message(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).pane_target().is_none() {
+            return;
+        }
+
+        let text = self.message_editor.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let send = self.store.update(cx, |store, cx| {
+            store.send_input(SessionInput::Text(text.clone()), cx)
+        });
+        // Emptied before the send is answered: the answer can be a round trip to
+        // another machine away, and the input has to be usable again at once.
+        self.message_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = send.await;
+            this.update_in(cx, |this, window, cx| {
+                apply_send_outcome(&this.message_editor, &text, outcome, window, cx);
+            })
+            .log_err();
+        })
+        // Detached rather than held in a field: dropping it would cancel the send
+        // itself, and a second send must not cut the first one short.
+        .detach();
+    }
+
+    fn interrupt_session(&mut self, _: &Interrupt, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).pane_target().is_none() {
+            return;
+        }
+
+        self.store.update(cx, |store, cx| {
+            // There is no text to hand back for an interrupt, and the store reports the
+            // failure itself, so nothing here waits for the answer.
+            store.send_input(SessionInput::Escape, cx).detach()
+        });
+    }
+
+    fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let has_selection = store.selected().is_some();
+        let can_send = store.pane_target().is_some();
+        let note = if can_send {
+            None
+        } else if has_selection {
+            Some(READ_ONLY_NOTE)
+        } else {
+            Some(SELECT_A_SESSION_TO_REPLY)
+        };
+
+        v_flex()
             .w_full()
             .p_2()
             .gap_1()
             .border_t_1()
             .border_color(cx.theme().colors().border)
+            .key_context("ClaudeSessionsInput")
+            .on_action(cx.listener(Self::send_message))
+            .on_action(cx.listener(Self::interrupt_session))
+            .when_some(note, |this, note| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Lock)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+            })
             .child(
-                Icon::new(IconName::Lock)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                div()
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.message_editor.clone()),
             )
             .child(
-                Label::new(READ_ONLY_NOTE)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .justify_end()
+                    .child(
+                        Button::new("claude-session-interrupt", "Esc")
+                            .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!can_send)
+                            .tooltip(Tooltip::text("Interrupt this session"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.interrupt_session(&Interrupt, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("claude-session-send", "Send")
+                            .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!can_send)
+                            .tooltip(Tooltip::text("Send to this session"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_message(&SendMessage, window, cx)
+                            })),
+                    ),
             )
     }
 
@@ -1143,6 +1299,7 @@ impl ClaudeSessionsPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let load = self.loaded_outputs.get(key).cloned();
+        let home_directory = self.store.read(cx).home_directory().map(Path::to_path_buf);
         let displayed_text = match &load {
             Some(OutputLoad::Loaded(text)) => text.clone(),
             _ => persisted.preview.clone(),
@@ -1167,18 +1324,20 @@ impl ClaudeSessionsPanel {
                     .color(Color::Muted)
                     .into_any_element(),
             ),
-            None if persisted_output_is_loadable(&persisted.path, paths::home_dir()) => Some(
-                Button::new(
-                    SharedString::from(format!("load-output-{entry_index}")),
-                    "Load full output",
+            None if persisted_output_is_loadable(&persisted.path, home_directory.as_deref()) => {
+                Some(
+                    Button::new(
+                        SharedString::from(format!("load-output-{entry_index}")),
+                        "Load full output",
+                    )
+                    .start_icon(Icon::new(IconName::CloudDownload).size(IconSize::XSmall))
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.load_full_output(load_key.clone(), load_path.clone(), entry_index, cx)
+                    }))
+                    .into_any_element(),
                 )
-                .start_icon(Icon::new(IconName::CloudDownload).size(IconSize::XSmall))
-                .label_size(LabelSize::XSmall)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.load_full_output(load_key.clone(), load_path.clone(), entry_index, cx)
-                }))
-                .into_any_element(),
-            ),
+            }
             None => None,
         };
 
@@ -1252,7 +1411,7 @@ impl Render for ClaudeSessionsPanel {
             .child(self.render_session_section(cx))
             .child(Divider::horizontal())
             .child(self.render_transcript_section(cx))
-            .child(self.render_read_only_footer(cx))
+            .child(self.render_input(cx))
     }
 }
 
@@ -1316,13 +1475,45 @@ impl Panel for ClaudeSessionsPanel {
     }
 }
 
+/// Answers a send that has come back.
+///
+/// A send that failed hands the user their text back: there is nothing they can do about
+/// the failure, and the message they typed would otherwise be gone with only a line of
+/// error to show for it. A send that arrived leaves the emptied input alone.
+///
+/// The text only goes back into an input that is still empty. The answer arrives after
+/// the user was free to type again, and anything they have typed since is newer than
+/// this: an input that holds one character of theirs is theirs. Nothing is ever sent
+/// again on its own — the returned text is a draft the user resends or discards.
+fn apply_send_outcome(
+    message_editor: &Entity<Editor>,
+    sent_text: &str,
+    outcome: anyhow::Result<()>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if outcome.is_ok() {
+        return;
+    }
+
+    if !message_editor.read(cx).text(cx).is_empty() {
+        return;
+    }
+
+    message_editor.update(cx, |editor, cx| editor.set_text(sent_text, window, cx));
+}
+
 fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
 }
 
 /// Flattens a conversation path into the items the list draws, deriving each record's
 /// expensive artifacts only the first time the record is seen.
-fn build_entries(path: &[&TranscriptRecord], cache: &mut EntryCache) -> Vec<Entry> {
+fn build_entries(
+    path: &[&TranscriptRecord],
+    home_directory: Option<&Path>,
+    cache: &mut EntryCache,
+) -> Vec<Entry> {
     let mut entries = Vec::with_capacity(path.len());
     let mut attachments = Vec::new();
     // `tool_result` blocks name the call they answer by id, so the ids seen on the way
@@ -1337,6 +1528,7 @@ fn build_entries(path: &[&TranscriptRecord], cache: &mut EntryCache) -> Vec<Entr
         append_record(
             record,
             base_key,
+            home_directory,
             &mut tool_names,
             &mut entries,
             &mut attachments,
@@ -1362,6 +1554,7 @@ fn build_entries(path: &[&TranscriptRecord], cache: &mut EntryCache) -> Vec<Entr
 fn append_record(
     record: &TranscriptRecord,
     base_key: SharedString,
+    home_directory: Option<&Path>,
     tool_names: &mut HashMap<String, SharedString>,
     entries: &mut Vec<Entry>,
     attachments: &mut Vec<AttachmentItem>,
@@ -1370,7 +1563,7 @@ fn append_record(
     if record.record_type == ATTACHMENT_RECORD_TYPE {
         let cache_key = cache_key(record, &base_key);
         attachments.push(cache.attachment(cache_key.as_ref(), || {
-            attachment_item(record, base_key.clone())
+            attachment_item(record, base_key.clone(), home_directory)
         }));
         return;
     }
@@ -1439,7 +1632,9 @@ fn append_record(
                 // that named it may itself have come from the cache.
                 register_tool_name(block, tool_names);
                 let cache_key = cache_key(record, &key);
-                let kind = cache.kind(cache_key.as_ref(), || block_kind(record, block, tool_names));
+                let kind = cache.kind(cache_key.as_ref(), || {
+                    block_kind(record, block, tool_names, home_directory)
+                });
                 entries.push(Entry { key, kind });
             }
         }
@@ -1504,6 +1699,7 @@ fn block_kind(
     record: &TranscriptRecord,
     block: &Value,
     tool_names: &HashMap<String, SharedString>,
+    home_directory: Option<&Path>,
 ) -> EntryKind {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -1563,7 +1759,7 @@ fn block_kind(
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let body = match structured_persisted_output(structured_result, &text)
+            let body = match structured_persisted_output(structured_result, &text, home_directory)
                 // The placeholder text is only a fallback: one persisted result in
                 // eighty-six carries no `persistedOutputPath` beside it.
                 .or_else(|| parse_persisted_output(&text))
@@ -1619,7 +1815,11 @@ fn unknown_kind(record_type: &str, subtype: Option<&str>, value: &Value) -> Entr
     }
 }
 
-fn attachment_item(record: &TranscriptRecord, key: SharedString) -> AttachmentItem {
+fn attachment_item(
+    record: &TranscriptRecord,
+    key: SharedString,
+    home_directory: Option<&Path>,
+) -> AttachmentItem {
     let attachment = record.raw.get("attachment");
     let label = SharedString::from(
         attachment
@@ -1655,7 +1855,7 @@ fn attachment_item(record: &TranscriptRecord, key: SharedString) -> AttachmentIt
         .as_deref()
         .and_then(parse_persisted_output)
         .or_else(|| attachment_content.and_then(parse_persisted_output))
-        .filter(|persisted| persisted_output_is_loadable(&persisted.path, paths::home_dir()));
+        .filter(|persisted| persisted_output_is_loadable(&persisted.path, home_directory));
 
     let body = rendered_text.unwrap_or_else(|| json_text(attachment.unwrap_or(&record.raw)));
 
@@ -1771,7 +1971,14 @@ fn fenced_code(text: &str, language: &str) -> SharedString {
 /// outside it is still shown as text; it is only the offer to read the file that is
 /// withheld, because a button that reads an arbitrary file is the risk here, and one
 /// that fails is no use either.
-fn persisted_output_is_loadable(path: &Path, home_directory: &Path) -> bool {
+fn persisted_output_is_loadable(path: &Path, home_directory: Option<&Path>) -> bool {
+    // `None` means no scan has said yet which machine's home the path was written under.
+    // There is nothing to check against then, so the offer is withheld: substituting this
+    // machine's home would be an answer about the wrong machine on a remote project.
+    let Some(home_directory) = home_directory else {
+        return false;
+    };
+
     path.is_absolute()
         && !path
             .components()
@@ -1790,12 +1997,13 @@ fn persisted_output_is_loadable(path: &Path, home_directory: &Path) -> bool {
 fn structured_persisted_output(
     result: Option<&Value>,
     inline_text: &str,
+    home_directory: Option<&Path>,
 ) -> Option<PersistedOutput> {
     let result = result?.as_object()?;
     let path = PathBuf::from(result.get("persistedOutputPath").and_then(Value::as_str)?);
     // A path the panel will not read back is no reason to replace the text with a
     // "saved to a file" heading: the structured `stdout` is already the whole body.
-    if !persisted_output_is_loadable(&path, paths::home_dir()) {
+    if !persisted_output_is_loadable(&path, home_directory) {
         return None;
     }
 
@@ -1862,24 +2070,12 @@ fn parse_persisted_output(text: &str) -> Option<PersistedOutput> {
     })
 }
 
-fn read_persisted_output(path: &Path) -> anyhow::Result<String> {
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-
-    // Read one byte past the cap so that hitting it can be distinguished from a file
-    // that happens to be exactly that long.
-    let mut bytes = Vec::new();
-    file.take(MAX_PERSISTED_OUTPUT_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
-
-    let was_truncated = bytes.len() as u64 > MAX_PERSISTED_OUTPUT_BYTES;
-    bytes.truncate(MAX_PERSISTED_OUTPUT_BYTES as usize);
-
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if was_truncated {
+fn persisted_output_text(contents: FileContents) -> String {
+    let mut text = String::from_utf8_lossy(&contents.bytes).into_owned();
+    if contents.truncated {
         text.push_str("\n\n… truncated by the panel; open the file above for the rest.");
     }
-    Ok(text)
+    text
 }
 
 /// Removes terminal escape sequences so that captured terminal output reads as text.
@@ -1984,10 +2180,16 @@ mod tests {
         }
     }
 
-    fn entries_of(json_lines: &[&str]) -> Vec<Entry> {
+    fn entries_of_with_home(json_lines: &[&str], home_directory: Option<&Path>) -> Vec<Entry> {
         let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
         let path: Vec<&TranscriptRecord> = records.iter().collect();
-        build_entries(&path, &mut EntryCache::default())
+        build_entries(&path, home_directory, &mut EntryCache::default())
+    }
+
+    /// The fixtures of every test that is not about the boundary itself write their paths
+    /// under this machine's home, which is what a local project's scan reports.
+    fn entries_of(json_lines: &[&str]) -> Vec<Entry> {
+        entries_of_with_home(json_lines, Some(paths::home_dir()))
     }
 
     #[test]
@@ -2262,17 +2464,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persisted_output_is_read_up_to_the_cap_and_truncation_is_reported() {
+    #[gpui::test]
+    async fn persisted_output_is_read_up_to_the_cap_and_truncation_is_reported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = LocalSource::new(cx.executor());
         let directory =
             std::env::temp_dir().join(format!("claude-sessions-output-cap-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("creating the temporary directory");
+        std::fs::create_dir_all(&directory).expect("creating the temporary directory");
         let cap = MAX_PERSISTED_OUTPUT_BYTES as usize;
+
+        let read = |path: PathBuf| source.read_file(path, MAX_PERSISTED_OUTPUT_BYTES);
 
         // A file of exactly the cap is legal input and must arrive whole and unlabelled.
         let at_cap = directory.join("at-cap.txt");
-        fs::write(&at_cap, vec![b'x'; cap]).expect("writing the fixture");
-        let text = read_persisted_output(&at_cap).expect("reading the file at the cap");
+        std::fs::write(&at_cap, vec![b'x'; cap]).expect("writing the fixture");
+        let text = persisted_output_text(
+            read(at_cap.clone())
+                .await
+                .expect("reading the file at the cap"),
+        );
         assert_eq!(
             text.len(),
             cap,
@@ -2285,8 +2496,12 @@ mod tests {
         );
 
         let over_cap = directory.join("over-cap.txt");
-        fs::write(&over_cap, vec![b'x'; cap + 1]).expect("writing the fixture");
-        let text = read_persisted_output(&over_cap).expect("reading the file over the cap");
+        std::fs::write(&over_cap, vec![b'x'; cap + 1]).expect("writing the fixture");
+        let text = persisted_output_text(
+            read(over_cap.clone())
+                .await
+                .expect("reading the file over the cap"),
+        );
         let kept = text.chars().filter(|character| *character == 'x').count();
         assert_eq!(
             kept, cap,
@@ -2298,7 +2513,7 @@ mod tests {
             &text[text.len().saturating_sub(80)..]
         );
 
-        fs::remove_dir_all(&directory).ok();
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
@@ -2377,8 +2592,8 @@ mod tests {
 
     const TOOL_USE_LINE: &str = r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
 
-    fn tool_result_body(json: &str) -> ToolResultBody {
-        let entries = entries_of(&[TOOL_USE_LINE, json]);
+    fn tool_result_body_with_home(json: &str, home_directory: Option<&Path>) -> ToolResultBody {
+        let entries = entries_of_with_home(&[TOOL_USE_LINE, json], home_directory);
         match entries.get(1).map(|entry| &entry.kind) {
             Some(EntryKind::ToolResult { body, .. }) => body.clone(),
             other => panic!(
@@ -2386,6 +2601,10 @@ mod tests {
                 other.map(|kind| matches!(kind, EntryKind::ToolResult { .. }))
             ),
         }
+    }
+
+    fn tool_result_body(json: &str) -> ToolResultBody {
+        tool_result_body_with_home(json, Some(paths::home_dir()))
     }
 
     #[test]
@@ -2460,6 +2679,46 @@ mod tests {
         );
     }
 
+    /// A remote project's transcript names paths under the remote machine's home, which
+    /// this machine's home says nothing about. The boundary has to be checked against the
+    /// home the scan reported, and while it has reported none there is no offer to make.
+    #[test]
+    fn a_remote_persisted_path_is_offered_against_the_home_the_scan_reported() {
+        let output_path = PathBuf::from("/home/deploy/.claude/projects/x/tool-results/a.txt");
+        let result = structured_persisted_result(&output_path);
+        let remote_home = PathBuf::from("/home/deploy");
+
+        let body = tool_result_body_with_home(&result, Some(&remote_home));
+        let ToolResultBody::Persisted(persisted) = &body else {
+            panic!(
+                "a path under the scanned machine's own .claude/projects must be offered for loading, got {body:?}"
+            );
+        };
+        assert_eq!(persisted.path, output_path);
+
+        let refused_homes: Vec<Option<PathBuf>> = vec![
+            // No scan has reported a home yet, so there is nothing to check against.
+            None,
+            // A server too old to send one must not open the boundary either.
+            Some(PathBuf::new()),
+            // The bug this replaced: checking a remote path against the local home.
+            Some(paths::home_dir().clone()),
+        ];
+        let wrongly_offered: Vec<&Option<PathBuf>> = refused_homes
+            .iter()
+            .filter(|home_directory| {
+                matches!(
+                    tool_result_body_with_home(&result, home_directory.as_deref()),
+                    ToolResultBody::Persisted(_)
+                )
+            })
+            .collect();
+        assert!(
+            wrongly_offered.is_empty(),
+            "{output_path:?} must not be offered for loading against these home directories, but was: {wrongly_offered:#?}"
+        );
+    }
+
     /// One record for each artifact the cache has to keep across a rebuild: a decoded
     /// image, a pretty-printed unrecognized record, terminal output with its escapes
     /// stripped, and an attachment's rendered text.
@@ -2500,7 +2759,7 @@ mod tests {
 
         let mut cache = EntryCache::default();
         let path: Vec<&TranscriptRecord> = records.iter().collect();
-        let before = build_entries(&path, &mut cache);
+        let before = build_entries(&path, Some(paths::home_dir()), &mut cache);
         let derived_at_first = cache.derived;
         assert_eq!(
             derived_at_first,
@@ -2512,7 +2771,7 @@ mod tests {
         // a second while a reply is streaming.
         let mut grown_path = path.clone();
         grown_path.push(&one_more_turn);
-        let after = build_entries(&grown_path, &mut cache);
+        let after = build_entries(&grown_path, Some(paths::home_dir()), &mut cache);
 
         let derived_again = cache.derived - derived_at_first;
         assert_eq!(
@@ -2538,7 +2797,11 @@ mod tests {
             record(r#"{"type":"system","subtype":"local_command","uuid":"ab","content":"kept"}"#);
 
         let mut cache = EntryCache::default();
-        let entries = build_entries(&[&overwritten, &namesake], &mut cache);
+        let entries = build_entries(
+            &[&overwritten, &namesake],
+            Some(paths::home_dir()),
+            &mut cache,
+        );
         assert_eq!(
             local_command_texts(&entries),
             vec![SharedString::from("first"), SharedString::from("kept")]
@@ -2546,7 +2809,11 @@ mod tests {
 
         let derived_at_first = cache.derived;
         cache.forget_record("a");
-        let entries = build_entries(&[&replacement, &namesake], &mut cache);
+        let entries = build_entries(
+            &[&replacement, &namesake],
+            Some(paths::home_dir()),
+            &mut cache,
+        );
 
         let derived_again = cache.derived - derived_at_first;
         assert_eq!(
@@ -2588,7 +2855,7 @@ mod tests {
         };
         assert_eq!(persisted.preview.as_ref(), "first line");
         assert!(
-            !persisted_output_is_loadable(&persisted.path, paths::home_dir()),
+            !persisted_output_is_loadable(&persisted.path, Some(paths::home_dir())),
             "{} is outside <home>/.claude/projects and must not be offered for loading",
             persisted.path.display()
         );
@@ -2600,7 +2867,7 @@ mod tests {
             panic!("the placeholder must still be recognized without structured fields");
         };
         assert!(
-            persisted_output_is_loadable(&persisted.path, paths::home_dir()),
+            persisted_output_is_loadable(&persisted.path, Some(paths::home_dir())),
             "{} is hook output Claude Code really writes and must stay loadable",
             persisted.path.display()
         );
@@ -2719,6 +2986,106 @@ mod tests {
             "a marker naming a path outside <home>/.claude/projects must be shown as text \
              and never offered, got {:?}",
             items[2].persisted
+        );
+    }
+
+    /// A window holding nothing but the panel's input, built exactly as the panel
+    /// builds it. The panel itself needs a workspace and a project, and neither takes
+    /// part in what these tests are about: the rule that decides whether the answer to
+    /// a send may write into the input.
+    fn message_input(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Editor>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        cx.add_window_view(|window, cx| {
+            let mut editor = Editor::auto_height(1, 8, window, cx);
+            editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
+            editor
+        })
+    }
+
+    /// What the panel does on the way out of `send_message`: it takes the text and
+    /// empties the input without waiting for the send to be answered.
+    fn take_the_text(
+        input: &Entity<Editor>,
+        text: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) -> String {
+        input.update_in(cx, |editor, window, cx| {
+            editor.set_text(text, window, cx);
+            let taken = editor.text(cx);
+            editor.clear(window, cx);
+            taken
+        })
+    }
+
+    #[gpui::test]
+    async fn a_send_that_fails_hands_the_message_back(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = message_input(cx);
+        let sent = take_the_text(&input, "the message that never arrived", cx);
+
+        cx.update(|window, cx| {
+            apply_send_outcome(
+                &input,
+                &sent,
+                Err(anyhow::anyhow!("can't find pane %9")),
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            input.update(cx, |editor, cx| editor.text(cx)),
+            "the message that never arrived",
+            "a send the user can do nothing about must not also cost them the message"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_send_that_fails_does_not_overwrite_what_the_user_typed_since(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (input, cx) = message_input(cx);
+        let sent = take_the_text(&input, "the message that never arrived", cx);
+
+        // The send is answered a round trip later, and the user did not wait for it.
+        input.update_in(cx, |editor, window, cx| {
+            editor.set_text("what the user is typing now", window, cx)
+        });
+
+        cx.update(|window, cx| {
+            apply_send_outcome(
+                &input,
+                &sent,
+                Err(anyhow::anyhow!("can't find pane %9")),
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            input.update(cx, |editor, cx| editor.text(cx)),
+            "what the user is typing now",
+            "the newer text is the user's; a failure from before it must not replace it"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_send_that_arrives_leaves_the_input_empty(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = message_input(cx);
+        let sent = take_the_text(&input, "the message that arrived", cx);
+
+        cx.update(|window, cx| apply_send_outcome(&input, &sent, Ok(()), window, cx));
+
+        assert_eq!(
+            input.update(cx, |editor, cx| editor.text(cx)),
+            "",
+            "a send that worked must leave the emptied input alone"
         );
     }
 }

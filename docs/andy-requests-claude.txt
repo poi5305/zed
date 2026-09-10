@@ -1246,3 +1246,486 @@ D.4 這次沒有改、但使用者問到的事
   - **read-only**：P1 就是唯讀，面板已標
     「Read-only. Replying from Zed is out of scope for this panel (P3).」
     從 Zed 打字回覆是 P3，未做。
+
+
+================================================================================
+附錄 E P3 + P4 任務書（2026-09-10 訂）
+================================================================================
+
+--------------------------------------------------------------------------------
+E.0 共同規則（每一份派工都要逐字帶）
+--------------------------------------------------------------------------------
+
+  - 禁止 `git stash` / `git checkout` / `git restore` / `git reset`。
+  - 禁止任何 lint 抑制（`#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]`）。
+  - 禁止 `unwrap()` / `expect()`（測試中可用）、禁止 `let _ =` 吞錯。
+  - 盲測檔（`blind_*_tests.rs`）不得讀、不得跑、不得改。
+  - 不得修改本 spec 檔；發現規格自相矛盾停下來回報。
+  - 正在挑輸入／改測試讓某個 case 過 → 停下來回報。回報「做不到」是成功的結果。
+  - `README.md` 前兩行 `> [!IMPORTANT]` / `> Remove this line...` 不得移除。
+  - `~/.claude/sessions/<pid>.<sha>.key` 與 `messagingSocketPath`：不讀、不記、不傳。
+  - gate：`cargo test -p <動到的 crate>`、`./script/clippy`、`cargo fmt --check`。
+
+--------------------------------------------------------------------------------
+E.1 架構決策：共用層放 `crates/remote/src/claude_sessions.rs`
+--------------------------------------------------------------------------------
+
+P4 的 server 端要在遠端做「掃註冊表 + 判活 + glob transcript + tail + 送輸入」。
+`remote_server` 不能依賴 `claude_sessions`（那是 UI crate，會拉進
+`ui` / `workspace` / `markdown` / `theme`）。判活邏輯剛剛才修過兩個 bug（附錄 D），
+複製兩份必然走歪，所以**移動**而不是複製。
+
+落點沿用本 repo 既有先例 `crates/remote/src/tmux_sessions.rs`
+（「本機執行的機器上的 tmux」，同時被 remote_server 與 client 用）。
+`remote` 已有 anyhow / collections / serde / serde_json / util / paths / smol / gpui，
+不需要新增依賴，且 `remote` 不依賴 `ui`/`workspace`/`project`，不會有循環。
+
+Client 端 `claude_sessions` 抽 source trait（list / tail / read_blob / send_input），
+local 直接呼叫共用層，remote 走 proto，UI 完全不分本地遠端（正文 §7 要求）。
+
+--------------------------------------------------------------------------------
+E.2 WP5 —— 共用層搬移 + P3 純函式（Opus 5 high）
+--------------------------------------------------------------------------------
+
+新檔 `crates/remote/src/claude_sessions.rs`，在 `crates/remote/src/remote.rs`
+加 `pub mod claude_sessions;`。
+
+**搬進來（盡量逐字，不要順手改行為）**
+
+  自 `crates/claude_sessions/src/session_registry.rs`（整檔，含 `mod tests`）：
+    `RegisteredSession` / `parse_registered_session` / `Liveness` / `liveness` /
+    `visible_sessions`
+  自 `crates/claude_sessions/src/session_store.rs`：
+    `read_registrations`(406) / `process_start_times`(486,528 兩個 cfg) /
+    `normalize_whitespace`(532) / `now_millis`(538) / `find_transcript`(549) /
+    `read_transcript_tail`(566) / `split_complete_lines`(386) /
+    `TailState`(76) / `TailProgress`(82) / `HEARTBEAT_CUTOFF_MILLIS`(35)
+    以及它們對應的既有測試（`test_split_complete_lines_*`、
+    `test_read_transcript_tail_*`、`test_normalize_whitespace_*`、
+    `test_read_registrations_treats_a_missing_directory_as_no_sessions`、
+    `test_process_start_times_are_reported_in_utc`）。
+
+  留在 `claude_sessions`：`ClaudeSessionStore`（gpui 生命週期）、`transcript.rs`、
+  panel、button、`resolve_visible_sessions` 與 `ProcessStartLookup`（gpui `Task`）。
+
+**盲測相容（硬性）**
+
+  `blind_registry_tests.rs` 寫的是 `use crate::session_registry::*;`。
+  那個檔一個字都不准動，所以 `crates/claude_sessions/src/claude_sessions.rs`
+  要留下這條路徑：`pub use remote::claude_sessions as session_registry;`
+  （原 `session_registry.rs` 檔案刪除）。
+
+**新增（P3 用，純函式優先）**
+
+  /// 註冊檔的 `tmux` 欄位形如 `awp:@1.%1`（session:@window_id.%pane_id）。
+  /// pane id 在整個 tmux server 內唯一，實測 `tmux display-message -t %1` 可解析，
+  /// 所以只取 `%<digits>` 當 target，完全避開 session 名的引號問題。
+  /// 形狀不符 → None（呼叫端據此停用輸入框）。
+  pub fn pane_target(tmux_field: &str) -> Option<String>
+
+  /// 送一段（可含換行的）文字進 pane，然後送 Enter。
+  /// 實測 tmux 3.6b：`load-buffer -b <name> -` 吃 stdin（文字不經過 shell），
+  /// `paste-buffer -d -p -b <name> -t <pane>` 的 `-p` 是 bracketed paste，
+  /// 多行才不會被 TUI 當成多次送出。
+  pub async fn send_text(pane_target: &str, text: &str) -> Result<()>
+
+  /// 中斷：`send-keys -t <pane> Escape`
+  pub async fn send_escape(pane_target: &str) -> Result<()>
+
+  /// server 端與 local source 共用的聚合：掃註冊表 + 判活 + 解析 transcript 路徑。
+  pub struct SessionSummary { pub session: RegisteredSession, pub transcript_path: Option<PathBuf> }
+  pub async fn list_sessions(home_directory: &Path, project_root: Option<&Path>) -> Result<Vec<SessionSummary>>
+
+  home 用 `crates/paths` 的 helper，不要自己讀 `$HOME`；remote 端要 resolve 遠端的 `~`。
+
+**硬性要求**
+
+  - `pane_target` 只接受 `%` 後面全是數字的尾段；`-`、空白、空字串一律 None
+    （值來自 JSON 檔，視為不可信輸入，且不得讓它變成 `tmux` 的旗標）。
+  - 送輸入的三個指令一律用 argv 傳參，不得組 shell 字串。
+  - 文字只走 stdin，不得放進命令列。
+  - `send_text` / `send_escape` 失敗要回 Err 並帶 stderr（UI 要顯示得出來）。
+  - 不得自動送任何東西：這兩支只在使用者按下按鈕時被呼叫。
+
+**回歸測試**：`pane_target` 的正例（`awp:@1.%1` → `%1`、`a:b:@10.%234` → `%234`）
+與反例（`awp:@1`、`awp:@1.%`、`awp:@1.%x`、`-t`、``、`%1 ; rm -rf /`）；
+搬過來的測試全部維持綠。
+
+--------------------------------------------------------------------------------
+E.3 WP6 —— source trait + local source + store 改接 + P3 UI（Opus 5 high）
+--------------------------------------------------------------------------------
+
+新檔 `crates/claude_sessions/src/session_source.rs`：
+
+  pub enum SessionInput { Text(String), Escape }
+
+  pub trait SessionSource: Send + Sync + 'static {
+      fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<Vec<SessionSummary>>>;
+      fn tail(&self, path: PathBuf, offset: u64) -> Task<Result<FileChunk>>;
+      fn read_blob(&self, path: PathBuf, max_bytes: u64) -> Task<Result<Vec<u8>>>;
+      fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>>;
+  }
+
+  pub struct FileChunk { pub bytes: Vec<u8>, pub next_offset: u64, pub restarted: bool }
+
+  `LocalSource`（本波做）：直接呼叫 `remote::claude_sessions::*`。
+  `RemoteSource`（WP9 做）：本波只留 trait 與 `LocalSource`。
+
+`ClaudeSessionStore`：
+  - 建構子改成 `new(project_root, source: Arc<dyn SessionSource>, cx)`。
+  - registry / transcript 輪詢改成走 source，不再自己讀檔。
+  - 新增 `pub fn send_input(&mut self, input: SessionInput, cx)`：
+    取目前選中 session 的 `tmux_target` → `pane_target()`；None 則不送、設 error。
+  - 既有測試改用一個 fake source（原本的 `fake_process_start_lookup` 那條路留著）。
+
+`ClaudeSessionsPanel`（P3 UI）：
+  - 底部把 `render_read_only_footer` 換成輸入區：多行輸入 + 「Send」+「Esc」。
+  - 選中的 session 沒有可用 pane target → 輸入區停用，顯示原本的唯讀說明。
+  - 送出成功清空輸入框；失敗把錯誤顯示在既有 error 位置。
+  - **送出只能由使用者觸發**（按鈕或 Enter），不得有任何自動送出路徑。
+  - `IconName` 只用既有的，不要新增 asset。
+
+--------------------------------------------------------------------------------
+E.4 WP7 —— proto + remote_server handler（Gemini 3.8 Flash high，機械性）
+--------------------------------------------------------------------------------
+
+樣板逐字對照 `ListTmuxSessions`：
+`crates/proto/proto/tmux.proto`、`crates/proto/proto/zed.proto:18,533-534`、
+`crates/proto/src/proto.rs:191-192,498`、
+`crates/remote_server/src/headless_project.rs:307,1357-1389`。
+
+新檔 `crates/proto/proto/claude_sessions.proto`：
+
+  message ClaudeSession { uint32 process_id=1; string session_id=2; string working_directory=3;
+    string version=4; optional string name=5; optional string status=6; optional int64 updated_at=7;
+    optional string tmux_target=8; optional string transcript_path=9; }
+  message ListClaudeSessions { uint64 project_id=1; optional string project_root=2; }
+  message ListClaudeSessionsResponse { repeated ClaudeSession sessions=1; }
+  message TailClaudeFile { uint64 project_id=1; string path=2; uint64 offset=3; uint64 max_bytes=4; }
+  message TailClaudeFileResponse { bytes contents=1; uint64 next_offset=2; bool restarted=3; }
+  message SendClaudeInput { uint64 project_id=1; string pane_target=2; oneof input { string text=3; bool escape=4; } }
+
+  zed.proto：`import "claude_sessions.proto";` + oneof 501..506（`// current max` 註解要跟著移）。
+  proto.rs：`(Msg, Background)` 逐個登記，request/response 配對兩組
+  （`SendClaudeInput` 回 `Ack`）。
+  handler 三支照 `handle_list_tmux_sessions` 的形狀，body 只呼叫
+  `remote::claude_sessions::*`，`cx.background_spawn` 包住 IO。
+  home 在 server 端 resolve。
+
+  **硬性**：不得把 raw JSON 丟給 client 解（正文 §7）；相容性處理留在產生端。
+  **不得**新增 proto 欄位以外的東西，不得改既有訊息編號。
+
+--------------------------------------------------------------------------------
+E.5 WP9 —— RemoteSource（Gemini 3.8 Flash high，機械性）
+--------------------------------------------------------------------------------
+
+`session_source.rs` 補 `RemoteSource { client: AnyProtoClient }`，三支 RPC 對接
+WP7 的訊息；panel 建 store 時依 `project.read(cx).remote_client()` 選 source
+（有 → RemoteSource，無 → LocalSource）。
+
+--------------------------------------------------------------------------------
+E.6 盲測（Opus 5 medium，禁看實作）
+--------------------------------------------------------------------------------
+
+只給 E.2 的 API 與語意，**不准讀** `crates/remote/src/claude_sessions.rs`
+與 `crates/claude_sessions/src/`。寫成
+`crates/claude_sessions/src/blind_input_tests.rs`（大腦負責掛 `mod`），
+覆蓋 `pane_target` 的淨化與 `FileChunk` 的 offset 語意
+（offset 前進、檔案縮小要 restarted、offset 超過檔尾）。
+
+--------------------------------------------------------------------------------
+E.7 順序與驗收
+--------------------------------------------------------------------------------
+
+  Wave 1  WP5 ∥ 盲測          Wave 2  WP6 ∥ WP7
+  Wave 3  WP9                 Wave 4  大腦驗收 + 乾淨 context Opus 對抗式 review
+                                      （findings JSON → RED → 修到綠）
+
+每一波之間由大腦跑 gate（test / clippy / fmt / `cargo build -p zed`
+/ `cargo build -p remote_server`）。收工前用真的 `~/.claude/sessions` 實跑一次，
+P3 的實際送出由使用者自己在 UI 上驗（agent 不得對真的 session 送任何輸入）。
+
+--------------------------------------------------------------------------------
+E.8 驗收發現：tail RPC 的任意檔案讀取（已修）
+--------------------------------------------------------------------------------
+
+WP7 交付後我驗 diff 發現的洞，嚴重度足以當場修，不留到 Wave 4。
+
+`read_transcript_tail(home, session_id, state)` 的語意是「`state.path` 存在就照著讀，
+否則才 glob」。這在 local 沒問題（path 是自己上一輪 glob 出來的），
+但 `TailClaudeTranscript.path` 是 **client 傳來的**，於是 handler 會照著讀任何
+remote server 讀得到的檔案。取證（暫時測試，跑完已還原）：
+
+  tail returned lines ["sk-secret-value-that-must-never-be-read"]
+    from Some("/var/folders/.../probe-not-a-transcript.key")
+
+也就是 `~/.claude/sessions/<pid>.<sha>.key` 可以被這條路徑讀出來 ——
+正文 §1.1／§8 明文「不讀、不記、不傳」的那個檔。
+
+**修法**（在 server 端信任邊界，`headless_project.rs`）：
+新增純函式 `transcript_path_to_follow(path, session_id, home)`，client 傳來的 path
+必須同時滿足：絕對路徑、位於 `<home>/.claude/projects/` 之下、不含 `..` component、
+檔名正好是 `<session_id>.jsonl`。不符就當成 `None`（不是回錯），
+讓 server 用 session_id 自己重新 glob —— 語意上正好等於「你追的檔不見了，重找」。
+
+**三個 clause 各自有一個只有它抓得到的案例，逐一突變都會變紅**：
+
+  拿掉 `starts_with(projects)`  → `<home>/.claude/sessions/<session>.jsonl` 這案變紅
+  拿掉檔名檢查                 → `projects/x/another-session.jsonl` 這案變紅
+  拿掉 `..` 檢查               → `projects/x/../../.claude/sessions/<session>.jsonl` 這案變紅
+
+**「什麼合法輸入會被誤殺」**：拿本機真的 7 個 session 跑 production 路徑
+（`list_sessions` → `transcript_path_to_follow`），6 個有 transcript 的全部通過，
+第 7 個本來就沒有 transcript（SDK session）。誤殺 0 筆。
+
+  註：`paths::home_dir()` 在 `cfg(test)` / `feature = "test-support"` 下固定回
+  `/Users/zed`（見 crates/util/src/paths.rs:27），所以測試裡拿不到真的 home，
+  實機驗證要自己傳 `$HOME`。production 不受影響。
+
+--------------------------------------------------------------------------------
+E.9 WP6 回報的五個規格問題 —— 大腦裁定
+--------------------------------------------------------------------------------
+
+1. **「送出成功後清空輸入框」字面上做不到，且照字面做會更糟。**
+   WP6 指出：等 tmux 三個子指令跑完（數十毫秒）才清空，會把使用者這段期間
+   新打的字一起吃掉。它的實作是交付給 source 的當下就清空。
+   **裁定：清空時機維持不變（交付即清），但送出失敗必須把文字還回輸入框，
+   且只在輸入框當下仍為空時才還**（使用者又打了字就不准蓋掉）。
+   這條列進 WP9 施工，附三支測試（失敗且空→還回、失敗但已有新內容→不覆蓋、成功→保持空）。
+
+2. **`error` 加來源標記（`ErrorSource::Poll` / `Send`）：接受。**
+   這不是超出最小差異，是修一個真 bug —— 原本 `apply_registry_scan` 每次成功掃描
+   都 `self.error.take()`，1 秒的輪詢會在使用者讀到之前把送出失敗的訊息清掉。
+   測試會綠只是因為測試控制時鐘。顯示位置與機制沒換，保留。
+
+3. **空白訊息被擋掉：接受。**
+   誤殺的合法輸入是「只按 Enter」—— 在 Claude Code 裡那等於接受權限提示的
+   預設選項。擋掉是對的：輸入框有焦點時誤按 Enter 會直接授權一個可能破壞性的工具。
+   使用者要接受提示仍可打「1」再 Enter，或按 Esc 中斷。
+   若日後要支援，應該做成明確的「Approve」按鈕，不是讓空訊息穿過去。
+
+4. **三支 registry 測試改了呼叫方式：接受，我逐字比對過。**
+   斷言文字的雜湊在兩支上完全相同；第三支
+   （`test_registry_scan_normalizes_padded_process_start`）唯一差別是
+   `session.process_start` 變成 `summary.session.process_start`，語意不變。
+   WP6 說「padded 那支現在有一半在驗測試 helper」是對的，但它仍然釘住
+   store 的列舉路徑吃 padded procStart 會判 Live；等價的產品路徑覆蓋在
+   `remote` 自己的 `test_list_sessions_reports_sessions_with_and_without_a_transcript`
+   與 `test_normalize_whitespace_matches_padded_ps_output`。兩邊都留。
+
+5. **`transcript_path()` 最多落後一次 registry 輪詢（1 秒）：接受。**
+   「還沒有 transcript」與「transcript 是空的」兩句提示的切換慢一拍，不是 bug。
+
+另外 WP6 回報 `./script/clippy` 全 workspace 編不過（`trusted_worktrees.rs:161` E0004）
+—— 我實測 `./script/clippy` exit code 0，涵蓋 claude_sessions / remote / remote_server 三個
+crate 都有 Checking。它那次應該是在樹還在半改狀態時跑的。不採信該回報。
+
+--------------------------------------------------------------------------------
+E.10 WP9（RemoteSource）交付與它自己回報的缺口
+--------------------------------------------------------------------------------
+
+交付：`RemoteSource` 四支方法對接四支 RPC（`project_id` 一律
+`proto::REMOTE_SERVER_PROJECT_ID`）；panel 依 `project.read(cx).remote_client()`
+選 source；`session_summary_from_proto` / `tail_progress_from_proto` 抽成純函式加測試。
+147 支測試（140 → 147），盲測 87 支未動。
+
+`process_start` 在 remote 填空字串、`kind` 填 `"interactive"`、`bridge_session_id` 填 None：
+判活與 interactive 過濾已經在 process 所在的那台機器做完，client 手上沒有那台機器的
+pid table，再判一次只會更差。
+
+**送出失敗還回文字**（E.9 第 1 項）的機制選了「store 的 `send_input` 回傳
+`Task<Result<()>>`」而不是事件 —— panel 需要「這次的結果」與「這次的文字」配對，
+回傳 task 讓兩者留在同一個 stack frame，不會錯配。界限用 `is_empty()` 而非
+`trim().is_empty()`：輸入框裡只要有一個字元就是使用者的，不做「那只是空白」的判斷。
+三支測試各用一次突變證明紅在對的原因（拿掉還原邏輯 / 拿掉「仍為空」守衛 / 不看 outcome）。
+
+它回報的四件事，我的處置：
+
+  1. **remote 上 persisted output 的按鈕永遠不會出現** —— 兩處守衛用的是
+     `paths::home_dir()`（本機 home），而 remote transcript 裡是遠端路徑。
+     它照指令沒有放寬界限，回報。**這是真缺口 → 開 WP10 修**：
+     `ListClaudeSessionsResponse` 加 `home_directory`，client 用「產生那些路徑的那台機器」
+     的 home 做界限判斷；home 還沒拿到時按鈕不顯示（不得拿本機 home 頂著用）。
+  2. **`NO_SESSIONS` 在遠端說謊**（"on this machine"）→ 併進 WP10 改掉。
+     `READ_ONLY_NOTE` 與 `NO_PANE_TARGET` 是 session 層級敘述，不動。
+  3. **`send_input` 的 task 被丟掉會把 tmux 寫入砍到一半** —— 目前兩個呼叫端
+     一個 await、一個 detach，走不到；已寫在 doc comment，型別無法強制。
+     留給 Wave 4 review 判斷是否值得換成 channel（要新增依賴，不擅自加是對的）。
+  4. `process_start` 在 remote 是空字串：panel／store 都不讀它，判活不在 client 做。接受。
+
+--------------------------------------------------------------------------------
+E.11 跨家族安全審查（Gemini，唯讀）的 findings
+--------------------------------------------------------------------------------
+
+這批 P3/P4 的程式碼主要是 Opus 寫的，所以安全面交給不同家族審（CLAUDE.md 要求）。
+唯讀、只找不修、只准輸出 JSON。它審五個界限，回報 A/C/E 乾淨、兩條 finding：
+
+**S1（high）—— `validate_claude_file_path` 界限過寬。根因是我 spec 寫錯。**
+
+  它允許整個 `<home>/.claude/`，於是 client 可以用 `proto::ReadClaudeFile` 讀走
+  `<home>/.claude/sessions/<pid>.<sha256>.key` —— 正文 §1.1／§8 明文
+  「不讀、不記、不傳」的那個檔。
+
+  這條界限是我在 E.4 的派工裡寫成「必須落在 `<home>/.claude/` 之下」的，
+  WP7 照做沒有錯。實際上被 offload 的 tool 輸出只住在
+  `<home>/.claude/projects/<slug>/tool-results/*.txt`，而 client 端同一條界限
+  （`persisted_output_is_loadable`）用的就是 `home/.claude/projects` ——
+  兩邊本來就不一致，寬的那邊在 server。
+
+  這正是「安全／金流／刪除加第二輪、換不同家族」這條規則要抓的東西：
+  同家族審同家族不會有人去質疑派工裡那行界限。
+
+**S2（medium）—— `send_text` 沒有失敗／取消的清理。**
+
+  `load-buffer` 成功之後若 `paste-buffer` 失敗（pane 不存在）或 Task 被 drop，
+  那個 buffer 會留在 tmux server 的 buffer stack 頂端，使用者手動貼上
+  （prefix + `]`）會意外貼出剛才那段文字。若 drop 發生在 paste 之後、
+  `send-keys Enter` 之前，文字會留在終端機裡沒送出。
+
+兩條都交給 Wave 4 的 Opus review 那一輪獨立驗證、寫 RED 測試、修到綠
+（來源標 handed，誤報要標 rejected 並說明理由）。
+
+--------------------------------------------------------------------------------
+E.12 Review 輪（Opus，乾淨 context）結果與大腦驗收
+--------------------------------------------------------------------------------
+
+findings 6 = 修 3 + wontfix 3。對帳平衡：RED 測試 3 支 ↔ 修正 3 條 ↔ `src/` 改動 3 處
+（我比對 review 前的快照，只有 `remote/src/claude_sessions.rs` 與
+`remote_server/src/headless_project.rs` 兩檔被動過，其餘四檔 byte-identical）。
+
+**修掉的三條**
+
+  S1（high，handed）server 端界限由 `<home>/.claude` 收到 `<home>/.claude/projects`。
+  S2（medium，handed）`paste-buffer`/`send-keys` 失敗時補 `delete-buffer`，
+    不遮蓋原始錯誤。取消（Task 被 drop）造成的殘留無法在 await point 清理，回報保留。
+  **R1（high，這輪自己找的）—— 比 S1 更嚴重的同類漏洞**：
+    `find_transcript` 把 `format!("{session_id}.jsonl")` 直接 join 到 projects 底下，
+    而 `session_id` 從來沒有被當成不可信輸入驗過。我在 E.8 只擋了 client 傳來的 `path`，
+    沒想到真正組出路徑的是 `session_id`。
+      concrete input：`TailClaudeTranscript { session_id: "../../../../../../etc/ssl/private/secrets" }`
+      後果：任何 remote server 讀得到的 `*.jsonl` 都能被讀走。
+    修法：新增私有 `transcript_file_name(session_id)`，`{session_id}.jsonl` 必須是
+    **恰好一個 `Component::Normal` 且等於自身**。放在共用層，所以四支 RPC、
+    `list_sessions`、`LocalSource` 一次全關。
+
+**wontfix 三條**：R2（併發 send 交錯，見 E.13）、R3（`display_working_directory`
+在 remote 用本機 home 縮寫路徑，純顯示且 fail open）、R4（`overwritten_uuids`
+無上限成長，P1 範圍、每筆約 40 bytes）。
+
+**我的驗收（不採信回報）**
+
+  gate：claude_sessions 151、remote 94、remote_server 56 全綠；clippy exit 0；
+  fmt clean；zed 與 remote_server build 綠；盲測三檔去空白雜湊未變；
+  收工時 tmux 沒有 `zed-claude-*` buffer 殘留。
+
+  三處修正各做一次突變，全部紅在對的斷言：
+    `transcript_file_name(session_id)?` → 改回 `format!(...)`
+      → `a_session_id_cannot_lead_the_transcript_search_out_of_the_projects_directory` 紅，
+        訊息帶出實際解析到的越界路徑。
+    `delete-buffer` 清理拿掉
+      → `a_send_that_cannot_reach_its_pane_leaves_no_paste_buffer_behind` 紅，
+        訊息顯示 tmux 仍持有 `zed-claude-89580-0`（我事後確認殘留已清掉，現在是 0）。
+    `.join("projects")` 改回 `.claude`
+      → `a_read_is_confined_to_the_directory_the_client_may_offer` 紅。
+
+  誤殺驗證：真的 7 個 session 過新的 `transcript_file_name` 之後，
+  仍然是 6 個解析到 transcript（與加界限之前相同），0 誤殺。
+
+**程序違規（review agent 自首）**
+
+  它在一次 Bash 呼叫裡把 `sed -n '1,120p' blind_input_tests.rs | head -60` 跟 keymap 的
+  diff 綁在同一個指令，讀到了盲測檔前 ~60 行。我的判定：
+  盲測三檔的雜湊未變（未被修改）、它的三處修正都不在 `pane_target`
+  （diff 證實：改的是 `transcript_file_name`、`delete-buffer`、server 界限），
+  所以那 16 支 `pane_target` 盲測**仍然是有效證據**。但這件事記在這裡：
+  日後若要改 `pane_target`，對這一隻而言那些測試已經不算盲測。
+
+--------------------------------------------------------------------------------
+E.13 R2 從 wontfix 改成修（大腦解除了它的阻礙）
+--------------------------------------------------------------------------------
+
+review 輪把 R2（兩個併發 send 的三個 tmux 行程會交錯，導致兩則訊息被併成一則、
+再送一個空行）標成 wontfix，理由是「要驗證得對真 pane 送輸入，這輪禁止」。
+
+那個阻礙是我的規則造成的，所以我自己去驗：開一個拋棄式 tmux session
+（`cat >> /tmp/probe.out`），實測**一次呼叫**的 command list 可行：
+
+  printf 'line one\nline two' | tmux load-buffer -b probe1 - ';' \
+    paste-buffer -d -p -b probe1 -t %11 ';' send-keys -t %11 Enter
+  → exit 0、檔案收到 "line one\nline two\n"（多行保留、Enter 送出）、buffer 不殘留
+
+tmux server 是單執行緒事件迴圈、逐個處理一個 client 的 command list，
+所以一次呼叫就沒有中間可被別的 send 插進來的空隙。已派工改成這個形式，
+並要求：失敗清理照舊保留（load-buffer 成功後 paste 失敗時 buffer 仍會留下）、
+`send_escape` 不動、端到端驗證只能用拋棄式 session、收工不得留下 session 或 buffer。
+
+**規格補充（R1 交回的規格漏洞，一併定案）**：
+`sessionId` 一律視為不可信輸入 —— 它只能構成**單一 path component**，
+client、server、local 三邊用同一條規則。
+
+--------------------------------------------------------------------------------
+E.14 R2 修完 + 大腦把 opt-in 測試改成預設跑
+--------------------------------------------------------------------------------
+
+`send_text` 收成**一次** tmux 呼叫：
+
+  load-buffer -b <name> - ";" paste-buffer -d -p -b <name> -t <pane> ";" send-keys -t <pane> Enter
+
+`";"` 是獨立的 argv 元素，不經 shell；文字仍然只走 stdin。抽出純函式
+`send_text_arguments(buffer_name, pane_target)` 釘住「單一 argv、兩個 `;`、順序正確」——
+併發競爭本身無法穩定重現，所以釘的是結構性質：任何人把它拆回三個呼叫就會紅。
+失敗清理（`delete-buffer`）保留，因為 command list 裡 paste 失敗時 load 已經成功、buffer 會留下。
+`send_escape` 未動。
+
+**大腦補的一件事**：它把端到端那支（真的開一個 `cat` session、送兩行、讀檔驗內容）
+設成環境變數 opt-in，理由是會跟既有的
+`a_send_that_cannot_reach_its_pane_leaves_no_paste_buffer_behind` 互踩
+（後者斷言「此 process 沒有 `zed-claude-<pid>-` 前綴的 buffer」，前者會短暫持有一個）。
+它不准改既有測試，所以只能 opt-in —— 代價是那支不在預設路徑上，等於 CI 不跑。
+
+我把根因解掉：`mod tests` 加一個 `TMUX_SERVER_TESTS: Mutex<()>`，兩支都先取鎖
+（poison 用 `into_inner()` 跨過，免得一支失敗連帶讓另一支噴出誤導的第二個失敗），
+然後移除環境變數 gate。既有測試只多一行取鎖，**斷言一字未改**。
+
+  連跑三次 `cargo test -p remote` → 96 passed / 0 failed，無 flake。
+  非空測證明：把 command list 最後的 `Enter` 改成 `Space`
+    → `a_multi_line_send_arrives_in_the_pane_as_one_message` 紅在
+      left: "line one\n" / right: "line one\nline two\n"。
+  收工時 tmux 沒有 `zed-claude-*` session 或 buffer 殘留。
+
+它自己列的殘留風險，我的處置：
+  - 「兩則訊息的先後順序」不保證（panel 兩個 detach task 誰先跑到 tmux 誰先送）：
+    接受。使用者連按兩次 Enter 的兩則訊息都會完整送到，只是順序可能互換，
+    不會被併成一則，也不會misroute 到別的 session。
+  - 「錯誤訊息變粗」（整串 command list + tmux stderr）：接受，仍看得到 tmux 的原因。
+  - 「依賴 tmux 對 `;` 的語意」：本機 3.6b 實測成功與失敗路徑都符合；
+    很舊的 tmux 會退化成什麼，純函式測試抓不到，只有端到端那支抓得到 ——
+    而它現在預設會跑。
+
+--------------------------------------------------------------------------------
+E.15 P3 + P4 交付狀態
+--------------------------------------------------------------------------------
+
+  測試：claude_sessions 151（含 87 支盲測）、remote 96、remote_server 56
+  gate：./script/clippy exit 0、cargo fmt --check clean、
+        cargo build -p zed 與 -p remote_server 都 0 error
+  新程式碼零 `#[allow]` / `#[expect]`、非測試碼零 `unwrap()` / `expect()`
+  README 前兩行完好
+
+  實機驗證（本機 7 個真 session）：
+    列舉 7/7 判 Live、transcript 找到 6/7（第 7 個是 SDK session，確認檔案不存在）
+    增量 tail：6 個 session 第一次讀完、第二次回 0 行且 restarted false
+    路徑界限：6 個真 transcript 全部通過 `transcript_path_to_follow`，誤殺 0
+    session id 界限：真 UUID 仍解析到 transcript（6/7，與加界限前相同）
+
+  **P3 的實際送出沒有由 agent 驗過**（規則明文禁止對真 session 送輸入）。
+  端到端只驗到「送進一個跑 `cat` 的拋棄式 pane，兩行合成一則、Enter 送出」。
+  真正打進一個活著的 Claude session 要由使用者自己按一次。
+
+  仍然欠的：
+    - WP2 / WP3（P1 的 transcript.rs / session_store.rs）欠一輪跨家族 review，
+      grok 額度用盡（見 C.4）。P3/P4 這一輪已經補上跨家族安全審查（E.11）。
+    - panel 的接線層沒有 entity 級測試（要 Workspace harness），
+      這一輪 review 評估後標 wontfix。
+    - R3（remote 上 `display_working_directory` 用本機 home 縮寫）、
+      R4（`overwritten_uuids` 無上限）留在 backlog。

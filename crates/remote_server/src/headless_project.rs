@@ -40,6 +40,7 @@ use smol::process::Child;
 
 use settings::initial_server_settings_content;
 use std::{
+    ffi::OsStr,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
@@ -305,6 +306,10 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_listening_ports);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_tmux_sessions);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_sessions);
+        session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
+        session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
+        session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -1388,6 +1393,162 @@ impl HeadlessProject {
         })
     }
 
+    async fn handle_list_claude_sessions(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ListClaudeSessions>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListClaudeSessionsResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let project_root = envelope.payload.project_root.map(PathBuf::from);
+
+        let session_summaries = cx
+            .background_spawn({
+                let home_directory = home_directory.clone();
+                async move {
+                    remote::claude_sessions::list_sessions(&home_directory, project_root.as_deref())
+                        .await
+                }
+            })
+            .await?;
+
+        Ok(proto::ListClaudeSessionsResponse {
+            sessions: session_summaries
+                .into_iter()
+                .map(|summary| proto::ClaudeSession {
+                    process_id: summary.session.process_id,
+                    session_id: summary.session.session_id,
+                    working_directory: summary
+                        .session
+                        .working_directory
+                        .to_string_lossy()
+                        .into_owned(),
+                    version: summary.session.version,
+                    name: summary.session.name,
+                    status: summary.session.status,
+                    updated_at: summary.session.updated_at,
+                    tmux_target: summary.session.tmux_target,
+                    transcript_path: summary
+                        .transcript_path
+                        .map(|transcript_path| transcript_path.to_string_lossy().into_owned()),
+                })
+                .collect(),
+            home_directory: home_directory.to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn handle_tail_claude_transcript(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::TailClaudeTranscript>,
+        cx: AsyncApp,
+    ) -> Result<proto::TailClaudeTranscriptResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+        let tail_state = remote::claude_sessions::TailState {
+            path: transcript_path_to_follow(
+                request.path.as_deref(),
+                &request.session_id,
+                &home_directory,
+            ),
+            offset: request.offset,
+            pending: request.pending,
+        };
+
+        let progress = cx
+            .background_spawn(async move {
+                remote::claude_sessions::read_transcript_tail(
+                    &home_directory,
+                    &request.session_id,
+                    tail_state,
+                )
+            })
+            .await?;
+
+        Ok(proto::TailClaudeTranscriptResponse {
+            path: progress
+                .path
+                .map(|path| path.to_string_lossy().into_owned()),
+            start_offset: progress.start_offset,
+            offset: progress.offset,
+            pending: progress.pending,
+            lines: progress.lines,
+            restarted: progress.restarted,
+        })
+    }
+
+    async fn handle_read_claude_file(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ReadClaudeFile>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadClaudeFileResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+        let file_path = PathBuf::from(request.path);
+
+        validate_claude_file_path(&file_path, &home_directory)?;
+
+        // An upper bound of 4 MiB prevents unbounded memory allocation if a client requests
+        // an excessively large file. Because protobuf defaults unset numeric fields to 0,
+        // max_bytes == 0 is interpreted as requesting the default maximum limit.
+        const MAXIMUM_READ_BYTES: u64 = 4 * 1024 * 1024;
+        let byte_limit = if request.max_bytes == 0 {
+            MAXIMUM_READ_BYTES
+        } else {
+            request.max_bytes.min(MAXIMUM_READ_BYTES)
+        };
+
+        let (contents, truncated) = cx
+            .background_spawn(async move {
+                use std::io::Read as _;
+                let mut file = std::fs::File::open(&file_path)?;
+                let mut read_buffer = Vec::new();
+                file.by_ref()
+                    .take(byte_limit + 1)
+                    .read_to_end(&mut read_buffer)?;
+                let is_truncated = read_buffer.len() as u64 > byte_limit;
+                if is_truncated {
+                    read_buffer.truncate(byte_limit as usize);
+                }
+                Ok::<_, anyhow::Error>((read_buffer, is_truncated))
+            })
+            .await?;
+
+        Ok(proto::ReadClaudeFileResponse {
+            contents,
+            truncated,
+        })
+    }
+
+    async fn handle_send_claude_input(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SendClaudeInput>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let request = envelope.payload;
+        // The pane target must be sanitized before passing it to tmux to prevent command injection.
+        let Some(sanitized_pane_target) =
+            remote::claude_sessions::pane_target(&request.pane_target)
+        else {
+            anyhow::bail!("invalid tmux pane target: {:?}", request.pane_target);
+        };
+
+        cx.background_spawn(async move {
+            match request.input {
+                Some(proto::send_claude_input::Input::Text(text_to_send)) => {
+                    remote::claude_sessions::send_text(&sanitized_pane_target, &text_to_send)
+                        .await?;
+                }
+                Some(proto::send_claude_input::Input::Escape(_)) => {
+                    remote::claude_sessions::send_escape(&sanitized_pane_target).await?;
+                }
+                None => anyhow::bail!("no input provided in SendClaudeInput"),
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+        Ok(proto::Ack {})
+    }
+
     async fn handle_get_remote_profiling_data(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetRemoteProfilingData>,
@@ -1491,4 +1652,206 @@ fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+// The path a tail is allowed to follow, which is only ever the transcript of the session
+// the request names.
+//
+// A client sends back the path it is already following so that a replaced file can be
+// noticed, but a path out of a request is not evidence of anything: the tail reads
+// whatever path it is handed, so without this it would answer with the contents of any
+// file the remote server can read, session key files included. A path that does not
+// belong to this session is dropped rather than refused, because the session's real
+// transcript is then located the same way the first request located it.
+fn transcript_path_to_follow(
+    path: Option<&str>,
+    session_id: &str,
+    home_directory: &Path,
+) -> Option<PathBuf> {
+    let path = PathBuf::from(path?);
+    let projects_directory = home_directory.join(".claude").join("projects");
+    let expected_file_name = format!("{session_id}.jsonl");
+
+    let names_this_sessions_transcript = path
+        .file_name()
+        .is_some_and(|file_name| file_name == OsStr::new(&expected_file_name));
+    if !path.is_absolute()
+        || !path.starts_with(&projects_directory)
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !names_this_sessions_transcript
+    {
+        return None;
+    }
+
+    Some(path)
+}
+
+// The files this protocol may read back, which are the tool outputs Claude Code persists
+// beside a transcript, under `~/.claude/projects`.
+//
+// The boundary is the projects directory rather than the whole of `~/.claude` because
+// `~/.claude/sessions` holds the `<pid>.<sha256>.key` credential for each session's
+// messaging socket, and a path out of a request is not evidence of anything: a boundary
+// at `~/.claude` would answer a request for a key file with its contents. Requiring an
+// absolute path with no parent traversal component ("..") is what makes the prefix check
+// mean what it says.
+fn validate_claude_file_path(path: &Path, home_directory: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("path must be absolute: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("path must not contain '..' components: {}", path.display());
+    }
+    let allowed_directory = home_directory.join(".claude").join("projects");
+    if !path.starts_with(&allowed_directory) {
+        anyhow::bail!(
+            "path {} is outside the allowed directory {}",
+            path.display(),
+            allowed_directory.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_validate_claude_file_path() {
+        let home_directory = PathBuf::from("/Users/testuser");
+
+        // Positive case: absolute path within <home>/.claude/
+        let valid_path = home_directory.join(".claude/projects/x/tool-results/a.txt");
+        assert!(validate_claude_file_path(&valid_path, &home_directory).is_ok());
+
+        // Negative case: relative path
+        let relative_path = Path::new("projects/x/tool-results/a.txt");
+        assert!(validate_claude_file_path(relative_path, &home_directory).is_err());
+
+        // Negative case: relative path with leading .claude
+        let relative_claude_path = Path::new(".claude/projects/x/tool-results/a.txt");
+        assert!(validate_claude_file_path(relative_claude_path, &home_directory).is_err());
+
+        // Negative case: path containing ".." component
+        let parent_directory_path = home_directory.join(".claude/../.ssh/id_rsa");
+        assert!(validate_claude_file_path(&parent_directory_path, &home_directory).is_err());
+
+        let internal_traversal_path = home_directory.join(".claude/projects/x/../../id_rsa");
+        assert!(validate_claude_file_path(&internal_traversal_path, &home_directory).is_err());
+
+        // Negative case: path within user home but outside .claude
+        let ssh_key_path = home_directory.join(".ssh/id_rsa");
+        assert!(validate_claude_file_path(&ssh_key_path, &home_directory).is_err());
+
+        // Negative case: system file outside user home
+        let password_file_path = Path::new("/etc/passwd");
+        assert!(validate_claude_file_path(password_file_path, &home_directory).is_err());
+    }
+
+    #[test]
+    fn test_a_tail_only_follows_the_transcript_of_the_session_it_names() {
+        let home_directory = PathBuf::from("/Users/testuser");
+        let session = "095bcff6-b9a8-4584-a3c6-861f16c9a807";
+        let transcript = home_directory
+            .join(".claude/projects/-Users-testuser-work")
+            .join(format!("{session}.jsonl"));
+
+        assert_eq!(
+            transcript_path_to_follow(transcript.to_str(), session, &home_directory),
+            Some(transcript.clone()),
+            "the session's own transcript is what a tail is for"
+        );
+        assert_eq!(
+            transcript_path_to_follow(None, session, &home_directory),
+            None,
+            "a request with no path leaves the transcript to be located from the session id"
+        );
+
+        for rejected in [
+            home_directory.join(".claude/sessions/17694.a66fc5e9.key"),
+            home_directory.join(".ssh/id_rsa"),
+            PathBuf::from("/etc/passwd"),
+            home_directory.join(".claude/projects/x/../../.ssh/id_rsa"),
+            home_directory.join(".claude/projects/x/another-session.jsonl"),
+            // Right name, no traversal, wrong directory: only the prefix check rejects
+            // these two, and the first of them is a session key file's neighbour.
+            home_directory
+                .join(".claude/sessions")
+                .join(format!("{session}.jsonl")),
+            PathBuf::from("/tmp").join(format!("{session}.jsonl")),
+            // Only the parent-directory check stands between this and a key file: it is
+            // under the projects directory lexically and it does carry the expected name.
+            home_directory
+                .join(".claude/projects/x/../../.claude/sessions")
+                .join(format!("{session}.jsonl")),
+            PathBuf::from(".claude/projects/x").join(format!("{session}.jsonl")),
+        ] {
+            assert_eq!(
+                transcript_path_to_follow(rejected.to_str(), session, &home_directory),
+                None,
+                "a tail must not be talked into reading {}",
+                rejected.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_pane_target_sanitization() {
+        assert_eq!(
+            remote::claude_sessions::pane_target("%3"),
+            Some("%3".to_string())
+        );
+        assert_eq!(
+            remote::claude_sessions::pane_target("session:@0.%42"),
+            Some("%42".to_string())
+        );
+        assert_eq!(remote::claude_sessions::pane_target("invalid"), None);
+        assert_eq!(remote::claude_sessions::pane_target("%"), None);
+        assert_eq!(remote::claude_sessions::pane_target("%3; malicious"), None);
+    }
+
+    #[test]
+    fn a_read_is_confined_to_the_directory_the_client_may_offer() {
+        let home_directory = PathBuf::from("/Users/testuser");
+
+        // Every path the panel can ask for: `persisted_output_is_loadable` only offers
+        // one under `<home>/.claude/projects`, so nothing a client legitimately sends is
+        // refused by a boundary drawn at the same directory.
+        for offered in [
+            home_directory.join(".claude/projects/-Users-testuser-work/tool-results/a.txt"),
+            home_directory.join(".claude/projects/-Users-testuser-work/memory/notes.md"),
+            home_directory.join(".claude/projects/-Users-testuser-work/095bcff6-b9a8-4584.jsonl"),
+            home_directory.join(".claude/projects"),
+        ] {
+            assert!(
+                validate_claude_file_path(&offered, &home_directory).is_ok(),
+                "a file the panel offers to read must stay readable: {}",
+                offered.display()
+            );
+        }
+
+        // The session key file holds the credential for a session's messaging socket,
+        // and nothing in this protocol has any reason to read it.
+        for refused in [
+            home_directory.join(".claude/sessions/17694.a66fc5e9.key"),
+            home_directory.join(".claude/sessions/17694.a66fc5e9.json"),
+            home_directory.join(".claude/.credentials.json"),
+            home_directory.join(".claude/todos/4e2e3600.json"),
+        ] {
+            let outcome = validate_claude_file_path(&refused, &home_directory);
+            assert!(
+                outcome.is_err(),
+                "reading {} must be refused, but validation answered {:?}",
+                refused.display(),
+                outcome
+            );
+        }
+    }
 }

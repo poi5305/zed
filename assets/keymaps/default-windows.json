@@ -1671,4 +1671,11 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    "context": "ClaudeSessionsInput > Editor",
+    "bindings": {
+      "enter": "claude_sessions::SendMessage",
+      "shift-enter": "editor::Newline",
+    },
+  },
 ]
