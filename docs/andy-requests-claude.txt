@@ -1154,3 +1154,95 @@ P2（subagent / workflow 檢視，見正文 §4）的資料層在 P1 已經備�
 `transcript.rs` 吸收 `isSidechain` 記錄但不讓它進 path，所以 P2 只要
 讀 `<sessionId>/subagents/agent-<id>.{jsonl,meta.json}` 並用 `toolUseId`
 掛回主對話，不需要重寫任何 P1 的東西。
+
+
+================================================================================
+附錄 D 實機驗證後的規格修訂（2026-09-10）
+================================================================================
+
+P1 交付後在本機開著 7 個 session 實跑，面板顯示
+「No Claude Code sessions are running on this machine.」。
+兩個原因都是**規格寫錯**、實作照規格做，測試也照規格寫，所以三邊一致地錯。
+
+--------------------------------------------------------------------------------
+D.1 `procStart` 是 UTC，`ps -o lstart=` 是本地時區
+--------------------------------------------------------------------------------
+
+正文 §2 與 A.2 事實清單只寫「與註冊檔的 `procStart` 做字串比對」，
+沒有寫時區。實機量到：
+
+  registry procStart : Thu Sep 10 02:53:02 2026
+  ps -o lstart=      : Thu Sep 10 10:53:02 2026     ← 本地 (Asia/Taipei, +8)
+  TZ=UTC ps -o lstart=: Thu Sep 10 02:53:02 2026    ← 相符
+
+7 個註冊檔（CLI 版本 2.1.257 ~ 2.1.267）全部相差正好 8 小時，
+即 Claude Code 寫入的是 UTC 呈現。字串比對永遠不相等 →
+每一個 session 都被判 `PidReused` → 全部被 `visible_sessions` 濾掉。
+
+**修訂**：取 process start time 的指令必須固定在 UTC 執行
+（`command.env("TZ", "UTC")`）。回歸測試
+`test_process_start_times_are_reported_in_utc`：spawn 一個真的 process、
+把回傳字串以 UTC 解析成 epoch、與 spawn 當下的時間比對，容差 5 秒。
+修之前紅在 `off by 28800 seconds`。
+
+  註：這支測試不能用 `#[gpui::test]`——await 真的 `ps` 會踩到
+  GPUI deterministic scheduler 的 "Parking forbidden"。改成一般
+  `#[test]` + `smol::block_on`。
+
+--------------------------------------------------------------------------------
+D.2 `updatedAt` 不是 heartbeat，不得當判活條件
+--------------------------------------------------------------------------------
+
+正文 §1.1 寫「`updatedAt` → heartbeat；太舊視為 stale」，§2 判活第 2 條
+要求「`updatedAt` 在合理範圍內」，A.2 據此定 `STALE_HEARTBEAT_MILLIS = 60_000`。
+實機 7 個註冊檔**每一個** `updatedAt == statusUpdatedAt`，也就是它只在
+session 狀態改變時被改寫，不是定時心跳：
+
+  web-tools-16    status=idle   updatedAt 距今 3336s   process 活著
+  dashboard-0f    status=busy   updatedAt 距今  284s   process 活著
+  phoneoncloud-81 status=idle   updatedAt 距今 138842s process 活著
+
+等在使用者輸入前的 idle session、或卡在一個長 tool call 的 busy session，
+都會好幾小時不動 `updatedAt`。所以 60 秒門檻即使在 D.1 修好之後，
+仍然只會留下「剛剛改過狀態」的那一個 session。
+
+**修訂**：判活只看 process 本身（pid 存在 **且** `procStart` 相符）。
+`updatedAt` 只能拿來顯示，不得作為隱藏 session 的依據。
+實作上 `liveness()` 的 API 與既有測試（含盲測）都不動——門檻由呼叫端給，
+`session_store` 改傳 `HEARTBEAT_CUTOFF_MILLIS = i64::MAX`。
+回歸測試 `test_a_session_that_has_not_changed_status_for_an_hour_is_still_listed`。
+
+  `Liveness::StaleHeartbeat` 這個 variant 因此在 production 走不到。
+  保留它是因為 `liveness()` 是純函式、門檻是參數，變體本身沒有錯；
+  錯的是正文對 `updatedAt` 語意的假設。
+
+--------------------------------------------------------------------------------
+D.3 實機驗收結果
+--------------------------------------------------------------------------------
+
+用 production code path（`read_registrations` → `process_start_times` →
+`visible_sessions` → `find_transcript`）對真的 `~/.claude/sessions` 跑過：
+
+  registrations read: 7      visible sessions: 7      liveness 全部 Live
+  transcript 找到 6 / 7
+
+唯一沒有 transcript 的是 `andy-type-50`（`entrypoint: "sdk-ts"`，
+SDK 起的 session）——`~/.claude/projects/*/9171f86a-….jsonl` 確認不存在，
+不是 glob 寫錯。這正是正文 §2 步驟 4 要求的「標成 no transcript
+而不是丟掉」的情形。
+
+--------------------------------------------------------------------------------
+D.4 這次沒有改、但使用者問到的事
+--------------------------------------------------------------------------------
+
+  - **「應該要從 tmux 找 claude session」**：探索來源仍是註冊表，不是列 tmux。
+    理由見正文 §2 的實測陷阱——`pane_current_command` 顯示的是版本字串
+    `2.1.267` 而不是 `claude`，而且 tmux 那邊也拿不到 `sessionId`。
+    註冊檔的 `tmux` 欄位（如 `"awp:@1.%1"`）反而是從 session 找到 pane 的
+    可靠方向，P3 送輸入要用它。實機 7 個 session 有 5 個帶 `tmux`
+    （本 session 與 SDK session 沒有）。
+  - **remote**：目前只讀本機 `~/.claude/sessions`，開 remote project 時
+    列的仍是本機 session。remote 是 P4，未做。
+  - **read-only**：P1 就是唯讀，面板已標
+    「Read-only. Replying from Zed is out of scope for this panel (P3).」
+    從 Zed 打字回覆是 P3，未做。

@@ -1404,11 +1404,9 @@ fn append_record(
                     },
                     // A `content` that is not text is a shape this has no rule for, and
                     // showing an empty command would drop the record.
-                    None => unknown_kind(
-                        &record.record_type,
-                        record.subtype.as_deref(),
-                        &record.raw,
-                    ),
+                    None => {
+                        unknown_kind(&record.record_type, record.subtype.as_deref(), &record.raw)
+                    }
                 }
             });
             entries.push(Entry {
@@ -2640,10 +2638,8 @@ mod tests {
 
     #[test]
     fn a_local_command_whose_content_is_not_text_is_kept_as_raw_json() {
-        let entries = entries_of(&[
-            r#"{"type":"system","subtype":"local_command","uuid":"a",
-                "content":[{"type":"text","text":"ls -l"}]}"#,
-        ]);
+        let entries = entries_of(&[r#"{"type":"system","subtype":"local_command","uuid":"a",
+                "content":[{"type":"text","text":"ls -l"}]}"#]);
 
         match &entries[0].kind {
             EntryKind::Unknown { label, raw } => {
@@ -2707,8 +2703,7 @@ mod tests {
             )
         };
         assert_eq!(
-            persisted.path,
-            inside,
+            persisted.path, inside,
             "the path must be read from the marker text, not from the escaped JSON body"
         );
         assert_eq!(persisted.size.as_ref(), "15.8KB");
