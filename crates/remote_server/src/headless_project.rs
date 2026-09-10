@@ -307,6 +307,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_get_listening_ports);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_tmux_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_sessions);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_subagents);
         session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
@@ -1436,6 +1437,42 @@ impl HeadlessProject {
         })
     }
 
+    async fn handle_list_claude_subagents(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ListClaudeSubagents>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListClaudeSubagentsResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
+
+        let subagents = cx
+            .background_spawn({
+                let home_directory = home_directory.clone();
+                async move {
+                    remote::claude_sessions::list_subagents(&home_directory, &session_id).await
+                }
+            })
+            .await?;
+
+        Ok(proto::ListClaudeSubagentsResponse {
+            subagents: subagents
+                .into_iter()
+                .map(|summary| proto::ClaudeSubagent {
+                    agent_id: summary.agent_id,
+                    workflow_run_id: summary.workflow_run_id,
+                    agent_type: summary.meta.agent_type,
+                    description: summary.meta.description,
+                    tool_use_id: summary.meta.tool_use_id,
+                    spawn_depth: summary.meta.spawn_depth,
+                    model: summary.meta.model,
+                    workflow_phase: summary.meta.workflow_phase,
+                    transcript_path: Some(summary.transcript_path.to_string_lossy().into_owned()),
+                    size: summary.size,
+                })
+                .collect(),
+        })
+    }
+
     async fn handle_tail_claude_transcript(
         _this: Entity<Self>,
         envelope: TypedEnvelope<proto::TailClaudeTranscript>,
@@ -1443,12 +1480,9 @@ impl HeadlessProject {
     ) -> Result<proto::TailClaudeTranscriptResponse> {
         let home_directory = paths::home_dir().to_path_buf();
         let request = envelope.payload;
+        let path = tail_target(&request, &home_directory)?;
         let tail_state = remote::claude_sessions::TailState {
-            path: transcript_path_to_follow(
-                request.path.as_deref(),
-                &request.session_id,
-                &home_directory,
-            ),
+            path,
             offset: request.offset,
             pending: request.pending,
         };
@@ -1688,6 +1722,40 @@ fn transcript_path_to_follow(
     Some(path)
 }
 
+// When an agent_id is provided, completely ignore any client-provided path.
+// A path out of a request is not evidence of anything: the main session transcript
+// tail accepts a client-provided path solely to detect if the file was replaced,
+// whereas each subagent transcript path is resolved directly by the server via
+// directory lookup at the cost of a single read_dir, so there is no reason to
+// trust or follow a client-supplied path.
+fn tail_target(
+    request: &proto::TailClaudeTranscript,
+    home_directory: &Path,
+) -> Result<Option<PathBuf>> {
+    if let Some(agent_id) = request.agent_id.as_deref() {
+        let path = remote::claude_sessions::subagent_transcript_path(
+            home_directory,
+            &request.session_id,
+            agent_id,
+            request.workflow_run_id.as_deref(),
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "transcript for subagent {:?} in session {:?} not found",
+                agent_id,
+                request.session_id
+            )
+        })?;
+        Ok(Some(path))
+    } else {
+        Ok(transcript_path_to_follow(
+            request.path.as_deref(),
+            &request.session_id,
+            home_directory,
+        ))
+    }
+}
+
 // The files this protocol may read back, which are the tool outputs Claude Code persists
 // beside a transcript, under `~/.claude/projects`.
 //
@@ -1853,5 +1921,162 @@ mod tests {
                 outcome
             );
         }
+    }
+
+    #[test]
+    fn test_tail_target_when_agent_id_is_none_uses_client_path() {
+        let home_directory = PathBuf::from("/Users/testuser");
+        let session_id = "095bcff6-b9a8-4584-a3c6-861f16c9a807";
+        let valid_main_transcript = home_directory
+            .join(".claude/projects/-Users-testuser-work")
+            .join(format!("{session_id}.jsonl"));
+
+        let request_with_path = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some(valid_main_transcript.to_str().unwrap().to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: None,
+            workflow_run_id: None,
+        };
+        assert_eq!(
+            tail_target(&request_with_path, &home_directory).unwrap(),
+            Some(valid_main_transcript)
+        );
+
+        let request_without_path = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: None,
+            workflow_run_id: None,
+        };
+        assert_eq!(
+            tail_target(&request_without_path, &home_directory).unwrap(),
+            None
+        );
+
+        let request_with_invalid_path = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some("/etc/passwd".to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: None,
+            workflow_run_id: None,
+        };
+        assert_eq!(
+            tail_target(&request_with_invalid_path, &home_directory).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tail_target_when_agent_id_is_some_ignores_client_path() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let home_directory = temporary_directory.path();
+        let session_id = "095bcff6-b9a8-4584-a3c6-861f16c9a807";
+        let agent_id = "a1b2c3d4";
+
+        let valid_main_transcript = home_directory
+            .join(".claude/projects/-Users-testuser-work")
+            .join(format!("{session_id}.jsonl"));
+
+        // Flat subagent layout: .claude/projects/<project>/<session_id>/subagents/agent-<agent_id>.jsonl
+        let subagent_directory = home_directory
+            .join(".claude/projects/-Users-testuser-work")
+            .join(session_id)
+            .join("subagents");
+        std::fs::create_dir_all(&subagent_directory).unwrap();
+        let subagent_transcript = subagent_directory.join(format!("agent-{agent_id}.jsonl"));
+        std::fs::write(&subagent_transcript, b"{}").unwrap();
+
+        // When agent_id is present, client-provided path must be ignored even if it is a valid main transcript path
+        let request = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some(valid_main_transcript.to_str().unwrap().to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: Some(agent_id.to_string()),
+            workflow_run_id: None,
+        };
+
+        let result = tail_target(&request, home_directory).unwrap();
+        assert_eq!(
+            result,
+            Some(subagent_transcript),
+            "when agent_id is present, client path must be ignored in favor of the subagent transcript"
+        );
+
+        // Workflow run layout: .claude/projects/<project>/<session_id>/subagents/workflows/<run_id>/agent-<agent_id>.jsonl
+        let workflow_run_id = "wf-run-123";
+        let workflow_directory = subagent_directory.join("workflows").join(workflow_run_id);
+        std::fs::create_dir_all(&workflow_directory).unwrap();
+        let workflow_transcript = workflow_directory.join("agent-wf-agent.jsonl");
+        std::fs::write(&workflow_transcript, b"{}").unwrap();
+
+        let workflow_request = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some(valid_main_transcript.to_str().unwrap().to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: Some("wf-agent".to_string()),
+            workflow_run_id: Some(workflow_run_id.to_string()),
+        };
+
+        let workflow_result = tail_target(&workflow_request, home_directory).unwrap();
+        assert_eq!(
+            workflow_result,
+            Some(workflow_transcript),
+            "when agent_id and workflow_run_id are present, client path must be ignored in favor of the workflow subagent transcript"
+        );
+    }
+
+    #[test]
+    fn test_tail_target_when_agent_id_cannot_be_resolved_returns_error() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let home_directory = temporary_directory.path();
+        let session_id = "095bcff6-b9a8-4584-a3c6-861f16c9a807";
+
+        let valid_main_transcript = home_directory
+            .join(".claude/projects/-Users-testuser-work")
+            .join(format!("{session_id}.jsonl"));
+
+        let request_nonexistent_agent = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some(valid_main_transcript.to_str().unwrap().to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: Some("nonexistent".to_string()),
+            workflow_run_id: None,
+        };
+
+        let result = tail_target(&request_nonexistent_agent, home_directory);
+        assert!(
+            result.is_err(),
+            "resolving a nonexistent agent must return an error even if client passed a valid path"
+        );
+
+        let request_invalid_agent_id = proto::TailClaudeTranscript {
+            project_id: 1,
+            session_id: session_id.to_string(),
+            path: Some(valid_main_transcript.to_str().unwrap().to_string()),
+            offset: 0,
+            pending: Vec::new(),
+            agent_id: Some("../escape".to_string()),
+            workflow_run_id: None,
+        };
+
+        let result = tail_target(&request_invalid_agent_id, home_directory);
+        assert!(
+            result.is_err(),
+            "an invalid agent_id that fails path validation must return an error"
+        );
     }
 }

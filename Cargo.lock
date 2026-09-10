@@ -3093,6 +3093,7 @@ dependencies = [
  "chrono",
  "collections",
  "editor",
+ "fs",
  "gpui",
  "markdown",
  "paths",

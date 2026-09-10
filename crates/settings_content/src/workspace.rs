@@ -811,6 +811,15 @@ pub struct ProjectPanelAutoOpenSettings {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ClaudeSessionsSettingsContent {
+    /// Where to dock the Claude sessions panel.
+    ///
+    /// Default: right
+    pub dock: Option<DockSide>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct ProjectPanelSettingsContent {
     /// Whether to show the project panel button in the status bar.
     ///

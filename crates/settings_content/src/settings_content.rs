@@ -271,6 +271,8 @@ pub struct SettingsContent {
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
 
+    pub claude_sessions: Option<ClaudeSessionsSettingsContent>,
+
     /// Configuration for Node-related features
     pub node: Option<NodeBinarySettings>,
 
@@ -404,6 +406,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
+        claude_sessions,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,

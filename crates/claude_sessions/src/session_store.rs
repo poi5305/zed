@@ -882,6 +882,99 @@ mod tests {
         std::fs::remove_dir_all(&home_directory).ok();
     }
 
+    /// Switching session is the gesture the whole panel is built around, and the
+    /// transcript the store follows has to switch with it: the new session's
+    /// conversation, none of the previous one's, and whatever the new session writes
+    /// after the switch.
+    #[gpui::test]
+    async fn test_selecting_another_session_follows_that_sessions_transcript(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("switch-session");
+        let registry_directory = home_directory.join(".claude").join("sessions");
+        write_file(
+            registry_directory.join("61.json"),
+            &registration_json(61, "session-a"),
+        );
+        write_file(
+            registry_directory.join("62.json"),
+            &registration_json(62, "session-b"),
+        );
+        write_transcript(
+            &home_directory,
+            "session-a",
+            "{\"type\":\"user\",\"uuid\":\"a1\"}\n",
+        );
+        let transcript_b = write_transcript(
+            &home_directory,
+            "session-b",
+            "{\"type\":\"user\",\"uuid\":\"b1\"}\n",
+        );
+
+        let store = cx.new(|cx| {
+            ClaudeSessionStore::new(
+                Arc::new(FakeSource::new(
+                    home_directory.clone(),
+                    fake_process_starts(vec![61, 62]),
+                )),
+                None,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        let uuids = |store: &ClaudeSessionStore| -> Vec<Option<String>> {
+            store
+                .transcript()
+                .active_path()
+                .iter()
+                .map(|record| record.uuid.clone())
+                .collect()
+        };
+
+        store.update(cx, |store, cx| store.select(61, cx));
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store),
+                vec![Some("a1".to_string())],
+                "the first selection has to be followed at all"
+            );
+        });
+
+        store.update(cx, |store, cx| store.select(62, cx));
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store),
+                vec![Some("b1".to_string())],
+                "the second session's conversation must replace the first one's, not be \
+                 appended to it"
+            );
+        });
+
+        // The session that is now being read writes another turn.
+        std::fs::write(
+            &transcript_b,
+            "{\"type\":\"user\",\"uuid\":\"b1\"}\n{\"type\":\"assistant\",\"uuid\":\"b2\",\"parentUuid\":\"b1\"}\n",
+        )
+        .expect("appending to the second session's transcript");
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                uuids(store),
+                vec![Some("b1".to_string()), Some("b2".to_string())],
+                "the tail has to keep following the session that was switched to"
+            );
+        });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
     #[gpui::test]
     async fn test_registry_scan_normalizes_padded_process_start() {
         let home_directory = temporary_directory("padded");
