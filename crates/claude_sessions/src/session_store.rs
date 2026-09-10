@@ -637,6 +637,15 @@ impl ClaudeSessionStore {
             return;
         }
 
+        // The selection can change while a read is in flight, in which case this progress
+        // describes a file the store is no longer following. Checked before the failure
+        // below is reported: a read that failed for a conversation the store has stopped
+        // following says nothing about the one it is following now, and the poll's error
+        // is drawn under the session list.
+        if self.followed_session_id.as_deref() != Some(session_id) {
+            return;
+        }
+
         let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
@@ -649,12 +658,6 @@ impl ClaudeSessionStore {
                 return;
             }
         };
-
-        // The selection can change while a read is in flight, in which case this progress
-        // describes a file the store is no longer following.
-        if self.followed_session_id.as_deref() != Some(session_id) {
-            return;
-        }
 
         let Some(conversation) = self.conversation_for(target) else {
             return;
@@ -2227,6 +2230,76 @@ mod tests {
                  agent's is the one being read"
             );
         });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A read that failed for a conversation the store has stopped following says
+    /// nothing about the one it is following now. The poll's error is what the panel
+    /// draws under the session list, so reporting it there blames the session on screen
+    /// for a failure that belongs to the one the user left.
+    #[gpui::test]
+    async fn test_a_failed_read_of_a_session_that_was_left_is_not_reported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("left-session-read-failure");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("91.json"),
+            &registration_json(91, "the-session-being-read"),
+        );
+        write_transcript(
+            &home_directory,
+            "the-session-being-read",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![91]),
+        ));
+        let store = cx.new(|cx| ClaudeSessionStore::new(source, None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        store.update(cx, |store, cx| store.select(91, cx));
+        cx.run_until_parked();
+
+        // The read of the conversation the user has already left comes back a failure.
+        store.update(cx, |store, cx| {
+            store.apply_tail_progress(
+                "the-session-the-user-left",
+                &TranscriptTarget::Main,
+                Err(anyhow!("the connection dropped")),
+                cx,
+            )
+        });
+
+        let reported = store.read_with(cx, |store, _| store.error().cloned());
+        assert_eq!(
+            reported, None,
+            "nothing is wrong with the session on screen, but its list was given the \
+             message {reported:?}"
+        );
+
+        // What the guard above must not kill: the failure of a read of the conversation
+        // the store really is following is the one thing the message is for.
+        store.update(cx, |store, cx| {
+            store.apply_tail_progress(
+                "the-session-being-read",
+                &TranscriptTarget::Main,
+                Err(anyhow!("the transcript could not be opened")),
+                cx,
+            )
+        });
+        let reported = store.read_with(cx, |store, _| store.error().cloned());
+        assert_eq!(
+            reported.as_deref(),
+            Some("Reading transcript: the transcript could not be opened"),
+            "the read that failed was of the conversation on screen, so the reader has \
+             to be told, but they were told {reported:?}"
+        );
 
         std::fs::remove_dir_all(&home_directory).ok();
     }

@@ -296,6 +296,18 @@ struct AttachmentItem {
     persisted: Option<PersistedOutput>,
 }
 
+/// One collapsible row's header, as the row it draws rather than as an argument list:
+/// six of them are built and each named the same seven things in the same order.
+struct DisclosureHeader<'key> {
+    entry_index: usize,
+    key: &'key SharedString,
+    icon: IconName,
+    icon_color: Color,
+    title: SharedString,
+    summary: Option<SharedString>,
+    is_expanded: bool,
+}
+
 /// The per-record artifacts that cost real work to derive — a decoded image, a
 /// pretty-printed unrecognized record, terminal output with its escapes stripped, the
 /// source string a [`Markdown`] is parsed from — kept across rebuilds of the
@@ -656,7 +668,7 @@ impl ClaudeSessionsPanel {
         // Moved out for the duration of the build so that the transcript can be borrowed
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
-        let (mut new_entries, activity, agent_calls) = {
+        let (mut new_entries, activity, agent_calls, sent_to_the_session) = {
             let store = self.store.read(cx);
             let home_directory = store.home_directory();
             let transcript = store.transcript();
@@ -665,26 +677,41 @@ impl ClaudeSessionsPanel {
             } else {
                 transcript.active_path()
             };
-            // Derived here, where the path has already been walked: the panel is drawn
+            // What the session is doing, and which records a sent message may have been
+            // written as, are questions about the session rather than about the
+            // conversation on screen: both are read from the session's own conversation
+            // whichever one the reader has open.
+            let session_path = store.main_transcript().active_path();
+            // Derived here, where the paths have already been walked: the panel is drawn
             // far more often than the transcript changes, and this is the only place the
             // transcript is read.
             (
                 build_entries(&path, home_directory, &mut cache),
-                activity(&path),
+                activity(&session_path),
                 agent_calls(&path),
+                // Read only while a message is waiting, which is rare and brief; see
+                // [`user_message_entries`].
+                (!self.pending_sends.is_empty()).then(|| user_message_entries(&session_path)),
             )
         };
         self.entry_cache = cache;
         self.activity = activity;
         self.agent_calls = agent_calls;
 
-        // Paired against the entries the transcript itself produced, before the pending
-        // ones are appended: a pending message must never be paired with another pending
-        // message, and nothing derived from one may reach the entry cache.
         self.pending_sends
             .retain_session(self.store.read(cx).selected());
-        self.pending_sends.pair_with(&new_entries);
-        new_entries.extend(self.pending_sends.entries());
+        // Paired against the session's own conversation and never against an agent's: an
+        // agent is given its task as a user record of its own conversation, so an agent's
+        // records hold the very text a send carries, and a pairing there would take down a
+        // message that had never arrived. Against records only, so that a pending message
+        // is never paired with another pending message and nothing derived from one
+        // reaches the entry cache.
+        if let Some(sent_to_the_session) = sent_to_the_session {
+            self.pending_sends.pair_with(&sent_to_the_session);
+        }
+        if pending_is_drawn_in(self.store.read(cx).transcript_target()) {
+            new_entries.extend(self.pending_sends.entries());
+        }
 
         let old_length = self.entries.len();
         let new_length = new_entries.len();
@@ -1575,13 +1602,15 @@ impl ClaudeSessionsPanel {
 
             EntryKind::Thinking { source } => {
                 let header = self.render_disclosure_header(
-                    index,
-                    &key,
-                    IconName::ToolThink,
-                    Color::Muted,
-                    "Thinking".into(),
-                    Some(first_line(&source)),
-                    is_expanded,
+                    DisclosureHeader {
+                        entry_index: index,
+                        key: &key,
+                        icon: IconName::ToolThink,
+                        icon_color: Color::Muted,
+                        title: "Thinking".into(),
+                        summary: Some(first_line(&source)),
+                        is_expanded,
+                    },
                     cx,
                 );
                 let body = if is_expanded {
@@ -1606,13 +1635,15 @@ impl ClaudeSessionsPanel {
             EntryKind::ToolUse { name, input } => {
                 let display = tool_input_display(&name, &input);
                 let header = self.render_disclosure_header(
-                    index,
-                    &key,
-                    IconName::ToolHammer,
-                    Color::Success,
-                    name,
-                    Some(first_line(&display.text)),
-                    is_expanded,
+                    DisclosureHeader {
+                        entry_index: index,
+                        key: &key,
+                        icon: IconName::ToolHammer,
+                        icon_color: Color::Success,
+                        title: name,
+                        summary: Some(first_line(&display.text)),
+                        is_expanded,
+                    },
                     cx,
                 );
                 let body = if is_expanded {
@@ -1661,17 +1692,19 @@ impl ClaudeSessionsPanel {
                     }
                 };
                 let header = self.render_disclosure_header(
-                    index,
-                    &key,
-                    if is_error {
-                        IconName::XCircle
-                    } else {
-                        IconName::ToolTerminal
+                    DisclosureHeader {
+                        entry_index: index,
+                        key: &key,
+                        icon: if is_error {
+                            IconName::XCircle
+                        } else {
+                            IconName::ToolTerminal
+                        },
+                        icon_color: if is_error { Color::Error } else { Color::Muted },
+                        title: label,
+                        summary: Some(summary),
+                        is_expanded,
                     },
-                    if is_error { Color::Error } else { Color::Muted },
-                    label,
-                    Some(summary),
-                    is_expanded,
                     cx,
                 );
 
@@ -1898,13 +1931,15 @@ impl ClaudeSessionsPanel {
 
             EntryKind::Attachments { items } => {
                 let header = self.render_disclosure_header(
-                    index,
-                    &key,
-                    IconName::Paperclip,
-                    Color::Muted,
-                    "Context".into(),
-                    Some(SharedString::from(format!("{} attachments", items.len()))),
-                    is_expanded,
+                    DisclosureHeader {
+                        entry_index: index,
+                        key: &key,
+                        icon: IconName::Paperclip,
+                        icon_color: Color::Muted,
+                        title: "Context".into(),
+                        summary: Some(SharedString::from(format!("{} attachments", items.len()))),
+                        is_expanded,
+                    },
                     cx,
                 );
 
@@ -1919,13 +1954,15 @@ impl ClaudeSessionsPanel {
 
             EntryKind::Unknown { label, raw } => {
                 let header = self.render_disclosure_header(
-                    index,
-                    &key,
-                    IconName::Json,
-                    Color::Hidden,
-                    SharedString::from(format!("Unrecognized: {label}")),
-                    None,
-                    is_expanded,
+                    DisclosureHeader {
+                        entry_index: index,
+                        key: &key,
+                        icon: IconName::Json,
+                        icon_color: Color::Hidden,
+                        title: SharedString::from(format!("Unrecognized: {label}")),
+                        summary: None,
+                        is_expanded,
+                    },
                     cx,
                 );
                 let body = if is_expanded {
@@ -2120,13 +2157,15 @@ impl ClaudeSessionsPanel {
                 "Show the whole output"
             };
             self.render_disclosure_header(
-                entry_index,
-                &output_key,
-                IconName::Ellipsis,
-                Color::Muted,
-                title.into(),
-                None,
-                is_expanded,
+                DisclosureHeader {
+                    entry_index,
+                    key: &output_key,
+                    icon: IconName::Ellipsis,
+                    icon_color: Color::Muted,
+                    title: title.into(),
+                    summary: None,
+                    is_expanded,
+                },
                 cx,
             )
         });
@@ -2142,18 +2181,20 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_disclosure_header(
         &self,
-        entry_index: usize,
-        key: &SharedString,
-        icon: IconName,
-        icon_color: Color,
-        title: SharedString,
-        summary: Option<SharedString>,
-        is_expanded: bool,
+        header: DisclosureHeader<'_>,
         cx: &mut Context<Self>,
     ) -> ListItem {
+        let DisclosureHeader {
+            entry_index,
+            key,
+            icon,
+            icon_color,
+            title,
+            summary,
+            is_expanded,
+        } = header;
         let toggle_key = key.clone();
         let click_key = key.clone();
 
@@ -2312,6 +2353,12 @@ struct PendingSend {
     /// them cannot be the record this send will become, and this is what stops a message
     /// sent twice from being paired with the first record both times.
     preexisting_keys: HashSet<SharedString>,
+    /// The newest of the user's own messages the conversation held when the send left,
+    /// whatever its text. The record this send becomes is written after it, so nothing
+    /// at or before it can be this send arriving — which is the only thing that holds
+    /// when the conversation later shows more of itself than the send was measured
+    /// against, as the history behind a compaction does when the reader opens it.
+    newest_preexisting_key: Option<SharedString>,
 }
 
 /// The messages the panel is drawing on its own behalf, because the transcript has
@@ -2344,7 +2391,9 @@ impl PendingSends {
         // Noted now rather than looked for later: these records are already in the
         // conversation, so none of them can be the one this send will be written as, and
         // a second send of the same text must not be paired with the first send's record.
-        let preexisting_keys = user_messages(entries)
+        let messages = user_messages(entries);
+        let newest_preexisting_key = messages.last().map(|(key, _)| key.clone());
+        let preexisting_keys = messages
             .into_iter()
             .filter(|(_, source)| source.trim() == text.as_ref())
             .map(|(key, _)| key)
@@ -2355,6 +2404,7 @@ impl PendingSends {
             process_id,
             text,
             preexisting_keys,
+            newest_preexisting_key,
         });
         id
     }
@@ -2399,11 +2449,35 @@ impl PendingSends {
         let mut paired: HashSet<u64> = HashSet::default();
 
         for send in &self.sends {
-            let arrival = arrivals.iter().find(|(key, source)| {
-                source.trim() == send.text.as_ref()
-                    && !send.preexisting_keys.contains(key)
-                    && !claimed.contains(key)
-            });
+            // Only the records written after the conversation the send was measured
+            // against are candidates. Without this, a conversation that shows more of
+            // itself than the send was measured against — the history behind a
+            // compaction being opened — offers an older record of the same text, and the
+            // message comes down having never arrived.
+            //
+            // A conversation that no longer holds that record leaves every arrival a
+            // candidate: compaction runs as a turn starts, which is the same moment the
+            // user's record is written, so the record a send was measured against can
+            // be gone by the time the send's own turns up.
+            let written_after_the_conversation_as_it_was = send
+                .newest_preexisting_key
+                .as_ref()
+                .and_then(|newest| {
+                    arrivals
+                        .iter()
+                        .position(|(key, _)| key == newest)
+                        .map(|index| index.saturating_add(1))
+                })
+                .unwrap_or(0);
+            let arrival = arrivals
+                .get(written_after_the_conversation_as_it_was..)
+                .unwrap_or_default()
+                .iter()
+                .find(|(key, source)| {
+                    source.trim() == send.text.as_ref()
+                        && !send.preexisting_keys.contains(key)
+                        && !claimed.contains(key)
+                });
             if let Some((key, _)) = arrival {
                 claimed.insert(key.clone());
                 paired.insert(send.id);
@@ -2450,6 +2524,89 @@ fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether the pending messages are drawn into the conversation on screen.
+///
+/// They belong to the session's own conversation: the reader sent them to the session,
+/// not to one of the agents it spawned, so nothing of theirs is drawn among an agent's
+/// records. A message that is not drawn is not taken down — it goes on waiting for the
+/// record it was sent as, and is drawn again as soon as the session's own conversation is
+/// back on screen.
+fn pending_is_drawn_in(target: &TranscriptTarget) -> bool {
+    match target {
+        TranscriptTarget::Main => true,
+        TranscriptTarget::Subagent { .. } => false,
+    }
+}
+
+/// The user's own messages in one conversation, as the entries [`build_entries`] would
+/// give the same records, and nothing else the records hold.
+///
+/// This is all [`PendingSends`] reads of a conversation, and building that conversation
+/// whole to get it would decode every image the session has ever pasted — a screenshot is
+/// around a megabyte and a half of base64 — on each of the four rebuilds a second a
+/// streaming reply causes. The keys have to be the ones the drawn conversation carries,
+/// because that is what a pending message's bookkeeping is written in;
+/// [`the_user_messages_read_off_a_path_are_the_ones_the_built_entries_carry`] holds the
+/// two together.
+fn user_message_entries(path: &[&TranscriptRecord]) -> Vec<Entry> {
+    let mut entries = Vec::new();
+
+    for (path_index, record) in path.iter().enumerate() {
+        // A record of another kind holds no message the user typed: an assistant record
+        // is the model's, and the two subtypes below are drawn as something other than a
+        // message. Attachments are of their own record type and are excluded with them.
+        if record.record_type != USER_RECORD_TYPE
+            || matches!(
+                record.subtype.as_deref(),
+                Some(COMPACT_BOUNDARY_SUBTYPE) | Some(LOCAL_COMMAND_SUBTYPE)
+            )
+        {
+            continue;
+        }
+
+        let base_key = match record.uuid.as_ref() {
+            Some(uuid) => SharedString::from(uuid.clone()),
+            None => SharedString::from(format!("path-{path_index}")),
+        };
+        match record
+            .raw
+            .get("message")
+            .and_then(|message| message.get("content"))
+        {
+            Some(Value::String(text)) => {
+                if let Some(kind) = message_kind(record, text) {
+                    entries.push(Entry {
+                        key: base_key,
+                        kind,
+                    });
+                }
+            }
+            Some(Value::Array(blocks)) => {
+                for (block_index, block) in blocks.iter().enumerate() {
+                    // Only a text block can be a message, and skipping the rest is what
+                    // keeps an image out of a walk performed for its neighbour's text.
+                    if block.get("type").and_then(Value::as_str) != Some("text") {
+                        continue;
+                    }
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(kind) = message_kind(record, text) {
+                        entries.push(Entry {
+                            key: SharedString::from(format!("{base_key}#{block_index}")),
+                            kind,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    entries
 }
 
 /// What the selected session is doing, as far as its transcript says.
@@ -3139,7 +3296,10 @@ fn block_kind(
             // beside it is a rendering of that result meant for the model's context. The
             // structured one is preferred while it yields text, then the rendering, and
             // only a result with neither falls back to raw JSON rather than being lost.
-            let structured_result = record.raw.get("toolUseResult");
+            let structured_result = record
+                .raw
+                .get("toolUseResult")
+                .filter(|_| record_holds_one_tool_result(record));
             let text = structured_result
                 .and_then(tool_use_result_text)
                 .or_else(|| {
@@ -3177,6 +3337,31 @@ fn block_kind(
     };
 
     Some(kind)
+}
+
+/// Whether the record's `toolUseResult` can be read as the answer to the `tool_result`
+/// block being drawn.
+///
+/// The field sits on the record while the blocks sit inside it, so it names one answer
+/// however many the record carries: a record answering two calls at once would show the
+/// first call's output — and, with a `persistedOutputPath` beside it, the first call's
+/// file — under the second call's name. A record with two of them has each block's own
+/// `content` to fall back on, which is the answer to that block and nothing else.
+fn record_holds_one_tool_result(record: &TranscriptRecord) -> bool {
+    record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(Value::as_str) == Some(TOOL_RESULT_BLOCK_TYPE)
+                })
+                .count()
+                == 1
+        })
 }
 
 fn image_kind(block: &Value) -> EntryKind {
@@ -3865,7 +4050,11 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
     use crate::SubagentMeta;
+    use crate::session_registry::{SessionSummary, TailProgress, TailState};
+    use crate::session_source::SessionListing;
     use crate::transcript::parse_record;
 
     fn record(json: &str) -> TranscriptRecord {
@@ -4406,6 +4595,43 @@ mod tests {
         assert_eq!(
             strip_ansi_escapes("\u{1b}Pq#0;2;0;0;0#0~~@@vv@@~~@@~~$\u{1b}\\kept"),
             "kept"
+        );
+    }
+
+    /// `toolUseResult` sits on the record while `tool_result` blocks sit inside it, so
+    /// it can only ever name one of the answers a record carries. A record answering two
+    /// calls at once must not show the first call's output under the second call's name.
+    #[test]
+    fn two_results_in_one_record_each_keep_their_own_output() {
+        let entries = entries_of(&[
+            r#"{"type":"assistant","uuid":"a","message":{"content":[
+                {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo one"}},
+                {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"echo two"}}]}}"#,
+            r#"{"type":"user","uuid":"b","toolUseResult":{"stdout":"OUTPUT-ONE","stderr":""},
+                "message":{"content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"OUTPUT-ONE"},
+                {"type":"tool_result","tool_use_id":"t2","content":"OUTPUT-TWO"}]}}"#,
+        ]);
+
+        let bodies: Vec<SharedString> = entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::ToolResult {
+                    body: ToolResultBody::Inline(text),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            bodies,
+            vec![
+                SharedString::from("OUTPUT-ONE"),
+                SharedString::from("OUTPUT-TWO")
+            ],
+            "the record's own `toolUseResult` answers one of the two calls, so each \
+             block's own content is what says what its call returned"
         );
     }
 
@@ -5963,6 +6189,73 @@ mod tests {
         );
     }
 
+    /// A record the conversation was carrying before the send cannot be the send
+    /// arriving, whether or not the reader had it on screen at the time. Opening the
+    /// history behind a compaction reveals such records, and pairing with one takes the
+    /// message down having never delivered it — the one thing a pending message exists
+    /// to stop.
+    #[test]
+    fn opening_the_history_behind_a_compaction_leaves_a_pending_message_alone() {
+        let older = user_message_line("a", "keep going");
+        let newer = user_message_line("b", "and now this");
+
+        // What the reader is looking at with the history closed: the turn before the
+        // compaction is not in the active path.
+        let on_screen = entries_of(&[&newer]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "keep going", &on_screen);
+
+        // The same conversation with the compacted-away turn revealed.
+        let whole_history = entries_of(&[&older, &newer]);
+        pending_sends.pair_with(&whole_history);
+
+        assert_eq!(
+            pending_texts(&shown(&whole_history, &pending_sends)),
+            vec![SharedString::from("keep going")],
+            "the only record of this text was written before the send, so the message \
+             has not arrived and must still be shown"
+        );
+    }
+
+    /// What the guard above must not kill: the record a send was measured against can
+    /// itself leave the conversation before the send's own record turns up — compaction
+    /// runs as a turn starts, which is the same moment the user's record is written —
+    /// and the send still has to be paired with the record that did arrive.
+    #[test]
+    fn a_pending_message_is_paired_after_the_record_it_was_measured_against_is_compacted_away() {
+        let on_screen = entries_of(&[&user_message_line("a", "and now this")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "keep going", &on_screen);
+
+        let after_compaction = entries_of(&[&user_message_line("c", "keep going")]);
+        pending_sends.pair_with(&after_compaction);
+
+        assert!(
+            pending_sends.is_empty(),
+            "the send's own record has arrived and drawing both would show it twice, \
+             {:?} left",
+            pending_ids(&pending_sends)
+        );
+    }
+
+    /// The other input the guard must not kill: the first thing said in a conversation
+    /// has no record before it to be written after, and its record is still what the
+    /// send became.
+    #[test]
+    fn the_first_message_of_a_conversation_is_paired_with_the_record_that_arrives() {
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "the very first thing I said", &[]);
+
+        let arrived = entries_of(&[&user_message_line("a", "the very first thing I said")]);
+        pending_sends.pair_with(&arrived);
+
+        assert!(
+            pending_sends.is_empty(),
+            "the record of the first message is that message arriving, {:?} left",
+            pending_ids(&pending_sends)
+        );
+    }
+
     #[test]
     fn two_sends_of_the_same_text_are_paired_with_the_two_records_in_order() {
         // A record already showing this text: it was there before either send, so it
@@ -6061,6 +6354,584 @@ mod tests {
             pending_ids(&pending_sends),
             vec![first, third],
             "the button takes down the message it sits on, not the one that reads the same"
+        );
+    }
+
+    const SCRIPTED_PROCESS_ID: u32 = 4242;
+    const SCRIPTED_SESSION_ID: &str = "scripted-session";
+    const SCRIPTED_AGENT_ID: &str = "a1";
+    /// Longer than both of the store's poll intervals, so that advancing by it lets a
+    /// scan and a read of each conversation land.
+    const A_FEW_POLLS: Duration = Duration::from_secs(2);
+
+    fn scripted_agent() -> TranscriptTarget {
+        TranscriptTarget::Subagent {
+            agent_id: SCRIPTED_AGENT_ID.to_string(),
+            workflow_run_id: None,
+        }
+    }
+
+    /// One line of a conversation being followed, chained to the record before it so
+    /// that the traversal keeps both of them, and marked as an agent's or the session's
+    /// own.
+    fn chained_line(
+        record_type: &str,
+        uuid: &str,
+        parent_uuid: Option<&str>,
+        is_sidechain: bool,
+        content: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "type": record_type,
+            "uuid": uuid,
+            "parentUuid": parent_uuid,
+            "isSidechain": is_sidechain,
+            "message": { "content": content },
+        })
+        .to_string()
+    }
+
+    fn unanswered_bash_call(uuid: &str, parent_uuid: Option<&str>, is_sidechain: bool) -> String {
+        chained_line(
+            ASSISTANT_RECORD_TYPE,
+            uuid,
+            parent_uuid,
+            is_sidechain,
+            serde_json::json!([
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "Bash",
+                    "input": { "command": "cargo test -p claude_sessions" },
+                }
+            ]),
+        )
+    }
+
+    /// The two conversations of one session, handed to the store as reads rather than as
+    /// files. What these tests are about is which of the two a decision is read from, and
+    /// nothing else about a transcript file takes part in that.
+    struct ScriptedSource {
+        home_directory: PathBuf,
+        session_lines: Mutex<Vec<String>>,
+        agent_lines: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedSource {
+        fn new(session_lines: &[String], agent_lines: &[String]) -> Self {
+            Self {
+                home_directory: PathBuf::from("/scripted-home"),
+                session_lines: Mutex::new(session_lines.to_vec()),
+                agent_lines: Mutex::new(agent_lines.to_vec()),
+            }
+        }
+
+        /// Hands over whatever has not been delivered yet, so that the poll's later turns
+        /// report a file that has stopped growing rather than the same records again.
+        fn deliver(
+            lines: &Mutex<Vec<String>>,
+            path: PathBuf,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            let delivered = std::mem::take(&mut *lines.lock().expect("reading the scripted lines"));
+            let offset = state
+                .offset
+                .saturating_add(delivered.len().try_into().unwrap_or(u64::MAX));
+            Task::ready(Ok(TailProgress {
+                path: Some(path),
+                start_offset: state.offset,
+                offset,
+                pending: Vec::new(),
+                lines: delivered,
+                restarted: false,
+            }))
+        }
+    }
+
+    impl SessionSource for ScriptedSource {
+        fn list_sessions(
+            &self,
+            _project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<SessionListing>> {
+            Task::ready(Ok(SessionListing {
+                sessions: vec![SessionSummary {
+                    session: RegisteredSession {
+                        process_id: SCRIPTED_PROCESS_ID,
+                        session_id: SCRIPTED_SESSION_ID.to_string(),
+                        working_directory: PathBuf::from("/scripted-project"),
+                        process_start: "Thu Sep 10 02:27:23 2026".to_string(),
+                        version: "2.1.267".to_string(),
+                        kind: "interactive".to_string(),
+                        name: Some("scripted".to_string()),
+                        status: None,
+                        updated_at: None,
+                        // No pane to type into: nothing in these tests sends, and this
+                        // is what makes a send impossible rather than merely unused.
+                        tmux_target: None,
+                        bridge_session_id: None,
+                    },
+                    transcript_path: Some(self.home_directory.join("session.jsonl")),
+                }],
+                home_directory: self.home_directory.clone(),
+            }))
+        }
+
+        fn tail_transcript(
+            &self,
+            _session_id: String,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            Self::deliver(
+                &self.session_lines,
+                self.home_directory.join("session.jsonl"),
+                state,
+            )
+        }
+
+        fn list_subagents(
+            &self,
+            _session_id: String,
+        ) -> Task<anyhow::Result<Vec<SubagentSummary>>> {
+            Task::ready(Ok(vec![SubagentSummary {
+                agent_id: SCRIPTED_AGENT_ID.to_string(),
+                workflow_run_id: None,
+                meta: SubagentMeta {
+                    agent_type: "general-purpose".to_string(),
+                    description: Some("read the file".to_string()),
+                    tool_use_id: None,
+                    spawn_depth: 1,
+                    model: None,
+                    workflow_phase: None,
+                },
+                transcript_path: self.home_directory.join("agent-a1.jsonl"),
+                size: 1,
+            }]))
+        }
+
+        fn tail_subagent(
+            &self,
+            _session_id: String,
+            _agent_id: String,
+            _workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            Self::deliver(
+                &self.agent_lines,
+                self.home_directory.join("agent-a1.jsonl"),
+                state,
+            )
+        }
+
+        fn read_file(&self, _path: PathBuf, _max_bytes: u64) -> Task<anyhow::Result<FileContents>> {
+            Task::ready(Ok(FileContents {
+                bytes: Vec::new(),
+                truncated: false,
+            }))
+        }
+
+        fn send_input(
+            &self,
+            _pane_target: String,
+            _input: SessionInput,
+        ) -> Task<anyhow::Result<()>> {
+            Task::ready(Err(anyhow::anyhow!(
+                "nothing in these tests may reach a session"
+            )))
+        }
+    }
+
+    /// A root view for the test window. The panel is never drawn: these tests are about
+    /// which conversation it reads rather than about how it looks, and drawing it would
+    /// pull in the whole of the application's theme wiring.
+    struct NoUi;
+
+    impl Render for NoUi {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// The panel over a store fed by [`ScriptedSource`], with the fields
+    /// [`ClaudeSessionsPanel::new`] gives it.
+    ///
+    /// The workspace and the project take no part in what these tests are about — which
+    /// of the two conversations a decision is read from — and the panel holds the
+    /// workspace only to open a file a conversation names, which none of them do.
+    fn scripted_panel(
+        session_lines: &[String],
+        agent_lines: &[String],
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<ClaudeSessionsPanel> {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let source: Arc<dyn SessionSource> =
+            Arc::new(ScriptedSource::new(session_lines, agent_lines));
+        let window = cx.add_window(|_window, _cx| NoUi);
+        window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    let store = cx.new(|cx| ClaudeSessionStore::new(source.clone(), None, cx));
+                    let store_subscription =
+                        cx.observe(&store, |this: &mut ClaudeSessionsPanel, _, cx| {
+                            this.rebuild_entries(cx);
+                            this.sync_input_availability(cx);
+                            cx.notify();
+                        });
+                    let message_editor = cx.new(|cx| {
+                        let mut editor = Editor::auto_height(1, 8, window, cx);
+                        editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
+                        editor.set_read_only(true);
+                        editor
+                    });
+
+                    ClaudeSessionsPanel {
+                        workspace: WeakEntity::new_invalid(),
+                        focus_handle: cx.focus_handle(),
+                        fs: fs::FakeFs::new(cx.background_executor().clone()),
+                        store,
+                        source,
+                        message_editor,
+                        project_root: None,
+                        entries: Vec::new(),
+                        pending_sends: PendingSends::default(),
+                        activity: Activity::Idle,
+                        agent_calls: HashMap::default(),
+                        list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+                        session_list_expanded: true,
+                        unread_below: UnreadBelow::default(),
+                        expanded: HashSet::default(),
+                        show_full_history: false,
+                        markdowns: HashMap::default(),
+                        entry_cache: EntryCache::default(),
+                        cached_transcript_generation: 0,
+                        cached_home_directory: None,
+                        overwrites_dropped: 0,
+                        loaded_outputs: HashMap::default(),
+                        output_loads: HashMap::default(),
+                        _store_subscription: store_subscription,
+                    }
+                })
+            })
+            .expect("building the panel in the test window")
+    }
+
+    /// Selects the scripted session and lets the polls deliver its own conversation.
+    fn read_the_scripted_session(
+        panel: &Entity<ClaudeSessionsPanel>,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.select_session(SCRIPTED_PROCESS_ID, cx)
+        });
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+    }
+
+    fn read_the_conversation_of(
+        target: TranscriptTarget,
+        panel: &Entity<ClaudeSessionsPanel>,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        panel.update(cx, |panel, cx| panel.select_transcript_target(target, cx));
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+    }
+
+    /// The bug this is about: an agent that has returned leaves its own conversation
+    /// ending in a call nothing answered, so reading the activity off the conversation on
+    /// screen leaves `Running …` pulsing above an input the reader cannot even type into.
+    #[gpui::test]
+    async fn an_agent_that_has_returned_does_not_pulse_running_above_the_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "m1",
+                None,
+                false,
+                serde_json::json!("go on"),
+            ),
+            chained_line(
+                ASSISTANT_RECORD_TYPE,
+                "m2",
+                Some("m1"),
+                false,
+                serde_json::json!([{ "type": "text", "text": "all done." }]),
+            ),
+        ];
+        let agent_lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "s1",
+                None,
+                true,
+                serde_json::json!("read the file"),
+            ),
+            unanswered_bash_call("s2", Some("s1"), true),
+        ];
+
+        let panel = scripted_panel(&session_lines, &agent_lines, cx);
+        read_the_scripted_session(&panel, cx);
+        read_the_conversation_of(scripted_agent(), &panel, cx);
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.activity,
+                Activity::Idle,
+                "the session has answered and is doing nothing; the unanswered call is in \
+                 the returned agent's conversation, not in the session's"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn the_activity_line_reads_the_session_and_not_the_agent_on_screen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "m1",
+                None,
+                false,
+                serde_json::json!("go on"),
+            ),
+            chained_line(
+                ASSISTANT_RECORD_TYPE,
+                "m2",
+                Some("m1"),
+                false,
+                serde_json::json!([{ "type": "thinking", "thinking": "weighing it up" }]),
+            ),
+        ];
+        let agent_lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "s1",
+                None,
+                true,
+                serde_json::json!("read the file"),
+            ),
+            unanswered_bash_call("s2", Some("s1"), true),
+        ];
+
+        let panel = scripted_panel(&session_lines, &agent_lines, cx);
+        read_the_scripted_session(&panel, cx);
+        read_the_conversation_of(scripted_agent(), &panel, cx);
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.activity,
+                Activity::Thinking,
+                "the line says what this session is doing, and it is thinking whichever \
+                 conversation the reader has open"
+            );
+        });
+    }
+
+    /// A pending message was sent to the session, so it belongs to the session's own
+    /// conversation and is not drawn into an agent's records.
+    #[gpui::test]
+    async fn a_pending_message_is_not_drawn_into_an_agents_conversation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_lines = [chained_line(
+            USER_RECORD_TYPE,
+            "m1",
+            None,
+            false,
+            serde_json::json!("an earlier message"),
+        )];
+        let agent_lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "s1",
+                None,
+                true,
+                serde_json::json!("read the file"),
+            ),
+            chained_line(
+                ASSISTANT_RECORD_TYPE,
+                "s2",
+                Some("s1"),
+                true,
+                serde_json::json!([{ "type": "text", "text": "read it." }]),
+            ),
+        ];
+
+        let panel = scripted_panel(&session_lines, &agent_lines, cx);
+        read_the_scripted_session(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel
+                .pending_sends
+                .remember(SCRIPTED_PROCESS_ID, "and the lint", &panel.entries);
+            panel.rebuild_entries(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                pending_texts(&panel.entries),
+                vec![SharedString::from("and the lint")],
+                "the message is drawn in the conversation it was sent to"
+            );
+        });
+
+        read_the_conversation_of(scripted_agent(), &panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                pending_texts(&panel.entries),
+                Vec::<SharedString>::new(),
+                "nothing the reader sent to the session belongs in an agent's conversation"
+            );
+            assert_eq!(
+                pending_ids(&panel.pending_sends).len(),
+                1,
+                "the message is only undrawn, not taken down: it is still waiting for the \
+                 record it was sent as"
+            );
+        });
+
+        read_the_conversation_of(TranscriptTarget::Main, &panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                pending_texts(&panel.entries),
+                vec![SharedString::from("and the lint")],
+                "back in the session's own conversation the message is drawn again"
+            );
+        });
+    }
+
+    /// An agent is given its task as a user record of its own conversation, so an
+    /// agent's records hold the very text a send carries. Pairing against them takes
+    /// down a message that never arrived, and the reader is left with no sign of it at
+    /// all once they return to the session.
+    #[gpui::test]
+    async fn an_agents_own_prompt_does_not_pair_with_a_message_sent_to_the_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_lines = [chained_line(
+            USER_RECORD_TYPE,
+            "m1",
+            None,
+            false,
+            serde_json::json!("an earlier message"),
+        )];
+        let agent_lines = [chained_line(
+            USER_RECORD_TYPE,
+            "s1",
+            None,
+            true,
+            serde_json::json!("run the tests"),
+        )];
+
+        let panel = scripted_panel(&session_lines, &agent_lines, cx);
+        read_the_scripted_session(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel
+                .pending_sends
+                .remember(SCRIPTED_PROCESS_ID, "run the tests", &panel.entries);
+            panel.rebuild_entries(cx);
+        });
+
+        read_the_conversation_of(scripted_agent(), &panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                pending_ids(&panel.pending_sends).len(),
+                1,
+                "the session has written no record of this message; the agent's own \
+                 prompt reading the same is not it arriving"
+            );
+        });
+
+        read_the_conversation_of(TranscriptTarget::Main, &panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                pending_texts(&panel.entries),
+                vec![SharedString::from("run the tests")],
+                "a message that never arrived must still be shown as waiting"
+            );
+        });
+    }
+
+    /// The bookkeeping of a pending message is written in the keys
+    /// [`build_entries`] gives the records, and [`user_message_entries`] reads the same
+    /// records without deriving the rest of the conversation. The two must agree key for
+    /// key, or a pending message is measured against one set of keys and paired against
+    /// another.
+    #[test]
+    fn the_user_messages_read_off_a_path_are_the_ones_the_built_entries_carry() {
+        let lines = [
+            user_message_line("u1", "a message with string content"),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u2",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": "call-1", "content": "done" },
+                    { "type": "text", "text": "a message after a result" },
+                ] },
+            })
+            .to_string(),
+            user_message_line(
+                "u3",
+                "<command-name>/goal</command-name>\n<command-args>ship it</command-args>",
+            ),
+            user_message_line(
+                "u4",
+                "<system-reminder>nothing the user typed</system-reminder>",
+            ),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u5",
+                "isCompactSummary": true,
+                "message": { "content": "a recap of the conversation" },
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u6",
+                "subtype": LOCAL_COMMAND_SUBTYPE,
+                "content": "the output of a command the user ran",
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": ATTACHMENT_RECORD_TYPE,
+                "uuid": "u7",
+                "content": "context Claude Code assembled",
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "u8",
+                "message": { "content": [{ "type": "text", "text": "the model's own words" }] },
+            })
+            .to_string(),
+            // No uuid, so it is keyed by its position in the path.
+            serde_json::json!({
+                "type": "user",
+                "message": { "content": "a message no record can reference" },
+            })
+            .to_string(),
+        ];
+
+        let records: Vec<TranscriptRecord> = lines.iter().map(|line| record(line)).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let built = build_entries(&path, Some(paths::home_dir()), &mut EntryCache::default());
+
+        assert_eq!(
+            user_messages(&user_message_entries(&path)),
+            user_messages(&built),
+            "the pairing of a pending message reads these keys, so they must be the keys \
+             the drawn conversation carries"
+        );
+        assert!(
+            !user_messages(&built).is_empty(),
+            "a fixture with no user messages in it would hold nothing together"
         );
     }
 }

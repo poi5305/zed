@@ -2237,3 +2237,82 @@ F.8 WP13 驗收與兩個必須先裁決的發現
     這讓 remote 與 local 對稱（LocalSource 不可能 error）。
   - `select_transcript_target(Subagent)` 在沒選 session 時留下懸空 target：
     UI 走不到（chip 來自 `subagents()`，沒選中就是空的），接受。
+
+--------------------------------------------------------------------------------
+F.9 跨家族安全審查：第一次回答被退回，第二次過關
+--------------------------------------------------------------------------------
+
+**第一次**回了 83 個位元組：
+  {"findings":[],"checked_and_clean":["A","B","C","D","E"],"could_not_determine":[]}
+五個界限（含 symlink、Windows 分隔符、generation 撞號）全部宣告乾淨，拿不出任何根據。
+同一隻上一輪做同樣任務時回了 2116 位元組並抓到一個 high（E.11 的 S1）。
+**我退回它**，並在重派的 prompt 加一個必填欄位 `evidence_per_boundary`：
+實際讀過的行號區間、界限為什麼擋得住（要引用實際判定）、考慮過的輸入類別、
+以及**「拿掉這個檢查會被什麼輸入打穿」** —— 說不出後者就必須放進 `could_not_determine`，
+不准放 checked_and_clean。
+
+**第二次**回了 7055 位元組，五個界限各有行號與機制，findings 仍是 0。
+我抽驗三條，全部對上：
+
+  A  `single_path_component`（claude_sessions.rs:285-295）守衛是
+     `only_component == OsStr::new(name)` —— 與它引述的一致。
+     它舉的打穿輸入：拿掉檢查後 `session_id = "../../sessions"` 會讓
+     `directory_entry.path().join(session_id)` 走出 projects 並命中 `~/.claude/sessions`。
+  C  store 建 `Transcript::new()` 在 158 / 612 / 679，`for_sidechain()` 只在
+     239（`select_transcript_target` 的 Subagent 分支）與 680（restart 時依 target 選）。
+     **主對話沒有任何路徑會拿到 sidechain 模式** —— 這是這個設計最怕的事，實地確認過。
+  E  `announced_workflow_run_id` 真的有 `.filter(|(id, _)| *id == tool_use_id)`，
+     所以隨便一個 Bash 輸出印 `Run ID: wf_x` 劫不走卡片 —— 它只讀同一個 tool_use 自己的 result。
+
+**流程教訓**：「零 finding」是可以接受的結果，但必須附得出可查核的證據。
+沒有證據的「全部乾淨」與沒審過沒有差別 —— 而且這一次證明了差別在哪：
+同一個模型、同一份程式碼、同一個任務，第一次 83 位元組、第二次 7055 位元組。
+往後所有唯讀審查的 prompt 都要帶 `evidence_per_boundary` 這個欄位。
+
+--------------------------------------------------------------------------------
+F.10 Review 輪 + 我駁回它三條 wontfix 的結果
+--------------------------------------------------------------------------------
+
+**Review 輪（Opus，乾淨 context）**：10 findings = 修 3 + wontfix 6 + rejected 1（它自己的誤報）。
+修掉的是 R1（pending 與送出**之前**就存在的同文字記錄配對）、R4（記錄層級的
+`toolUseResult` 被套到該筆的每一個 tool_result block）、R5（已離開的 session 的讀取失敗
+報在現在這個 session 上）。R4 它給 low 是有根據的：掃過 875 個真 transcript、
+8315 筆答工具的 user 記錄，**零筆**有超過一個 tool_result block。
+它也獨立重驗那五個界限，結論與 Gemini 一致。
+
+**我駁回它三條 wontfix**（R2 / R3 / R6），理由是它的前提錯了 ——
+它說「沒有 Workspace harness 就寫不出 RED，抽出來的純函式會從出生就是綠的」。
+正確做法是抽一個把「該用哪一份 transcript」變成可斷言的 seam，再**用突變證明它接在對的地方**。
+
+派工後它自己建了 entity harness（`ScriptedSource` + `scripted_panel`：
+`WeakEntity::new_invalid()` + `FakeFs` + 一個 `NoUi` root window，不 render 以避開
+`GlobalThemeSettingsProvider`，並照 `new` 接上同一條 `cx.observe`）—— **不需要新 dev-dep**，
+所以「值不值得建」的答案是值得。這也回頭補上了 P1 就留著的 G5（沒有 entity 級測試）那個缺口。
+
+三條的實際缺陷：
+  R3（high）活動指示從**螢幕上那一份**推導。看一隻已跑完的 agent 時，
+     它的 transcript 尾端常是一個沒有 tool_result 的 tool_use → 那行**永遠脈動 Running…**，
+     而輸入框是停用的；反過來 session 真的在 thinking 時看 agent 的人看不到。
+  R2（high）pending 泡泡被畫進 agent 的對話，且配對拿 agent 的記錄比 ——
+     agent 的第一筆 user 記錄就是它被交付的任務，文字若與送出的訊息相同就會**誤配掉**，
+     真正沒送達的訊息再也不顯示。
+  R6（medium）`render_disclosure_header` 上的 `#[allow(clippy::too_many_arguments)]`。
+
+**它誠實回報的一件事，我覆核為真**：那個 `#[allow]` **從來沒有作用** ——
+根 `Cargo.toml:1142` 有 `too_many_arguments = "allow"`（我實地確認過），
+所以刪掉前後 clippy 都是 exit 0，R6 的「紅」只能是 grep 命中。它照樣做了 struct 重構。
+
+**「全樹零 `#[allow]`」這條它做不到也不該做**：`crates/` 底下有 604 處、散在 211 個檔案，
+全部是 upstream zed 的。規則的範圍是我們寫的程式碼 —— `crates/claude_sessions/` 與
+`crates/remote/src/claude_sessions.rs` 現在是 **0**（我獨立 grep 確認）。
+
+**我的突變抽查**（各自還原成 byte-identical）：
+  `activity(&session_path)` → `activity(&path)`            → 2 支紅
+  `pending_is_drawn_in` 的 Subagent 分支 false → true      → 1 支紅
+
+**它交回給我裁決的灰色地帶，裁定如下**：`agent_calls(&path)` 仍從螢幕上那一份推導 ——
+看某隻 agent 的對話時，那份對話裡的 `Agent`/`Workflow` 呼叫會拿 `subagents()` 去配對。
+**維持現狀，這是對的**：實機量測過 spawn_depth 2/3 的 agent 也是平放在同一個
+`subagents/` 目錄（附錄 F.1 的分佈表：4 筆 depth 2、3 筆 depth 3），
+所以它們本來就在 `subagents()` 裡；而巢狀 agent 的 `toolUseId` 指向的正是**母 agent
+transcript 裡的那個 tool_use** —— 於是看母 agent 時用 tool_use_id 配對剛好配到對的那隻。
