@@ -2,7 +2,7 @@ mod project_location;
 mod project_manager_button;
 mod project_manager_panel;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -12,7 +12,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use workspace::Workspace;
 
-pub use project_location::{ProjectLocation, parse_project_location, remote_project_uri};
+pub use project_location::{
+    ImportedPath, ProjectLocation, import_vscode_path, parse_project_location, remote_project_uri,
+};
 pub use project_manager_button::ProjectManagerButton;
 pub use project_manager_panel::ProjectManagerPanel;
 
@@ -20,7 +22,9 @@ actions!(
     project_manager,
     [
         /// Toggles focus on the project manager panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Imports the projects of the VS Code "Project Manager" extension.
+        ImportFromVsCode
     ]
 );
 
@@ -28,6 +32,12 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ProjectManagerPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ImportFromVsCode, _window, cx| {
+            let Some(panel) = workspace.panel::<ProjectManagerPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| panel.import_from_vscode(cx));
         });
     })
     .detach();
@@ -101,15 +111,25 @@ pub fn project_entry_element_id(group: &ProjectGroup, index: usize) -> String {
     format!("project-manager-entry-{tag}-{index}")
 }
 
-/// Indices of the enabled projects whose name or tags match `query`.
+/// Indices of the enabled projects whose name or tags match `query`, ordered by name.
+///
+/// Ordered here rather than in the file: `projects.json` holds projects in the order they
+/// were added, and an import writes them in the order of the file it read, neither of
+/// which is an order a reader can look a project up in. Compared without case, so that
+/// `andy-stocktw` and `Andy-stocktw` sit next to each other instead of in two blocks.
 pub fn filter_projects(projects: &[ProjectEntry], query: &str) -> Vec<usize> {
     let lowercase_query = query.trim().to_lowercase();
-    projects
+    // Sorted as (name, index) pairs rather than by indexing back into `projects`, and the
+    // index in the key is what settles two projects of the same name: the one the file
+    // holds first stays first.
+    let mut matches: Vec<(String, usize)> = projects
         .iter()
         .enumerate()
         .filter(|(_, project)| project.enabled && project.matches_query(&lowercase_query))
-        .map(|(index, _)| index)
-        .collect()
+        .map(|(index, project)| (project.name.trim().to_lowercase(), index))
+        .collect();
+    matches.sort();
+    matches.into_iter().map(|(_, index)| index).collect()
 }
 
 /// Groups the given projects by tag, sorted alphabetically, with the untagged
@@ -189,6 +209,135 @@ pub fn parse_projects(contents: &str) -> Result<ParsedProjects> {
     Ok(parsed)
 }
 
+/// The extension whose file format this panel's `projects.json` follows. Its storage
+/// directory is named after the extension's id, and every editor built on VS Code keeps
+/// it in the same place under its own application directory.
+const VSCODE_PROJECT_MANAGER_STORAGE: &str = "alefragnani.project-manager";
+
+/// The editors that run the extension. Each keeps its own copy, and a reader who moved
+/// from one to another has projects in the one they left.
+const VSCODE_FLAVORS: [&str; 5] = ["Code", "Code - Insiders", "Cursor", "VSCodium", "Windsurf"];
+
+/// Where the VS Code "Project Manager" extension keeps its projects, newest flavor first.
+///
+/// Every path is returned whether or not it exists; the caller reads the ones that do.
+pub fn vscode_project_files() -> Vec<PathBuf> {
+    let home = paths::home_dir();
+    VSCODE_FLAVORS
+        .iter()
+        .map(|flavor| {
+            let application = if cfg!(target_os = "macos") {
+                home.join("Library/Application Support").join(flavor)
+            } else if cfg!(target_os = "windows") {
+                std::env::var("APPDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| home.join("AppData/Roaming"))
+                    .join(flavor)
+            } else {
+                home.join(".config").join(flavor)
+            };
+            application
+                .join("User/globalStorage")
+                .join(VSCODE_PROJECT_MANAGER_STORAGE)
+                .join("projects.json")
+        })
+        .collect()
+}
+
+/// What reading a VS Code "Project Manager" file produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VsCodeImport {
+    pub projects: Vec<ProjectEntry>,
+    /// One line for each entry that was left out, and for each one that was imported with
+    /// something worth saying about it.
+    pub warnings: Vec<String>,
+}
+
+/// Reads a VS Code "Project Manager" file into entries this panel can store.
+///
+/// The two formats are the same file — this panel's `projects.json` follows that
+/// extension's — so it is read with the same parser and only the paths are translated.
+/// An entry whose folder cannot be translated is left out and reported rather than
+/// failing the file: importing twenty-seven of twenty-eight projects, with a line saying
+/// which one was dropped and why, is worth more than importing none of them.
+pub fn import_vscode_projects(contents: &str) -> Result<VsCodeImport> {
+    let parsed = parse_projects(contents).context("reading the VS Code project file")?;
+    let mut import = VsCodeImport {
+        projects: Vec::with_capacity(parsed.projects.len()),
+        warnings: parsed.errors,
+    };
+
+    for project in parsed.projects {
+        match import_project(project) {
+            Ok((project, warnings)) => {
+                import.projects.push(project);
+                import.warnings.extend(warnings);
+            }
+            Err(error) => import.warnings.push(format!("{error:#}")),
+        }
+    }
+    Ok(import)
+}
+
+/// One imported entry and whatever has to be said about the paths in it.
+fn import_project(project: ProjectEntry) -> Result<(ProjectEntry, Vec<String>)> {
+    let named = |error: anyhow::Error| error.context(format!("skipped \"{}\"", project.name));
+
+    let mut warnings = Vec::new();
+    let root = import_vscode_path(&project.root_path).map_err(named)?;
+    let mut paths = Vec::with_capacity(project.paths.len());
+    for path in &project.paths {
+        let imported = import_vscode_path(path).map_err(named)?;
+        warnings.extend(imported.warning);
+        paths.push(imported.path);
+    }
+    warnings.extend(root.warning);
+
+    Ok((
+        ProjectEntry {
+            name: project.name,
+            root_path: root.path,
+            paths,
+            tags: project.tags,
+            enabled: project.enabled,
+        },
+        warnings,
+    ))
+}
+
+/// How many of an import's entries were new.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportMerge {
+    pub added: usize,
+    /// Entries whose name is already in the list.
+    pub skipped: usize,
+}
+
+/// Adds the imported projects that are not in `existing` already.
+///
+/// Matched on name, because that is what the reader calls a project and what they would
+/// otherwise see twice in the panel. An entry already there is left exactly as it is: its
+/// tags and its path may have been edited here since it was first imported, and running
+/// the import again is not a reason to undo that.
+pub fn merge_imported_projects(
+    existing: &mut Vec<ProjectEntry>,
+    imported: Vec<ProjectEntry>,
+) -> ImportMerge {
+    let mut merge = ImportMerge::default();
+    for project in imported {
+        let is_new = !existing
+            .iter()
+            .any(|held| held.name.trim().eq_ignore_ascii_case(project.name.trim()));
+        if is_new {
+            existing.push(project);
+            merge.added += 1;
+        } else {
+            merge.skipped += 1;
+        }
+    }
+    merge
+}
+
 pub fn serialize_projects(projects: &[ProjectEntry]) -> Result<String> {
     let mut contents =
         serde_json::to_string_pretty(projects).context("serializing projects.json")?;
@@ -222,6 +371,148 @@ pub async fn save_projects(fs: &Arc<dyn Fs>, path: &Path, projects: &[ProjectEnt
 mod tests {
     use super::*;
     use fs::FakeFs;
+
+    /// The shape of a real export: local folders as plain paths, remote ones behind
+    /// `vscode-remote://ssh-remote+<host>`, one of them a Coder workspace and one of them
+    /// a folder on a Windows host.
+    #[test]
+    fn a_vscode_export_imports_its_hosts_as_ssh() {
+        let import = import_vscode_projects(
+            r#"[
+                {"name":"CDB-ewimg","rootPath":"/Users/andy/go/src/github.com/CreatorDB/ewimg",
+                 "paths":[],"tags":[],"enabled":true,"profile":""},
+                {"name":"XR-robotmon (DB2)",
+                 "rootPath":"vscode-remote://ssh-remote+192.168.100.252/mnt/data/andy/robotmon",
+                 "paths":[],"tags":[],"enabled":true,"profile":""},
+                {"name":"CDB-agency (coder)",
+                 "rootPath":"vscode-remote://ssh-remote+coder-vscode.coder.elggum.com--poi5305--andy.main/home/coder/dashboard",
+                 "paths":[],"tags":[],"enabled":true,"profile":""},
+                {"name":"Ubuntu","rootPath":"vscode-remote://wsl+Ubuntu-22.04/home/andy/work",
+                 "paths":[],"tags":[],"enabled":true,"profile":""}
+            ]"#,
+        )
+        .expect("a VS Code export is the same file shape");
+
+        assert_eq!(
+            import
+                .projects
+                .iter()
+                .map(|project| project.root_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/Users/andy/go/src/github.com/CreatorDB/ewimg",
+                "ssh://192.168.100.252/mnt/data/andy/robotmon",
+                // A Coder workspace is reached through the host `coder config-ssh`
+                // writes, so it needs no handling of its own.
+                "ssh://coder-vscode.coder.elggum.com--poi5305--andy.main/home/coder/dashboard",
+                "wsl://Ubuntu-22.04/home/andy/work",
+            ]
+        );
+        assert!(
+            import.warnings.is_empty(),
+            "nothing about these needed saying: {:?}",
+            import.warnings
+        );
+        assert!(
+            import
+                .projects
+                .iter()
+                .all(|project| project.location().is_ok()),
+            "and every one of them parses back into a location to open"
+        );
+    }
+
+    /// An entry that cannot be translated is left out with a line naming it, rather than
+    /// failing the whole file: the reader has twenty-seven other projects in it.
+    #[test]
+    fn an_untranslatable_entry_is_reported_and_the_rest_imported() {
+        let import = import_vscode_projects(
+            r#"[
+                {"name":"Container","rootPath":"vscode-remote://dev-container+7b2268/workspaces/app",
+                 "paths":[],"tags":[],"enabled":true},
+                {"name":"Kept","rootPath":"/Users/andy/kept","paths":[],"tags":[],"enabled":true}
+            ]"#,
+        )
+        .expect("the file itself is readable");
+
+        assert_eq!(
+            import
+                .projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Kept"]
+        );
+        assert_eq!(import.warnings.len(), 1, "{:?}", import.warnings);
+        let warning = &import.warnings[0];
+        assert!(
+            warning.contains("Container") && warning.contains("dev-container"),
+            "the line has to name the project and what was wrong with it: {warning}"
+        );
+    }
+
+    /// A folder on a Windows host keeps the leading separator its URI needs, and the
+    /// reader is told so rather than left to discover it when the folder does not open.
+    #[test]
+    fn a_windows_folder_behind_ssh_is_imported_with_a_warning() {
+        let import = import_vscode_projects(
+            r#"[{"name":"XR-xrpc (Win)",
+                 "rootPath":"vscode-remote://ssh-remote+192.168.1.132/C:/Users/XR/workspace/xrpc",
+                 "paths":[],"tags":[],"enabled":true}]"#,
+        )
+        .expect("readable");
+
+        assert_eq!(
+            import.projects[0].root_path,
+            "ssh://192.168.1.132/C:/Users/XR/workspace/xrpc"
+        );
+        let warning = import
+            .warnings
+            .first()
+            .unwrap_or_else(|| panic!("expected a warning, got {:?}", import.warnings));
+        assert!(
+            warning.contains("drive C"),
+            "the warning has to say what is odd about it: {warning}"
+        );
+    }
+
+    /// Running the import twice must not double the list, and must not undo edits made
+    /// here to a project that was imported before.
+    #[test]
+    fn importing_twice_adds_only_what_is_new() {
+        let mut existing = vec![ProjectEntry {
+            name: "CDB-ewimg".into(),
+            root_path: "/somewhere/else".into(),
+            paths: Vec::new(),
+            tags: vec!["work".into()],
+            enabled: true,
+        }];
+        let imported = vec![
+            ProjectEntry::new("cdb-ewimg", "/Users/andy/ewimg"),
+            ProjectEntry::new("R-robotmon", "/Users/andy/robotmon"),
+        ];
+
+        let merge = merge_imported_projects(&mut existing, imported);
+
+        assert_eq!(
+            merge,
+            ImportMerge {
+                added: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(existing.len(), 2);
+        assert_eq!(
+            existing[0].root_path, "/somewhere/else",
+            "the entry already held keeps the path it was edited to"
+        );
+        assert_eq!(
+            existing[0].tags,
+            vec!["work".to_string()],
+            "and keeps its tags"
+        );
+        assert_eq!(existing[1].name, "R-robotmon");
+    }
 
     #[test]
     fn test_parse_projects_normal() {
@@ -338,8 +629,9 @@ mod tests {
 
         assert_eq!(
             filter_projects(&projects, ""),
-            vec![0, 1, 2],
-            "the disabled project is never listed"
+            vec![1, 2, 0],
+            "the disabled project is never listed, and the rest come out by name: \
+             Dotfiles, Scratch, Zed"
         );
         assert_eq!(filter_projects(&projects, "dot"), vec![1]);
         assert_eq!(
@@ -353,6 +645,30 @@ mod tests {
             "the disabled project matching the tag stays hidden"
         );
         assert_eq!(filter_projects(&projects, "nothing"), Vec::<usize>::new());
+    }
+
+    /// A list of twenty-odd projects in the order they happened to be added to the file
+    /// is a list a reader has to scan; by name they can go straight to one.
+    #[test]
+    fn projects_are_listed_by_name_whatever_order_the_file_holds_them_in() {
+        let projects = vec![
+            ProjectEntry::new("zed-fc", "/zed-fc"),
+            ProjectEntry::new("Andy-stocktw", "/stocktw"),
+            ProjectEntry::new("cdb-agency", "/agency"),
+            ProjectEntry::new("CDB-ewimg", "/ewimg"),
+        ];
+
+        let listed: Vec<&str> = filter_projects(&projects, "")
+            .into_iter()
+            .filter_map(|index| projects.get(index))
+            .map(|project| project.name.as_str())
+            .collect();
+
+        assert_eq!(
+            listed,
+            vec!["Andy-stocktw", "cdb-agency", "CDB-ewimg", "zed-fc"],
+            "ordered by name without case, so that the two CDB projects are together"
+        );
     }
 
     #[test]

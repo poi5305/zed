@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,27 +7,33 @@ use editor::{Editor, EditorElement, EditorEvent, EditorStyle};
 use fs::Fs;
 use futures::StreamExt as _;
 use gpui::{
-    AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, Pixels, Render,
-    SharedString, Subscription, Task, TextStyle, WeakEntity, div, px, relative, rems,
+    AsyncApp, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, FontStyle,
+    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, TextStyle, WeakEntity,
+    div, px, relative, rems,
 };
 use recent_projects::open_remote_project;
 use remote::RemoteConnectionOptions;
+use rope::Rope;
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use ui::{Icon, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Workspace,
+    MultiWorkspace, OpenMode, OpenOptions, Workspace, create_and_open_local_file,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
 use crate::{
-    ProjectEntry, ProjectGroup, ProjectLocation, ToggleFocus, filter_projects, group_projects,
-    load_projects, project_entry_element_id, remote_project_uri, save_projects,
+    ImportMerge, ProjectEntry, ProjectGroup, ProjectLocation, ToggleFocus, filter_projects,
+    group_projects, import_vscode_projects, load_projects, merge_imported_projects,
+    project_entry_element_id, remote_project_uri, save_projects, vscode_project_files,
 };
 
 const PROJECT_MANAGER_PANEL_KEY: &str = "ProjectManagerPanel";
 const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
+
+/// What a `projects.json` that does not exist yet is created with.
+const EMPTY_PROJECT_LIST: &str = "[]\n";
 
 pub struct ProjectManagerPanel {
     workspace: WeakEntity<Workspace>,
@@ -37,9 +43,14 @@ pub struct ProjectManagerPanel {
     projects: Vec<ProjectEntry>,
     project_rows: Vec<ProjectRow>,
     load_error: Option<SharedString>,
+    /// What the last import did, a line at a time. Kept apart from `load_error` because
+    /// an import that reports something is not an import that failed.
+    notice: Vec<SharedString>,
     position: DockPosition,
     reload_task: Task<()>,
     save_task: Task<()>,
+    import_task: Task<()>,
+    edit_task: Task<()>,
     _watch_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -102,9 +113,12 @@ impl ProjectManagerPanel {
                 projects: Vec::new(),
                 project_rows: Vec::new(),
                 load_error: None,
+                notice: Vec::new(),
                 position: DockPosition::Left,
                 reload_task: Task::ready(()),
                 save_task: Task::ready(()),
+                import_task: Task::ready(()),
+                edit_task: Task::ready(()),
                 _watch_task: watch_task,
                 _subscriptions: subscriptions,
             };
@@ -114,6 +128,7 @@ impl ProjectManagerPanel {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.notice.clear();
         let fs = self.fs.clone();
         self.reload_task = cx.spawn(async move |this, cx| {
             let result = load_projects(&fs, paths::projects_file()).await;
@@ -231,32 +246,38 @@ impl ProjectManagerPanel {
         cx.notify();
     }
 
+    /// Opens `projects.json` in an editor.
+    ///
+    /// Through the same path Zed opens its own settings file by: the file is on this
+    /// machine, and a window whose project is on a remote host has to be handed a local
+    /// workspace to open it in. Opening it through the remote window asks the host for a
+    /// path that only exists here, and asking `open_paths` for a local window is not
+    /// enough either — a window holding both a local and a remote workspace counts as
+    /// local while its active workspace is still the remote one, which is how the path
+    /// reached the host again. `with_local_or_wsl_workspace`, which
+    /// [`create_and_open_local_file`] goes through, is what actually switches workspaces.
     fn edit_projects_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let fs = self.fs.clone();
-        let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            let path = paths::projects_file().clone();
-            // The editor cannot open a file that does not exist yet, so seed an
-            // empty project list on the first edit.
-            if !fs.is_file(&path).await {
-                save_projects(&fs, &path, &[]).await?;
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let opened = workspace.update(cx, |_workspace, cx| {
+            create_and_open_local_file(paths::projects_file().as_path(), window, cx, || {
+                // An empty list rather than an empty file: the panel reads this back,
+                // and a project file that is not a JSON array at all is an error it
+                // would have to report.
+                Rope::from(EMPTY_PROJECT_LIST)
+            })
+        });
+
+        self.edit_task = cx.spawn(async move |this, cx| {
+            // Said in the panel, not only in the log: a button that reports its failure
+            // to a file the reader is not watching is a button that does nothing.
+            if let Err(error) = opened.await {
+                this.update(cx, |this, cx| this.report_error(error, cx))
+                    .log_err();
             }
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.open_abs_path(
-                        path,
-                        OpenOptions {
-                            visible: Some(OpenVisible::None),
-                            ..Default::default()
-                        },
-                        window,
-                        cx,
-                    )
-                })?
-                .await?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
     }
 
     /// Every visible worktree root of the current workspace, which is what "Save
@@ -280,6 +301,68 @@ impl ProjectManagerPanel {
             .and_then(|client| client.read(cx).remote_connection())
             .map(|connection| connection.connection_options());
         Some((connection, roots))
+    }
+
+    /// Imports the projects of the VS Code "Project Manager" extension, whose file
+    /// format this panel's own `projects.json` follows.
+    ///
+    /// Read from the extension's own storage when one of the editors that runs it has
+    /// written a file there, and asked for when none has: that directory is several
+    /// levels deep inside an application support folder, so finding it is worth more than
+    /// a file picker, while a reader who keeps an export of their own still gets one.
+    pub fn import_from_vscode(&mut self, cx: &mut Context<Self>) {
+        let fs = self.fs.clone();
+        let candidates = vscode_project_files();
+
+        // Its own task slot: dropping a `Task` cancels it, so sharing one with the reload
+        // the projects.json watcher triggers would abort the import half-written.
+        self.import_task = cx.spawn(async move |this, cx| {
+            let source = match first_project_file(&fs, candidates).await {
+                Some(source) => source,
+                None => match ask_for_a_project_file(cx).await {
+                    Ok(Some(source)) => source,
+                    // A dialog the reader closed is not an error to report back to them.
+                    Ok(None) => return,
+                    Err(error) => {
+                        this.update(cx, |this, cx| this.report_error(error, cx))
+                            .log_err();
+                        return;
+                    }
+                },
+            };
+
+            let imported = async {
+                let contents = fs
+                    .load(&source)
+                    .await
+                    .with_context(|| format!("reading {}", source.display()))?;
+                let import = import_vscode_projects(&contents)?;
+
+                let path = paths::projects_file().clone();
+                let mut parsed = load_projects(&fs, &path).await?;
+                let merge = merge_imported_projects(&mut parsed.projects, import.projects);
+                if merge.added > 0 {
+                    save_projects(&fs, &path, &parsed.projects).await?;
+                }
+                anyhow::Ok((parsed, merge, import.warnings))
+            }
+            .await;
+
+            this.update(cx, |this, cx| {
+                match imported {
+                    Ok((parsed, merge, warnings)) => {
+                        this.set_projects(parsed.projects);
+                        this.load_error = entry_errors_message(&parsed.errors);
+                        this.notice = import_notice(&source, merge, &warnings);
+                    }
+                    Err(error) => {
+                        this.load_error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
     }
 
     fn save_current_project(&mut self, cx: &mut Context<Self>) {
@@ -377,6 +460,14 @@ impl ProjectManagerPanel {
                     })),
             )
             .child(
+                IconButton::new("project-manager-import", IconName::Download)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Import Projects from VS Code"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.import_from_vscode(cx);
+                    })),
+            )
+            .child(
                 IconButton::new("project-manager-refresh", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Refresh"))
@@ -396,7 +487,7 @@ impl ProjectManagerPanel {
         let row = self.project_rows.get(index)?;
         let name: SharedString = project.name.clone().into();
         let element_id = SharedString::from(project_entry_element_id(group, index));
-        let new_window_id = SharedString::from(format!("{element_id}-new-window"));
+        let this_window_id = SharedString::from(format!("{element_id}-this-window"));
 
         let icon = row.icon;
         let host = row.host.clone();
@@ -423,15 +514,15 @@ impl ProjectManagerPanel {
                 )
                 .tooltip(Tooltip::text(tooltip))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_project(index, false, window, cx);
+                    this.open_project(index, CLICK_OPENS_A_NEW_WINDOW, window, cx);
                 }))
                 .end_slot(
-                    IconButton::new(new_window_id, IconName::ArrowUpRight)
+                    IconButton::new(this_window_id, IconName::Replace)
                         .icon_size(IconSize::Small)
                         .visible_on_hover(element_id)
-                        .tooltip(Tooltip::text("Open in New Window"))
+                        .tooltip(Tooltip::text("Open in This Window"))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_project(index, true, window, cx);
+                            this.open_project(index, false, window, cx);
                         })),
                 )
                 .into_any_element(),
@@ -478,6 +569,14 @@ fn project_row(project: &ProjectEntry) -> ProjectRow {
 /// `Workspace::open_paths` adds the folders to the project this window already
 /// shows; opening a saved project has to replace what the window shows instead,
 /// which is what `OpenMode::Activate` does with the requesting window.
+/// What clicking a project row does.
+///
+/// A window of its own: the reader is choosing another project, not another file, and
+/// opening it over this window would take away the project they were working in — along
+/// with its tabs, its terminals and its layout. The row keeps a button for replacing this
+/// window, for the reader who meant that.
+const CLICK_OPENS_A_NEW_WINDOW: bool = true;
+
 fn open_mode_for_window(new_window: bool) -> OpenMode {
     if new_window {
         OpenMode::NewWindow
@@ -522,6 +621,63 @@ fn project_entry_for_roots(
     Ok(entry)
 }
 
+/// The first of `candidates` that is a file, or `None` when none of them is.
+async fn first_project_file(fs: &Arc<dyn Fs>, candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    for candidate in candidates {
+        if fs.is_file(&candidate).await {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Asks the reader for a project file to import. `Ok(None)` when they closed the dialog
+/// without choosing one, which is a decision rather than a failure.
+async fn ask_for_a_project_file(cx: &mut AsyncApp) -> Result<Option<PathBuf>> {
+    let receiver = cx.update(|cx| {
+        cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        })
+    });
+
+    match receiver.await {
+        Ok(Ok(paths)) => Ok(paths.and_then(|paths| paths.into_iter().next())),
+        Ok(Err(error)) => Err(error).context("choosing a project file to import"),
+        // The dialog went away with the window it belonged to.
+        Err(_) => Ok(None),
+    }
+}
+
+/// How many lines of an import's warnings are shown. Enough for every entry of a real
+/// export that needed one, and short of burying the panel under a list as long as the
+/// file itself when a reader imports one written for another machine.
+const SHOWN_IMPORT_WARNINGS: usize = 6;
+
+/// What an import did, as lines for the panel: what it read and how much of it was new,
+/// then what it could not bring across.
+fn import_notice(source: &Path, merge: ImportMerge, warnings: &[String]) -> Vec<SharedString> {
+    let mut lines = vec![SharedString::from(format!(
+        "Imported {} of {} projects from {}",
+        merge.added,
+        merge.added + merge.skipped,
+        source.display()
+    ))];
+    lines.extend(
+        warnings
+            .iter()
+            .take(SHOWN_IMPORT_WARNINGS)
+            .map(|warning| SharedString::from(warning.clone())),
+    );
+    let hidden = warnings.len().saturating_sub(SHOWN_IMPORT_WARNINGS);
+    if hidden > 0 {
+        lines.push(SharedString::from(format!("…and {hidden} more")));
+    }
+    lines
+}
+
 fn entry_errors_message(errors: &[String]) -> Option<SharedString> {
     if errors.is_empty() {
         return None;
@@ -550,6 +706,22 @@ impl Render for ProjectManagerPanel {
             )
             .when_some(self.load_error.clone(), |this, error| {
                 this.child(div().p_2().child(Label::new(error).color(Color::Error)))
+            })
+            .when(!self.notice.is_empty(), |this| {
+                this.child(v_flex().px_2().py_1().gap_0p5().children(
+                    self.notice.iter().enumerate().map(|(line, text)| {
+                        // The first line is what the import did; the ones under it are
+                        // what it could not do, which is the part worth the warning
+                        // colour.
+                        Label::new(text.clone())
+                            .size(LabelSize::Small)
+                            .color(if line == 0 {
+                                Color::Muted
+                            } else {
+                                Color::Warning
+                            })
+                    }),
+                ))
             })
             .child(
                 v_flex()
@@ -725,6 +897,17 @@ mod tests {
             "opening a project in this window must switch the window to it, not merge its folders into the project already open"
         );
         assert_eq!(open_mode_for_window(true), OpenMode::NewWindow);
+    }
+
+    /// Clicking a project must not take away the window the reader was working in. The
+    /// default is asserted here because it is a single `bool` at the click site, and
+    /// flipping it back would otherwise be a silent change of behaviour.
+    #[test]
+    fn clicking_a_project_opens_a_window_of_its_own() {
+        assert_eq!(
+            open_mode_for_window(CLICK_OPENS_A_NEW_WINDOW),
+            OpenMode::NewWindow
+        );
     }
 
     #[test]

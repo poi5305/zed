@@ -840,12 +840,9 @@ impl ClaudeSessionsPanel {
         })
     }
 
-    /// Opens the same view as a tab in the editor area, for a conversation that is
-    /// easier to read at the width of a pane than at the width of a dock.
-    ///
-    /// The tab reads the store the panel already scans through: opening one does not
-    /// start a second scan of the same sessions, and the session selected in either
-    /// place is the one both of them show.
+    /// Opens the session selected in the dock as a tab in the editor area, for a
+    /// conversation that is easier to read at the width of a pane than at the width of a
+    /// dock.
     pub fn open_in_pane(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -854,58 +851,88 @@ impl ClaudeSessionsPanel {
         let Some(panel) = workspace.panel::<Self>(cx) else {
             return;
         };
-        let (fs, store, source, project_root) = {
+        let (fs, source, project_root, process_id) = {
             let panel = panel.read(cx);
             (
                 panel.fs.clone(),
-                panel.store.clone(),
                 panel.source.clone(),
                 panel.project_root.clone(),
+                panel.store.read(cx).selected(),
             )
         };
-        Self::open_reading(workspace, fs, store, source, project_root, window, cx);
+        Self::reveal_session_in_pane(workspace, fs, source, project_root, process_id, window, cx);
     }
 
-    /// Brings the tab that reads the conversation forward, opening one when the window
-    /// has none. Called from the dock, where selecting a session would otherwise leave
-    /// the reader with a selection and nowhere it is shown.
+    /// Brings the tab that reads `process_id` forward, opening one when the window has
+    /// none for it. Called from the dock, where selecting a session would otherwise
+    /// leave the reader with a selection and nowhere it is shown.
     ///
     /// The fields are taken from `self` rather than read back off the workspace, which
     /// would read this entity while it is the one being updated.
-    fn reveal_in_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn reveal_in_pane(
+        &mut self,
+        process_id: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         let fs = self.fs.clone();
-        let store = self.store.clone();
         let source = self.source.clone();
         let project_root = self.project_root.clone();
         workspace.update(cx, |workspace, cx| {
-            // Bound before the call below so that the iterator's borrow of the
-            // workspace has ended by the time the item is activated through it.
-            let existing = workspace.items_of_type::<Self>(cx).next();
-            match existing {
-                Some(existing) => {
-                    workspace.activate_item(&existing, true, true, window, cx);
-                }
-                None => {
-                    Self::open_reading(workspace, fs, store, source, project_root, window, cx);
-                }
-            }
+            Self::reveal_session_in_pane(
+                workspace,
+                fs,
+                source,
+                project_root,
+                process_id,
+                window,
+                cx,
+            );
         });
     }
 
-    fn open_reading(
+    /// One tab per session, identified by the process it is reading.
+    ///
+    /// A tab holds a store of its own, pinned to the session it was opened for, so that
+    /// opening a second conversation leaves the first tab reading what it was reading
+    /// instead of being retargeted under the reader. Asking for a session a tab already
+    /// holds activates that tab rather than opening a second one: two tabs of the same
+    /// conversation would only be two copies of the same scroll position.
+    ///
+    /// Matched on the process id rather than on the name in the tab, because two
+    /// sessions run from the same directory carry the same name, and the point of a tab
+    /// of its own is that it keeps showing the conversation it was opened for.
+    fn reveal_session_in_pane(
         workspace: &mut Workspace,
         fs: Arc<dyn Fs>,
-        store: Entity<ClaudeSessionStore>,
         source: Arc<dyn SessionSource>,
         project_root: Option<PathBuf>,
+        process_id: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // Bound before the call below so that the iterator's borrow of the workspace has
+        // ended by the time the item is activated through it.
+        let existing = workspace
+            .items_of_type::<Self>(cx)
+            .find(|item| item.read(cx).store.read(cx).selected() == process_id);
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+
         let workspace_handle = workspace.weak_handle();
         let item = cx.new(|cx| {
+            let store = cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
+                if let Some(process_id) = process_id {
+                    store.select(process_id, cx);
+                }
+                store
+            });
             let mut this = Self::new_reading(
                 workspace_handle,
                 fs,
@@ -1706,7 +1733,7 @@ impl ClaudeSessionsPanel {
             .tooltip(Tooltip::text(format!("pid {process_id}")))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_session(process_id, cx);
-                this.reveal_in_pane(window, cx);
+                this.reveal_in_pane(Some(process_id), window, cx);
             }))
     }
 

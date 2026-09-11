@@ -1,3 +1,4 @@
+use collections::HashSet;
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     AsyncWindowContext, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontStyle, Global,
@@ -27,10 +28,12 @@ use crate::{
     ConnectionEntry as _, ConnectionKey, DEFAULT_FORWARD_HOST, DEFAULT_LOCAL_BIND_HOST,
     ForwardConnection, LOCAL_PORT_SEARCH_LIMIT, PortForwardDraft, ToggleFocus,
     apply_port_forward_edit, can_add_forward, choose_local_port, connection_is_editable,
-    connection_key_for_options, connection_label, describe_port_forward, local_port_is_configured,
+    connection_key_for_options, connection_label, connection_label_for_key, describe_port_forward,
+    local_port_is_configured,
     port_detection::{AutoForwardAction, OnAutoForward, auto_forward_action, on_auto_forward},
     port_detector::{PortDetector, PortDetectorEvent},
-    port_forwards_for_key_mut, remove_port_forward, validate_port_forward,
+    port_forward_endpoints, port_forwards_for_key_mut, remove_port_forward, tunnelled_forwards,
+    validate_port_forward,
 };
 
 const FORWARD_PORTS_PANEL_KEY: &str = "ForwardPortsPanel";
@@ -38,6 +41,10 @@ const FORWARD_PORTS_PANEL_KEY: &str = "ForwardPortsPanel";
 /// Shown for a connection that is not currently open, where there is nothing to
 /// report a live state for.
 const FORWARD_STATUS_INACTIVE: &str = "Inactive";
+
+/// Said for a forward the reader disconnected by hand, which has no live state of its
+/// own to report and is not the same thing as one belonging to another connection.
+const FORWARD_STATUS_DISCONNECTED: &str = "Disconnected";
 
 const CONNECTION_NOT_EDITABLE: &str = "This connection is not defined in your user settings file, so its port forwards cannot be changed here.";
 
@@ -83,6 +90,11 @@ pub struct ForwardPortsPanel {
     /// carried by the transport itself (`ssh -L`), so binding them again here
     /// would only collide with the ssh process.
     established_at_connect: Vec<SshPortForwardOption>,
+    /// Forwards the reader has disconnected by hand. Held for this session rather
+    /// than written to the settings file: the button says "disconnect", not
+    /// "remove", and a forward that is configured is expected back when the window
+    /// is opened on the connection again. Delete is what removes one for good.
+    disconnected: HashSet<SshPortForwardOption>,
     /// Kept so that a detector which gave up can be built again without
     /// reopening the connection.
     proto_client: Option<AnyProtoClient>,
@@ -99,6 +111,9 @@ pub struct ForwardPortsPanel {
 /// Identifies the notification a detected port gets, so that a port which is
 /// still listening on the next scan does not stack up notifications.
 struct DetectedPortNotification;
+
+/// Identifies the notification a failed forward reports itself through.
+struct ForwardFailureNotification;
 
 /// One store per remote connection: several windows can be open on the same
 /// connection, but its message handlers may only be registered once.
@@ -132,6 +147,17 @@ fn port_forward_store(client: &Entity<RemoteClient>, cx: &mut App) -> Entity<Por
         .0
         .insert(client_id, store.clone());
     store
+}
+
+/// The icon for the far end of a forward, which is whatever the connection reaches:
+/// the same icons the rest of Zed draws for an ssh host, a wsl distribution and a
+/// container.
+fn remote_icon_for_key(key: &ConnectionKey) -> IconName {
+    match key {
+        ConnectionKey::Ssh { .. } => IconName::Server,
+        ConnectionKey::Wsl { .. } => IconName::Linux,
+        ConnectionKey::DevContainer { .. } => IconName::Box,
+    }
 }
 
 fn single_line_editor(
@@ -210,6 +236,7 @@ impl ForwardPortsPanel {
                 connected_connection,
                 connected_dev_container,
                 established_at_connect,
+                disconnected: HashSet::default(),
                 proto_client,
                 _port_detector: None,
                 _port_detector_subscription: None,
@@ -256,10 +283,7 @@ impl ForwardPortsPanel {
             .map(|connection| connection.forwards.clone())
             .unwrap_or_default();
         let established = self.established_at_connect.clone();
-        let tunnelled = configured
-            .into_iter()
-            .filter(|forward| !established.contains(forward))
-            .collect();
+        let tunnelled = tunnelled_forwards(&configured, &established, &self.disconnected);
 
         store.update(cx, |store, cx| {
             store.set_forwards(tunnelled, cx);
@@ -304,6 +328,27 @@ impl ForwardPortsPanel {
                 .collect()
         };
         self.connections = connections;
+        // The connection this window is on belongs in the list whether or not the
+        // settings file has an entry for it. It is the connection whose ports are
+        // being detected and the one a forward is almost always meant for, and
+        // without a row of its own a reader connected from a URI or an ssh config
+        // host sees a panel that does not mention the host they are on.
+        if let Some(key) = self.connected_connection.clone() {
+            if !self
+                .connections
+                .iter()
+                .any(|connection| connection.key == key)
+            {
+                self.connections.insert(
+                    0,
+                    ConnectionForwards {
+                        label: connection_label_for_key(&key),
+                        key,
+                        forwards: Vec::new(),
+                    },
+                );
+            }
+        }
         self.sync_tunnels(cx);
         cx.notify();
     }
@@ -558,6 +603,41 @@ impl ForwardPortsPanel {
             .log_err();
     }
 
+    /// Whether this forward can be connected or disconnected from here at all:
+    /// only the connection this window holds has tunnels to start and stop.
+    fn forward_is_tunnellable(&self, key: &ConnectionKey, forward: &SshPortForwardOption) -> bool {
+        self.connected_connection.as_ref() == Some(key)
+            && self.port_forwards.is_some()
+            // A forward `ssh -L` already carries is not this panel's to open or close.
+            && !self.established_at_connect.contains(forward)
+    }
+
+    fn connect_forward(&mut self, forward: SshPortForwardOption, cx: &mut Context<Self>) {
+        if self.disconnected.remove(&forward) {
+            self.sync_tunnels(cx);
+            cx.notify();
+        }
+    }
+
+    fn disconnect_forward(&mut self, forward: SshPortForwardOption, cx: &mut Context<Self>) {
+        if self.disconnected.insert(forward) {
+            self.sync_tunnels(cx);
+            cx.notify();
+        }
+    }
+
+    /// Shows a message as a notification as well as in the panel, for a failure
+    /// that followed a gesture made outside the panel.
+    fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let toast = Toast::new(
+            NotificationId::unique::<ForwardFailureNotification>(),
+            message.into(),
+        );
+        self.workspace
+            .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
+            .log_err();
+    }
+
     /// Whether the connection already forwards a local port that would collide
     /// with the one a detected port would take.
     fn detected_port_is_forwarded(&self, key: &ConnectionKey, port: u16) -> bool {
@@ -590,7 +670,11 @@ impl ForwardPortsPanel {
             return;
         }
         if !self.connection_is_editable(&key, cx) {
+            // Said where the gesture was, not only in a panel the reader may not
+            // have open: a click on the notification that reported nothing looks
+            // like a click that did nothing.
             self.error = Some(CONNECTION_NOT_EDITABLE.into());
+            self.report(CONNECTION_NOT_EDITABLE, cx);
             cx.notify();
             return;
         }
@@ -653,19 +737,6 @@ impl ForwardPortsPanel {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let first_connection = {
-            let app: &App = cx;
-            self.connections
-                .iter()
-                .find(|connection| self.can_add_forward(&connection.key, app))
-                .map(|connection| (connection.key.clone(), connection.label.clone()))
-        };
-        let add_tooltip = match &first_connection {
-            Some((_, label)) => format!("Add Port Forward to {label}"),
-            None => "Add Port Forward".to_string(),
-        };
-        let first_key = first_connection.map(|(key, _)| key);
-
         h_flex()
             .p_1()
             .gap_1()
@@ -680,16 +751,24 @@ impl ForwardPortsPanel {
             .child(
                 h_flex()
                     .gap_px()
+                    // A forward belongs to a connection, and the button beside a
+                    // connection is what adds one. This one is at the level of the
+                    // list, so it adds what the list holds: another connection. It
+                    // opens the same flow the rest of Zed adds a remote through,
+                    // rather than writing a half-filled entry from here.
                     .child(
-                        IconButton::new("forward-ports-add", IconName::Plus)
+                        IconButton::new("forward-ports-add-connection", IconName::Plus)
                             .icon_size(IconSize::Small)
-                            .disabled(first_key.is_none())
-                            .tooltip(Tooltip::text(add_tooltip))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(key) = first_key.clone() {
-                                    this.open_form(key, None, window, cx);
-                                }
-                            })),
+                            .tooltip(Tooltip::text("Add Remote Server"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::OpenRemote {
+                                        from_existing_connection: false,
+                                        create_new_window: Some(false),
+                                    }),
+                                    cx,
+                                );
+                            }),
                     )
                     .child(
                         IconButton::new("forward-ports-refresh", IconName::RotateCw)
@@ -775,6 +854,12 @@ impl ForwardPortsPanel {
         cx: &App,
     ) -> AnyElement {
         let status = self.forward_status(key, forward, cx);
+        if self.disconnected.contains(forward) && self.connected_connection.as_ref() == Some(key) {
+            return Label::new(FORWARD_STATUS_DISCONNECTED)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element();
+        }
         let (label, color) = match &status {
             Some(status @ PortForwardStatus::Active) => (status.label(), Color::Success),
             Some(status @ PortForwardStatus::External) => (status.label(), Color::Muted),
@@ -813,6 +898,7 @@ impl ForwardPortsPanel {
     ) -> AnyElement {
         let element_id =
             SharedString::from(format!("forward-ports-{connection_index}-{forward_index}"));
+        let (local_end, remote_end) = port_forward_endpoints(forward);
 
         ListItem::new(element_id.clone())
             .spacing(ListItemSpacing::Sparse)
@@ -821,12 +907,74 @@ impl ForwardPortsPanel {
                     .w_full()
                     .gap_2()
                     .justify_between()
-                    .child(Label::new(describe_port_forward(forward)).single_line())
+                    // Which end is which is drawn rather than spelled out: the words
+                    // took more of a narrow panel than the addresses they labelled.
+                    // The same icons the rest of Zed uses for this machine and for a
+                    // remote host, with the words kept in the tooltip.
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!(
+                                "forward-ports-ends-{connection_index}-{forward_index}"
+                            )))
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(
+                                Icon::new(IconName::Screen)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(local_end).single_line())
+                            .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                Icon::new(remote_icon_for_key(key))
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(remote_end).single_line())
+                            .tooltip(Tooltip::text(describe_port_forward(forward))),
+                    )
                     .child(self.render_forward_status(key, forward, cx)),
             )
+            // Shown without hovering: a forward is a socket on this machine, and
+            // whether it can be closed should not be something the reader has to
+            // find by moving the mouse over the row.
             .end_slot(
                 h_flex()
                     .gap_px()
+                    // Only the connection this window holds has a tunnel to open or
+                    // close; a row belonging to another connection is configuration
+                    // and nothing more.
+                    .when(self.forward_is_tunnellable(key, forward), |this| {
+                        let is_disconnected = self.disconnected.contains(forward);
+                        this.child(
+                            IconButton::new(
+                                SharedString::from(format!(
+                                    "forward-ports-tunnel-{connection_index}-{forward_index}"
+                                )),
+                                if is_disconnected {
+                                    IconName::PlayFilled
+                                } else {
+                                    IconName::Stop
+                                },
+                            )
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(if is_disconnected {
+                                "Connect Port Forward"
+                            } else {
+                                "Disconnect Port Forward"
+                            }))
+                            .on_click(cx.listener({
+                                let forward = forward.clone();
+                                move |this, _, _, cx| {
+                                    if is_disconnected {
+                                        this.connect_forward(forward.clone(), cx);
+                                    } else {
+                                        this.disconnect_forward(forward.clone(), cx);
+                                    }
+                                }
+                            })),
+                        )
+                    })
                     .child(
                         IconButton::new(
                             SharedString::from(format!(
@@ -835,7 +983,6 @@ impl ForwardPortsPanel {
                             IconName::Pencil,
                         )
                         .icon_size(IconSize::Small)
-                        .visible_on_hover(element_id.clone())
                         .tooltip(Tooltip::text("Edit Port Forward"))
                         .on_click(cx.listener({
                             let key = key.clone();
@@ -853,7 +1000,6 @@ impl ForwardPortsPanel {
                             IconName::Trash,
                         )
                         .icon_size(IconSize::Small)
-                        .visible_on_hover(element_id)
                         .tooltip(Tooltip::text("Delete Port Forward"))
                         .on_click(cx.listener({
                             let key = key.clone();

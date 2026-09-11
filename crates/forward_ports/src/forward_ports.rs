@@ -3,6 +3,7 @@ mod forward_ports_panel;
 pub mod port_detection;
 mod port_detector;
 
+use collections::HashSet;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -296,33 +297,61 @@ fn ssh_connection_label(connection: &SshConnection) -> String {
     label
 }
 
-/// Whether an edit for `key` can be written to the user settings file: either
-/// its entry is already in that file, or it is a dev container this window is
-/// connected to, whose entry can be created from the live options.
+/// Whether an edit for `key` can be written to the user settings file.
 ///
-/// Edits go to the user settings file, so a connection that only exists in
-/// another settings source cannot be changed from here.
+/// An ssh or wsl key carries everything its entry needs — the host, the user and
+/// the port — so one can be written from the key alone, and a connection opened
+/// from a URI or from an ssh config host is as editable as one that was typed
+/// into the settings file. This is what lets the panel record a forward for the
+/// connection this window is actually on, which is the one whose ports are being
+/// detected.
+///
+/// A dev container is the exception: its entry needs the running container's id
+/// and user, which the key does not carry, so one can only be written while this
+/// window holds that container's connection.
 pub fn connection_is_editable(
     user_settings: Option<&RemoteSettingsContent>,
     key: &ConnectionKey,
     dev_container_options: Option<&DockerConnectionOptions>,
 ) -> bool {
-    let entry_exists = user_settings.is_some_and(|remote| match key {
-        ConnectionKey::Ssh { .. } => remote
-            .ssh_connections
-            .as_ref()
-            .is_some_and(|connections| find_connection(connections, key).is_some()),
-        ConnectionKey::Wsl { .. } => remote
-            .wsl_connections
-            .as_ref()
-            .is_some_and(|connections| find_connection(connections, key).is_some()),
-        ConnectionKey::DevContainer { .. } => remote
-            .dev_container_connections
-            .as_ref()
-            .is_some_and(|connections| find_connection(connections, key).is_some()),
-    });
+    match key {
+        ConnectionKey::Ssh { .. } | ConnectionKey::Wsl { .. } => true,
+        ConnectionKey::DevContainer { .. } => {
+            let entry_exists = user_settings.is_some_and(|remote| {
+                remote
+                    .dev_container_connections
+                    .as_ref()
+                    .is_some_and(|connections| find_connection(connections, key).is_some())
+            });
+            entry_exists
+                || dev_container_options.is_some_and(|options| options.connection_key() == *key)
+        }
+    }
+}
 
-    entry_exists || dev_container_options.is_some_and(|options| options.connection_key() == *key)
+/// How a connection reads in the panel when it has no settings entry to take a
+/// nickname from, built from the key alone.
+pub fn connection_label_for_key(key: &ConnectionKey) -> String {
+    match key {
+        ConnectionKey::Ssh {
+            host,
+            username,
+            port,
+        } => connection_label(&ForwardConnection::Ssh(SshConnection {
+            host: host.clone(),
+            username: username.clone(),
+            port: *port,
+            ..SshConnection::default()
+        })),
+        ConnectionKey::Wsl { distro_name, user } => {
+            connection_label(&ForwardConnection::Wsl(WslConnection {
+                distro_name: distro_name.clone(),
+                user: user.clone(),
+                ..WslConnection::default()
+            }))
+        }
+        ConnectionKey::DevContainer { name } => name.clone(),
+    }
 }
 
 /// Whether the panel offers an Add button for a row.
@@ -355,9 +384,27 @@ pub fn port_forwards_for_key_mut<'a>(
     dev_container_options: Option<&DockerConnectionOptions>,
 ) -> Option<&'a mut Vec<SshPortForwardOption>> {
     match key {
-        ConnectionKey::Ssh { .. } => {
-            let connections = remote.ssh_connections.as_mut()?;
-            let index = find_connection(connections, key)?;
+        // Written from the key when the file has no entry for this connection yet:
+        // a forward recorded against no connection is a forward that never runs,
+        // and the key holds every field the entry addresses it by.
+        ConnectionKey::Ssh {
+            host,
+            username,
+            port,
+        } => {
+            let connections = remote.ssh_connections.get_or_insert_with(Vec::new);
+            let index = match find_connection(connections, key) {
+                Some(index) => index,
+                None => {
+                    connections.push(SshConnection {
+                        host: host.clone(),
+                        username: username.clone(),
+                        port: *port,
+                        ..SshConnection::default()
+                    });
+                    connections.len().saturating_sub(1)
+                }
+            };
             Some(
                 connections
                     .get_mut(index)?
@@ -365,9 +412,19 @@ pub fn port_forwards_for_key_mut<'a>(
                     .get_or_insert_with(Vec::new),
             )
         }
-        ConnectionKey::Wsl { .. } => {
-            let connections = remote.wsl_connections.as_mut()?;
-            let index = find_connection(connections, key)?;
+        ConnectionKey::Wsl { distro_name, user } => {
+            let connections = remote.wsl_connections.get_or_insert_with(Vec::new);
+            let index = match find_connection(connections, key) {
+                Some(index) => index,
+                None => {
+                    connections.push(WslConnection {
+                        distro_name: distro_name.clone(),
+                        user: user.clone(),
+                        ..WslConnection::default()
+                    });
+                    connections.len().saturating_sub(1)
+                }
+            };
             Some(
                 connections
                     .get_mut(index)?
@@ -494,6 +551,24 @@ pub fn choose_local_port(
         .find(|candidate| !local_port_is_configured(configured, *candidate) && can_bind(*candidate))
 }
 
+/// The forwards the panel opens tunnels for.
+///
+/// Two kinds are left out, for opposite reasons: one the transport already carries
+/// (`ssh -L` bound it when the connection was made, so binding it again would only
+/// collide with the ssh process), and one the reader disconnected by hand.
+pub fn tunnelled_forwards(
+    configured: &[SshPortForwardOption],
+    established_at_connect: &[SshPortForwardOption],
+    disconnected: &HashSet<SshPortForwardOption>,
+) -> Vec<SshPortForwardOption> {
+    configured
+        .iter()
+        .filter(|forward| !established_at_connect.contains(forward))
+        .filter(|forward| !disconnected.contains(*forward))
+        .cloned()
+        .collect()
+}
+
 pub fn parse_port(field: PortField, text: &str) -> Result<u16, PortForwardError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -579,12 +654,23 @@ fn format_endpoint(host: Option<&str>, port: u16) -> String {
     }
 }
 
-pub fn describe_port_forward(forward: &SshPortForwardOption) -> String {
-    format!(
-        "{} → {}",
+/// The two ends of a forward: the socket this machine binds, then what the host
+/// connects it to — the same way round as `ssh -L`.
+///
+/// Returned apart rather than as one string because which end is which is drawn with
+/// an icon: `localhost:3000 → localhost:3000` is the common case, and nothing in the
+/// text of it says which `localhost` is this machine.
+pub fn port_forward_endpoints(forward: &SshPortForwardOption) -> (String, String) {
+    (
         format_endpoint(forward.local_host.as_deref(), forward.local_port),
-        format_endpoint(forward.remote_host.as_deref(), forward.remote_port)
+        format_endpoint(forward.remote_host.as_deref(), forward.remote_port),
     )
+}
+
+/// The same two ends in words, for the tooltip that says what the icons mean.
+pub fn describe_port_forward(forward: &SshPortForwardOption) -> String {
+    let (local, remote) = port_forward_endpoints(forward);
+    format!("{local} on this machine → {remote} on the remote host")
 }
 
 #[cfg(test)]
@@ -618,6 +704,36 @@ mod tests {
             remote_host: remote_host.to_string(),
             remote_port: remote_port.to_string(),
         }
+    }
+
+    /// A forward is left out of the tunnels for two opposite reasons, and confusing
+    /// them means either a port that never opens or two things binding one socket.
+    #[test]
+    fn test_only_the_forwards_this_panel_owns_are_tunnelled() {
+        let carried_by_ssh = forward(None, 5432, None, 5432);
+        let disconnected_by_hand = forward(None, 8080, None, 80);
+        let running = forward(None, 3000, None, 3000);
+        let configured = [
+            carried_by_ssh.clone(),
+            disconnected_by_hand.clone(),
+            running.clone(),
+        ];
+
+        assert_eq!(
+            tunnelled_forwards(
+                &configured,
+                &[carried_by_ssh],
+                &HashSet::from_iter([disconnected_by_hand])
+            ),
+            vec![running.clone()],
+            "one is already bound by the ssh process and one the reader closed"
+        );
+
+        assert_eq!(
+            tunnelled_forwards(&configured, &[], &HashSet::default()).len(),
+            3,
+            "with nothing to exclude, every configured forward is opened"
+        );
     }
 
     #[test]
@@ -898,16 +1014,23 @@ mod tests {
     #[test]
     fn test_describe_port_forward_fills_in_localhost_and_brackets_ipv6() {
         assert_eq!(
+            port_forward_endpoints(&forward(None, 8080, None, 80)),
+            ("localhost:8080".to_string(), "localhost:80".to_string()),
+            "an unset host on either side is the loopback each end defaults to"
+        );
+        assert_eq!(
+            port_forward_endpoints(&forward(Some("127.0.0.1"), 8080, Some("10.0.0.5"), 80)),
+            ("127.0.0.1:8080".to_string(), "10.0.0.5:80".to_string())
+        );
+        assert_eq!(
+            port_forward_endpoints(&forward(Some("::1"), 8080, Some("::1"), 80)),
+            ("[::1]:8080".to_string(), "[::1]:80".to_string()),
+            "an IPv6 host is bracketed so the port is not read as part of it"
+        );
+        assert_eq!(
             describe_port_forward(&forward(None, 8080, None, 80)),
-            "localhost:8080 → localhost:80"
-        );
-        assert_eq!(
-            describe_port_forward(&forward(Some("127.0.0.1"), 8080, Some("10.0.0.5"), 80)),
-            "127.0.0.1:8080 → 10.0.0.5:80"
-        );
-        assert_eq!(
-            describe_port_forward(&forward(Some("::1"), 8080, Some("::1"), 80)),
-            "[::1]:8080 → [::1]:80"
+            "localhost:8080 on this machine → localhost:80 on the remote host",
+            "the words are what the tooltip says the two icons mean"
         );
     }
 
@@ -1328,14 +1451,94 @@ mod tests {
 
         assert!(
             can_add_forward(Some(&remote), &ssh_key, None),
-            "ssh rows report an unwritable connection when the form is saved, not by hiding Add"
+            "an ssh row offers Add whether or not the file has an entry for it yet"
         );
         assert!(can_add_forward(Some(&remote), &wsl_key, None));
+        // The rule this used to assert was the opposite: Add was offered and the save
+        // then refused, because the entry did not exist. The entry is now written from
+        // the key, which is what makes a connection opened from a URI or an ssh config
+        // host forwardable at all.
         assert!(
-            !connection_is_editable(Some(&remote), &ssh_key, None),
-            "offering Add is not the same as claiming the entry can be written"
+            connection_is_editable(Some(&remote), &ssh_key, None),
+            "the key carries the host, the user and the port, so the entry can be written"
         );
-        assert!(!connection_is_editable(Some(&remote), &wsl_key, None));
+        assert!(connection_is_editable(Some(&remote), &wsl_key, None));
+    }
+
+    /// A connection opened from a URI or an ssh config host has no settings entry, and
+    /// refusing to write one left the reader with a notification offering a forward, a
+    /// click that did nothing, and a panel that did not mention the host they were on.
+    #[test]
+    fn test_a_forward_for_a_connection_with_no_entry_writes_one() {
+        let mut remote = RemoteSettingsContent::default();
+        let key = ConnectionKey::Ssh {
+            host: "coder-vscode.coder.elggum.com--poi5305--andy.main".to_string(),
+            username: None,
+            port: None,
+        };
+
+        port_forwards_for_key_mut(&mut remote, &key, None)
+            .unwrap_or_else(|| panic!("an ssh entry is written from the key"))
+            .push(forward(None, 3000, None, 3000));
+
+        let written = remote
+            .ssh_connections
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected the ssh_connections list to exist"));
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            written
+                .first()
+                .map(|connection| connection.connection_key()),
+            Some(key.clone()),
+            "the entry addresses the same connection the forward was recorded for"
+        );
+        assert_eq!(
+            written
+                .first()
+                .and_then(|connection| connection.port_forwards.clone()),
+            Some(vec![forward(None, 3000, None, 3000)])
+        );
+
+        // A second forward for the same connection joins the entry that is now there
+        // rather than adding a duplicate one beside it.
+        port_forwards_for_key_mut(&mut remote, &key, None)
+            .unwrap_or_else(|| panic!("the entry is found the second time"))
+            .push(forward(None, 8080, None, 80));
+        assert_eq!(
+            remote.ssh_connections.as_ref().map(Vec::len),
+            Some(1),
+            "one connection, two forwards"
+        );
+        assert_eq!(
+            remote
+                .ssh_connections
+                .as_ref()
+                .and_then(|connections| connections.first())
+                .and_then(|connection| connection.port_forwards.as_ref())
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    /// The row for a connection with no entry has no nickname to take a label from.
+    #[test]
+    fn test_a_connection_with_no_entry_is_still_named_in_the_panel() {
+        assert_eq!(
+            connection_label_for_key(&ConnectionKey::Ssh {
+                host: "example.com".to_string(),
+                username: Some("andy".to_string()),
+                port: Some(2222),
+            }),
+            "andy@example.com:2222"
+        );
+        assert_eq!(
+            connection_label_for_key(&ConnectionKey::Wsl {
+                distro_name: "Ubuntu-22.04".to_string(),
+                user: None,
+            }),
+            "Ubuntu-22.04"
+        );
     }
 
     #[test]
