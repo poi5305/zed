@@ -6656,6 +6656,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]
@@ -14129,6 +14130,7 @@ dependencies = [
  "project",
  "recent_projects",
  "remote",
+ "rope",
  "schemars 1.0.4",
  "serde",
  "serde_json",

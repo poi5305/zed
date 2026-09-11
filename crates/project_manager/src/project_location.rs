@@ -128,6 +128,142 @@ pub fn remote_project_uri(options: &RemoteConnectionOptions, path: &Path) -> Opt
     })
 }
 
+/// The scheme VS Code writes for a folder that is not on this machine. What follows it
+/// is not a host but a remote *kind* and its argument, joined by a `+`.
+const VSCODE_REMOTE_SCHEME: &str = "vscode-remote";
+const VSCODE_SSH_REMOTE: &str = "ssh-remote+";
+const VSCODE_WSL_REMOTE: &str = "wsl+";
+const FILE_SCHEME: &str = "file";
+
+/// A `rootPath` translated out of a VS Code project file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedPath {
+    pub path: String,
+    /// Something true of this translation that the reader has to be told, for a path that
+    /// was imported anyway. A path that cannot be translated at all is an `Err` instead.
+    pub warning: Option<String>,
+}
+
+/// Translates one `rootPath` of a VS Code "Project Manager" entry into the form this
+/// panel stores.
+///
+/// The two formats are otherwise the same file, so the translation is only of the path:
+///
+/// * A plain path is what a local folder already looks like here.
+/// * `vscode-remote://ssh-remote+<host>/<path>` becomes `ssh://<host>/<path>`. The host
+///   is a name in the reader's SSH config, which is also how a Coder workspace is
+///   reached — `coder config-ssh` writes one host per workspace — so those entries need
+///   nothing beyond this.
+/// * `vscode-remote://wsl+<distribution>/<path>` becomes `wsl://<distribution>/<path>`.
+/// * `file:///<path>` is a local folder written as a URI, so it becomes the path again.
+///
+/// Every other remote VS Code can name — a dev container, an attached container, a
+/// codespace, a tunnel — identifies its target by something that is not a host name, and
+/// is reported rather than guessed at.
+pub fn import_vscode_path(candidate: &str) -> Result<ImportedPath> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        bail!("it names no folder");
+    }
+
+    let Some((scheme, rest)) = split_scheme(candidate) else {
+        return Ok(ImportedPath {
+            path: candidate.to_string(),
+            warning: None,
+        });
+    };
+
+    match scheme.to_ascii_lowercase().as_str() {
+        // Already stored in this panel's own form, which is what re-importing a file
+        // that was exported from here produces.
+        SSH_SCHEME | WSL_SCHEME | DOCKER_SCHEME => Ok(ImportedPath {
+            path: candidate.to_string(),
+            warning: None,
+        }),
+        FILE_SCHEME => {
+            let path = decode(rest.trim_start_matches('/'))
+                .with_context(|| format!("decoding the path of \"{candidate}\""))?;
+            if path.is_empty() {
+                bail!("\"{candidate}\" names no folder");
+            }
+            Ok(ImportedPath {
+                path: format!("/{path}"),
+                warning: None,
+            })
+        }
+        VSCODE_REMOTE_SCHEME => import_vscode_remote(candidate, rest),
+        other => bail!(
+            "\"{candidate}\" uses the scheme \"{other}\", which is not a folder this panel can open"
+        ),
+    }
+}
+
+fn import_vscode_remote(candidate: &str, rest: &str) -> Result<ImportedPath> {
+    let (authority, path) = match rest.find('/') {
+        Some(separator) => (&rest[..separator], &rest[separator..]),
+        None => (rest, ""),
+    };
+    if path.is_empty() {
+        bail!("\"{candidate}\" names a host but no folder on it");
+    }
+    let authority =
+        decode(authority).with_context(|| format!("decoding the remote of \"{candidate}\""))?;
+
+    // VS Code writes a folder on a Windows host as `/C:/Users/...`: a drive letter behind
+    // a leading separator. The leading separator is what makes it a path in a URI at all,
+    // and dropping it would leave a path this panel rejects as relative, so it is kept
+    // and said out loud instead.
+    let warning = windows_drive_path(path).map(|drive| {
+        format!(
+            "\"{candidate}\" is on drive {drive} of a Windows host, and is imported as \
+             \"{path}\"; open it once to check that the host reads it that way"
+        )
+    });
+
+    if let Some(host) = authority.strip_prefix(VSCODE_SSH_REMOTE) {
+        if host.is_empty() {
+            bail!("\"{candidate}\" does not name a host");
+        }
+        return Ok(ImportedPath {
+            path: format!(
+                "{SSH_SCHEME}://{}{path}",
+                utf8_percent_encode(host, AUTHORITY_ESCAPES)
+            ),
+            warning,
+        });
+    }
+    if let Some(distribution) = authority.strip_prefix(VSCODE_WSL_REMOTE) {
+        if distribution.is_empty() {
+            bail!("\"{candidate}\" does not name a WSL distribution");
+        }
+        return Ok(ImportedPath {
+            path: format!(
+                "{WSL_SCHEME}://{}{path}",
+                utf8_percent_encode(distribution, AUTHORITY_ESCAPES)
+            ),
+            warning,
+        });
+    }
+
+    let kind = authority
+        .split_once('+')
+        .map_or(authority.as_str(), |(kind, _)| kind);
+    bail!(
+        "\"{candidate}\" is a \"{kind}\" remote, which names its target by something other \
+         than a host; open it once from Zed and save the project from there"
+    )
+}
+
+/// The drive letter of `/C:/Users/andy`, or `None` for a path that is not one.
+fn windows_drive_path(path: &str) -> Option<char> {
+    let mut characters = path.strip_prefix('/')?.chars();
+    let drive = characters.next()?;
+    if !drive.is_ascii_alphabetic() || characters.next()? != ':' {
+        return None;
+    }
+    Some(drive.to_ascii_uppercase())
+}
+
 fn parse_candidate(candidate: &str) -> Result<(Option<RemoteConnectionOptions>, PathBuf)> {
     let Some((scheme, rest)) = split_scheme(candidate) else {
         return Ok((None, PathBuf::from(shellexpand::tilde(candidate).as_ref())));

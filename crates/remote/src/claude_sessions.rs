@@ -187,12 +187,50 @@ pub fn read_registrations(registry_directory: &Path) -> Result<Vec<RegisteredSes
 
 /// Start times of the given processes, in the same format the registration files use.
 ///
-/// One `ps` invocation covers macOS and Linux: `lstart` prints the wall-clock start time
-/// that Claude Code recorded, whereas `/proc/<pid>/stat` reports clock ticks since boot,
-/// which could only be compared after reconstructing boot time and the locale's date
-/// formatting. Reading another process's environment is not an option either — on macOS
+/// Claude Code records `procStart` in whatever form its own platform reads it in, and the
+/// two platforms do not agree, so neither does this:
+///
+/// * On Linux it records field 22 of `/proc/<pid>/stat` verbatim — the process's start
+///   time in clock ticks since boot — so that file is read back directly. Comparing a
+///   registration written there against a wall-clock date is what hid every session on a
+///   Linux host: the two strings can never be equal, so every live session was read as a
+///   reused pid and filtered out of the list with nothing reported.
+/// * On macOS it records the date `ps -o lstart=` prints.
+///
+/// Reading another process's environment is not an option on either: on macOS
 /// `ps eww` returns nothing for processes owned by other sessions.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> {
+    let mut start_times = HashMap::default();
+    for process_id in process_ids {
+        // A process that has gone leaves no entry, which is what an absent start time
+        // says to `liveness`.
+        let Ok(stat) = smol::fs::read_to_string(format!("/proc/{process_id}/stat")).await else {
+            continue;
+        };
+        if let Some(start_time) = start_time_in_proc_stat(&stat) {
+            start_times.insert(process_id, start_time);
+        }
+    }
+    start_times
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line, the process's start time in clock ticks since
+/// boot.
+///
+/// Split at the last `)` rather than counted from the left: field 2 is the executable's
+/// name in parentheses, and a name is free to hold both spaces and parentheses of its
+/// own, which would shift every field after it.
+pub fn start_time_in_proc_stat(stat: &str) -> Option<String> {
+    let after_name = stat.rsplit_once(')')?.1;
+    // The fields after the name begin at field 3, so field 22 is the twentieth of them.
+    after_name
+        .split_whitespace()
+        .nth(19)
+        .map(|start_time| start_time.to_string())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> {
     let mut start_times = HashMap::default();
     if process_ids.is_empty() {
@@ -1183,6 +1221,43 @@ async fn run_with_stdin(program: &str, arguments: &[&str], stdin_contents: &[u8]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// On Linux, `procStart` is field 22 of `/proc/<pid>/stat`. Counting that field from
+    /// the left is what a reader of the format gets wrong: field 2 is the executable's
+    /// name in parentheses, and a name may hold spaces and parentheses of its own.
+    #[test]
+    fn test_start_time_in_proc_stat_is_counted_from_the_end_of_the_name() {
+        // The state is field 3, so eighteen fields follow it before field 22.
+        let fields_after_name = |start_time: &str| {
+            let mut fields: Vec<String> = (0..18).map(|index| index.to_string()).collect();
+            fields.push(start_time.to_string());
+            fields.extend((0..4).map(|index| format!("tail{index}")));
+            fields.join(" ")
+        };
+
+        assert_eq!(
+            start_time_in_proc_stat(&format!(
+                "45188 (claude) S {}",
+                fields_after_name("112579206")
+            )),
+            Some("112579206".to_string()),
+            "the value a Linux registration records as procStart"
+        );
+        assert_eq!(
+            start_time_in_proc_stat(&format!(
+                "45188 (node (worker) two) S {}",
+                fields_after_name("42")
+            )),
+            Some("42".to_string()),
+            "a name holding spaces and parentheses must not shift the field that is read"
+        );
+        assert_eq!(
+            start_time_in_proc_stat("45188 (claude) S 1 2 3"),
+            None,
+            "a line with no field 22 yields nothing rather than some other field"
+        );
+        assert_eq!(start_time_in_proc_stat("nonsense"), None);
+    }
 
     /// A row showing the context of the answer before a compaction says the session is
     /// holding a conversation it has already dropped.
