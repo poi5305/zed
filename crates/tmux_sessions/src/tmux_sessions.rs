@@ -1,10 +1,8 @@
-mod tmux_sessions_button;
 mod tmux_sessions_panel;
 
 use gpui::{App, actions};
 use workspace::Workspace;
 
-pub use tmux_sessions_button::TmuxSessionsButton;
 pub use tmux_sessions_panel::TmuxSessionsPanel;
 
 actions!(

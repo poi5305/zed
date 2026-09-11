@@ -18,13 +18,19 @@ use gpui::{Context, SharedString, Task};
 use util::ResultExt as _;
 
 use crate::{
-    session_registry::{RegisteredSession, SubagentSummary, TailProgress, TailState, pane_target},
+    session_registry::{
+        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend, pane_target,
+    },
     session_source::{SessionInput, SessionListing, SessionSource},
     transcript::{Transcript, parse_record},
 };
 
 const REGISTRY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Slower than the transcript's: this shells out to tmux every time, and what it reads
+/// is a terminal's screen, which a reader takes in whole rather than line by line.
+const PANE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Reported when a send is attempted for a session Zed has no pane to type into. The UI
 /// disables the input in that case, so this is the answer to a send that got through
@@ -68,6 +74,10 @@ pub struct ClaudeSessionStore {
     /// checked against it come from that machine too, and this process's own home is not
     /// an answer about a remote one.
     home_directory: Option<PathBuf>,
+    /// What the last scan read off the end of each listed session's transcript, keyed by
+    /// pid. Every listed session has one, not only the one being followed — a row says
+    /// what its own session is carrying.
+    session_spend: HashMap<u32, TranscriptSpend>,
     /// Where the last scan found each listed session's transcript, keyed by pid. Only the
     /// machine a session runs on can locate its transcript, so this comes from the scan
     /// rather than being looked for here.
@@ -98,8 +108,14 @@ pub struct ClaudeSessionStore {
     /// each was started.
     transcript_resets: u64,
     error: Option<(ErrorSource, SharedString)>,
+    /// The selected session's tmux pane as it was last seen, and `None` when there is no
+    /// pane to read or its last read failed. Everything Claude Code draws without
+    /// recording it — a prompt waiting for an answer, the messages queued behind the
+    /// running turn, the status line — is only here.
+    pane_contents: Option<SharedString>,
     _registry_poll: Task<()>,
     _transcript_poll: Task<()>,
+    _pane_poll: Task<()>,
 }
 
 /// One conversation being followed: the records absorbed so far, and where reading of
@@ -151,6 +167,7 @@ impl ClaudeSessionStore {
             sessions: Vec::new(),
             home_directory: None,
             transcript_paths: HashMap::default(),
+            session_spend: HashMap::default(),
             selected_process_id: None,
             subagents: Vec::new(),
             transcript_target: TranscriptTarget::Main,
@@ -159,11 +176,14 @@ impl ClaudeSessionStore {
             subagent_conversation: None,
             transcript_resets: 0,
             error: None,
+            pane_contents: None,
             _registry_poll: Task::ready(()),
             _transcript_poll: Task::ready(()),
+            _pane_poll: Task::ready(()),
         };
         this._registry_poll = this.spawn_registry_poll(cx);
         this._transcript_poll = this.spawn_transcript_poll(cx);
+        this._pane_poll = this.spawn_pane_poll(cx);
         this
     }
 
@@ -313,6 +333,11 @@ impl ClaudeSessionStore {
         false
     }
 
+    /// What the last scan read off the end of one session's transcript.
+    pub fn session_spend(&self, process_id: u32) -> Option<TranscriptSpend> {
+        self.session_spend.get(&process_id).copied()
+    }
+
     /// The tmux pane the selected session can be typed into, or `None` when there is
     /// none — no selection, no `tmux` field, or a field that is not shaped like a pane
     /// id. The input UI is enabled by exactly this answer.
@@ -406,6 +431,50 @@ impl ClaudeSessionStore {
                 cx.background_executor().timer(REGISTRY_POLL_INTERVAL).await;
             }
         })
+    }
+
+    /// Reads the selected session's pane while it has one. A failure clears what was
+    /// read rather than being reported as an error: the pane is a supplement to the
+    /// conversation, and a session whose pane cannot be read is still readable.
+    fn spawn_pane_poll(&self, cx: &mut Context<Self>) -> Task<()> {
+        let source = self.source.clone();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                // The only exit: the store has been dropped, so nothing is left to update.
+                let Ok(pane_target) = this.read_with(cx, |this, _| this.pane_target()) else {
+                    break;
+                };
+
+                let contents = match pane_target {
+                    Some(pane_target) => source.capture_pane(pane_target).await.ok(),
+                    None => None,
+                };
+
+                if this
+                    .update(cx, |this, cx| this.apply_pane_contents(contents, cx))
+                    .is_err()
+                {
+                    break;
+                }
+
+                cx.background_executor().timer(PANE_POLL_INTERVAL).await;
+            }
+        })
+    }
+
+    fn apply_pane_contents(&mut self, contents: Option<String>, cx: &mut Context<Self>) {
+        let contents = contents.map(|contents| SharedString::from(contents.trim_end().to_string()));
+        if self.pane_contents == contents {
+            return;
+        }
+        self.pane_contents = contents;
+        cx.notify();
+    }
+
+    /// The selected session's pane as the last read of it found it.
+    pub fn pane_contents(&self) -> Option<&SharedString> {
+        self.pane_contents.as_ref()
     }
 
     fn spawn_transcript_poll(&self, cx: &mut Context<Self>) -> Task<()> {
@@ -513,10 +582,14 @@ impl ClaudeSessionStore {
 
         let home_directory = Some(listing.home_directory);
         let mut transcript_paths = HashMap::default();
+        let mut session_spend = HashMap::default();
         let mut sessions = Vec::with_capacity(listing.sessions.len());
         for summary in listing.sessions {
             if let Some(transcript_path) = summary.transcript_path {
                 transcript_paths.insert(summary.session.process_id, transcript_path);
+            }
+            if let Some(spend) = summary.spend {
+                session_spend.insert(summary.session.process_id, spend);
             }
             sessions.push(summary.session);
         }
@@ -526,8 +599,10 @@ impl ClaudeSessionStore {
         let mut changed = self.take_error_from(ErrorSource::Poll)
             || self.sessions != sessions
             || self.transcript_paths != transcript_paths
+            || self.session_spend != session_spend
             || self.home_directory != home_directory;
         self.transcript_paths = transcript_paths;
+        self.session_spend = session_spend;
         self.home_directory = home_directory;
 
         let selected_session_id = self.selected_process_id.and_then(|process_id| {
@@ -774,8 +849,17 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum SentInput {
-        Text { pane_target: String, text: String },
-        Escape { pane_target: String },
+        Text {
+            pane_target: String,
+            text: String,
+        },
+        Escape {
+            pane_target: String,
+        },
+        Key {
+            pane_target: String,
+            key: &'static str,
+        },
     }
 
     /// What the store asked the source to read, recorded so that a test can tell a read
@@ -859,6 +943,9 @@ mod tests {
                     .map(|session| SessionSummary {
                         transcript_path: find_transcript(&self.home_directory, &session.session_id),
                         session,
+                        // These tests are about which conversation the store reads, and a
+                        // session's spend is read from the end of a file they never write.
+                        spend: None,
                     })
                     .collect(),
                     home_directory: self.home_directory.clone(),
@@ -916,10 +1003,18 @@ mod tests {
             Task::ready(read_file_prefix(&path, max_bytes))
         }
 
+        fn capture_pane(&self, _pane_target: String) -> Task<Result<String>> {
+            Task::ready(Ok(String::new()))
+        }
+
         fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>> {
             let sent_input = match input {
                 SessionInput::Text(text) => SentInput::Text { pane_target, text },
                 SessionInput::Escape => SentInput::Escape { pane_target },
+                SessionInput::Key(key) => SentInput::Key {
+                    pane_target,
+                    key: key.tmux_name(),
+                },
             };
             self.sent_inputs
                 .lock()

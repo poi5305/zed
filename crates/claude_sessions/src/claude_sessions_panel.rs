@@ -1,7 +1,11 @@
-//! Renders the conversation of a Claude Code session running on this machine.
+//! Renders the sessions of Claude Code running on this machine, and the conversation of
+//! the selected one.
 //!
-//! The panel is a better view of a transcript the CLI is already writing, not a second
-//! place to talk to it: everything here is read-only.
+//! One type draws both halves, in two views that share a store: the dock panel draws the
+//! list of sessions, and an editor tab — the same type with `in_pane` set — draws the
+//! conversation and the input that talks to it. A transcript is not readable at the
+//! width of a dock, and the selection lives in the store rather than in either view, so
+//! choosing a session in the dock is what the tab shows.
 //!
 //! Two properties drive the shape of this file. The conversation order comes from
 //! [`crate::Transcript`], never from the file's line order, because rewinds and
@@ -21,35 +25,55 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, AsyncWindowContext, Entity, EventEmitter,
-    FocusHandle, Focusable, Image, ImageFormat, ListAlignment, ListSizingBehavior, ListState,
-    Render, Subscription, Task, WeakEntity, img, list, pulsating_between,
+    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, DragMoveEvent,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, Length,
+    ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent, Pixels, Rems,
+    Render, Subscription, Task, TextStyleRefinement, WeakEntity, img, list, pulsating_between,
+    relative,
 };
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
+use task::{RevealStrategy, SpawnInTerminal, TaskId};
+use terminal_view::TerminalView;
+use theme::Appearance;
 use ui::{
-    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, SelectableButton as _,
-    TintColor, Tooltip, prelude::*,
+    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes, Scrollbars,
+    SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
-    Workspace,
+    Item, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
 use crate::{
-    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, RegisteredSession, SendMessage,
-    SubagentSummary, ToggleFocus, TranscriptRecord, TranscriptTarget,
-    session_registry::workflow_run_id_in_tool_result,
+    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, OpenInEditor,
+    RegisteredSession, SendMessage, SubagentSummary, ToggleFocus, TranscriptRecord,
+    TranscriptTarget, Usage, rates_for_model,
+    session_registry::PaneKey,
+    session_registry::{tmux_session_name, workflow_run_id_in_tool_result},
     session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
+    transcript::Spend,
 };
 
 const CLAUDE_SESSIONS_PANEL_KEY: &str = "ClaudeSessionsPanel";
 
 const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 const LOCAL_COMMAND_SUBTYPE: &str = "local_command";
+
+/// Timing the CLI writes for its own use: how long a turn took and how many messages
+/// were in it, and nothing a reader of the conversation is looking for. It is the one
+/// record on the conversation's chain with no content at all, so it is left out rather
+/// than drawn as a block of unrecognized JSON.
+const TURN_DURATION_SUBTYPE: &str = "turn_duration";
 const ATTACHMENT_RECORD_TYPE: &str = "attachment";
+
+/// The attachment Claude Code writes for a message typed while it was answering.
+const QUEUED_COMMAND_ATTACHMENT: &str = "queued_command";
+
+/// Said above a message the session is holding behind the turn it is running.
+const QUEUED_NOTE: &str = "Queued";
 const ATTACHMENTS_ENTRY_KEY: &str = "context-attachments";
 
 /// The blocks Claude Code injects into the text of a user record: context it assembled
@@ -151,6 +175,211 @@ const NO_OUTPUT_NOTE: &str = "(no output)";
 /// beside every message competes with the text for attention.
 const ROLE_RAIL_OPACITY: f32 = 0.5;
 
+/// How much of the session's terminal is mirrored. Enough for a prompt and its options,
+/// the queued messages behind a running turn, and the status line under them — the parts
+/// of the screen that are not in the transcript.
+const PANE_MIRROR_LINES: usize = 14;
+
+/// Multiples of the text's own size, for the lines within a paragraph.
+const CONVERSATION_LINE_HEIGHT: f32 = 1.5;
+
+/// What the toolbar says about the session, left to right: the model answering it, the
+/// effort it is answering at, how much context its newest answer was given, and what it
+/// has cost.
+///
+/// Each is left out when the transcript does not say it, rather than shown as a blank or
+/// a zero — a session that has not answered yet knows none of them.
+fn session_facts(spend: &Spend) -> Vec<SharedString> {
+    let mut facts = Vec::new();
+    if let Some(model) = spend.model.clone() {
+        facts.push(model);
+    }
+    if let Some(effort) = spend.effort.clone() {
+        facts.push(effort);
+    }
+    if spend.context_tokens > 0 {
+        let context = compact_token_count(spend.context_tokens);
+        // Marked when it came from a compaction rather than an answer: that figure counts
+        // the kept conversation alone, so the next answer measures a larger context once
+        // the system prompt, the tools and the skills are re-sent. Without the word, that
+        // jump reads as the panel having been wrong.
+        facts.push(SharedString::from(if spend.context_is_post_compaction {
+            format!("{context} ctx (compacted)")
+        } else {
+            format!("{context} ctx")
+        }));
+    }
+    if let Some(cost) = session_cost(spend) {
+        facts.push(cost);
+    }
+    facts
+}
+
+/// What one answer cost, and the tokens behind the figure.
+///
+/// Priced by the model the session is on: an answer's own record names the model, but the
+/// usage read here has already been separated from it, and a session's model changes
+/// rarely enough that the newest one is the right guess for all of them. Nothing is said
+/// at all for a model with no known rates.
+fn answer_cost(usage: Usage, store: &ClaudeSessionStore) -> Option<SharedString> {
+    let spend = store.transcript().spend();
+    let rates = rates_for_model(spend.model.as_deref()?)?;
+    Some(SharedString::from(answer_summary(usage, rates)))
+}
+
+/// The line drawn under an answer when the reader has asked what it cost.
+///
+/// The three kinds of input are named separately because they are priced twenty-fold
+/// apart — fresh input at the full rate, a cache write at twice it or a quarter more, a
+/// cache read at a tenth of it — so one combined "in" figure says nothing about where an
+/// answer's money went. Each is left out when it is zero, which keeps the line short on
+/// the answers that only read from the cache.
+fn answer_summary(usage: Usage, rates: ModelRates) -> String {
+    let mut parts = vec![format_usd(usage.cost(rates))];
+
+    if usage.input_tokens > 0 {
+        parts.push(format!("{} in", compact_token_count(usage.input_tokens)));
+    }
+    if usage.cache_read_tokens > 0 {
+        parts.push(format!(
+            "{} cache read",
+            compact_token_count(usage.cache_read_tokens)
+        ));
+    }
+    let cache_write = usage
+        .cache_write_1h_tokens
+        .saturating_add(usage.cache_write_5m_tokens);
+    if cache_write > 0 {
+        parts.push(format!("{} cache write", compact_token_count(cache_write)));
+    }
+    parts.push(format!("{} out", compact_token_count(usage.output_tokens)));
+    if usage.thinking_tokens > 0 {
+        // Bracketed because it is part of the output above rather than additional to it.
+        parts.push(format!(
+            "({} thinking)",
+            compact_token_count(usage.thinking_tokens)
+        ));
+    }
+
+    parts.join(" · ")
+}
+
+/// What the session has cost.
+///
+/// Claude Code's own figure when it has written one, because it prices every model it
+/// ran — including ones this code has no rates for. Otherwise the total derived from the
+/// token counts, marked `~` to say it was derived here and from which rates. A model
+/// with no known rates yields nothing rather than a wrong number.
+fn session_cost(spend: &Spend) -> Option<SharedString> {
+    if let Some(reported) = &spend.reported {
+        return Some(SharedString::from(format_usd(reported.total_usd)));
+    }
+
+    let rates = rates_for_model(spend.model.as_deref()?)?;
+    Some(SharedString::from(format!(
+        "~{}",
+        format_usd(spend.usage.cost(rates))
+    )))
+}
+
+/// Cents for anything under ten dollars and whole dollars above it: at a hundred dollars
+/// the cents are noise, and under a dollar they are the whole figure.
+fn format_usd(amount: f64) -> String {
+    if amount < 10. {
+        format!("${amount:.2}")
+    } else {
+        format!("${amount:.0}")
+    }
+}
+
+/// Token counts as a reader reads them: `535K`, `2.3M`.
+fn compact_token_count(tokens: u64) -> String {
+    match tokens {
+        0..=9_999 => format!("{tokens}"),
+        10_000..=999_999 => format!("{}K", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.),
+    }
+}
+
+/// Wall-clock milliseconds, as the registrations record them.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How long a session has sat without changing what it is doing.
+///
+/// `None` for anything recent: every session is quiet between turns, and a row that says
+/// so for all of them says nothing. What it answers is the opposite question — which of
+/// these was last touched days ago.
+fn idle_for(updated_at: Option<i64>, now_millis: i64) -> Option<SharedString> {
+    const MINUTE: i64 = 60 * 1000;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const TWO_DAYS: i64 = 2 * DAY;
+    /// Below this a session is simply between turns.
+    const WORTH_SAYING: i64 = 10 * MINUTE;
+
+    let idle = now_millis.saturating_sub(updated_at?);
+    if idle < WORTH_SAYING {
+        return None;
+    }
+
+    // Hours are kept past the first day, because "33h" says something "1d" does not —
+    // it would read the same as 47h. Past two days the hours stop being a unit anyone
+    // converts in their head.
+    Some(SharedString::from(match idle {
+        ..HOUR => format!("idle {}m", idle / MINUTE),
+        HOUR..TWO_DAYS => format!("idle {}h", idle / HOUR),
+        _ => format!("idle {}d", idle / DAY),
+    }))
+}
+
+/// The ground under the reader's own messages. A neutral grey rather than a wash of the
+/// theme's foreground, which carries the theme's hue and reads as a faint tint rather
+/// than as grey; and light enough to be a step away from the conversation's ground
+/// without becoming a block of its own.
+const USER_MESSAGE_GROUND: Hsla = Hsla {
+    h: 0.,
+    s: 0.,
+    l: 0.5,
+    a: 0.02,
+};
+
+/// The conversation's scrollbar is drawn in its own colour rather than the theme's, so
+/// that how far up the history the reader is sitting is legible at a glance against the
+/// transcript behind it.
+const CONVERSATION_SCROLLBAR_COLOR: Hsla = Hsla {
+    h: 28. / 360.,
+    s: 0.9,
+    l: 0.55,
+    a: 1.,
+};
+
+/// Tall enough for a prompt and its options without taking the conversation's room. The
+/// reader drags it from here.
+const DEFAULT_TERMINAL_HEIGHT: Pixels = px(260.);
+
+/// The grab area on the terminal's top edge.
+const TERMINAL_RESIZE_HANDLE_HEIGHT: Pixels = px(4.);
+
+const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
+
+const MAX_TERMINAL_HEIGHT: Pixels = px(1200.);
+
+/// Dragged when the terminal's top edge is pulled. Nothing is carried across the screen:
+/// the edge itself is what moves, so the preview draws nothing.
+#[derive(Clone)]
+struct DraggedTerminalDivider;
+
+impl Render for DraggedTerminalDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -186,14 +415,49 @@ pub struct ClaudeSessionsPanel {
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
     session_list_expanded: bool,
+    /// True for the copy opened as an editor tab, which is already where opening one
+    /// would take the reader.
+    in_pane: bool,
+    /// Whether the session's terminal is showing. Open by default: the prompts it
+    /// carries are the ones that stop a session until they are answered, and a reader who
+    /// does not know one is waiting reads the session as stuck.
+    pane_expanded: bool,
+    /// The terminal attached to the selected session's tmux pane, and the session it
+    /// belongs to. Attaching is asynchronous and the reader can select another session
+    /// while it runs, so what it was attached for is kept beside it rather than assumed.
+    terminal: Option<Entity<TerminalView>>,
+    terminal_process_id: Option<u32>,
+    /// How tall the terminal section is. Dragged by its top edge, and kept here rather
+    /// than measured, because the reader's choice has to survive every redraw.
+    terminal_height: Pixels,
+    /// Whether the message input is showing. Closed by default: the terminal above it
+    /// takes typing directly, and this is the second way to say the same thing — worth
+    /// having for a message pasted from elsewhere, not worth the room when it is idle.
+    input_expanded: bool,
+    /// Held so that dropping it cancels an attach that is still running.
+    _terminal_attach: Task<()>,
     /// See [`UnreadBelow`].
     unread_below: UnreadBelow,
+    /// Whether the reader was at the tail of the conversation the last time the list
+    /// could say so.
+    ///
+    /// `ListState::is_scrolled_to_end` answers `None` while the items a splice added
+    /// have not been measured, and every arrival splices. Reading that as "at the tail"
+    /// scrolls a reader who is part-way up the history down to the tail on the next
+    /// arrival — so the last definite answer is kept here and used instead.
+    scrolled_to_end: bool,
     /// Keys of the entries — and of the attachments nested inside the context section —
     /// the user has opened.
     expanded: HashSet<SharedString>,
     /// Whether the conversation is read with [`crate::Transcript::full_path`], which
     /// includes everything compaction dropped from the model's context.
     show_full_history: bool,
+    /// Whether what each answer cost is drawn beneath it.
+    show_costs: bool,
+    /// Whether the session's tool calls, their results, and its thinking are drawn.
+    /// Closed by default: one turn can hold dozens of them, and a conversation read for
+    /// what was said is buried under them.
+    show_tool_calls: bool,
     markdowns: HashMap<SharedString, Entity<Markdown>>,
     /// Keyed by record uuid, and so unaffected by the conversation growing around an
     /// entry; see [`EntryCache`].
@@ -224,6 +488,9 @@ enum EntryKind {
     Message {
         role: MessageRole,
         source: SharedString,
+        /// What the answer this message is part of was billed. `None` for the reader's
+        /// own messages, which are not billed on their own.
+        usage: Option<Usage>,
     },
     Thinking {
         source: SharedString,
@@ -251,6 +518,12 @@ enum EntryKind {
     },
     /// A message that has left for the session but has not appeared in its transcript
     /// yet; see [`PendingSends`]. The only entry that does not come from a record.
+    /// A message the CLI is holding behind the turn it is running, read from the queue
+    /// log. Unlike [`Self::Pending`] it carries no id: the queue is the session's, so
+    /// there is nothing here for the panel to take back.
+    Queued {
+        text: SharedString,
+    },
     Pending {
         id: u64,
         text: SharedString,
@@ -508,7 +781,9 @@ impl MessageRole {
     /// that a label is truncated and the color is what is left to tell the rows apart.
     fn color(self) -> Color {
         match self {
-            Self::User => Color::Info,
+            // Read apart from the assistant's at a glance: both were blues, and the rail
+            // beside a message is the only thing that says whose it is.
+            Self::User => Color::Error,
             Self::Assistant => Color::Accent,
             Self::Other => Color::Muted,
             Self::CompactSummary => Color::Warning,
@@ -553,49 +828,163 @@ impl ClaudeSessionsPanel {
             };
             let store =
                 cx.new(|cx| ClaudeSessionStore::new(source.clone(), project_root.clone(), cx));
-            let store_subscription = cx.observe(&store, |this: &mut Self, _, cx| {
-                this.rebuild_entries(cx);
-                this.sync_input_availability(cx);
-                // The session list changes on scans that leave the conversation
-                // untouched, so the panel is redrawn whether or not entries moved.
-                cx.notify();
-            });
-
-            let message_editor = cx.new(|cx| {
-                let mut editor = Editor::auto_height(1, 8, window, cx);
-                editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
-                // Nothing is selected yet, so there is nothing to type into.
-                editor.set_read_only(true);
-                editor
-            });
-
-            Self {
-                workspace: workspace_handle,
-                focus_handle: cx.focus_handle(),
+            Self::new_reading(
+                workspace_handle,
                 fs,
                 store,
                 source,
-                message_editor,
                 project_root,
-                entries: Vec::new(),
-                pending_sends: PendingSends::default(),
-                activity: Activity::Idle,
-                agent_calls: HashMap::default(),
-                list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
-                session_list_expanded: true,
-                unread_below: UnreadBelow::default(),
-                expanded: HashSet::default(),
-                show_full_history: false,
-                markdowns: HashMap::default(),
-                entry_cache: EntryCache::default(),
-                cached_transcript_generation: 0,
-                cached_home_directory: None,
-                overwrites_dropped: 0,
-                loaded_outputs: HashMap::default(),
-                output_loads: HashMap::default(),
-                _store_subscription: store_subscription,
-            }
+                window,
+                cx,
+            )
         })
+    }
+
+    /// Opens the same view as a tab in the editor area, for a conversation that is
+    /// easier to read at the width of a pane than at the width of a dock.
+    ///
+    /// The tab reads the store the panel already scans through: opening one does not
+    /// start a second scan of the same sessions, and the session selected in either
+    /// place is the one both of them show.
+    pub fn open_in_pane(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+        let (fs, store, source, project_root) = {
+            let panel = panel.read(cx);
+            (
+                panel.fs.clone(),
+                panel.store.clone(),
+                panel.source.clone(),
+                panel.project_root.clone(),
+            )
+        };
+        Self::open_reading(workspace, fs, store, source, project_root, window, cx);
+    }
+
+    /// Brings the tab that reads the conversation forward, opening one when the window
+    /// has none. Called from the dock, where selecting a session would otherwise leave
+    /// the reader with a selection and nowhere it is shown.
+    ///
+    /// The fields are taken from `self` rather than read back off the workspace, which
+    /// would read this entity while it is the one being updated.
+    fn reveal_in_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = self.fs.clone();
+        let store = self.store.clone();
+        let source = self.source.clone();
+        let project_root = self.project_root.clone();
+        workspace.update(cx, |workspace, cx| {
+            // Bound before the call below so that the iterator's borrow of the
+            // workspace has ended by the time the item is activated through it.
+            let existing = workspace.items_of_type::<Self>(cx).next();
+            match existing {
+                Some(existing) => {
+                    workspace.activate_item(&existing, true, true, window, cx);
+                }
+                None => {
+                    Self::open_reading(workspace, fs, store, source, project_root, window, cx);
+                }
+            }
+        });
+    }
+
+    fn open_reading(
+        workspace: &mut Workspace,
+        fs: Arc<dyn Fs>,
+        store: Entity<ClaudeSessionStore>,
+        source: Arc<dyn SessionSource>,
+        project_root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let workspace_handle = workspace.weak_handle();
+        let item = cx.new(|cx| {
+            let mut this = Self::new_reading(
+                workspace_handle,
+                fs,
+                store,
+                source,
+                project_root,
+                window,
+                cx,
+            );
+            this.in_pane = true;
+            this
+        });
+        workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+    }
+
+    fn new_reading(
+        workspace: WeakEntity<Workspace>,
+        fs: Arc<dyn Fs>,
+        store: Entity<ClaudeSessionStore>,
+        source: Arc<dyn SessionSource>,
+        project_root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let store_subscription = cx.observe(&store, |this: &mut Self, _, cx| {
+            this.rebuild_entries(cx);
+            this.sync_input_availability(cx);
+            if this.in_pane {
+                cx.emit(ItemNameChanged);
+            }
+            // The session list changes on scans that leave the conversation
+            // untouched, so the panel is redrawn whether or not entries moved.
+            cx.notify();
+        });
+
+        let message_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 8, window, cx);
+            editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
+            // Nothing is selected yet, so there is nothing to type into.
+            editor.set_read_only(true);
+            editor
+        });
+
+        Self {
+            workspace,
+            focus_handle: cx.focus_handle(),
+            fs,
+            store,
+            source,
+            message_editor,
+            project_root,
+            in_pane: false,
+            pane_expanded: true,
+            terminal: None,
+            terminal_process_id: None,
+            terminal_height: DEFAULT_TERMINAL_HEIGHT,
+            input_expanded: false,
+            _terminal_attach: Task::ready(()),
+            entries: Vec::new(),
+            pending_sends: PendingSends::default(),
+            activity: Activity::Idle,
+            agent_calls: HashMap::default(),
+            list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+            session_list_expanded: true,
+            unread_below: UnreadBelow::default(),
+            scrolled_to_end: true,
+            expanded: HashSet::default(),
+            show_full_history: false,
+            show_tool_calls: false,
+            show_costs: false,
+            markdowns: HashMap::default(),
+            entry_cache: EntryCache::default(),
+            cached_transcript_generation: 0,
+            cached_home_directory: None,
+            overwrites_dropped: 0,
+            loaded_outputs: HashMap::default(),
+            output_loads: HashMap::default(),
+            _store_subscription: store_subscription,
+        }
     }
 
     fn select_session(&mut self, process_id: u32, cx: &mut Context<Self>) {
@@ -613,6 +1002,7 @@ impl ClaudeSessionsPanel {
         self.show_full_history = false;
         self.unread_below.reset();
         self.list_state.scroll_to_end();
+        self.scrolled_to_end = true;
     }
 
     /// Follows another of the selected session's conversations, from a chip or from the
@@ -627,6 +1017,119 @@ impl ClaudeSessionsPanel {
             .update(cx, |store, cx| store.select_transcript_target(target, cx));
     }
 
+    /// Attaches a terminal to the selected session's pane, so that the CLI can be typed
+    /// into and scrolled the way it would be in any other terminal.
+    ///
+    /// The transcript above stays the way the conversation is read — it is built for
+    /// that, and a terminal only ever shows the last screenful. This is for the parts
+    /// the transcript does not have: a prompt waiting to be answered, the messages
+    /// queued behind the running turn, the status line.
+    ///
+    /// Nothing is attached until the terminal is on screen, and what is attached is
+    /// dropped when the reader selects another session: a session's pane is one
+    /// terminal, and attaching to one a reader has left would leave a client on it for
+    /// as long as the panel lived.
+    fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.store.read(cx).selected();
+        let wanted = self
+            .pane_expanded
+            .then_some(selected)
+            .flatten()
+            .filter(|_| self.store.read(cx).pane_target().is_some());
+
+        if wanted == self.terminal_process_id {
+            return;
+        }
+
+        self.terminal_process_id = wanted;
+        self.terminal = None;
+        self._terminal_attach = Task::ready(());
+
+        let Some(process_id) = wanted else {
+            cx.notify();
+            return;
+        };
+        let Some(pane_target) = self.store.read(cx).pane_target() else {
+            cx.notify();
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+
+        // `command` is spawned as a program with `args`, never through a shell, so the
+        // two are kept apart here: a whole command line in `command` is looked up as one
+        // file name and never found. It also means the pane id reaches tmux as its own
+        // argument, with no quoting to get right.
+        let label = format!("tmux attach -t {pane_target}");
+        let spawn = SpawnInTerminal {
+            id: TaskId(format!("claude-session-attach-{process_id}")),
+            full_label: label.clone(),
+            label: label.clone(),
+            command: Some("tmux".to_string()),
+            args: vec!["attach".to_string(), "-t".to_string(), pane_target],
+            command_label: label,
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::NoFocus,
+            env: std::collections::HashMap::default(),
+            ..Default::default()
+        };
+
+        let terminal = project.update(cx, |project, cx| project.create_terminal_task(spawn, cx));
+        self._terminal_attach = cx.spawn_in(window, async move |this, cx| {
+            // A failure leaves the mirror standing in for the terminal, which is what
+            // the reader sees until an attach succeeds.
+            let Some(terminal) = terminal.await.log_err() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                // The reader may have selected another session while this ran; what was
+                // attached for that one is not shown under this one.
+                if this.terminal_process_id != Some(process_id) {
+                    return;
+                }
+                let workspace = this.workspace.clone();
+                let project = project.downgrade();
+                this.terminal =
+                    Some(cx.new(|cx| {
+                        TerminalView::new(terminal, workspace, None, project, window, cx)
+                    }));
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    /// Collapsing takes the terminal down rather than hiding it: an attached client that
+    /// nobody is looking at still holds the pane's size down to its own.
+    fn toggle_pane_mirror(&mut self, cx: &mut Context<Self>) {
+        self.pane_expanded = !self.pane_expanded;
+        cx.notify();
+    }
+
+    /// Answers a prompt the CLI has drawn in the pane, with one of the keys it is
+    /// waiting for. A prompt is answered in the terminal or not at all, so without this
+    /// a session that stopped to ask something can only be unblocked by leaving Zed.
+    fn send_pane_key(&mut self, key: PaneKey, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
+
+        self.store.update(cx, |store, cx| {
+            // There is no text to hand back for a keypress, and the store reports the
+            // failure itself, so nothing here waits for the answer.
+            store.send_input(SessionInput::Key(key), cx).detach()
+        });
+    }
+
+    fn toggle_input(&mut self, cx: &mut Context<Self>) {
+        self.input_expanded = !self.input_expanded;
+        cx.notify();
+    }
+
     fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
         self.session_list_expanded = !self.session_list_expanded;
         cx.notify();
@@ -636,7 +1139,28 @@ impl ClaudeSessionsPanel {
     /// what arrived below their window offers.
     fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to_end();
+        self.scrolled_to_end = true;
         self.unread_below.reset();
+        cx.notify();
+    }
+
+    /// Only the drawing changes, so the entries stand — but every entry that gains or
+    /// loses a line of cost changes height, and the list holds the heights it measured.
+    fn toggle_costs(&mut self, cx: &mut Context<Self>) {
+        self.show_costs = !self.show_costs;
+        let count = self.entries.len();
+        self.list_state.remeasure_items(0..count);
+        cx.notify();
+    }
+
+    /// The entries are rebuilt rather than filtered at draw time, because the list
+    /// measures what it is given: hiding an item the list still holds would leave its
+    /// height behind as a gap.
+    fn toggle_tool_calls(&mut self, cx: &mut Context<Self>) {
+        self.show_tool_calls = !self.show_tool_calls;
+        self.entries.clear();
+        self.list_state.reset(0);
+        self.rebuild_entries(cx);
         cx.notify();
     }
 
@@ -698,6 +1222,21 @@ impl ClaudeSessionsPanel {
         self.activity = activity;
         self.agent_calls = agent_calls;
 
+        // Dropped after the build rather than skipped during it, so that the cache still
+        // holds every record's artifacts and showing them again costs no rederivation.
+        // The chips above stay: which agents a turn started is read from the calls, not
+        // from the entries, so hiding these does not hide those.
+        if !self.show_tool_calls {
+            new_entries.retain(|entry| {
+                !matches!(
+                    entry.kind,
+                    EntryKind::ToolUse { .. }
+                        | EntryKind::ToolResult { .. }
+                        | EntryKind::Thinking { .. }
+                )
+            });
+        }
+
         self.pending_sends
             .retain_session(self.store.read(cx).selected());
         // Paired against the session's own conversation and never against an agent's: an
@@ -711,6 +1250,35 @@ impl ClaudeSessionsPanel {
         }
         if pending_is_drawn_in(self.store.read(cx).transcript_target()) {
             new_entries.extend(self.pending_sends.entries());
+            // Drawn after the pending sends and behind the same rule, because both are
+            // messages that have not reached the conversation yet. A message sent from
+            // Zed is in the session's queue as well, and is already drawn as a pending
+            // send — the one the panel can take down when the send fails — so the queue
+            // entry matching it is left to that.
+            let store = self.store.read(cx);
+            new_entries.extend(
+                store
+                    .transcript()
+                    .queued_messages()
+                    .iter()
+                    .filter(|text| !self.pending_sends.holds_text(text))
+                    // A background task reporting in is queued exactly as a message
+                    // typed mid-turn is, and its text is nothing but the block the CLI
+                    // wrote to tell itself. Held to the same rule as the conversation's
+                    // own records — what is left once the injected blocks are cut — so a
+                    // notification is dropped and typed words, which are never one of
+                    // those blocks, are kept whole.
+                    .filter_map(|text| user_visible_text(text))
+                    .map(|text| Entry {
+                        // Keyed on the text: the queue log gives these no id of their own,
+                        // and the key has to be the same across rebuilds or the list
+                        // remeasures an item that did not change.
+                        key: SharedString::from(format!("queued-{text}")),
+                        kind: EntryKind::Queued {
+                            text: SharedString::from(text),
+                        },
+                    }),
+            );
         }
 
         let old_length = self.entries.len();
@@ -741,8 +1309,12 @@ impl ClaudeSessionsPanel {
             return;
         }
 
-        // Captured before the splice, which itself moves the scroll position.
-        let was_scrolled_to_end = self.list_state.is_scrolled_to_end().unwrap_or(true);
+        // Captured before the splice, which itself moves the scroll position. A `None`
+        // from the list is not an answer, so the last definite one stands.
+        if let Some(at_end) = self.list_state.is_scrolled_to_end() {
+            self.scrolled_to_end = at_end;
+        }
+        let was_scrolled_to_end = self.scrolled_to_end;
 
         // What arrived is counted against where the reader was sitting: at the bottom it
         // is scrolled into view below, and anywhere else it lands out of sight, which is
@@ -957,10 +1529,29 @@ impl ClaudeSessionsPanel {
                     // what the rows were saying: how many are running and which one the
                     // conversation below belongs to.
                     .child(
-                        Label::new(summary)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new(summary)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            )
+                            .when(!self.in_pane, |this| {
+                                this.child(
+                                    IconButton::new(
+                                        "claude-sessions-open-in-editor",
+                                        IconName::ArrowUpRight,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Open in Editor"))
+                                    .on_click(cx.listener(
+                                        |_this, _, window, cx| {
+                                            window.dispatch_action(Box::new(OpenInEditor), cx);
+                                        },
+                                    )),
+                                )
+                            }),
                     ),
             )
             .when_some(error, |this, error| {
@@ -976,7 +1567,7 @@ impl ClaudeSessionsPanel {
                 this.child(
                     v_flex()
                         .id("claude-sessions-list")
-                        .max_h(px(200.))
+                        .flex_1()
                         .overflow_y_scroll()
                         .when(sessions.is_empty(), |this| {
                             this.child(
@@ -1011,8 +1602,28 @@ impl ClaudeSessionsPanel {
                 .unwrap_or_else(|| session.session_id.clone()),
         );
         let working_directory = self.display_working_directory(&session.working_directory);
-        let version = SharedString::from(format!("v{}", session.version));
-        let tmux_target = session.tmux_target.clone().map(SharedString::from);
+        // What the session is carrying and what it has cost, read from the end of its own
+        // transcript rather than from the one the panel is following — every row is a
+        // different session, and only one of them is the one being read.
+        let spend = self.store.read(cx).session_spend(process_id);
+        let context = spend.filter(|spend| spend.context_tokens > 0).map(|spend| {
+            SharedString::from(format!("{} ctx", compact_token_count(spend.context_tokens)))
+        });
+        let cost = spend
+            .and_then(|spend| spend.total_cost_usd)
+            .map(|total| SharedString::from(format_usd(total)));
+        // How long the session has sat without changing what it is doing. Said because
+        // every listed process is alive — `updatedAt` is not a heartbeat, so a session is
+        // never filtered out for being quiet — and this is what tells one in use from one
+        // left open two days ago.
+        let idle = idle_for(session.updated_at, now_millis());
+        // Bracketed and before the name, because a session is found by which tmux
+        // session it is running in as often as by what Claude Code called it.
+        let tmux_session = session
+            .tmux_target
+            .as_deref()
+            .and_then(tmux_session_name)
+            .map(|name| SharedString::from(format!("[{name}]")));
         let is_bridged = session.bridge_session_id.is_some();
 
         // Wrapped so that the pulse can be applied to the element: the icon itself
@@ -1050,6 +1661,12 @@ impl ClaudeSessionsPanel {
                     .child(
                         h_flex()
                             .gap_1()
+                            .children(tmux_session.map(|tmux_session| {
+                                Label::new(tmux_session)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                            }))
                             .child(Label::new(name).size(LabelSize::Small).single_line())
                             .when(is_bridged, |this| {
                                 this.child(
@@ -1058,11 +1675,15 @@ impl ClaudeSessionsPanel {
                                         .color(Color::Accent),
                                 )
                             })
-                            .child(
-                                Label::new(version)
+                            .children(context.map(|context| {
+                                Label::new(context)
                                     .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                                    .color(Color::Muted)
+                                    .single_line()
+                            }))
+                            .children(cost.map(|cost| {
+                                Label::new(cost).size(LabelSize::XSmall).color(Color::Muted)
+                            })),
                     )
                     .child(
                         h_flex()
@@ -1074,8 +1695,8 @@ impl ClaudeSessionsPanel {
                                     .color(Color::Muted)
                                     .single_line(),
                             )
-                            .children(tmux_target.map(|target| {
-                                Label::new(target)
+                            .children(idle.map(|idle| {
+                                Label::new(idle)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Hidden)
                                     .single_line()
@@ -1083,7 +1704,10 @@ impl ClaudeSessionsPanel {
                     ),
             )
             .tooltip(Tooltip::text(format!("pid {process_id}")))
-            .on_click(cx.listener(move |this, _, _, cx| this.select_session(process_id, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_session(process_id, cx);
+                this.reveal_in_pane(window, cx);
+            }))
     }
 
     /// The row of conversations the selected session has to offer: its own, then one chip
@@ -1282,7 +1906,11 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
-    fn render_transcript_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_transcript_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let store = self.store.read(cx);
         let has_selection = store.selected().is_some();
         let has_transcript_file = store.transcript_path().is_some();
@@ -1305,8 +1933,11 @@ impl ClaudeSessionsPanel {
         // `None` — a list whose new items have not been measured yet, which is exactly
         // what a splice leaves behind — is not an answer, and clearing the count on it
         // would throw away the arrival that caused the splice.
-        if self.list_state.is_scrolled_to_end() == Some(true) {
-            self.unread_below.scrolled(true);
+        if let Some(at_end) = self.list_state.is_scrolled_to_end() {
+            self.scrolled_to_end = at_end;
+            if at_end {
+                self.unread_below.scrolled(true);
+            }
         }
         let unread_below = self.unread_below.count();
 
@@ -1322,6 +1953,13 @@ impl ClaudeSessionsPanel {
                 )
                 .with_sizing_behavior(ListSizingBehavior::Auto)
                 .flex_grow_1(),
+            )
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.list_state)
+                    .thumb_color(CONVERSATION_SCROLLBAR_COLOR),
+                window,
+                cx,
             )
             // A reader who has scrolled up is not followed to the tail, so the messages
             // that arrive land out of sight and the session looks like it has stopped.
@@ -1488,24 +2126,311 @@ impl ClaudeSessionsPanel {
         });
     }
 
+    /// The one control the conversation needs of its own: whether the session's tool
+    /// calls and thinking are part of what is read.
+    fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let showing = self.show_tool_calls;
+
+        let showing_costs = self.show_costs;
+        let spend = self.store.read(cx).transcript().spend();
+        // Read from the newest answer, so a session whose model or effort changed
+        // part-way says what it is on now rather than what it started on.
+        let facts = session_facts(&spend);
+        let unpriced = spend
+            .reported
+            .as_ref()
+            .is_some_and(|reported| reported.has_unknown_model_cost);
+
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .children(facts.into_iter().map(|fact| {
+                        Label::new(fact)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line()
+                    }))
+                    // Said only because Claude Code says it: a total it could not price
+                    // in full is worth less than the admission that it is short.
+                    .when(unpriced, |this| {
+                        this.child(
+                            Label::new("unpriced models")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("claude-session-costs", IconName::CurrencyDollar)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(showing_costs)
+                            .tooltip(Tooltip::text(if showing_costs {
+                                "Hide what each answer cost"
+                            } else {
+                                "Show what each answer cost"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
+                    )
+                    .child(
+                        IconButton::new(
+                            "claude-session-tool-calls",
+                            if showing {
+                                IconName::Eye
+                            } else {
+                                IconName::EyeOff
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .toggle_state(showing)
+                        .tooltip(Tooltip::text(if showing {
+                            "Hide tool calls and thinking"
+                        } else {
+                            "Show tool calls and thinking"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_tool_calls(cx))),
+                    ),
+            )
+    }
+
+    /// Draws the session's terminal as it currently looks.
+    ///
+    /// Claude Code draws three things there that it never writes to the transcript: a
+    /// prompt waiting to be answered, the messages queued behind the turn it is running,
+    /// and its status line. None of them can be read from the conversation, so they are
+    /// shown as the terminal itself has them rather than parsed into this panel's own
+    /// elements — a parser would have to be right about the CLI's layout, and would go
+    /// wrong the first time that layout changed.
+    ///
+    /// Only the tail is drawn. The rest of the screen is the conversation, which is above
+    /// this in a form built for reading.
+    /// What stands in for the terminal until it is attached, and after an attach that
+    /// failed: the same screen, read through tmux rather than driven by it.
+    fn render_pane_mirror(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let can_send = self.can_send(cx);
+        let contents = self.store.read(cx).pane_contents()?;
+        let tail: String = {
+            let lines: Vec<&str> = contents.lines().collect();
+            let from = lines.len().saturating_sub(PANE_MIRROR_LINES);
+            lines.get(from..).unwrap_or_default().join("\n")
+        };
+        if tail.trim().is_empty() {
+            return None;
+        }
+
+        let expanded = self.pane_expanded;
+
+        Some(
+            v_flex()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .child(
+                            Disclosure::new("claude-session-pane-mirror", expanded).on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_pane_mirror(cx)),
+                            ),
+                        )
+                        .child(
+                            Label::new("Terminal")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1())
+                        .children(
+                            expanded
+                                .then(|| {
+                                    [
+                                        (PaneKey::Up, IconName::ChevronUp, "Up"),
+                                        (PaneKey::Down, IconName::ChevronDown, "Down"),
+                                        (PaneKey::Enter, IconName::Return, "Enter"),
+                                    ]
+                                    .map(
+                                        |(key, icon, name)| {
+                                            IconButton::new(
+                                                SharedString::from(format!(
+                                                    "claude-session-pane-key-{name}"
+                                                )),
+                                                icon,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .disabled(!can_send)
+                                            .tooltip(Tooltip::text(format!(
+                                                "Send {name} to the terminal"
+                                            )))
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.send_pane_key(key, cx)
+                                                }),
+                                            )
+                                        },
+                                    )
+                                })
+                                .into_iter()
+                                .flatten(),
+                        ),
+                )
+                .when(expanded, |this| {
+                    this.child(
+                        div()
+                            .id("claude-session-pane-mirror-contents")
+                            .w_full()
+                            .px_2()
+                            .pb_2()
+                            .overflow_x_scroll()
+                            .child(
+                                div()
+                                    .font_buffer(cx)
+                                    .text_size(TextSize::XSmall.rems(cx))
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .whitespace_nowrap()
+                                    .child(tail),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The terminal, framed the way the mirror it stands in for is.
+    ///
+    /// The section owns the dragged height and the terminal fills what is left of it
+    /// under the header, so that the height the reader set is the height they see rather
+    /// than that plus a header.
+    fn render_terminal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let terminal = self.terminal.clone()?;
+        let expanded = self.pane_expanded;
+
+        Some(
+            v_flex()
+                .w_full()
+                .when(expanded, |this| this.h(self.terminal_height))
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                // The bounds this reports are the section's, so the height the drag
+                // wants is the distance from the pointer down to the section's bottom,
+                // which does not move while the top edge is dragged.
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<DraggedTerminalDivider>, _, cx| {
+                        let height = event.bounds.bottom() - event.event.position.y;
+                        this.terminal_height =
+                            height.clamp(MIN_TERMINAL_HEIGHT, MAX_TERMINAL_HEIGHT);
+                        cx.notify();
+                    },
+                ))
+                .when(expanded, |this| {
+                    this.child(
+                        div()
+                            .id("claude-session-terminal-resize")
+                            .w_full()
+                            .h(TERMINAL_RESIZE_HANDLE_HEIGHT)
+                            .cursor_row_resize()
+                            .on_drag(DraggedTerminalDivider, |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| DraggedTerminalDivider)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .occlude(),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .child(
+                            Disclosure::new("claude-session-terminal", expanded).on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_pane_mirror(cx)),
+                            ),
+                        )
+                        .child(
+                            Label::new("Terminal")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .when(expanded, |this| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .overflow_hidden()
+                            // A terminal that is not focused takes no keys. Nothing else
+                            // focuses this one: in a pane that is the pane's job, and
+                            // here there is no pane.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    if let Some(terminal) = this.terminal.as_ref() {
+                                        terminal.focus_handle(cx).focus(window, cx);
+                                    }
+                                }),
+                            )
+                            .child(terminal),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_send = self.can_send(cx);
+        // A session that is answering is the one case where interrupting is what the
+        // reader wants, so the button says so and is tinted then rather than sitting
+        // there as one more grey control.
+        let is_answering = !matches!(self.activity, Activity::Idle);
         let store = self.store.read(cx);
         let has_selection = store.selected().is_some();
         let is_reading_an_agent =
             matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
         let note = input_note(can_send, is_reading_an_agent, has_selection);
 
+        let expanded = self.input_expanded;
+
         v_flex()
             .w_full()
-            .p_2()
-            .gap_1()
             .border_t_1()
             .border_color(cx.theme().colors().border)
+            // Outside the collapsed part, so that the keys still reach the session while
+            // the input is closed: interrupting does not need somewhere to type.
             .key_context("ClaudeSessionsInput")
             .on_action(cx.listener(Self::send_message))
             .on_action(cx.listener(Self::interrupt_session))
-            .when_some(note, |this, note| {
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Disclosure::new("claude-session-input", expanded)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_input(cx))),
+                    )
+                    .child(
+                        Label::new("Message")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(expanded, |this| this.p_2().gap_1())
+            .when_some(note.filter(|_| expanded), |this, note| {
                 this.child(
                     h_flex()
                         .gap_1()
@@ -1517,43 +2442,66 @@ impl ClaudeSessionsPanel {
                         .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
                 )
             })
-            .child(
-                div()
-                    .w_full()
-                    .px_1()
-                    .py_0p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .bg(cx.theme().colors().editor_background)
-                    .child(self.message_editor.clone()),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .justify_end()
-                    .child(
-                        Button::new("claude-session-interrupt", "Esc")
+            .when(expanded, |this| {
+                this.child(
+                    div().w_full().px_2().child(
+                        div()
+                            .w_full()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .bg(cx.theme().colors().editor_background)
+                            .child(self.message_editor.clone()),
+                    ),
+                )
+            })
+            .when(expanded, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .pb_2()
+                        .gap_1()
+                        .justify_end()
+                        .child(
+                            Button::new(
+                                "claude-session-interrupt",
+                                if is_answering { "Stop" } else { "Esc" },
+                            )
                             .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
                             .label_size(LabelSize::XSmall)
                             .disabled(!can_send)
-                            .tooltip(Tooltip::text("Interrupt this session"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.interrupt_session(&Interrupt, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("claude-session-send", "Send")
-                            .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
-                            .label_size(LabelSize::XSmall)
-                            .disabled(!can_send)
-                            .tooltip(Tooltip::text("Send to this session"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.send_message(&SendMessage, window, cx)
-                            })),
-                    ),
-            )
+                            .when(is_answering, |this| {
+                                this.style(ButtonStyle::Tinted(TintColor::Error))
+                            })
+                            .tooltip(Tooltip::for_action_title(
+                                if is_answering {
+                                    "Stop this session"
+                                } else {
+                                    "Interrupt this session"
+                                },
+                                &Interrupt,
+                            ))
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.interrupt_session(&Interrupt, window, cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new("claude-session-send", "Send")
+                                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                                .label_size(LabelSize::XSmall)
+                                .disabled(!can_send)
+                                .tooltip(Tooltip::text("Send to this session"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_message(&SendMessage, window, cx)
+                                })),
+                        ),
+                )
+            })
     }
 
     fn render_entry(
@@ -1569,12 +2517,65 @@ impl ClaudeSessionsPanel {
         let is_expanded = self.expanded.contains(&key);
 
         match entry.kind {
-            EntryKind::Message { role, source } => {
+            EntryKind::Message {
+                role,
+                source,
+                usage,
+            } => {
+                // The recap a compaction writes is the length of the conversation it
+                // replaced, and it arrives at the top of what the reader is about to
+                // read. Drawn closed, like a tool call, so that the session's own
+                // messages are what the view opens on.
+                if role == MessageRole::CompactSummary {
+                    let header = self.render_disclosure_header(
+                        DisclosureHeader {
+                            entry_index: index,
+                            key: &key,
+                            icon: role.icon(),
+                            icon_color: role.color(),
+                            title: role.label().into(),
+                            summary: Some(first_line(&source)),
+                            is_expanded,
+                        },
+                        cx,
+                    );
+                    let body = if is_expanded {
+                        let markdown = self.markdown_for(&key, source, cx);
+                        Some(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .pb_1()
+                                .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
+                        )
+                    } else {
+                        None
+                    };
+                    return v_flex()
+                        .w_full()
+                        .child(header)
+                        .children(body)
+                        .into_any_element();
+                }
+
                 let markdown = self.markdown_for(&key, source, cx);
+                let cost = self
+                    .show_costs
+                    .then_some(usage)
+                    .flatten()
+                    .and_then(|usage| answer_cost(usage, self.store.read(cx)));
                 v_flex()
                     .w_full()
-                    .px_2()
+                    .px_4()
                     .py_1()
+                    // What the reader typed is given a ground of its own, so that their
+                    // own words are told apart from the session's answers by more than
+                    // the colour of a rail two characters wide. A wash of the foreground
+                    // rather than a fixed grey: it lifts off a dark background and
+                    // settles onto a light one, so either theme reads as a step.
+                    .when(role == MessageRole::User, |this| {
+                        this.bg(USER_MESSAGE_GROUND).rounded_sm()
+                    })
                     .gap_0p5()
                     .border_l_2()
                     .border_color(role.color().color(cx).opacity(ROLE_RAIL_OPACITY))
@@ -1597,6 +2598,11 @@ impl ClaudeSessionsPanel {
                             .w_full()
                             .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
                     )
+                    .children(cost.map(|cost| {
+                        Label::new(cost)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Hidden)
+                    }))
                     .into_any_element()
             }
 
@@ -1805,6 +2811,44 @@ impl ClaudeSessionsPanel {
                         .size(LabelSize::Small)
                         .color(Color::Muted)
                         .inline_code(cx),
+                )
+                .into_any_element(),
+
+            // The session is holding this one behind the turn it is running. Drawn like a
+            // pending send, without the button: the queue belongs to the session, and
+            // nothing here can take a message out of it.
+            EntryKind::Queued { text } => v_flex()
+                .w_full()
+                .px_4()
+                .py_1()
+                .gap_0p5()
+                .border_l_2()
+                .border_color(
+                    MessageRole::User
+                        .color()
+                        .color(cx)
+                        .opacity(ROLE_RAIL_OPACITY),
+                )
+                .bg(USER_MESSAGE_GROUND)
+                .rounded_sm()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(MessageRole::User.icon())
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(QUEUED_NOTE)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .child(Label::new(text).size(LabelSize::Small).color(Color::Muted)),
                 )
                 .into_any_element(),
 
@@ -2227,17 +3271,36 @@ impl ClaudeSessionsPanel {
 }
 
 impl Render for ClaudeSessionsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The two halves are never drawn together: the dock draws the list of sessions and
+    /// an editor tab draws the conversation of the selected one, because a transcript is
+    /// not readable at the width of a dock and the list is what the dock is for.
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.in_pane {
+            // Both halves of what decides it — the selection and whether the terminal is
+            // showing — are known here, and this runs on every change to either.
+            self.sync_terminal(window, cx);
+        }
+
         v_flex()
             .key_context("ClaudeSessionsPanel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(self.render_session_section(cx))
-            .child(Divider::horizontal())
-            .children(self.render_agent_chips(cx))
-            .child(self.render_transcript_section(cx))
-            .children(self.render_activity())
-            .child(self.render_input(cx))
+            .map(|this| {
+                if self.in_pane {
+                    this.bg(conversation_background(cx))
+                        .child(self.render_conversation_toolbar(cx))
+                        .children(self.render_agent_chips(cx))
+                        .child(self.render_transcript_section(window, cx))
+                        .children(self.render_activity())
+                        .children(
+                            self.render_terminal(cx)
+                                .or_else(|| self.render_pane_mirror(cx)),
+                        )
+                        .child(self.render_input(cx))
+                } else {
+                    this.child(self.render_session_section(cx))
+                }
+            })
     }
 }
 
@@ -2248,6 +3311,51 @@ impl Focusable for ClaudeSessionsPanel {
 }
 
 impl EventEmitter<PanelEvent> for ClaudeSessionsPanel {}
+
+/// Emitted when the tab's name is out of date, which is whenever the selected session
+/// changes — the tab is named after the conversation it holds.
+pub struct ItemNameChanged;
+
+impl EventEmitter<ItemNameChanged> for ClaudeSessionsPanel {}
+
+/// Lets the same view be opened as a tab in the editor area, where a conversation has
+/// the width of a pane to be read at. The tab is the same element tree as the dock
+/// panel, input included, rather than a second rendering of the transcript to keep in
+/// step with this one.
+impl Item for ClaudeSessionsPanel {
+    type Event = ItemNameChanged;
+
+    fn to_item_events(_event: &Self::Event, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
+        f(workspace::item::ItemEvent::UpdateTab);
+    }
+
+    /// The tab holds one conversation, so it is named after that session rather than
+    /// after the panel. Selecting another session in the dock renames it, because both
+    /// views read the same store.
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        let store = self.store.read(cx);
+        let selected = store.selected();
+        store
+            .sessions()
+            .iter()
+            .find(|session| selected == Some(session.process_id))
+            .map(|session| {
+                let name = session
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| session.session_id.clone());
+                match session.tmux_target.as_deref().and_then(tmux_session_name) {
+                    Some(tmux_session) => SharedString::from(format!("[{tmux_session}] {name}")),
+                    None => SharedString::from(name),
+                }
+            })
+            .unwrap_or_else(|| "Claude Sessions".into())
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::AiClaude))
+    }
+}
 
 impl Panel for ClaudeSessionsPanel {
     fn persistent_name() -> &'static str {
@@ -2280,10 +3388,10 @@ impl Panel for ClaudeSessionsPanel {
     ) {
         settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
             let dock = match position {
-                DockPosition::Left => DockSide::Left,
+                DockPosition::Right => DockSide::Right,
                 // `position_is_valid` refuses the bottom dock, so this is only reached by
-                // a caller that ignored it; the right-hand side is the default.
-                DockPosition::Right | DockPosition::Bottom => DockSide::Right,
+                // a caller that ignored it; the left-hand side is the default.
+                DockPosition::Left | DockPosition::Bottom => DockSide::Left,
             };
             settings.claude_sessions.get_or_insert_default().dock = Some(dock);
         });
@@ -2487,6 +3595,12 @@ impl PendingSends {
         self.sends.retain(|send| !paired.contains(&send.id));
     }
 
+    /// Whether one of these is the same message as `text`, which is how a queue entry
+    /// read from the log is recognised as one of these rather than a second message.
+    fn holds_text(&self, text: &str) -> bool {
+        self.sends.iter().any(|send| send.text == text)
+    }
+
     fn entries(&self) -> Vec<Entry> {
         self.sends
             .iter()
@@ -2517,6 +3631,7 @@ fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
             EntryKind::Message {
                 role: MessageRole::User,
                 source,
+                ..
             } => Some((entry.key.clone(), source.clone())),
             // A slash command is the user's message too, and it is what a send of
             // `/compact` turns into.
@@ -3010,8 +4125,81 @@ fn dock_position(dock: DockSide) -> DockPosition {
     }
 }
 
+/// The ground the conversation is read against: darker than the editor's own, which
+/// separates a tab of messages from a tab of code and gives the tinted code blocks
+/// inside it something to sit on.
+///
+/// Only a dark theme is darkened. The same shift applied to a light one would turn its
+/// background grey without making anything easier to read.
+fn conversation_background(cx: &App) -> Hsla {
+    let editor_background = cx.theme().colors().editor_background;
+    match cx.theme().appearance() {
+        Appearance::Dark => editor_background.blend(gpui::black().opacity(0.4)),
+        Appearance::Light => editor_background,
+    }
+}
+
+/// Makes the conversation read as markdown rather than as flat text: headings carry
+/// weight as well as size, code is tinted apart from prose, and a quote is marked by an
+/// accent instead of by the same border colour as every other rule in the panel.
+///
+/// Refined here rather than in [`MarkdownStyle::themed`], which the agent panel shares.
+/// The sizes stay below the markdown preview's: this is a conversation of many short
+/// messages, and preview-sized headings would leave little room for the prose under them.
 fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
-    MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+    let colors = cx.theme().colors();
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+
+    let heading = |font_size: Rems, font_weight: FontWeight| TextStyleRefinement {
+        font_size: Some(font_size.into()),
+        font_weight: Some(font_weight),
+        line_height: Some(relative(1.3)),
+        ..Default::default()
+    };
+    style.heading_level_styles = Some(HeadingLevelStyles {
+        h1: Some(heading(rems(1.3), FontWeight::BOLD)),
+        h2: Some(heading(rems(1.15), FontWeight::BOLD)),
+        h3: Some(heading(rems(1.05), FontWeight::SEMIBOLD)),
+        h4: Some(heading(rems(1.), FontWeight::SEMIBOLD)),
+        h5: Some(heading(rems(0.95), FontWeight::SEMIBOLD)),
+        h6: Some(heading(rems(0.875), FontWeight::SEMIBOLD)),
+    });
+    style.heading.margin.top = Some(Length::Definite(px(12.).into()));
+    style.heading.margin.bottom = Some(Length::Definite(px(4.).into()));
+
+    // Inline code is a span of text, so its background is all it can be given — neither
+    // padding nor a corner radius reaches a `TextStyleRefinement`. The accent colour is
+    // what separates it from the prose around it at a glance.
+    style.inline_code.color = Some(colors.text_accent);
+
+    let corner_radius = AbsoluteLength::Pixels(px(6.));
+    style.code_block.corner_radii.top_left = Some(corner_radius);
+    style.code_block.corner_radii.top_right = Some(corner_radius);
+    style.code_block.corner_radii.bottom_left = Some(corner_radius);
+    style.code_block.corner_radii.bottom_right = Some(corner_radius);
+
+    // The themed line height is 1.75 times the *buffer* font size while this text is set
+    // at the larger UI font size, which leaves the lines of a paragraph nearly touching.
+    // Relative to the text's own size instead, so that changing either font size keeps
+    // the same rhythm.
+    style.base_text_style.line_height = relative(CONVERSATION_LINE_HEIGHT);
+    style.paragraph_line_height = relative(CONVERSATION_LINE_HEIGHT);
+
+    // A blank line between paragraphs has to read as a blank line. The themed spacing is
+    // a flat 8px against lines that are around 24px tall, so two paragraphs ran together
+    // as though the second were a wrapped continuation of the first. One line's height is
+    // exactly what the author typed — an empty line — so that is what it is set to.
+    let line =
+        style.base_text_style.font_size.to_pixels(window.rem_size()) * CONVERSATION_LINE_HEIGHT;
+    style.paragraph_spacing = line;
+
+    style.block_quote.color = Some(colors.text_muted);
+    style.block_quote_border_color = colors.text_accent.opacity(0.4);
+
+    // Top-level list items run into each other without it.
+    style.list_spacing = px(4.);
+
+    style
 }
 
 /// A tool's output is drawn inside the panel's own framed card, so the code block that
@@ -3077,7 +4265,42 @@ fn append_record(
     attachments: &mut Vec<AttachmentItem>,
     cache: &mut EntryCache,
 ) {
+    // Context Claude Code injected into the turn rather than anything either side said:
+    // a skill's instructions, an expanded command, the output of a hook. These carry the
+    // user's own role and can run to tens of thousands of lines, so drawn as messages
+    // they bury the conversation they were injected into.
+    if record
+        .raw
+        .get("isMeta")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
     if record.record_type == ATTACHMENT_RECORD_TYPE {
+        // A message typed while the session was answering is the reader's own, and
+        // belongs in the conversation where they typed it rather than in the folded
+        // context section beside the attachments Claude Code injected.
+        //
+        // It is recorded as an attachment because of when it arrived: the user record it
+        // would have been is written when the turn it was queued behind finishes, and it
+        // is written with no content at all — the text is only here. Drawn from the
+        // attachment, and skipped as an empty record there, the message appears once.
+        if let Some(prompt) = queued_command_prompt(record) {
+            let cache_key = cache_key(record, &base_key);
+            let kind = cache.kind(cache_key.as_ref(), || EntryKind::Message {
+                role: MessageRole::User,
+                source: prompt,
+                usage: None,
+            });
+            entries.push(Entry {
+                key: base_key,
+                kind,
+            });
+            return;
+        }
+
         let cache_key = cache_key(record, &base_key);
         attachments.push(cache.attachment(cache_key.as_ref(), || {
             attachment_item(record, base_key.clone(), home_directory)
@@ -3104,6 +4327,7 @@ fn append_record(
             });
             return;
         }
+        Some(TURN_DURATION_SUBTYPE) => return,
         Some(LOCAL_COMMAND_SUBTYPE) => {
             let cache_key = cache_key(record, &base_key);
             let kind = cache.kind(cache_key.as_ref(), || {
@@ -3240,6 +4464,7 @@ fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
     Some(EntryKind::Message {
         role,
         source: SharedString::from(source),
+        usage: Usage::from_record(&record.raw),
     })
 }
 
@@ -3393,6 +4618,37 @@ fn unknown_kind(record_type: &str, subtype: Option<&str>, value: &Value) -> Entr
         label: SharedString::from(label),
         raw: SharedString::from(json_text(value)),
     }
+}
+
+/// The text of a message that was queued behind a running turn, or `None` for every
+/// other attachment.
+fn queued_command_prompt(record: &TranscriptRecord) -> Option<SharedString> {
+    let attachment = record.raw.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str)? != QUEUED_COMMAND_ATTACHMENT {
+        return None;
+    }
+
+    // A message with an image in it is recorded as content blocks rather than as a
+    // string, and the blocks hold the image's base64 as well as the text. Only the text
+    // is taken: read as a string the whole thing is skipped, and drawn whole it would be
+    // a screenful of encoded image.
+    let prompt = match attachment.get("prompt")? {
+        Value::String(prompt) => prompt.trim().to_string(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => return None,
+    };
+
+    // Same rule as the conversation's own records: a queued `<task-notification>` is the
+    // CLI telling itself a background command finished, not a message anyone typed.
+    // Same rule as the conversation's own records: a queued `<task-notification>` is the
+    // CLI telling itself a background command finished, not a message anyone typed.
+    user_visible_text(&prompt).map(SharedString::from)
 }
 
 fn attachment_item(
@@ -4098,8 +5354,9 @@ mod tests {
     }
 
     /// The dock side the user dragged the panel to has to be there after a restart, and
-    /// nothing the panel holds itself outlives one. The default stays the right-hand
-    /// dock: the left one already holds the project panel.
+    /// nothing the panel holds itself outlives one. The default is the left-hand dock:
+    /// the project panel defaults to the right one, and two panels sharing a dock take
+    /// turns being the visible one instead of being readable side by side.
     #[gpui::test]
     async fn the_dock_side_is_read_from_the_settings(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4108,20 +5365,20 @@ mod tests {
 
             assert_eq!(
                 ClaudeSessionsSettings::get_global(cx).dock,
-                DockSide::Right,
-                "the right-hand dock is the only one the project panel is not already in"
+                DockSide::Left,
+                "the left-hand dock is the one the project panel is not already in"
             );
 
             <settings::SettingsStore as gpui::UpdateGlobal>::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |content| {
-                    content.claude_sessions.get_or_insert_default().dock = Some(DockSide::Left);
+                    content.claude_sessions.get_or_insert_default().dock = Some(DockSide::Right);
                 });
             });
 
             assert_eq!(
                 ClaudeSessionsSettings::get_global(cx).dock,
-                DockSide::Left,
-                "the side in the settings is the side the panel opens on"
+                DockSide::Right,
+                "the side in the settings is the side the panel opens on, not the default"
             );
         });
     }
@@ -4402,6 +5659,269 @@ mod tests {
         );
     }
 
+    /// Claude Code's own total is preferred because it prices every model it ran; the
+    /// derived one is marked so that a reader can tell which they are looking at.
+    #[test]
+    fn the_reported_total_wins_and_a_derived_one_says_so() {
+        let mut spend = Spend {
+            model: Some("claude-opus-5".into()),
+            usage: Usage {
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            session_cost(&spend).as_deref(),
+            Some("~$25"),
+            "derived from the token counts, and marked as derived"
+        );
+
+        spend.reported = Some(crate::transcript::ReportedCost {
+            total_usd: 173.309_849_25,
+            ..Default::default()
+        });
+        assert_eq!(
+            session_cost(&spend).as_deref(),
+            Some("$173"),
+            "Claude Code's own figure, unmarked"
+        );
+    }
+
+    /// The two figures count different things — an answer's is the whole request, a
+    /// compaction's is the conversation it kept — so the jump from one to the other has to
+    /// be explained where it is shown or it reads as the panel having been wrong.
+    #[test]
+    fn a_context_read_from_a_compaction_says_so() {
+        let measured = Spend {
+            context_tokens: 94_578,
+            ..Default::default()
+        };
+        assert!(
+            session_facts(&measured).contains(&SharedString::from("94K ctx")),
+            "a measured context is stated plainly: {:?}",
+            session_facts(&measured)
+        );
+
+        let compacted = Spend {
+            context_tokens: 14_846,
+            context_is_post_compaction: true,
+            ..Default::default()
+        };
+        assert!(
+            session_facts(&compacted).contains(&SharedString::from("14K ctx (compacted)")),
+            "and one left by a compaction is marked: {:?}",
+            session_facts(&compacted)
+        );
+    }
+
+    /// A model with no known rates must produce no figure rather than a wrong one.
+    #[test]
+    fn a_session_on_an_unknown_model_shows_no_cost() {
+        let spend = Spend {
+            model: Some("some-unreleased-model".into()),
+            usage: Usage {
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(session_cost(&spend), None);
+        assert!(
+            !session_facts(&spend).iter().any(|fact| fact.contains('$')),
+            "and nothing in the toolbar claims a price: {:?}",
+            session_facts(&spend)
+        );
+    }
+
+    /// The three kinds of input are priced twenty-fold apart, so a single "in" figure
+    /// said nothing about where an answer's money went.
+    #[test]
+    fn the_cost_line_names_each_kind_of_input() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        // The shape a real answer has: almost nothing fresh, a large cache read, and a
+        // cache write when the conversation grew since the last one.
+        let usage = Usage {
+            input_tokens: 2,
+            cache_read_tokens: 29_592,
+            cache_write_1h_tokens: 27_456,
+            cache_write_5m_tokens: 0,
+            output_tokens: 488,
+            thinking_tokens: 335,
+        };
+
+        assert_eq!(
+            answer_summary(usage, rates),
+            // The cache write dominates: 27,456 tokens at twice the input rate is
+            // $0.275 of the $0.302, while the 29,592 read tokens are $0.015.
+            "$0.30 · 2 in · 29K cache read · 27K cache write · 488 out · (335 thinking)"
+        );
+    }
+
+    /// Most answers only read from the cache, and a line of zeroes reads as noise.
+    #[test]
+    fn the_cost_line_leaves_out_what_an_answer_did_not_use() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        let usage = Usage {
+            cache_read_tokens: 100_000,
+            output_tokens: 50,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            answer_summary(usage, rates),
+            "$0.05 · 100K cache read · 50 out",
+            "no fresh input, no cache write, and no thinking to report"
+        );
+    }
+
+    /// Every registered process is alive, because `updatedAt` is not a heartbeat and a
+    /// quiet session cannot be filtered out for being quiet. So the row has to say which
+    /// ones have sat untouched, and stay quiet about the ones simply between turns.
+    #[test]
+    fn only_a_session_left_sitting_reports_how_long() {
+        const MINUTE: i64 = 60 * 1000;
+        const HOUR: i64 = 60 * MINUTE;
+        let now = 1_789_000_000_000;
+
+        assert_eq!(
+            idle_for(Some(now - 30 * 1000), now),
+            None,
+            "half a minute is a session between turns"
+        );
+        assert_eq!(
+            idle_for(Some(now - 9 * MINUTE), now),
+            None,
+            "and so is nine minutes"
+        );
+        assert_eq!(
+            idle_for(Some(now - 45 * MINUTE), now).as_deref(),
+            Some("idle 45m")
+        );
+        assert_eq!(
+            idle_for(Some(now - 33 * HOUR), now).as_deref(),
+            Some("idle 33h")
+        );
+        assert_eq!(
+            idle_for(Some(now - 58 * HOUR), now).as_deref(),
+            Some("idle 2d"),
+            "past a day the hours stop being the useful unit"
+        );
+        assert_eq!(
+            idle_for(None, now),
+            None,
+            "a registration with no timestamp says nothing rather than claiming zero"
+        );
+    }
+
+    #[test]
+    fn small_amounts_keep_their_cents() {
+        assert_eq!(format_usd(0.004), "$0.00");
+        assert_eq!(format_usd(0.42), "$0.42");
+        assert_eq!(format_usd(9.99), "$9.99");
+        assert_eq!(format_usd(10.4), "$10", "above ten the cents are noise");
+        assert_eq!(format_usd(141.75), "$142");
+    }
+
+    #[test]
+    fn token_counts_read_as_a_reader_reads_them() {
+        assert_eq!(compact_token_count(0), "0");
+        assert_eq!(compact_token_count(9_999), "9999");
+        assert_eq!(compact_token_count(534_777), "534K");
+        assert_eq!(compact_token_count(2_300_000), "2.3M");
+    }
+
+    /// A message typed while the session was answering. Claude Code records the text
+    /// only in a `queued_command` attachment, and writes the user record it belongs to
+    /// with empty content, so the reader's own words were drawn nowhere in the
+    /// conversation — they were folded into the context section with the injected
+    /// attachments, and the record that should have carried them was skipped as empty.
+    #[test]
+    fn a_message_queued_behind_a_turn_is_drawn_as_the_readers_own() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"what I asked first"}}"#,
+            r#"{"type":"attachment","uuid":"b","parentUuid":"a",
+"attachment":{"type":"queued_command","prompt":"and this while it was busy"}}"#,
+            // The record the queued message belongs to, as Claude Code writes it.
+            r#"{"type":"user","uuid":"c","parentUuid":"b","message":{"content":""}}"#,
+        ]);
+
+        let messages = message_sources(&entries);
+        assert_eq!(
+            messages,
+            vec![
+                SharedString::from("what I asked first"),
+                SharedString::from("and this while it was busy"),
+            ],
+            "the queued message is one of the reader's messages, in the order they typed \
+             it, and is drawn exactly once"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Attachments { .. })),
+            "it is not context injected around the turn, so it does not fold into that \
+             section"
+        );
+    }
+
+    /// Context Claude Code injects into a turn — a skill's instructions, an expanded
+    /// command — carries the user's own role and can run to tens of thousands of lines.
+    #[test]
+    fn injected_context_is_not_drawn_as_a_message() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"what I typed"}}"#,
+            r#"{"type":"user","uuid":"b","parentUuid":"a","isMeta":true,
+"message":{"content":"Base directory for this skill: ..."}}"#,
+        ]);
+
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("what I typed")],
+            "only what the reader typed is theirs"
+        );
+    }
+
+    /// A background command reporting in is queued the same way a message typed mid-turn
+    /// is, so the panel drew the CLI's own `<task-notification>` block as words the reader
+    /// had typed — several screenfuls of them over a long session.
+    #[test]
+    fn a_queued_task_notification_is_not_drawn_as_a_message() {
+        let entries = entries_of(&[
+            r#"{"type":"attachment","uuid":"a","parentUuid":"z","attachment":{
+"type":"queued_command","commandMode":"task-notification","prompt":
+"<task-notification>\n<task-id>byygs214e</task-id>\n<status>completed</status>\n</task-notification>"}}"#,
+            r#"{"type":"attachment","uuid":"b","parentUuid":"a","attachment":{
+"type":"queued_command","prompt":"and this is mine"}}"#,
+        ]);
+
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("and this is mine")],
+            "the notification is the CLI's, and only the typed message is the reader's"
+        );
+    }
+
+    /// A queued message with an image in it is recorded as content blocks, and the blocks
+    /// carry the image's base64 beside the text.
+    #[test]
+    fn a_queued_message_with_an_image_is_drawn_from_its_text() {
+        let entries = entries_of(&[
+            r#"{"type":"attachment","uuid":"a","parentUuid":"z","attachment":{
+"type":"queued_command","prompt":[
+{"type":"text","text":"look at this"},
+{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBB"}}]}}"#,
+        ]);
+
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("look at this")],
+            "the text is the message; the encoded image is not part of it"
+        );
+    }
+
     #[test]
     fn attachments_collapse_into_one_section_at_the_top() {
         let entries = entries_of(&[
@@ -4417,6 +5937,30 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label.as_ref(), "environment");
         assert_eq!(items[1].body.as_ref(), "diag text");
+    }
+
+    /// The one record the CLI writes onto the conversation's chain with no content of
+    /// any kind: drawn as unrecognized JSON, it was the largest block in the
+    /// conversation and said only how many milliseconds the turn took.
+    #[test]
+    fn a_turn_duration_record_is_left_out_of_the_conversation() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"hello"}}"#,
+            r#"{"type":"system","subtype":"turn_duration","uuid":"b","parentUuid":"a",
+"durationMs":162711,"messageCount":1177}"#,
+        ]);
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "the timing record has nothing for a reader and must not be drawn at all, \
+             but the conversation around it is kept; entry keys: {:?}",
+            entries.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(entries[0].kind, EntryKind::Message { .. }),
+            "the message before it is what is left"
+        );
     }
 
     #[test]
@@ -6471,6 +8015,9 @@ mod tests {
                         bridge_session_id: None,
                     },
                     transcript_path: Some(self.home_directory.join("session.jsonl")),
+                    // Read from the end of a real transcript, which these tests write by
+                    // hand and never through that reader.
+                    spend: None,
                 }],
                 home_directory: self.home_directory.clone(),
             }))
@@ -6538,6 +8085,10 @@ mod tests {
                 "nothing in these tests may reach a session"
             )))
         }
+
+        fn capture_pane(&self, _pane_target: String) -> Task<anyhow::Result<String>> {
+            Task::ready(Ok(String::new()))
+        }
     }
 
     /// A root view for the test window. The panel is never drawn: these tests are about
@@ -6596,6 +8147,13 @@ mod tests {
                         source,
                         message_editor,
                         project_root: None,
+                        in_pane: false,
+                        pane_expanded: true,
+                        terminal: None,
+                        terminal_process_id: None,
+                        terminal_height: DEFAULT_TERMINAL_HEIGHT,
+                        input_expanded: false,
+                        _terminal_attach: Task::ready(()),
                         entries: Vec::new(),
                         pending_sends: PendingSends::default(),
                         activity: Activity::Idle,
@@ -6603,8 +8161,11 @@ mod tests {
                         list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
                         session_list_expanded: true,
                         unread_below: UnreadBelow::default(),
+                        scrolled_to_end: true,
                         expanded: HashSet::default(),
                         show_full_history: false,
+                        show_tool_calls: false,
+                        show_costs: false,
                         markdowns: HashMap::default(),
                         entry_cache: EntryCache::default(),
                         cached_transcript_generation: 0,
