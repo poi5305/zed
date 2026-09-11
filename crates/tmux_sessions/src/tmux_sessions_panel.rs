@@ -7,29 +7,33 @@ use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::terminal_panel::TerminalPanel;
-use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{Disclosure, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use remote::tmux_sessions::list_tmux_sessions;
+
 use crate::{ToggleFocus, tmux_attach_command};
 
 const TMUX_SESSIONS_PANEL_KEY: &str = "TmuxSessionsPanel";
 
-const NOT_REMOTE: &str = "Open a remote project to list the tmux sessions running on that host.";
+const TMUX_MISSING_REMOTE: &str = "No tmux binary was found on the remote host.";
 
-const TMUX_MISSING: &str = "No tmux binary was found on the remote host.";
+const TMUX_MISSING_LOCAL: &str = "No tmux binary was found on this machine.";
 
-const NO_SESSIONS: &str = "No tmux sessions are running on the remote host.";
+const NO_SESSIONS_REMOTE: &str = "No tmux sessions are running on the remote host.";
+
+const NO_SESSIONS_LOCAL: &str = "No tmux sessions are running on this machine.";
 
 pub struct TmuxSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     position: DockPosition,
-    /// `None` when the window is open on a local project, which has no remote
-    /// host to ask.
+    /// `None` when the window is open on a local project, whose tmux server is
+    /// listed by running tmux here rather than by asking a remote host.
     remote_client: Option<AnyProtoClient>,
     sessions: Vec<proto::TmuxSession>,
     /// False only when the remote host has no tmux binary; a host with tmux
@@ -83,42 +87,66 @@ impl TmuxSessionsPanel {
         })
     }
 
+    /// Lists the tmux server of whichever machine the project is open on: the
+    /// remote host through its server, a local project by running tmux here.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.remote_client.clone() else {
-            self.sessions.clear();
-            self.loading = false;
-            cx.notify();
-            return;
-        };
-
-        let response = client.request(proto::ListTmuxSessions {
-            project_id: rpc::proto::REMOTE_SERVER_PROJECT_ID,
-        });
         self.loading = true;
         self.error = None;
-        self._refresh = cx.spawn(async move |this, cx| {
-            let response = response.await;
-            this.update(cx, |this, cx| {
-                this.loading = false;
-                match response {
-                    Ok(response) => {
-                        this.tmux_available = response.tmux_available;
-                        this.sessions = response.sessions;
-                        // A session that went away should not keep its name in
-                        // the expanded set forever.
-                        let names: HashSet<String> = this
-                            .sessions
-                            .iter()
-                            .map(|session| session.name.clone())
-                            .collect();
-                        this.expanded_sessions.retain(|name| names.contains(name));
-                    }
-                    Err(error) => this.error = Some(error.to_string().into()),
-                }
-                cx.notify();
-            })
-            .log_err();
-        });
+        self._refresh = match self.remote_client.clone() {
+            Some(client) => {
+                let response = client.request(proto::ListTmuxSessions {
+                    project_id: rpc::proto::REMOTE_SERVER_PROJECT_ID,
+                });
+                cx.spawn(async move |this, cx| {
+                    let listing = response
+                        .await
+                        .map(|response| (response.tmux_available, response.sessions));
+                    this.update(cx, |this, cx| this.apply_listing(listing, cx))
+                        .log_err();
+                })
+            }
+            None => {
+                // Listing shells out twice, so it is kept off the thread that
+                // draws the window.
+                let listing = cx.background_spawn(list_tmux_sessions());
+                cx.spawn(async move |this, cx| {
+                    let listing = listing.await.map(|listing| {
+                        (
+                            listing.tmux_available,
+                            listing.sessions.into_iter().map(proto_session).collect(),
+                        )
+                    });
+                    this.update(cx, |this, cx| this.apply_listing(listing, cx))
+                        .log_err();
+                })
+            }
+        };
+        cx.notify();
+    }
+
+    /// The tail both listing paths share, so that there is one place the panel's
+    /// state is brought up to date from a listing rather than two.
+    fn apply_listing(
+        &mut self,
+        listing: anyhow::Result<(bool, Vec<proto::TmuxSession>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading = false;
+        match listing {
+            Ok((tmux_available, sessions)) => {
+                self.tmux_available = tmux_available;
+                self.sessions = sessions;
+                // A session that went away should not keep its name in the
+                // expanded set forever.
+                let names: HashSet<String> = self
+                    .sessions
+                    .iter()
+                    .map(|session| session.name.clone())
+                    .collect();
+                self.expanded_sessions.retain(|name| names.contains(name));
+            }
+            Err(error) => self.error = Some(error.to_string().into()),
+        }
         cx.notify();
     }
 
@@ -188,7 +216,7 @@ impl TmuxSessionsPanel {
             .child(
                 IconButton::new("tmux-sessions-refresh", IconName::RotateCw)
                     .icon_size(IconSize::Small)
-                    .disabled(self.remote_client.is_none() || self.loading)
+                    .disabled(self.loading)
                     .tooltip(Tooltip::text("Refresh"))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
@@ -201,14 +229,32 @@ impl TmuxSessionsPanel {
         let window_count = session.window_count;
         let attached = session.attached;
 
+        // The disclosure is a child of the row rather than `ListItem::toggle`,
+        // which draws it at `left(rems(-1.))` — outside a row whose indent level
+        // is zero, where the panel clips it. `ButtonLike` stops click
+        // propagation, so toggling here does not also attach to the session.
         let header = ListItem::new(SharedString::from(format!("tmux-session-{index}")))
             .spacing(ListItemSpacing::Sparse)
-            .toggle(expanded)
-            .on_toggle(cx.listener({
-                let name = name.clone();
-                move |this, _, _, cx| this.toggle_session(&name, cx)
-            }))
-            .start_slot(Icon::new(IconName::Terminal).size(IconSize::Small))
+            .start_slot(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Disclosure::new(
+                            SharedString::from(format!("tmux-session-toggle-{index}")),
+                            expanded,
+                        )
+                        .tooltip(Tooltip::text(if expanded {
+                            "Hide windows"
+                        } else {
+                            "Show windows"
+                        }))
+                        .on_click(cx.listener({
+                            let name = name.clone();
+                            move |this, _, _, cx| this.toggle_session(&name, cx)
+                        })),
+                    )
+                    .child(Icon::new(IconName::Terminal).size(IconSize::Small)),
+            )
             .child(
                 h_flex()
                     .gap_1()
@@ -291,17 +337,24 @@ impl TmuxSessionsPanel {
         )
     }
 
-    /// What to show instead of the tree: there is always a reason a remote host
-    /// has nothing to list, and a blank panel does not say which one it is.
+    /// What to show instead of the tree: there is always a reason a host has
+    /// nothing to list, and a blank panel does not say which one it is. Which
+    /// machine was asked is part of that reason, so the message names it.
     fn empty_message(&self) -> Option<&'static str> {
-        if self.remote_client.is_none() {
-            return Some(NOT_REMOTE);
-        }
+        let remote = self.remote_client.is_some();
         if !self.tmux_available {
-            return Some(TMUX_MISSING);
+            return Some(if remote {
+                TMUX_MISSING_REMOTE
+            } else {
+                TMUX_MISSING_LOCAL
+            });
         }
         if self.sessions.is_empty() {
-            return Some(NO_SESSIONS);
+            return Some(if remote {
+                NO_SESSIONS_REMOTE
+            } else {
+                NO_SESSIONS_LOCAL
+            });
         }
         None
     }
@@ -383,9 +436,8 @@ impl Panel for TmuxSessionsPanel {
         px(300.)
     }
 
-    /// Hidden on a local project, which has no remote host to list tmux on.
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        self.remote_client.as_ref().map(|_| IconName::TerminalAlt)
+        Some(IconName::TerminalAlt)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -404,5 +456,24 @@ impl Panel for TmuxSessionsPanel {
         if active {
             self.refresh(cx);
         }
+    }
+}
+
+/// The panel holds the proto shape for both listing paths, so that the rendering
+/// reads one type no matter which machine the sessions came from.
+fn proto_session(session: remote::tmux_sessions::TmuxSession) -> proto::TmuxSession {
+    proto::TmuxSession {
+        name: session.name,
+        attached: session.attached,
+        window_count: session.window_count,
+        windows: session
+            .windows
+            .into_iter()
+            .map(|window| proto::TmuxWindow {
+                index: window.index,
+                name: window.name,
+                active: window.active,
+            })
+            .collect(),
     }
 }

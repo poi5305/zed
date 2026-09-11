@@ -1756,6 +1756,9 @@
     "bindings": {
       "enter": "claude_sessions::SendMessage",
       "shift-enter": "editor::Newline",
+      // The button beside the input is labelled "Esc"; without this the key it names
+      // does nothing.
+      "escape": "claude_sessions::Interrupt",
     },
   },
 ]

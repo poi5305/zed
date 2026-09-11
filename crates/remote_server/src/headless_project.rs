@@ -311,6 +311,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
+        session.add_request_handler(cx.weak_entity(), Self::handle_capture_claude_pane);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -1431,6 +1432,8 @@ impl HeadlessProject {
                     transcript_path: summary
                         .transcript_path
                         .map(|transcript_path| transcript_path.to_string_lossy().into_owned()),
+                    context_tokens: summary.spend.map(|spend| spend.context_tokens).unwrap_or(0),
+                    total_cost_usd: summary.spend.and_then(|spend| spend.total_cost_usd),
                 })
                 .collect(),
             home_directory: home_directory.to_string_lossy().into_owned(),
@@ -1578,6 +1581,30 @@ impl HeadlessProject {
         })
     }
 
+    async fn handle_capture_claude_pane(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CaptureClaudePane>,
+        cx: AsyncApp,
+    ) -> Result<proto::CaptureClaudePaneResponse> {
+        // Sanitized before it reaches tmux, exactly as a send's target is: this drives
+        // the same command with a value that came over the connection.
+        let Some(pane_target) = remote::claude_sessions::pane_target(&envelope.payload.pane_target)
+        else {
+            anyhow::bail!(
+                "invalid tmux pane target: {:?}",
+                envelope.payload.pane_target
+            );
+        };
+        // Shells out, so it is kept off the thread that serves the rest of the session.
+        let contents = cx
+            .background_spawn(
+                async move { remote::claude_sessions::capture_pane(&pane_target).await },
+            )
+            .await?;
+
+        Ok(proto::CaptureClaudePaneResponse { contents })
+    }
+
     async fn handle_send_claude_input(
         _this: Entity<Self>,
         envelope: TypedEnvelope<proto::SendClaudeInput>,
@@ -1599,6 +1626,13 @@ impl HeadlessProject {
                 }
                 Some(proto::send_claude_input::Input::Escape(_)) => {
                     remote::claude_sessions::send_escape(&sanitized_pane_target).await?;
+                }
+                Some(proto::send_claude_input::Input::Key(key)) => {
+                    // The set is closed here as well as at the sender: a key name that
+                    // crossed the connection is not one this host wrote.
+                    let key = remote::claude_sessions::PaneKey::from_tmux_name(&key)
+                        .with_context(|| format!("unknown pane key {key:?}"))?;
+                    remote::claude_sessions::send_key(&sanitized_pane_target, key).await?;
                 }
                 None => anyhow::bail!("no input provided in SendClaudeInput"),
             }

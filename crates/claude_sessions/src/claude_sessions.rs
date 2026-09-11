@@ -6,18 +6,17 @@ mod blind_registry_tests;
 mod blind_subagent_tests;
 #[cfg(test)]
 mod blind_transcript_tests;
-mod claude_sessions_button;
 mod claude_sessions_panel;
 mod session_source;
 mod session_store;
 mod transcript;
+mod usage;
 
 use gpui::{App, actions};
 use serde::Deserialize;
 use settings::{DockSide, RegisterSetting, Settings};
 use workspace::Workspace;
 
-pub use claude_sessions_button::ClaudeSessionsButton;
 pub use claude_sessions_panel::ClaudeSessionsPanel;
 // The registry parsing and liveness rules live in `remote`, so that the remote server can
 // run them without depending on this crate's UI. The alias keeps the path this crate's
@@ -29,6 +28,7 @@ pub use session_source::{
 };
 pub use session_store::{ClaudeSessionStore, TranscriptTarget};
 pub use transcript::{CompactMetadata, Transcript, TranscriptRecord};
+pub use usage::{ModelRates, Usage, rates_for_model};
 
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that
 /// the side the user dragged it to is still there after a restart — the same place every
@@ -41,15 +41,15 @@ pub struct ClaudeSessionsSettings {
 impl Settings for ClaudeSessionsSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self {
-            // The right-hand dock is the default because the left one already holds the
-            // project panel and the project manager panel, and the point of this one is
-            // to be readable beside them. A settings file too old to carry the key at
-            // all gets that same answer rather than a panic.
+            // The left-hand dock is the default because the project panel defaults to the
+            // right one, and a panel sharing a dock with it would take turns being the
+            // visible one rather than being readable beside it. A settings file too old
+            // to carry the key at all gets that same answer rather than a panic.
             dock: content
                 .claude_sessions
                 .as_ref()
                 .and_then(|claude_sessions| claude_sessions.dock)
-                .unwrap_or(DockSide::Right),
+                .unwrap_or(DockSide::Left),
         }
     }
 }
@@ -62,7 +62,9 @@ actions!(
         /// Sends the message to the selected Claude Code session.
         SendMessage,
         /// Interrupts the selected Claude Code session, as Escape does in the terminal.
-        Interrupt
+        Interrupt,
+        /// Opens the Claude sessions conversation as a tab in the editor area.
+        OpenInEditor
     ]
 );
 
@@ -70,6 +72,9 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ClaudeSessionsPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenInEditor, window, cx| {
+            ClaudeSessionsPanel::open_in_pane(workspace, window, cx);
         });
     })
     .detach();

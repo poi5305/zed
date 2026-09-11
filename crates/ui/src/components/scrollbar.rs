@@ -388,6 +388,7 @@ pub struct Scrollbars<T: ScrollableHandle = ScrollHandle> {
     style: Option<ScrollbarStyle>,
     reveal_policy: ScrollbarRevealPolicy,
     track_color: Option<Hsla>,
+    thumb_color: Option<Hsla>,
     border: bool,
 }
 
@@ -416,6 +417,7 @@ impl Scrollbars {
             style: None,
             reveal_policy: ScrollbarRevealPolicy::default(),
             track_color: None,
+            thumb_color: None,
             border: false,
         }
     }
@@ -456,6 +458,7 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
             visibility,
             get_visibility,
             track_color,
+            thumb_color,
             border,
             style,
             reveal_policy,
@@ -468,6 +471,7 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
             tracked_entity: tracked_entity_id,
             visibility,
             track_color,
+            thumb_color,
             border,
             get_visibility,
             style,
@@ -477,6 +481,14 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
 
     pub fn show_along(mut self, along: ScrollAxes) -> Self {
         self.visibility = along.apply_to(self.visibility, ReservedSpace::Thumb);
+        self
+    }
+
+    /// Draws the thumb in `color` rather than in the theme's scrollbar colors, for a
+    /// scrollbar that has to be told apart from the others on screen. The hover and drag
+    /// states are derived from it so that it still answers to the pointer.
+    pub fn thumb_color(mut self, color: Hsla) -> Self {
+        self.thumb_color = Some(color);
         self
     }
 
@@ -649,6 +661,8 @@ struct ScrollbarState<T: ScrollableHandle = ScrollHandle> {
     get_visibility: fn(&App) -> ShowScrollbar,
     visibility: Point<ReservedSpace>,
     track_color: Option<TrackColors>,
+    /// Overrides the theme's thumb colors; see [`Scrollbars::thumb_color`].
+    thumb_color: Option<Hsla>,
     reveal_policy: ScrollbarRevealPolicy,
     show_state: VisibilityState,
     style: ScrollbarStyle,
@@ -675,6 +689,7 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
                 background: color,
                 has_border: config.border,
             }),
+            thumb_color: config.thumb_color,
             show_behavior,
             get_visibility: config.get_visibility,
             style: config.style.unwrap_or_default(),
@@ -1421,6 +1436,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                 let state = self.state.read(cx);
                 let thumb_state = &state.thumb_state;
                 let style = state.style;
+                let thumb_override = state.thumb_color;
 
                 if thumb_state.is_dragging() {
                     capture_phase = DispatchPhase::Capture;
@@ -1439,13 +1455,22 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                 {
                     const MAXIMUM_OPACITY: f32 = 0.7;
                     let (thumb_base_color, hovered) = match thumb_state {
-                        ThumbState::Dragging(dragged_axis, _) if dragged_axis == axis => {
-                            (colors.scrollbar_thumb_active_background, false)
-                        }
-                        ThumbState::Hover(hovered_axis) if hovered_axis == axis => {
-                            (colors.scrollbar_thumb_hover_background, true)
-                        }
-                        _ => (colors.scrollbar_thumb_background, false),
+                        ThumbState::Dragging(dragged_axis, _) if dragged_axis == axis => (
+                            thumb_override.unwrap_or(colors.scrollbar_thumb_active_background),
+                            false,
+                        ),
+                        ThumbState::Hover(hovered_axis) if hovered_axis == axis => (
+                            thumb_override.unwrap_or(colors.scrollbar_thumb_hover_background),
+                            true,
+                        ),
+                        _ => (
+                            // Faded when idle so that an overridden colour is as quiet as
+                            // the theme's own thumb is until it is reached for.
+                            thumb_override
+                                .map(|color| color.opacity(0.6))
+                                .unwrap_or(colors.scrollbar_thumb_background),
+                            false,
+                        ),
                     };
 
                     let blend_color = track_config

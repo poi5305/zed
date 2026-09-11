@@ -434,6 +434,116 @@ fn read_appended_lines(
     })
 }
 
+/// The record Claude Code writes when it compacts a conversation, which says how much
+/// context the compaction left behind.
+const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
+
+/// How much of a transcript's end is read to find what the session is costing. Large
+/// enough to hold the last few dozen records — an answer's usage and one of Claude Code's
+/// cost snapshots are both within a handful of records of the end — and small enough to
+/// read for every listed session on every scan of a directory of multi-megabyte files.
+const SPEND_TAIL_BYTES: u64 = 256 * 1024;
+
+/// What a session is costing, as the end of its transcript reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TranscriptSpend {
+    /// The context the newest answer was given: what was sent fresh, plus what was read
+    /// from the cache, plus what was written into it.
+    pub context_tokens: u64,
+    /// Claude Code's own total for the session, when one of its `cost-state` snapshots is
+    /// within the tail that was read.
+    ///
+    /// `None` rather than a figure derived from the tail's own token counts: those cover
+    /// only the answers in the tail, and a total that is silently partial is worse than
+    /// no total at all.
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Reads the end of a transcript for what its session is costing.
+///
+/// Only the end of it. This is read for every session in the list on every scan, and a
+/// transcript is megabytes of conversation whose last few records hold both answers.
+pub fn read_transcript_spend(path: &Path) -> Result<TranscriptSpend> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("reading metadata of {}", path.display()))?
+        .len();
+
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let offset = size.saturating_sub(SPEND_TAIL_BYTES);
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking in {}", path.display()))?;
+
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)
+        .with_context(|| format!("reading {}", path.display()))?;
+
+    let text = String::from_utf8_lossy(&tail);
+    let mut lines = text.lines();
+    if offset > 0 {
+        // The read began mid-file, so the first line is whatever it landed in the middle
+        // of rather than a record.
+        lines.next();
+    }
+
+    Ok(spend_in_lines(lines))
+}
+
+/// The newest answer's context and the newest cost snapshot among `lines`.
+fn spend_in_lines<'a>(lines: impl Iterator<Item = &'a str>) -> TranscriptSpend {
+    let mut spend = TranscriptSpend::default();
+
+    for line in lines {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if let Some(total) = record
+            .get("totalCostUSD")
+            .and_then(serde_json::Value::as_f64)
+        {
+            spend.total_cost_usd = Some(total);
+            continue;
+        }
+
+        // A compaction replaces the conversation the next answer will be given, so the
+        // context the last answer measured is no longer what the session carries.
+        // `postTokens` counts the conversation the compaction kept and not the system
+        // prompt, tool definitions or skills that the next request re-sends, so it reads
+        // low until that request measures the whole context and supersedes it below.
+        if record.get("subtype").and_then(serde_json::Value::as_str)
+            == Some(COMPACT_BOUNDARY_SUBTYPE)
+        {
+            if let Some(post_tokens) = record
+                .get("compactMetadata")
+                .and_then(|metadata| metadata.get("postTokens"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                spend.context_tokens = post_tokens;
+            }
+            continue;
+        }
+
+        let Some(usage) = record
+            .get("message")
+            .and_then(|message| message.get("usage"))
+        else {
+            continue;
+        };
+        let tokens = |key: &str| -> u64 {
+            usage
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        // Later lines are newer, so the last answer in the tail is the one that stands.
+        spend.context_tokens = tokens("input_tokens")
+            .saturating_add(tokens("cache_read_input_tokens"))
+            .saturating_add(tokens("cache_creation_input_tokens"));
+    }
+
+    spend
+}
+
 /// Splits every complete line out of `buffer`, leaving any trailing partial line behind.
 ///
 /// The buffer holds bytes rather than text because a read can stop in the middle of a
@@ -462,6 +572,10 @@ pub fn split_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
 pub struct SessionSummary {
     pub session: RegisteredSession,
     pub transcript_path: Option<PathBuf>,
+    /// What the end of the session's transcript says it is costing. `None` when there is
+    /// no transcript yet, or when reading its tail failed — a listing is still worth
+    /// having without it.
+    pub spend: Option<TranscriptSpend>,
 }
 
 /// Scans the registry under `home_directory`, keeps the sessions whose process is still
@@ -502,9 +616,15 @@ pub async fn list_sessions(
         .into_iter()
         .map(|session| {
             let transcript_path = find_transcript(home_directory, &session.session_id);
+            // Read for every session on every scan, which is why only the end of each
+            // file is read; see `read_transcript_spend`.
+            let spend = transcript_path
+                .as_deref()
+                .and_then(|path| read_transcript_spend(path).log_err());
             SessionSummary {
                 session,
                 transcript_path,
+                spend,
             }
         })
         .collect())
@@ -771,6 +891,17 @@ fn workflow_run_id(candidate: &str) -> Option<&str> {
     single_path_component(candidate)
 }
 
+/// The name of the tmux session a registration's `tmux` field points into.
+///
+/// The field is shaped `session:@window.%pane`, and `:` is tmux's own separator between
+/// a session and the window inside it, so a session name can never contain one and
+/// everything before the first is the name. Only read for display — sends and captures
+/// address the pane by its id; see [`pane_target`].
+pub fn tmux_session_name(tmux_field: &str) -> Option<&str> {
+    let name = tmux_field.split(':').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
 /// The pane a registration's `tmux` field names, as a target `tmux` accepts.
 ///
 /// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. Only the pane id
@@ -884,12 +1015,91 @@ pub async fn send_text(pane_target: &str, text: &str) -> Result<()> {
 }
 
 /// Interrupts whatever the session is doing, which is what Escape means to Claude Code.
+/// The keys a prompt drawn in a session's pane can be answered with.
+///
+/// An enum rather than a key name, so that nothing but these three can reach
+/// `tmux send-keys`: the caller is a UI button, and a pane that accepts arbitrary key
+/// names from one would accept whatever a registration could be made to carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneKey {
+    Up,
+    Down,
+    Enter,
+}
+
+impl PaneKey {
+    /// The name tmux knows the key by.
+    pub fn tmux_name(self) -> &'static str {
+        match self {
+            PaneKey::Up => "Up",
+            PaneKey::Down => "Down",
+            PaneKey::Enter => "Enter",
+        }
+    }
+
+    /// Reads back what [`Self::tmux_name`] wrote. `None` for anything else, which is what
+    /// keeps the set closed when the name has crossed a connection.
+    pub fn from_tmux_name(name: &str) -> Option<Self> {
+        match name {
+            "Up" => Some(PaneKey::Up),
+            "Down" => Some(PaneKey::Down),
+            "Enter" => Some(PaneKey::Enter),
+            _ => None,
+        }
+    }
+}
+
+/// Answers a prompt drawn in the pane, by sending it one of the keys it is waiting for.
+pub async fn send_key(pane_target: &str, key: PaneKey) -> Result<()> {
+    if pane_target.is_empty() {
+        anyhow::bail!("no tmux pane to send to");
+    }
+
+    run_tmux(&["send-keys", "-t", pane_target, key.tmux_name()]).await
+}
+
+/// The visible contents of a session's tmux pane, top line first.
+///
+/// This is the only way to read what Claude Code draws but never records: a prompt
+/// waiting for an answer, the messages queued behind the running turn, and the status
+/// line. `-p` writes the pane to stdout; only the visible screen is taken, because the
+/// scrollback behind it is the conversation, which is read from the transcript instead.
+pub async fn capture_pane(pane_target: &str) -> Result<String> {
+    if pane_target.is_empty() {
+        anyhow::bail!("no tmux pane to capture");
+    }
+
+    let output = capture_tmux(&["capture-pane", "-p", "-t", pane_target]).await?;
+    Ok(output)
+}
+
 pub async fn send_escape(pane_target: &str) -> Result<()> {
     if pane_target.is_empty() {
         anyhow::bail!("no tmux pane to send to");
     }
 
     run_tmux(&["send-keys", "-t", pane_target, "Escape"]).await
+}
+
+/// Like [`run_tmux`], but hands back what tmux wrote rather than only whether it
+/// succeeded.
+async fn capture_tmux(arguments: &[&str]) -> Result<String> {
+    let mut command = util::command::new_command("tmux");
+    command.args(arguments);
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("running tmux {}", arguments.join(" ")))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Every argument is passed as its own `argv` entry, never through a shell, so that no
@@ -973,6 +1183,113 @@ async fn run_with_stdin(program: &str, arguments: &[&str], stdin_contents: &[u8]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// A row showing the context of the answer before a compaction says the session is
+    /// holding a conversation it has already dropped.
+    #[test]
+    fn a_compaction_in_the_tail_replaces_the_context_before_it() {
+        let compacted = spend_in_lines(
+            [
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":679693,"cache_creation_input_tokens":198,"output_tokens":10}}}"#,
+                r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":680651,"postTokens":14846}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            compacted.context_tokens, 14846,
+            "what the compaction kept, not the 680K the answer before it was given"
+        );
+
+        let answered_since = spend_in_lines(
+            [
+                r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":680651,"postTokens":14846}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":94576,"cache_creation_input_tokens":9982,"output_tokens":10}}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            answered_since.context_tokens, 104_560,
+            "an answer measured the whole request, which supersedes the compaction"
+        );
+    }
+
+    /// The newest answer's context wins, and a partial cost total is not reported at
+    /// all — the tail covers only the answers inside it.
+    #[test]
+    fn the_tail_reports_the_newest_answer_and_only_a_whole_total() {
+        let spend = spend_in_lines(
+            [
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":1000,"cache_creation_input_tokens":500,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":9000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#,
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(
+            spend.context_tokens, 9003,
+            "the newest answer's context, not the largest or the sum"
+        );
+        assert_eq!(
+            spend.total_cost_usd, None,
+            "no cost snapshot in the tail means no total, not a partial one"
+        );
+    }
+
+    #[test]
+    fn a_cost_snapshot_in_the_tail_is_the_total() {
+        let spend = spend_in_lines(
+            [
+                r#"{"type":"cost-state","totalCostUSD":12.5,"hasUnknownModelCost":false}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":7,"output_tokens":2}}}"#,
+                r#"{"type":"cost-state","totalCostUSD":13.75,"hasUnknownModelCost":false}"#,
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(
+            spend.total_cost_usd,
+            Some(13.75),
+            "the newest snapshot stands; each one is a total of the whole session"
+        );
+        assert_eq!(spend.context_tokens, 8);
+    }
+
+    /// A transcript is read mid-write and a tail begins mid-line, so unparseable lines
+    /// are ordinary rather than exceptional.
+    #[test]
+    fn lines_that_are_not_records_are_skipped() {
+        let spend = spend_in_lines(
+            [
+                r#"tokens":{"input_tokens":999}}} <- the half line a tail can begin with"#,
+                "",
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(spend.context_tokens, 4);
+    }
+
+    #[test]
+    fn the_tmux_session_name_is_everything_before_the_first_separator() {
+        assert_eq!(tmux_session_name("zed:@6.%8"), Some("zed"));
+        assert_eq!(
+            tmux_session_name("my work:@1.%1"),
+            Some("my work"),
+            "a name may hold anything but tmux's own separator, spaces included"
+        );
+        assert_eq!(
+            tmux_session_name("solo"),
+            Some("solo"),
+            "a field with no separator is the name on its own"
+        );
+        assert_eq!(
+            tmux_session_name(":@6.%8"),
+            None,
+            "an empty name is no name, not an empty label"
+        );
+        assert_eq!(tmux_session_name(""), None);
+    }
 
     const SAMPLE_ONE_JSON: &str = r#"{"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
  "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,

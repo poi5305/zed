@@ -85,6 +85,7 @@ pub enum IconName {
     Copy,
     CountdownTimer,
     Crosshair,
+    CurrencyDollar,
     CursorIBeam,
     Dash,
     DatabaseZap,

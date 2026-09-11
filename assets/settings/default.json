@@ -857,7 +857,7 @@
   "resize_all_panels_in_dock": ["left"],
   "claude_sessions": {
     // Where to dock the Claude sessions panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
   },
   "project_panel": {
     // Whether to show the project panel button in the status bar

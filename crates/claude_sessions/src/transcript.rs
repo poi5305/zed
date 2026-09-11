@@ -10,12 +10,21 @@
 //!
 //! This module performs no file I/O; it only consumes lines and records.
 
+use crate::usage::Usage;
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
+use gpui::SharedString;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::VecDeque;
 
 const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
+
+/// The log Claude Code writes for the messages queued behind a running turn.
+const QUEUE_OPERATION_RECORD_TYPE: &str = "queue-operation";
+
+/// Claude Code's own accounting of what the session has cost.
+const COST_STATE_RECORD_TYPE: &str = "cost-state";
 
 #[derive(Debug, Clone)]
 pub struct TranscriptRecord {
@@ -105,6 +114,9 @@ pub fn parse_record(line: &str) -> Result<Option<TranscriptRecord>> {
 
 pub struct Transcript {
     records: Vec<TranscriptRecord>,
+    /// The messages waiting behind the turn that is running, oldest first; see
+    /// [`Self::queued_messages`].
+    queued: VecDeque<SharedString>,
     index_by_uuid: HashMap<String, usize>,
     leaf_uuid: Option<String>,
     overwritten_uuids: Vec<String>,
@@ -135,6 +147,7 @@ impl Transcript {
     fn with_reading(reads_sidechain: bool) -> Self {
         Self {
             records: Vec::new(),
+            queued: VecDeque::new(),
             index_by_uuid: HashMap::default(),
             leaf_uuid: None,
             overwritten_uuids: Vec::new(),
@@ -145,6 +158,11 @@ impl Transcript {
     /// Absorbs records in file order. Safe to call repeatedly as the file grows.
     pub fn absorb(&mut self, records: impl IntoIterator<Item = TranscriptRecord>) {
         for record in records {
+            // Applied as the record arrives rather than replayed on demand: these have no
+            // uuid, so they are only ever appended and never rewritten, which makes the
+            // queue a running total rather than something to recompute.
+            self.apply_queue_operation(&record);
+
             let Some(uuid) = record.uuid.clone() else {
                 // Records such as `mode`, `last-prompt` and `ai-title` have no uuid, so
                 // nothing can reference them and they can never be a leaf.
@@ -174,6 +192,119 @@ impl Transcript {
                     self.records.push(record);
                 }
             }
+        }
+    }
+
+    /// What the session has spent and how it is configured, read from its own answers.
+    ///
+    /// Totalled over every answer in the file rather than over the conversation on
+    /// screen: compaction shortens that, and a bill does not shrink because the history
+    /// behind it was summarised. Walked on each call rather than accumulated, because an
+    /// answer's record is rewritten as it streams — adding each one as it arrived would
+    /// count the same answer many times.
+    pub fn spend(&self) -> Spend {
+        let mut spend = Spend::default();
+        for record in &self.records {
+            // Claude Code's own accounting, written as a snapshot of the whole session,
+            // so the newest one is the answer and the ones before it are history. It is
+            // preferred over the total derived from token counts: it is the CLI's own
+            // figure, and it prices models this code may not know the rates for.
+            if record.record_type == COST_STATE_RECORD_TYPE {
+                spend.reported = ReportedCost::from_record(&record.raw);
+                continue;
+            }
+
+            // A compaction replaces the conversation the next answer will be given, so
+            // the context the last answer measured is no longer what the session carries.
+            // `postTokens` is Claude Code's own figure for what it kept, and it counts
+            // the conversation alone: the system prompt, the tool definitions and the
+            // skills are re-sent on the next request, so it reads low until that request
+            // measures the whole context and supersedes it below.
+            if record.subtype.as_deref() == Some(COMPACT_BOUNDARY_SUBTYPE) {
+                if let Some(post_tokens) = record
+                    .compact_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.post_tokens)
+                {
+                    spend.context_tokens = post_tokens;
+                    spend.context_is_post_compaction = true;
+                }
+                continue;
+            }
+
+            let Some(usage) = Usage::from_record(&record.raw) else {
+                continue;
+            };
+            spend.usage = spend.usage.add(usage);
+            spend.answers = spend.answers.saturating_add(1);
+            // The newest answer's own numbers, which say how the session is running now
+            // rather than how it ran across the whole file.
+            spend.context_tokens = usage.context_tokens();
+            spend.context_is_post_compaction = false;
+            if let Some(model) = record
+                .raw
+                .get("message")
+                .and_then(|message| message.get("model"))
+                .and_then(Value::as_str)
+            {
+                spend.model = Some(SharedString::from(model.to_string()));
+            }
+            if let Some(effort) = record.raw.get("effort").and_then(Value::as_str) {
+                spend.effort = Some(SharedString::from(effort.to_string()));
+            }
+        }
+        spend
+    }
+
+    /// The messages the user typed while a turn was running and that have not been taken
+    /// into one yet, oldest first.
+    ///
+    /// Claude Code writes a line of a queue log for every change to the queue and
+    /// nothing that states what it holds, so this is the log played forward. The
+    /// operations are:
+    ///
+    /// - `enqueue` — the text arrived and is waiting.
+    /// - `remove` — that text left the queue, with a `reason` for why.
+    /// - `dequeue` — the oldest went into a turn; it carries no text of its own.
+    /// - `popAll` — the queue was taken whole.
+    pub fn queued_messages(&self) -> &VecDeque<SharedString> {
+        &self.queued
+    }
+
+    fn apply_queue_operation(&mut self, record: &TranscriptRecord) {
+        if record.record_type != QUEUE_OPERATION_RECORD_TYPE {
+            return;
+        }
+        let content = record
+            .raw
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|content| !content.is_empty());
+
+        match record.raw.get("operation").and_then(Value::as_str) {
+            Some("enqueue") => {
+                if let Some(content) = content {
+                    self.queued
+                        .push_back(SharedString::from(content.to_string()));
+                }
+            }
+            // The text says which one left, because a queue can hold more than one and
+            // the one removed is not always the oldest.
+            Some("remove") => {
+                if let Some(content) = content
+                    && let Some(position) = self.queued.iter().position(|queued| queued == content)
+                {
+                    self.queued.remove(position);
+                }
+            }
+            Some("dequeue") => {
+                self.queued.pop_front();
+            }
+            Some("popAll") => self.queued.clear(),
+            // An operation this does not know cannot be applied, and guessing at it would
+            // leave the queue saying something untrue for the rest of the session.
+            _ => {}
         }
     }
 
@@ -285,6 +416,60 @@ mod tests {
         transcript
     }
 
+    /// The queue log is the only statement of what is waiting: no record says what the
+    /// queue holds, so every operation has to be applied or the answer drifts and stays
+    /// wrong for the rest of the session.
+    #[test]
+    fn the_queue_log_played_forward_is_what_is_waiting() {
+        let transcript = transcript(&[
+            r#"{"type":"queue-operation","operation":"enqueue","content":"first"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"enqueue","content":"second"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"enqueue","content":"third"}"#.to_string(),
+            // Names the one that left, which need not be the oldest.
+            r#"{"type":"queue-operation","operation":"remove","content":"second",
+"reason":"absorbed_mid_turn"}"#
+                .to_string(),
+            // Carries no text: the oldest went into a turn.
+            r#"{"type":"queue-operation","operation":"dequeue"}"#.to_string(),
+        ]);
+
+        assert_eq!(
+            transcript.queued_messages().iter().collect::<Vec<_>>(),
+            vec![&SharedString::from("third")],
+            "first was dequeued into a turn and second was removed by name"
+        );
+    }
+
+    #[test]
+    fn taking_the_queue_whole_empties_it() {
+        let transcript = transcript(&[
+            r#"{"type":"queue-operation","operation":"enqueue","content":"a"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"enqueue","content":"b"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"popAll","content":"a and b"}"#.to_string(),
+        ]);
+
+        assert!(
+            transcript.queued_messages().is_empty(),
+            "popAll took both, so nothing is still waiting: {:?}",
+            transcript.queued_messages()
+        );
+    }
+
+    /// An operation this code does not know cannot be applied, and applying it as a
+    /// guess would leave the queue wrong for every message after it.
+    #[test]
+    fn an_unknown_queue_operation_leaves_the_queue_alone() {
+        let transcript = transcript(&[
+            r#"{"type":"queue-operation","operation":"enqueue","content":"kept"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"reshuffle","content":"kept"}"#.to_string(),
+        ]);
+
+        assert_eq!(
+            transcript.queued_messages().iter().collect::<Vec<_>>(),
+            vec![&SharedString::from("kept")]
+        );
+    }
+
     fn uuids(path: &[&TranscriptRecord]) -> Vec<String> {
         path.iter()
             .map(|record| record.uuid.clone().unwrap_or_else(|| "<none>".to_string()))
@@ -313,6 +498,55 @@ mod tests {
         format!(
             r#"{{"type":"user","uuid":"{uuid}","parentUuid":"{parent}","isCompactSummary":true}}"#
         )
+    }
+
+    /// The context an answer measured stops being what the session carries the moment a
+    /// compaction drops the conversation behind it. Read from the compaction until the
+    /// next answer measures the whole request again, because a figure six times too large
+    /// is what a reader would otherwise be told the session is holding.
+    #[test]
+    fn a_compaction_says_what_context_is_left_until_the_next_answer() {
+        let answer = |uuid: &str, parent: &str, context: u64| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","parentUuid":"{parent}","message":{{"model":"claude-opus-5","usage":{{"input_tokens":2,"cache_read_input_tokens":{context},"output_tokens":10}}}}}}"#
+            )
+        };
+
+        let before = transcript(&[answer("a", "start", 680_000)]);
+        assert_eq!(before.spend().context_tokens, 680_002);
+        assert!(
+            !before.spend().context_is_post_compaction,
+            "an answer measured it, so nothing is estimated"
+        );
+
+        let compacted = transcript(&[
+            answer("a", "start", 680_000),
+            boundary("b", "a", "manual"),
+            summary("c", "b"),
+        ]);
+        assert_eq!(
+            compacted.spend().context_tokens,
+            16995,
+            "the compaction's own postTokens, not the 680K the last answer was given"
+        );
+        assert!(
+            compacted.spend().context_is_post_compaction,
+            "and it is marked, because it counts the kept conversation and not the whole \
+             request the next answer will be given"
+        );
+
+        let answered_since = transcript(&[
+            answer("a", "start", 680_000),
+            boundary("b", "a", "manual"),
+            summary("c", "b"),
+            answer("d", "c", 94_576),
+        ]);
+        assert_eq!(
+            answered_since.spend().context_tokens,
+            94_578,
+            "a measured answer supersedes the compaction's figure"
+        );
+        assert!(!answered_since.spend().context_is_post_compaction);
     }
 
     #[test]
@@ -746,5 +980,68 @@ mod tests {
         // reported: nothing can be keyed on it.
         transcript.absorb([record(r#"{"type":"mode"}"#), record(r#"{"type":"mode"}"#)]);
         assert_eq!(transcript.overwritten_uuids(), expected(&["b"]));
+    }
+}
+
+/// What a session has spent, and how the model answering it is configured.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Spend {
+    /// Totalled over every answer in the file.
+    pub usage: Usage,
+    /// What Claude Code itself reported, when it has written a `cost-state` record for
+    /// this session yet. Shown in preference to the total derived from `usage`.
+    pub reported: Option<ReportedCost>,
+    /// How many answers that total covers.
+    pub answers: u64,
+    /// The context the newest answer was given, which is the size the next one starts
+    /// from. After a compaction that no answer has followed yet, what the compaction says
+    /// it kept; see `context_is_post_compaction`.
+    pub context_tokens: u64,
+    /// Whether `context_tokens` came from a compaction rather than from an answer. Said
+    /// because the two count different things: an answer's usage is the whole request,
+    /// and a compaction's figure is the conversation it kept, without the system prompt,
+    /// the tool definitions or the skills that the next request re-sends. It reads far
+    /// below what that request will measure, so it is marked where it is shown.
+    pub context_is_post_compaction: bool,
+    /// Read from the newest answer that named one, so that a session whose model or
+    /// effort changed part-way reports what it is on now.
+    pub model: Option<SharedString>,
+    pub effort: Option<SharedString>,
+}
+
+/// What Claude Code itself says the session has cost, read from its `cost-state` record.
+///
+/// Preferred over any total derived from token counts: the CLI knows the rates for every
+/// model it ran, including ones this code has no rates for. `has_unknown_model_cost`
+/// carries its own admission that a figure is incomplete, and is passed on rather than
+/// hidden.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReportedCost {
+    pub total_usd: f64,
+    pub has_unknown_model_cost: bool,
+    /// Milliseconds spent waiting on the API, retries included.
+    pub api_duration_ms: u64,
+    /// Milliseconds spent running tools.
+    pub tool_duration_ms: u64,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+}
+
+impl ReportedCost {
+    fn from_record(raw: &Value) -> Option<Self> {
+        let total_usd = raw.get("totalCostUSD").and_then(Value::as_f64)?;
+        let number = |key: &str| raw.get(key).and_then(Value::as_u64).unwrap_or(0);
+
+        Some(Self {
+            total_usd,
+            has_unknown_model_cost: raw
+                .get("hasUnknownModelCost")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            api_duration_ms: number("totalAPIDuration"),
+            tool_duration_ms: number("totalToolDuration"),
+            lines_added: number("totalLinesAdded"),
+            lines_removed: number("totalLinesRemoved"),
+        })
     }
 }

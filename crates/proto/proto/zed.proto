@@ -541,7 +541,9 @@ message Envelope {
     ReadClaudeFileResponse read_claude_file_response = 506;
     SendClaudeInput send_claude_input = 507;
     ListClaudeSubagents list_claude_subagents = 508;
-    ListClaudeSubagentsResponse list_claude_subagents_response = 509; // current max
+    ListClaudeSubagentsResponse list_claude_subagents_response = 509;
+    CaptureClaudePane capture_claude_pane = 510;
+    CaptureClaudePaneResponse capture_claude_pane_response = 511; // current max
   }
 
   reserved 87 to 88;

@@ -20,8 +20,8 @@ use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
 
 use crate::session_registry::{
-    self, RegisteredSession, SessionSummary, SubagentMeta, SubagentSummary, TailProgress,
-    TailState, read_subagent_transcript_tail, read_transcript_tail,
+    self, PaneKey, RegisteredSession, SessionSummary, SubagentMeta, SubagentSummary, TailProgress,
+    TailState, TranscriptSpend, read_subagent_transcript_tail, read_transcript_tail,
 };
 
 /// What the user asked to send to a session. `Escape` carries no text because it is an
@@ -29,6 +29,8 @@ use crate::session_registry::{
 pub enum SessionInput {
     Text(String),
     Escape,
+    /// Answers a prompt the CLI has drawn in the pane. See [`PaneKey`].
+    Key(PaneKey),
 }
 
 /// The prefix of a file that was read, and whether the file went on past it.
@@ -73,6 +75,10 @@ pub trait SessionSource: Send + Sync + 'static {
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>>;
 
     fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>>;
+
+    /// The visible contents of the session's tmux pane, which is where Claude Code draws
+    /// what it never writes to the transcript.
+    fn capture_pane(&self, pane_target: String) -> Task<Result<String>>;
 }
 
 /// The sessions running on the machine Zed itself is running on.
@@ -145,8 +151,14 @@ impl SessionSource for LocalSource {
             match input {
                 SessionInput::Text(text) => session_registry::send_text(&pane_target, &text).await,
                 SessionInput::Escape => session_registry::send_escape(&pane_target).await,
+                SessionInput::Key(key) => session_registry::send_key(&pane_target, key).await,
             }
         })
+    }
+
+    fn capture_pane(&self, pane_target: String) -> Task<Result<String>> {
+        self.executor
+            .spawn(async move { session_registry::capture_pane(&pane_target).await })
     }
 }
 
@@ -250,6 +262,16 @@ impl SessionSource for RemoteSource {
         })
     }
 
+    fn capture_pane(&self, pane_target: String) -> Task<Result<String>> {
+        let request = self.client.request(proto::CaptureClaudePane {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            pane_target,
+        });
+
+        self.executor
+            .spawn(async move { Ok(request.await?.contents) })
+    }
+
     fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>> {
         let request = self.client.request(proto::SendClaudeInput {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
@@ -259,6 +281,9 @@ impl SessionSource for RemoteSource {
                 // The variant is the whole message; the boolean it carries only exists
                 // because a protobuf `oneof` arm must have a type.
                 SessionInput::Escape => proto::send_claude_input::Input::Escape(true),
+                SessionInput::Key(key) => {
+                    proto::send_claude_input::Input::Key(key.tmux_name().to_string())
+                }
             }),
         });
 
@@ -321,6 +346,14 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
             bridge_session_id: None,
         },
         transcript_path: session.transcript_path.map(PathBuf::from),
+        // Zero context means the far end found no answer to read, which is the same
+        // thing as having nothing to report.
+        spend: (session.context_tokens > 0 || session.total_cost_usd.is_some()).then_some(
+            TranscriptSpend {
+                context_tokens: session.context_tokens,
+                total_cost_usd: session.total_cost_usd,
+            },
+        ),
     }
 }
 
@@ -396,6 +429,8 @@ mod tests {
             updated_at: Some(1_759_000_000_000),
             tmux_target: Some("main:@3.%7".to_string()),
             transcript_path: Some("/home/andy/.claude/projects/p/abc-123.jsonl".to_string()),
+            context_tokens: 0,
+            total_cost_usd: None,
         }
     }
 

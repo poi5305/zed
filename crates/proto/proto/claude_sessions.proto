@@ -12,6 +12,11 @@ message ClaudeSession {
   optional int64 updated_at = 7;
   optional string tmux_target = 8;
   optional string transcript_path = 9;
+  // The context the session's newest answer was given. Zero when its transcript holds no
+  // answer yet.
+  uint64 context_tokens = 10;
+  // Claude Code's own total for the session, when it has written one.
+  optional double total_cost_usd = 11;
 }
 
 // Request to list Claude Code sessions on the remote host.
@@ -90,6 +95,18 @@ message ReadClaudeFileResponse {
   bool truncated = 2;
 }
 
+// Request the visible contents of a Claude Code session's tmux pane. The CLI draws
+// several things there that it never writes to the transcript: a prompt waiting to be
+// answered, the messages queued behind the turn it is running, and its status line.
+message CaptureClaudePane {
+  uint64 project_id = 1;
+  string pane_target = 2;
+}
+
+message CaptureClaudePaneResponse {
+  string contents = 1;
+}
+
 // Request to send text or an Escape keypress to a Claude Code session's tmux pane.
 message SendClaudeInput {
   uint64 project_id = 1;
@@ -97,5 +114,7 @@ message SendClaudeInput {
   oneof input {
     string text = 3;
     bool escape = 4;
+    // One of the key names `PaneKey` writes; anything else is refused by the host.
+    string key = 5;
   }
 }
