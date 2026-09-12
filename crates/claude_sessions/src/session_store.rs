@@ -19,7 +19,8 @@ use util::ResultExt as _;
 
 use crate::{
     session_registry::{
-        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend, pane_target,
+        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend,
+        attach_arguments, pane_target,
     },
     session_source::{SessionInput, SessionListing, SessionSource},
     transcript::{Transcript, parse_record},
@@ -344,6 +345,14 @@ impl ClaudeSessionStore {
     pub fn pane_target(&self) -> Option<String> {
         let session = self.selected_session()?;
         pane_target(session.tmux_target.as_deref()?)
+    }
+
+    /// The tmux invocation that shows the selected session's own window in a terminal,
+    /// or `None` when there is no selection or no pane to show. What it attaches is a
+    /// mirror of the session rather than the session itself; see [`attach_arguments`].
+    pub fn attach_arguments(&self) -> Option<Vec<String>> {
+        let session = self.selected_session()?;
+        attach_arguments(session.tmux_target.as_deref()?)
     }
 
     /// Sends to the selected session. Only ever called from a user gesture: nothing in
