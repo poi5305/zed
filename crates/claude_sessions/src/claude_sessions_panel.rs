@@ -1076,7 +1076,7 @@ impl ClaudeSessionsPanel {
             cx.notify();
             return;
         };
-        let Some(pane_target) = self.store.read(cx).pane_target() else {
+        let Some(arguments) = self.store.read(cx).attach_arguments() else {
             cx.notify();
             return;
         };
@@ -1087,15 +1087,15 @@ impl ClaudeSessionsPanel {
 
         // `command` is spawned as a program with `args`, never through a shell, so the
         // two are kept apart here: a whole command line in `command` is looked up as one
-        // file name and never found. It also means the pane id reaches tmux as its own
+        // file name and never found. It also means every target reaches tmux as its own
         // argument, with no quoting to get right.
-        let label = format!("tmux attach -t {pane_target}");
+        let label = format!("tmux {}", arguments.join(" "));
         let spawn = SpawnInTerminal {
             id: TaskId(format!("claude-session-attach-{process_id}")),
             full_label: label.clone(),
             label: label.clone(),
             command: Some("tmux".to_string()),
-            args: vec!["attach".to_string(), "-t".to_string(), pane_target],
+            args: arguments,
             command_label: label,
             use_new_terminal: true,
             allow_concurrent_runs: true,
