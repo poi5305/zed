@@ -552,7 +552,11 @@ message Envelope {
     InstallClaudeQuestionHook install_claude_question_hook = 517;
     InstallClaudeQuestionHookResponse install_claude_question_hook_response = 518;
     ListClaudeSlashCommands list_claude_slash_commands = 519;
-    ListClaudeSlashCommandsResponse list_claude_slash_commands_response = 520; // current max
+    ListClaudeSlashCommandsResponse list_claude_slash_commands_response = 520;
+    ListClaudeSessionFiles list_claude_session_files = 521;
+    ListClaudeSessionFilesResponse list_claude_session_files_response = 522;
+    WriteClaudeSessionFile write_claude_session_file = 523;
+    WriteClaudeSessionFileResponse write_claude_session_file_response = 524; // current max
   }
 
   reserved 87 to 88;

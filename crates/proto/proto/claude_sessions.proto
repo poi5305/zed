@@ -196,3 +196,27 @@ message SendClaudeInput {
     string key = 5;
   }
 }
+
+// Request the paths under a session's working directory that a partly typed `@` names.
+message ListClaudeSessionFiles {
+  uint64 project_id = 1;
+  string directory = 2;
+  string query = 3;
+}
+
+message ListClaudeSessionFilesResponse {
+  repeated string paths = 1;
+}
+
+// Request that a file pasted into the message box be written where the session can read
+// it. The host decides where; only the name is taken from here, and only its last
+// component.
+message WriteClaudeSessionFile {
+  uint64 project_id = 1;
+  string name = 2;
+  bytes contents = 3;
+}
+
+message WriteClaudeSessionFileResponse {
+  string path = 1;
+}
