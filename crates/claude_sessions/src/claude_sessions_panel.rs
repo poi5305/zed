@@ -363,6 +363,57 @@ fn compact_token_count(tokens: u64) -> String {
     }
 }
 
+/// A step through the commands menu, or none at all when the highlight is only being
+/// read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuStep {
+    Up,
+    Down,
+    Stay,
+}
+
+/// Where the highlight lands after `step`, over a menu of `offered` rows.
+///
+/// The highlight is kept as a plain index rather than as the command it names, because
+/// the menu is rebuilt from what is typed on every keystroke — so it is clamped here
+/// rather than trusted: a row that was highlighted before the name was typed out further
+/// can be past the end of what is left.
+fn step_through_menu(highlighted: usize, offered: usize, step: MenuStep) -> usize {
+    let Some(last) = offered.checked_sub(1) else {
+        return 0;
+    };
+    let highlighted = highlighted.min(last);
+
+    // Held at both ends rather than wrapped: a menu that jumps from its last row to its
+    // first reads as having lost the keypress.
+    match step {
+        MenuStep::Up => highlighted.saturating_sub(1),
+        MenuStep::Down => highlighted.saturating_add(1).min(last),
+        MenuStep::Stay => highlighted,
+    }
+}
+
+/// What Enter does while the commands menu is open.
+#[derive(Debug, PartialEq, Eq)]
+enum EnterInMenu {
+    /// Put this command in the box: what is typed does not name it in full yet.
+    Complete(String),
+    /// Send what is typed, which is already the whole command.
+    Send,
+}
+
+fn enter_in_slash_menu(typed: &str, highlighted: &SlashCommand) -> EnterInMenu {
+    // A command that takes arguments is not whole when its name is: what it is about has
+    // still to be typed, so Enter fills the name in and leaves the reader there.
+    let whole = highlighted.argument_hint.is_none()
+        && typed.strip_prefix('/') == Some(highlighted.name.as_str());
+    if whole {
+        EnterInMenu::Send
+    } else {
+        EnterInMenu::Complete(highlighted.name.clone())
+    }
+}
+
 /// Which way the arrow key moves the cursor when the box holds a draft rather than a
 /// recalled message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +671,13 @@ pub struct ClaudeSessionsPanel {
     /// The call the reader chose to answer in their own words rather than by picking, so
     /// that choosing it for one question does not leave the next one waiting for typing.
     typing_answer_for: Option<SharedString>,
+    /// Which row of the commands menu the arrow keys are on. Kept as an index rather
+    /// than as the command it names, because the menu is rebuilt from what is typed on
+    /// every keystroke; see [`step_through_menu`].
+    slash_highlight: usize,
+    /// The text the commands menu was closed at, so that Escape can put it away without
+    /// taking what is typed with it — and so that typing on brings it back.
+    dismissed_slash_menu_for: Option<String>,
     /// The slash commands the selected session answers to, as the machine it runs on last
     /// listed them. Read once per session rather than per keystroke: the files behind
     /// them change far less often than the reader types.
@@ -1232,6 +1290,8 @@ impl ClaudeSessionsPanel {
             quit_armed: false,
             ticked: None,
             typing_answer_for: None,
+            slash_highlight: 0,
+            dismissed_slash_menu_for: None,
             slash_commands: Vec::new(),
             _listing_slash_commands: Task::ready(()),
             _answering: Task::ready(()),
@@ -1436,6 +1496,10 @@ impl ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.step_through_slash_menu(MenuStep::Up, cx) {
+            return;
+        }
+
         let history = message_history(&self.entries);
         let typed = self.message_editor.read(cx).text(cx);
         let step = step_back_through_history(&history, self.history_index, &typed);
@@ -1449,10 +1513,43 @@ impl ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.step_through_slash_menu(MenuStep::Down, cx) {
+            return;
+        }
+
         let history = message_history(&self.entries);
         let typed = self.message_editor.read(cx).text(cx);
         let step = step_forward_through_history(&history, self.history_index, &typed);
         self.take_history_step(step, window, cx);
+    }
+
+    /// Moves the highlight, and reports whether the menu was open to take the key.
+    fn step_through_slash_menu(&mut self, step: MenuStep, cx: &mut Context<Self>) -> bool {
+        let Some(offered) = self.offered_slash_commands(cx).map(|offered| offered.len()) else {
+            return false;
+        };
+        self.slash_highlight = step_through_menu(self.slash_highlight, offered, step);
+        cx.notify();
+        true
+    }
+
+    /// The command the menu's highlight is on, clamped to what the menu is still
+    /// offering.
+    fn highlighted_slash_command(&self, cx: &Context<Self>) -> Option<SlashCommand> {
+        let offered = self.offered_slash_commands(cx)?;
+        let at = step_through_menu(self.slash_highlight, offered.len(), MenuStep::Stay);
+        offered.get(at).map(|command| (*command).clone())
+    }
+
+    /// Puts the menu away without taking what is typed with it. Typing on brings it back.
+    fn dismiss_slash_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.offered_slash_commands(cx).is_none() {
+            return false;
+        }
+        self.dismissed_slash_menu_for = Some(self.message_editor.read(cx).text(cx));
+        self.slash_highlight = 0;
+        cx.notify();
+        true
     }
 
     fn take_history_step(
@@ -1514,6 +1611,9 @@ impl ClaudeSessionsPanel {
             return None;
         }
         let typed = self.message_editor.read(cx).text(cx);
+        if self.dismissed_slash_menu_for.as_deref() == Some(typed.as_str()) {
+            return None;
+        }
         let named = slash_command_being_named(&typed)?;
 
         let matches = matching_slash_commands(&self.slash_commands, named);
@@ -1539,9 +1639,13 @@ impl ClaudeSessionsPanel {
         };
 
         self.message_editor.update(cx, |editor, cx| {
-            editor.set_text(text, window, cx);
+            editor.set_text(text.clone(), window, cx);
             editor.move_to_end(&Default::default(), window, cx);
         });
+        // A command whose name is now whole would otherwise leave the menu open on the
+        // one row it still matches, with Enter completing what is already complete.
+        self.dismissed_slash_menu_for = Some(text);
+        self.slash_highlight = 0;
         cx.notify();
     }
 
@@ -2791,6 +2895,17 @@ impl ClaudeSessionsPanel {
             return;
         }
 
+        // Enter belongs to the commands menu while it is open, as it does in every other
+        // completion menu — except when what is typed is already the whole command, for
+        // which completing it would cost a second Enter every time.
+        if let Some(highlighted) = self.highlighted_slash_command(cx) {
+            let typed = self.message_editor.read(cx).text(cx);
+            if let EnterInMenu::Complete(name) = enter_in_slash_menu(&typed, &highlighted) {
+                self.use_slash_command(&name, window, cx);
+                return;
+            }
+        }
+
         let text = self.message_editor.read(cx).text(cx);
         if text.trim().is_empty() {
             return;
@@ -2849,6 +2964,12 @@ impl ClaudeSessionsPanel {
 
     fn interrupt_session(&mut self, _: &Interrupt, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_send(cx) {
+            return;
+        }
+
+        // Escape puts the commands menu away first. Interrupting the session as well
+        // would make closing a menu cost a turn.
+        if self.dismiss_slash_menu(cx) {
             return;
         }
 
@@ -3133,10 +3254,11 @@ impl ClaudeSessionsPanel {
     /// is looking while they type. Picking one fills the box rather than sending it: a
     /// command that takes arguments is only half typed when its name is.
     fn render_slash_commands(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let offered = self.offered_slash_commands(cx)?;
+        let highlighted = step_through_menu(self.slash_highlight, offered.len(), MenuStep::Stay);
         // Taken by value here: the rows outlive the borrow of the commands, because each
         // row's handler carries the name it will put in the box.
-        let rows: Vec<(SharedString, Option<SharedString>, SharedString, String)> = self
-            .offered_slash_commands(cx)?
+        let rows: Vec<(SharedString, Option<SharedString>, SharedString, String)> = offered
             .into_iter()
             .map(|command| {
                 let scope = match command.scope {
@@ -3158,22 +3280,43 @@ impl ClaudeSessionsPanel {
             .collect();
 
         let mut menu = v_flex().w_full().px_2().pb_1().gap_0p5().child(
-            Label::new("Commands")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+            h_flex()
+                .w_full()
+                .gap_1()
+                .flex_wrap()
+                .justify_between()
+                .child(
+                    Label::new("Commands")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                // Said because the menu is new: one nobody knows takes the arrow keys is
+                // a menu picked with the mouse.
+                .child(
+                    Label::new("\u{2191}\u{2193} choose \u{b7} enter use \u{b7} esc close")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
         );
 
         for (index, (name, description, scope, command_name)) in rows.into_iter().enumerate() {
+            let is_highlighted = index == highlighted;
             menu = menu.child(
                 h_flex()
                     .w_full()
                     .gap_1()
                     .justify_between()
+                    // On the row rather than only on the button, so that which row Enter
+                    // would take is legible across the whole width of the menu.
+                    .when(is_highlighted, |this| {
+                        this.rounded_sm().bg(cx.theme().colors().element_selected)
+                    })
                     .child(
                         Button::new(
                             SharedString::from(format!("claude-session-slash-{index}")),
                             name,
                         )
+                        .toggle_state(is_highlighted)
                         .label_size(LabelSize::XSmall)
                         .tooltip(Tooltip::text(
                             description
@@ -7014,6 +7157,72 @@ mod tests {
         }
     }
 
+    fn command_named(name: &str, argument_hint: Option<&str>) -> SlashCommand {
+        SlashCommand {
+            name: name.to_string(),
+            description: None,
+            argument_hint: argument_hint.map(str::to_string),
+            scope: SlashCommandScope::Builtin,
+        }
+    }
+
+    /// Up and Down belong to the menu while it is open. They walk the messages already
+    /// sent when it is not — and a reader picking a command with the arrow keys, which
+    /// is how every other menu is picked, would otherwise find their half-typed command
+    /// replaced by something they sent an hour ago.
+    #[test]
+    fn the_arrow_keys_walk_the_commands_menu_while_it_is_open() {
+        let offered = 3;
+
+        assert_eq!(step_through_menu(0, offered, MenuStep::Down), 1);
+        assert_eq!(step_through_menu(1, offered, MenuStep::Up), 0);
+    }
+
+    /// Held rather than wrapped at both ends: a menu that jumps from the last row to the
+    /// first reads as having lost the keypress.
+    #[test]
+    fn walking_past_either_end_of_the_menu_stays_where_it_is() {
+        assert_eq!(step_through_menu(0, 3, MenuStep::Up), 0);
+        assert_eq!(step_through_menu(2, 3, MenuStep::Down), 2);
+    }
+
+    /// The menu shrinks as the name is typed out, and the row that was highlighted can
+    /// be past the end of what is left. Reading it as-is would highlight nothing and
+    /// Enter would complete nothing.
+    #[test]
+    fn a_highlight_past_the_end_of_the_menu_falls_on_its_last_row() {
+        assert_eq!(step_through_menu(7, 2, MenuStep::Stay), 1);
+        assert_eq!(step_through_menu(7, 2, MenuStep::Up), 0);
+        assert_eq!(step_through_menu(7, 1, MenuStep::Down), 0);
+    }
+
+    /// Enter completes what is half-typed, and sends what is whole. Completing an
+    /// already-whole command would cost a second Enter for every command that takes no
+    /// arguments, and sending a half-typed one would send a command that does not exist.
+    #[test]
+    fn enter_completes_a_half_typed_command_and_sends_a_whole_one() {
+        let compact = command_named("compact", None);
+
+        assert_eq!(
+            enter_in_slash_menu("/comp", &compact),
+            EnterInMenu::Complete("compact".to_string())
+        );
+        assert_eq!(enter_in_slash_menu("/compact", &compact), EnterInMenu::Send);
+    }
+
+    /// A command that takes arguments is not whole when its name is: the reader has
+    /// still to type what it is about, so Enter fills the name in and leaves them there.
+    #[test]
+    fn enter_on_a_command_that_takes_arguments_completes_its_name() {
+        let goal = command_named("goal", Some("<what to aim for>"));
+
+        assert_eq!(
+            enter_in_slash_menu("/goal", &goal),
+            EnterInMenu::Complete("goal".to_string()),
+            "the name alone is not the whole command when it takes something after it"
+        );
+    }
+
     fn question_named(header: &str, asked: &str) -> Question {
         Question {
             header: header.to_string(),
@@ -10590,6 +10799,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         quit_armed: false,
                         ticked: None,
                         typing_answer_for: None,
+                        slash_highlight: 0,
+                        dismissed_slash_menu_for: None,
                         slash_commands: Vec::new(),
                         _listing_slash_commands: Task::ready(()),
                         _answering: Task::ready(()),
