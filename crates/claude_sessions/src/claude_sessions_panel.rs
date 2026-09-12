@@ -1345,6 +1345,9 @@ impl ClaudeSessionsPanel {
         // aimed at it. Neither means anything against the one arrived at.
         self.history_index = None;
         self.quit_armed = false;
+        self.ticked = None;
+        self.typing_answer_for = None;
+        self._answering = Task::ready(());
     }
 
     /// Follows another of the selected session's conversations, from a chip or from the
@@ -1772,13 +1775,15 @@ impl ClaudeSessionsPanel {
     /// Takes the reader to typing their own answer, which the terminal offers as one more
     /// row below the options it was given.
     fn answer_in_own_words(&mut self, cx: &mut Context<Self>) {
-        let Some((question, _, tool_use_id)) = self.waiting_question(cx) else {
+        let Some((question, question_index, tool_use_id)) = self.waiting_question(cx) else {
             return;
         };
         let already_ticked = self
             .ticked
             .as_ref()
-            .filter(|ticked| ticked.tool_use_id == tool_use_id)
+            .filter(|ticked| {
+                ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
+            })
             .map(|ticked| ticked.ticked.clone())
             .unwrap_or_default();
         let Some(keys) = keys_for_own_words(
@@ -5299,10 +5304,12 @@ fn question_named_on_screen(pane: &str, questions: &[Question]) -> Option<usize>
             if asked.is_empty() {
                 return None;
             }
-            Some((screen.rfind(&asked)?, index))
+            let start = screen.rfind(&asked)?;
+            let end = start.checked_add(asked.len())?;
+            Some((end, asked.len(), index))
         })
         .max()
-        .map(|(_, index)| index)
+        .map(|(_, _, index)| index)
 }
 
 fn without_whitespace(text: &str) -> String {
@@ -5862,24 +5869,28 @@ fn append_record(
         // would have been is written when the turn it was queued behind finishes, and it
         // is written with no content at all — the text is only here. Drawn from the
         // attachment, and skipped as an empty record there, the message appears once.
-        if let Some(prompt) = queued_command_prompt(record) {
+        let prompt = queued_command_prompt(record);
+        let images = queued_command_images(record);
+        if prompt.is_some() || !images.is_empty() {
             let cache_key = cache_key(record, &base_key);
-            let kind = cache.kind(cache_key.as_ref(), || EntryKind::Message {
-                role: MessageRole::User,
-                source: prompt,
-                usage: None,
-            });
-            entries.push(Entry {
-                key: base_key.clone(),
-                kind,
-            });
-            for (index, block) in queued_command_images(record).into_iter().enumerate() {
-                let key = SharedString::from(format!("{base_key}-image-{index}"));
+            if let Some(prompt) = prompt {
+                let kind = cache.kind(cache_key.as_ref(), || EntryKind::Message {
+                    role: MessageRole::User,
+                    source: prompt,
+                    usage: None,
+                });
+                entries.push(Entry {
+                    key: base_key.clone(),
+                    kind,
+                });
+            }
+            for (index, block) in images.into_iter().enumerate() {
+                let key = SharedString::from(format!("{base_key}#image-{index}"));
                 // Keyed off the record's own cache key so that a decoded image survives
                 // the conversation being rebuilt around it, as every other one does.
                 let image_cache_key = cache_key
                     .as_ref()
-                    .map(|cache_key| SharedString::from(format!("{cache_key}-image-{index}")));
+                    .map(|cache_key| SharedString::from(format!("{cache_key}#image-{index}")));
                 let kind = cache.kind(image_cache_key.as_ref(), || image_kind(block));
                 entries.push(Entry { key, kind });
             }
@@ -7115,6 +7126,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_message_queued_with_only_an_image_keeps_the_image() {
+        let queued = serde_json::json!({
+            "type": "attachment",
+            "uuid": "q-image-only",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8=",
+                    },
+                }],
+            },
+        })
+        .to_string();
+
+        let entries = entries_of(&[&queued]);
+        let actual = entries
+            .iter()
+            .filter(|entry| matches!(&entry.kind, EntryKind::Image { .. }))
+            .count();
+        assert_eq!(
+            actual, 1,
+            "an image-only queued command must draw one image; expected 1, got {actual}"
+        );
+    }
+
+    #[test]
+    fn replacing_a_queued_image_for_one_uuid_invalidates_its_cached_decode() {
+        let queued = |data: &str| {
+            serde_json::json!({
+                "type": "attachment",
+                "uuid": "q-cache",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": data,
+                            },
+                        },
+                    ],
+                },
+            })
+            .to_string()
+        };
+        let first_record = record(&queued("aGVsbG8="));
+        let replacement_record = record(&queued("d29ybGQ="));
+        let mut cache = EntryCache::default();
+
+        let first_entries = build_entries(&[&first_record], None, &mut cache);
+        assert_eq!(decoded_image(&first_entries).bytes, b"hello".to_vec());
+
+        cache.forget_record("q-cache");
+        let replacement_entries = build_entries(&[&replacement_record], None, &mut cache);
+        let actual = decoded_image(&replacement_entries).bytes.clone();
+        assert_eq!(
+            actual,
+            b"world".to_vec(),
+            "the replacement record carries a new image; expected bytes {:?}, got {actual:?}",
+            b"world"
+        );
+    }
+
     /// After the last question of a call is answered, Claude Code does not return the
     /// answers — it draws every one of them back and asks whether to send them. Until
     /// that is answered the call is still waiting, and the panel drew the last question
@@ -7306,6 +7388,20 @@ mod tests {
         );
 
         assert_eq!(question_being_asked(Some(pane), &questions), 1);
+    }
+
+    #[test]
+    fn a_question_that_is_a_suffix_of_another_does_not_steal_its_match() {
+        let questions = [
+            question_named("whole", "Which database?"),
+            question_named("suffix", "database?"),
+        ];
+
+        let actual = question_being_asked(Some("Which database?\n"), &questions);
+        assert_eq!(
+            actual, 0,
+            "the whole question is the text on screen; expected index 0, got index {actual}"
+        );
     }
 
     /// A pane carrying none of the questions' text falls back to the marks, which is
@@ -10844,6 +10940,74 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 })
             })
             .expect("building the panel in the test window")
+    }
+
+    #[gpui::test]
+    async fn switching_conversations_clears_the_answer_state_of_the_one_left(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let panel = scripted_panel(&[], &[], cx);
+        let actual = panel.update(cx, |panel, _cx| {
+            panel.history_index = Some(3);
+            panel.quit_armed = true;
+            let mut ticked_options = HashSet::default();
+            ticked_options.insert(0);
+            panel.ticked = Some(TickedAnswer {
+                tool_use_id: "call-from-the-old-conversation".into(),
+                question_index: 1,
+                ticked: ticked_options,
+            });
+            panel.typing_answer_for = Some("call-from-the-old-conversation".into());
+
+            panel.show_the_newest_of_another_conversation();
+            (
+                panel.history_index,
+                panel.quit_armed,
+                panel.ticked.is_some(),
+                panel.typing_answer_for.is_some(),
+            )
+        });
+
+        assert_eq!(
+            actual,
+            (None, false, false, false),
+            "all state aimed at the old conversation must be cleared; expected (None, false, false, false), got {actual:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn switching_conversations_cancels_an_answer_sequence_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _panel = panel_with_answer_task(&completed, cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(ANSWER_KEY_INTERVAL * 2);
+        cx.run_until_parked();
+
+        let actual = completed.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            actual, false,
+            "the answer task belongs to the old conversation; expected completed=false, got completed={actual}"
+        );
+    }
+
+    fn panel_with_answer_task(
+        completed: &Arc<std::sync::atomic::AtomicBool>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<ClaudeSessionsPanel> {
+        let panel = scripted_panel(&[], &[], cx);
+        panel.update(cx, |panel, cx| {
+            panel._answering = cx.spawn({
+                let completed = completed.clone();
+                async move |_, cx| {
+                    cx.background_executor().timer(ANSWER_KEY_INTERVAL).await;
+                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            panel.show_the_newest_of_another_conversation();
+        });
+        panel
     }
 
     /// Selects the scripted session and lets the polls deliver its own conversation.

@@ -477,17 +477,22 @@ impl ClaudeSessionStore {
                     break;
                 };
 
-                let contents = match pane_target {
+                let contents = match pane_target.clone() {
                     Some(pane_target) => source.capture_pane(pane_target).await.ok(),
                     None => None,
                 };
-                let question = match session_id {
+                let question = match session_id.clone() {
                     Some(session_id) => source.pending_question(session_id).await.log_err(),
                     None => None,
                 };
 
                 if this
                     .update(cx, |this, cx| {
+                        if this.pane_target() != pane_target
+                            || this.selected_session_id() != session_id
+                        {
+                            return;
+                        }
                         this.apply_pane_contents(contents, cx);
                         this.apply_question_state(question, cx);
                     })
@@ -773,6 +778,9 @@ impl ClaudeSessionStore {
         self.transcript_target = TranscriptTarget::Main;
         self.subagents.clear();
         self.subagent_conversation = None;
+        self.pane_contents = None;
+        self.recorded_question = None;
+        self.live_message = None;
 
         let generation = self.start_transcript();
         self.main_conversation = FollowedConversation::new(Transcript::new(), generation);
@@ -1366,6 +1374,78 @@ mod tests {
                 "a read from before the restart must not make the fresh tail skip the start of the file"
             );
         });
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[gpui::test]
+    async fn selecting_another_session_clears_the_old_sessions_live_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("selection-live-state");
+        let registry_directory = home_directory.join(".claude").join("sessions");
+        write_file(
+            registry_directory.join("31.json"),
+            &registration_json(31, "first-session"),
+        );
+        write_file(
+            registry_directory.join("32.json"),
+            &registration_json(32, "second-session"),
+        );
+
+        let store = cx.new(|cx| {
+            ClaudeSessionStore::new(
+                Arc::new(FakeSource::new(
+                    home_directory.clone(),
+                    fake_process_starts(vec![31, 32]),
+                )),
+                None,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            store.select(31, cx);
+            store.apply_pane_contents(Some("the first pane".to_string()), cx);
+            store.apply_question_state(
+                Some(QuestionState {
+                    question: Some(PendingQuestion {
+                        tool_use_id: "call-from-first-session".to_string(),
+                        questions: vec![crate::session_registry::Question {
+                            header: "Choice".to_string(),
+                            question: "Which one?".to_string(),
+                            options: vec![crate::session_registry::QuestionOption {
+                                label: "First".to_string(),
+                                description: None,
+                            }],
+                            multi_select: false,
+                        }],
+                    }),
+                    hook_installed: true,
+                    live_message: Some("the first live message".to_string()),
+                }),
+                cx,
+            );
+            store.select(32, cx);
+        });
+
+        let actual = store.read_with(cx, |store, _| {
+            (
+                store.pane_contents().cloned(),
+                store
+                    .recorded_question()
+                    .map(|question| question.tool_use_id.clone()),
+                store.live_message().cloned(),
+                store.question_hook_installed(),
+            )
+        });
+        assert_eq!(
+            actual,
+            (None, None, None, true),
+            "the selected session changed, so only the machine-wide hook state may remain; expected (None, None, None, true), got {actual:?}"
+        );
 
         std::fs::remove_dir_all(&home_directory).ok();
     }

@@ -1005,26 +1005,13 @@ fn read_slash_commands_in(
     read_slash_commands_under(directory, scope, None, commands);
 }
 
-/// How deep a tree of command directories is walked.
-///
-/// A depth alone is not enough — a symlink cycle would still be walked to the bottom of
-/// it — but it is what stops an honestly deep tree from costing an unbounded walk, and
-/// it bounds the recursion whatever the filesystem does.
-const SLASH_COMMAND_DIRECTORY_DEPTH: usize = 8;
-
 fn read_slash_commands_under(
     directory: &Path,
     scope: SlashCommandScope,
     namespace: Option<&str>,
     commands: &mut Vec<SlashCommand>,
 ) {
-    read_slash_commands_to_depth(
-        directory,
-        scope,
-        namespace,
-        commands,
-        SLASH_COMMAND_DIRECTORY_DEPTH,
-    )
+    read_slash_commands_to_depth(directory, scope, namespace, commands)
 }
 
 fn read_slash_commands_to_depth(
@@ -1032,61 +1019,69 @@ fn read_slash_commands_to_depth(
     scope: SlashCommandScope,
     namespace: Option<&str>,
     commands: &mut Vec<SlashCommand>,
-    depth_left: usize,
 ) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        // A machine with no commands of its own is the ordinary case, not a failure.
-        return;
-    };
+    let mut pending = vec![(
+        directory.to_path_buf(),
+        namespace.map(str::to_string),
+        HashSet::default(),
+    )];
 
-    for entry in entries {
-        let Some(entry) = entry.log_err() else {
+    while let Some((directory, namespace, mut ancestors)) = pending.pop() {
+        let Ok(identity) = fs::canonicalize(&directory) else {
             continue;
         };
-        let path = entry.path();
-        let Ok(file_name) = entry.file_name().into_string() else {
-            continue;
-        };
-
-        // `.git` and the like are the machine's own business, and a command the reader
-        // never wrote is not one they can be offered.
-        if file_name.starts_with('.') {
+        if !ancestors.insert(identity) {
             continue;
         }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            // A machine with no commands of its own is the ordinary case, not a failure.
+            continue;
+        };
 
-        if path.is_dir() {
-            // A directory symlink pointing at an ancestor is walked forever otherwise,
-            // and the walk ends in a stack overflow rather than an error.
-            let Some(depth_left) = depth_left.checked_sub(1) else {
+        for entry in entries {
+            let Some(entry) = entry.log_err() else {
                 continue;
             };
-            let nested = match namespace {
-                Some(namespace) => format!("{namespace}:{file_name}"),
-                None => file_name,
+            let path = entry.path();
+            let Ok(file_name) = entry.file_name().into_string() else {
+                continue;
             };
-            read_slash_commands_to_depth(&path, scope, Some(&nested), commands, depth_left);
-            continue;
+
+            // `.git` and the like are the machine's own business, and a command the reader
+            // never wrote is not one they can be offered.
+            if file_name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                let nested = match &namespace {
+                    Some(namespace) => format!("{namespace}:{file_name}"),
+                    None => file_name,
+                };
+                pending.push((path, Some(nested), ancestors.clone()));
+                continue;
+            }
+
+            let Some(stem) = file_name.strip_suffix(".md") else {
+                continue;
+            };
+            let name = match &namespace {
+                Some(namespace) => format!("{namespace}:{stem}"),
+                None => stem.to_string(),
+            };
+            // One unreadable command must not hide the rest.
+            let Some(contents) = fs::read_to_string(&path).log_err() else {
+                continue;
+            };
+            let (description, argument_hint) = slash_command_front_matter(&contents);
+
+            commands.push(SlashCommand {
+                name,
+                description,
+                argument_hint,
+                scope,
+            });
         }
-
-        let Some(stem) = file_name.strip_suffix(".md") else {
-            continue;
-        };
-        let name = match namespace {
-            Some(namespace) => format!("{namespace}:{stem}"),
-            None => stem.to_string(),
-        };
-        // One unreadable command must not hide the rest.
-        let Some(contents) = fs::read_to_string(&path).log_err() else {
-            continue;
-        };
-        let (description, argument_hint) = slash_command_front_matter(&contents);
-
-        commands.push(SlashCommand {
-            name,
-            description,
-            argument_hint,
-            scope,
-        });
     }
 }
 
@@ -1243,7 +1238,12 @@ const QUESTION_HOOK_SOURCE: &str = r#"#!/bin/sh
 #
 # Nothing is printed and the exit status is always 0: this hook rules on nothing.
 payload=$(cat)
-directory="$HOME/.claude/pending-questions"
+hook_directory=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || exit 0
+case "$hook_directory" in
+  */.claude/hooks) claude_directory=${hook_directory%/hooks} ;;
+  *) [ -n "${HOME:-}" ] || exit 0; claude_directory="$HOME/.claude" ;;
+esac
+directory="$claude_directory/pending-questions"
 mkdir -p "$directory" || exit 0
 session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
 # Not every machine a session runs on has python3, and a hook that silently recorded
@@ -1252,7 +1252,7 @@ if [ -z "$session" ]; then
   session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
 fi
 [ -n "$session" ] || exit 0
-case "$session" in */*|*..*) exit 0 ;; esac
+case "$session" in */*|.|..) exit 0 ;; esac
 printf '%s' "$payload" > "$directory/$session.json.tmp" 2>/dev/null || exit 0
 mv "$directory/$session.json.tmp" "$directory/$session.json" 2>/dev/null || exit 0
 exit 0
@@ -1272,21 +1272,30 @@ const LIVE_MESSAGE_HOOK_SOURCE: &str = r#"#!/bin/sh
 #
 # Nothing is printed and the exit status is always 0: this hook rules on nothing.
 payload=$(cat)
-directory="$HOME/.claude/live-messages"
+hook_directory=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || exit 0
+case "$hook_directory" in
+  */.claude/hooks) claude_directory=${hook_directory%/hooks} ;;
+  *) [ -n "${HOME:-}" ] || exit 0; claude_directory="$HOME/.claude" ;;
+esac
+directory="$claude_directory/live-messages"
 mkdir -p "$directory" || exit 0
 session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
 if [ -z "$session" ]; then
   session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
 fi
 [ -n "$session" ] || exit 0
-case "$session" in */*|*..*) exit 0 ;; esac
+case "$session" in */*|.|..) exit 0 ;; esac
 
 file="$directory/$session.jsonl"
 # A message begins again at index 0, so its first piece is what clears the one before it.
 # Without this the file is every message the session has ever drawn.
-case "$payload" in
-  *'"index":0,'*|*'"index": 0,'*|*'"index":0}'*|*'"index": 0}'*) : > "$file" 2>/dev/null || exit 0 ;;
-esac
+index=$(printf '%s' "$payload" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("index"); print(value if type(value) is int else "")' 2>/dev/null)
+if [ -z "$index" ]; then
+  index=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"index"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+fi
+if [ -n "$index" ] && [ "$index" -eq 0 ] 2>/dev/null; then
+  : > "$file" 2>/dev/null || exit 0
+fi
 # A message that somehow never starts over must not grow without limit.
 if [ -f "$file" ]; then
   size=$(wc -c < "$file" 2>/dev/null || echo 0)
@@ -1333,6 +1342,10 @@ fn hook_matcher(event: &str) -> Option<&'static str> {
     (event == "PreToolUse").then_some(QUESTION_HOOK_TOOL)
 }
 
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
 /// Whether the hooks Zed installs are in place on this machine.
 pub fn question_hook_is_installed(home_directory: &Path) -> bool {
     let Some(settings) = read_claude_settings(home_directory).log_err().flatten() else {
@@ -1341,7 +1354,8 @@ pub fn question_hook_is_installed(home_directory: &Path) -> bool {
 
     INSTALLED_HOOKS.iter().all(|(event, script, _)| {
         let script = home_directory.join(".claude").join(script);
-        script.is_file() && settings_name_the_hook(&settings, event, &script.to_string_lossy())
+        let command = shell_quote(script.to_string_lossy().as_ref());
+        script.is_file() && settings_name_the_hook(&settings, event, &command)
     })
 }
 
@@ -1358,21 +1372,24 @@ fn read_claude_settings(home_directory: &Path) -> Result<Option<serde_json::Valu
     }
 }
 
-fn settings_name_the_hook(settings: &serde_json::Value, event: &str, script: &str) -> bool {
+fn settings_name_the_hook(settings: &serde_json::Value, event: &str, command: &str) -> bool {
+    let matcher = hook_matcher(event);
     settings
         .get("hooks")
         .and_then(|hooks| hooks.get(event))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|hook| {
-                            hook.get("command").and_then(serde_json::Value::as_str) == Some(script)
+                entry.get("matcher").and_then(serde_json::Value::as_str) == matcher
+                    && entry
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|hooks| {
+                            hooks.iter().any(|hook| {
+                                hook.get("command").and_then(serde_json::Value::as_str)
+                                    == Some(command)
+                            })
                         })
-                    })
             })
         })
 }
@@ -1403,7 +1420,7 @@ pub fn install_question_hook(home_directory: &Path) -> Result<Option<PathBuf>> {
             fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
                 .with_context(|| format!("making {} executable", script.display()))?;
         }
-        commands.push((event, script.to_string_lossy().into_owned()));
+        commands.push((event, shell_quote(script.to_string_lossy().as_ref())));
     }
 
     let existing = read_claude_settings(home_directory)?;
@@ -4003,6 +4020,52 @@ mod tests {
     }
 
     #[test]
+    fn a_command_below_nine_directories_is_still_listed() {
+        let home_directory = temporary_directory("slash-command-depth");
+        let mut command_directory = home_directory.join(".claude").join("commands");
+        for component in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            command_directory.push(component);
+        }
+        write_file(
+            command_directory.join("command.md"),
+            "---\ndescription: Deep but finite\n---\nbody",
+        );
+
+        let commands = list_slash_commands(&home_directory, None);
+        let expected = "a:b:c:d:e:f:g:h:i:command";
+        let actual = commands.iter().any(|command| command.name == expected);
+        assert_eq!(
+            actual, true,
+            "a finite command tree has no cycle; expected {expected:?} to be listed, got present={actual}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_is_visited_only_once() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let home_directory = temporary_directory("slash-command-real-cycle");
+        let commands_directory = home_directory.join(".claude").join("commands");
+        write_file(
+            commands_directory.join("valid.md"),
+            "---\ndescription: Valid command\n---\nbody",
+        );
+        symlink(&commands_directory, commands_directory.join("loop"))?;
+
+        let commands = list_slash_commands(&home_directory, None);
+        let actual = commands
+            .iter()
+            .filter(|command| command.name.ends_with("valid"))
+            .count();
+        assert_eq!(
+            actual, 1,
+            "one filesystem directory must contribute its command once even through a cycle; expected 1, got {actual}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_live_message_hook_truncates_when_index_zero_has_no_trailing_comma() -> Result<()> {
         let temp_dir = temporary_directory("hook-truncate-test");
         let session_id = "test-session";
@@ -4044,6 +4107,119 @@ mod tests {
             contents.lines().next(),
             Some(payload),
             "hook must truncate file on index:0 even when object ends without a comma"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_message_hook_reads_index_zero_as_json_not_as_one_textual_spelling() -> Result<()> {
+        let home_directory = temporary_directory("hook-index-json");
+        let session_id = "index-spacing";
+        let live_directory = home_directory.join(".claude").join(LIVE_MESSAGES_DIRECTORY);
+        fs::create_dir_all(&live_directory)?;
+        let message_file = live_directory.join(format!("{session_id}.jsonl"));
+        write_file(
+            message_file.clone(),
+            "stale content from previous message\n",
+        );
+
+        let hook_path = home_directory.join("hook.sh");
+        fs::write(&hook_path, LIVE_MESSAGE_HOOK_SOURCE)?;
+        let payload = r#"{"type":"content_block_start","session_id":"index-spacing","index" : 0}"#;
+        let status = smol::block_on(
+            smol::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
+                .arg("--")
+                .arg(payload)
+                .arg(&hook_path)
+                .env("HOME", &home_directory)
+                .status(),
+        )?;
+        assert!(status.success(), "the hook must always exit 0");
+
+        let contents = fs::read_to_string(&message_file)?;
+        let actual = contents.lines().next();
+        assert_eq!(
+            actual,
+            Some(payload),
+            "numeric index zero starts a new message regardless of JSON whitespace; expected first line {payload:?}, got {actual:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn question_hook_accepts_a_single_component_session_id_with_special_characters() -> Result<()> {
+        let home_directory = temporary_directory("hook-special-session");
+        let hook_path = home_directory.join("hook.sh");
+        fs::write(&hook_path, QUESTION_HOOK_SOURCE)?;
+        let session_id = "session..candidate '$()[]";
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "tool_use_id": "call-1",
+            "tool_input": {"questions": []},
+        })
+        .to_string();
+        let status = smol::block_on(
+            smol::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
+                .arg("--")
+                .arg(&payload)
+                .arg(&hook_path)
+                .env("HOME", &home_directory)
+                .status(),
+        )?;
+        assert!(status.success(), "the hook must always exit 0");
+
+        let expected_path = home_directory
+            .join(".claude")
+            .join(PENDING_QUESTIONS_DIRECTORY)
+            .join(format!("{session_id}.json"));
+        let actual = expected_path.is_file();
+        assert_eq!(
+            actual,
+            true,
+            "the Rust reader accepts this one path component; expected {} to exist, got exists={actual}",
+            expected_path.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_question_hook_finds_its_home_when_home_is_unset() -> Result<()> {
+        let home_directory = temporary_directory("hook-without-home");
+        install_question_hook(&home_directory)?;
+        let hook_path = home_directory.join(".claude").join(QUESTION_HOOK_SCRIPT);
+        let session_id = "home-fallback";
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "tool_use_id": "call-1",
+            "tool_input": {"questions": []},
+        })
+        .to_string();
+        let status = smol::block_on(
+            smol::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
+                .arg("--")
+                .arg(&payload)
+                .arg(&hook_path)
+                .env_remove("HOME")
+                .status(),
+        )?;
+        assert!(status.success(), "the hook must always exit 0");
+
+        let expected_path = home_directory
+            .join(".claude")
+            .join(PENDING_QUESTIONS_DIRECTORY)
+            .join(format!("{session_id}.json"));
+        let actual = expected_path.is_file();
+        assert_eq!(
+            actual,
+            true,
+            "the installed script's location identifies its Claude directory; expected {} to exist, got exists={actual}",
+            expected_path.display()
         );
         Ok(())
     }
@@ -4298,6 +4474,72 @@ mod tests {
 
         let script = home_directory.join(".claude").join(QUESTION_HOOK_SCRIPT);
         assert!(script.is_file(), "the hook has to have something to run");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_hook_command_quotes_its_script_path_for_the_shell() -> Result<()> {
+        let home_directory = temporary_directory("hook command's path");
+        install_question_hook(&home_directory)?;
+        let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            home_directory.join(".claude").join("settings.json"),
+        )?)?;
+        let command = settings
+            .pointer("/hooks/PreToolUse/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .context("the installed question hook command")?;
+        let payload = serde_json::json!({
+            "session_id": "quoted-command",
+            "tool_use_id": "call-1",
+            "tool_input": {"questions": []},
+        })
+        .to_string();
+
+        let actual = smol::block_on(run_with_stdin(
+            "/bin/sh",
+            &["-c", command],
+            payload.as_bytes(),
+        ))
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            actual,
+            Ok(()),
+            "the command must execute a path containing spaces and a single quote; expected Ok(()), got {actual:?}"
+        );
+
+        let expected_path = home_directory
+            .join(".claude")
+            .join(PENDING_QUESTIONS_DIRECTORY)
+            .join("quoted-command.json");
+        assert_eq!(
+            expected_path.is_file(),
+            true,
+            "the executed hook must write {}; expected exists=true, got exists=false",
+            expected_path.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_question_hook_with_the_wrong_matcher_is_not_the_installed_hook() -> Result<()> {
+        let home_directory = temporary_directory("question-hook-matcher");
+        install_question_hook(&home_directory)?;
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        let entry = settings
+            .pointer_mut("/hooks/PreToolUse/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("the installed PreToolUse entry")?;
+        entry.insert("matcher".to_string(), serde_json::json!("Bash"));
+        fs::write(&settings_path, format!("{settings:#}\n"))?;
+
+        let actual = question_hook_is_installed(&home_directory);
+        assert_eq!(
+            actual, false,
+            "a PreToolUse hook for Bash never receives AskUserQuestion; expected installed=false, got installed={actual}"
+        );
         Ok(())
     }
 
