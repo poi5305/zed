@@ -905,14 +905,26 @@ pub fn list_slash_commands(
     let mut commands = Vec::new();
 
     if let Some(project_root) = project_root {
+        let claude = project_root.join(".claude");
         read_slash_commands_in(
-            &project_root.join(".claude").join("commands"),
+            &claude.join("commands"),
+            SlashCommandScope::Project,
+            &mut commands,
+        );
+        read_skills_in(
+            &claude.join("skills"),
             SlashCommandScope::Project,
             &mut commands,
         );
     }
+    let claude = home_directory.join(".claude");
     read_slash_commands_in(
-        &home_directory.join(".claude").join("commands"),
+        &claude.join("commands"),
+        SlashCommandScope::User,
+        &mut commands,
+    );
+    read_skills_in(
+        &claude.join("skills"),
         SlashCommandScope::User,
         &mut commands,
     );
@@ -938,6 +950,49 @@ pub fn list_slash_commands(
     }
 
     commands
+}
+
+/// The file a skill's directory is a skill by virtue of holding.
+const SKILL_FILE: &str = "SKILL.md";
+
+/// Appends every skill under `directory`.
+///
+/// A skill is invoked by typing its name after a slash exactly as a command in
+/// `commands/` is, so a menu that lists only `commands/` is missing most of what a
+/// session answers to. The name is the directory's, which is what the CLI resolves —
+/// the `name` in the front matter is what the skill calls itself, and the two can differ.
+fn read_skills_in(directory: &Path, scope: SlashCommandScope, commands: &mut Vec<SlashCommand>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        // A machine with no skills is the ordinary case, not a failure.
+        return;
+    };
+
+    for entry in entries {
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+
+        // A directory with no `SKILL.md` in it is not a skill, and a name read off the
+        // directory alone would put a command in the menu that does not exist.
+        let path = entry.path().join(SKILL_FILE);
+        let Some(contents) = fs::read_to_string(&path).ok() else {
+            continue;
+        };
+        let (description, argument_hint) = slash_command_front_matter(&contents);
+
+        commands.push(SlashCommand {
+            name,
+            description,
+            argument_hint,
+            scope,
+        });
+    }
 }
 
 /// Appends every command under `directory`, including those in directories of their own,
@@ -4870,6 +4925,108 @@ mod tests {
         assert_eq!(third.lines, vec!["{\"uuid\":\"agent-9\"}".to_string()]);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod slash_command_skill_tests {
+    use super::*;
+
+    fn write(path: PathBuf, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("creating the parent directory");
+        }
+        fs::write(path, contents).expect("writing the fixture");
+    }
+
+    /// A skill is invoked by typing its name after a slash, exactly as a command in
+    /// `commands/` is, so a menu that lists only `commands/` is missing most of what the
+    /// session actually answers to. On this machine that was eleven of them.
+    #[test]
+    fn test_skills_are_slash_commands_too() {
+        let home_directory =
+            std::env::temp_dir().join(format!("zed-skills-{}", std::process::id()));
+        let project_root = home_directory.join("project");
+        fs::remove_dir_all(&home_directory).ok();
+
+        write(
+            home_directory
+                .join(".claude")
+                .join("skills")
+                .join("wrangler")
+                .join("SKILL.md"),
+            "---\nname: wrangler\ndescription: The Workers CLI\n---\n\n# Wrangler\n",
+        );
+        write(
+            project_root
+                .join(".claude")
+                .join("skills")
+                .join("deploy")
+                .join("SKILL.md"),
+            "---\ndescription: Ship it\nargument-hint: <environment>\n---\n",
+        );
+        // A directory with no SKILL.md in it is not a skill, and a name that would be
+        // read off the directory alone would put one in the menu that does not exist.
+        fs::create_dir_all(home_directory.join(".claude").join("skills").join("notes"))
+            .expect("creating the directory");
+
+        let commands = list_slash_commands(&home_directory, Some(&project_root));
+        let named = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command.name == name)
+                .cloned()
+        };
+
+        let wrangler = named("wrangler").expect("the user's skill is a command");
+        assert_eq!(wrangler.description.as_deref(), Some("The Workers CLI"));
+        assert_eq!(wrangler.scope, SlashCommandScope::User);
+
+        let deploy = named("deploy").expect("the project's skill is a command");
+        assert_eq!(deploy.argument_hint.as_deref(), Some("<environment>"));
+        assert_eq!(deploy.scope, SlashCommandScope::Project);
+
+        assert!(
+            named("notes").is_none(),
+            "a directory with no SKILL.md in it is not a skill, got {:?}",
+            commands
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A skill and a command of the same name are one row, as they are one command: the
+    /// CLI resolves the name once.
+    #[test]
+    fn test_a_skill_and_a_command_of_one_name_are_one_row() {
+        let home_directory =
+            std::env::temp_dir().join(format!("zed-skill-clash-{}", std::process::id()));
+        fs::remove_dir_all(&home_directory).ok();
+
+        write(
+            home_directory
+                .join(".claude")
+                .join("commands")
+                .join("deploy.md"),
+            "---\ndescription: From commands\n---\n",
+        );
+        write(
+            home_directory
+                .join(".claude")
+                .join("skills")
+                .join("deploy")
+                .join("SKILL.md"),
+            "---\ndescription: From skills\n---\n",
+        );
+
+        let commands = list_slash_commands(&home_directory, None);
+        let deploys: Vec<&SlashCommand> = commands
+            .iter()
+            .filter(|command| command.name == "deploy")
+            .collect();
+        assert_eq!(deploys.len(), 1, "got {deploys:?}");
+
+        fs::remove_dir_all(&home_directory).ok();
     }
 }
 
