@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use serde::Deserialize;
 use smol::io::AsyncWriteExt as _;
 use util::{ResultExt as _, command::Stdio};
@@ -674,6 +674,14 @@ const SUBAGENT_FILE_PREFIX: &str = "agent-";
 const SUBAGENT_META_SUFFIX: &str = ".meta.json";
 const SUBAGENT_TRANSCRIPT_SUFFIX: &str = ".jsonl";
 const WORKFLOW_RUN_ID_LABEL: &str = "Run ID:";
+const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
+const WORKFLOW_JOURNAL_RESULT_TYPE: &str = "result";
+const PENDING_QUESTIONS_DIRECTORY: &str = "pending-questions";
+const QUESTION_HOOK_SCRIPT: &str = "hooks/record-pending-question.sh";
+const QUESTION_HOOK_TOOL: &str = "AskUserQuestion";
+const LIVE_MESSAGES_DIRECTORY: &str = "live-messages";
+const LIVE_MESSAGE_HOOK_SCRIPT: &str = "hooks/record-live-message.sh";
+const LIVE_MESSAGE_HOOK_EVENT: &str = "MessageDisplay";
 
 /// The `agent-<agentId>.meta.json` sidecar written beside a subagent's transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -719,6 +727,734 @@ pub struct SubagentSummary {
     pub meta: SubagentMeta,
     pub transcript_path: PathBuf,
     pub size: u64,
+    /// What the run's journal says about this agent, for an agent belonging to a
+    /// `Workflow` run. `None` for every other agent, and for one whose run has written no
+    /// journal this scan could read.
+    pub workflow_agent_finished: Option<bool>,
+}
+
+/// A question a session has put to its user and is waiting on.
+///
+/// The CLI writes nothing about a question into the transcript until it has been
+/// answered — the assistant message holding the call is not flushed while the call is
+/// outstanding — so the terminal is otherwise the only place a waiting question exists.
+/// A `PreToolUse` hook records the call as it is made, and this is what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    /// The call this question is. Whether it is still waiting is answered by the
+    /// conversation rather than by this file: the hook records a question being asked and
+    /// has no way to record it being answered, so a reader tells the two apart by looking
+    /// for the tool result that answers this id.
+    pub tool_use_id: String,
+    pub questions: Vec<Question>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The short name the terminal shows in its tab strip when a call carries several
+    /// questions, and what a reader picks one of them out by.
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// The hook payload, which is the tool call's own input inside the envelope the hook is
+/// given. Only the parts a reader draws are named; the envelope carries several other
+/// fields, and the writer ships independently of this reader and adds more between
+/// releases.
+#[derive(Deserialize)]
+struct QuestionHookPayload {
+    #[serde(rename = "tool_use_id", alias = "toolUseId", default)]
+    tool_use_id: Option<String>,
+    #[serde(rename = "tool_input", default)]
+    tool_input: Option<QuestionHookInput>,
+}
+
+#[derive(Deserialize, Default)]
+struct QuestionHookInput {
+    #[serde(default)]
+    questions: Vec<QuestionHookQuestion>,
+}
+
+#[derive(Deserialize)]
+struct QuestionHookQuestion {
+    #[serde(default)]
+    header: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    options: Vec<QuestionHookOption>,
+    #[serde(rename = "multiSelect", default)]
+    multi_select: bool,
+}
+
+#[derive(Deserialize)]
+struct QuestionHookOption {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Parses one recorded question. Unknown fields are ignored, because the CLI that writes
+/// the payload ships independently of this reader.
+///
+/// A payload naming no call, or carrying no question with any option in it, is not a
+/// question this side can draw: offering a reader a question with nothing to pick would
+/// be worse than leaving the terminal to show it.
+pub fn parse_pending_question(contents: &str) -> Result<Option<PendingQuestion>> {
+    let payload: QuestionHookPayload = serde_json::from_str(contents)?;
+    let Some(tool_use_id) = payload.tool_use_id.filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+
+    let questions: Vec<Question> = payload
+        .tool_input
+        .unwrap_or_default()
+        .questions
+        .into_iter()
+        .filter(|question| !question.options.is_empty())
+        .map(|question| Question {
+            header: question.header,
+            question: question.question,
+            options: question
+                .options
+                .into_iter()
+                .map(|option| QuestionOption {
+                    label: option.label,
+                    description: option
+                        .description
+                        .map(|description| description.trim().to_string())
+                        .filter(|description| !description.is_empty()),
+                })
+                .collect(),
+            multi_select: question.multi_select,
+        })
+        .collect();
+
+    if questions.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PendingQuestion {
+        tool_use_id,
+        questions,
+    }))
+}
+
+/// A slash command a session will answer to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// Without the leading slash, as the reader types it.
+    pub name: String,
+    pub description: Option<String>,
+    /// What the command expects after its name, when it said so.
+    pub argument_hint: Option<String>,
+    pub scope: SlashCommandScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlashCommandScope {
+    /// Built into the CLI. Listed from this side rather than read from the machine,
+    /// because the CLI writes its own commands down nowhere.
+    Builtin,
+    /// A `.md` under the project's own `.claude/commands`.
+    Project,
+    /// A `.md` under the user's `~/.claude/commands`.
+    User,
+}
+
+/// The commands the CLI answers to whatever the machine holds.
+///
+/// Kept deliberately short: a list this side maintains goes stale, and a stale entry that
+/// does nothing is worse than a command the reader types out in full. These are the ones
+/// worth a row of their own — everything else is still typed, and still sent.
+const BUILTIN_SLASH_COMMANDS: [(&str, &str); 14] = [
+    ("clear", "Start a new conversation"),
+    ("compact", "Summarise the conversation so far"),
+    ("context", "Show what is in the context window"),
+    ("cost", "Show what this session has cost"),
+    ("agents", "Manage the agents this session can spawn"),
+    ("workflows", "Watch the workflows this session is running"),
+    ("model", "Change the model"),
+    ("effort", "Change the reasoning effort"),
+    ("resume", "Resume an earlier conversation"),
+    ("status", "Show the session's status"),
+    ("usage", "Show what is left of the usage limit"),
+    ("config", "Open the settings"),
+    ("export", "Export the conversation"),
+    ("help", "List every command"),
+];
+
+/// Every slash command a session in `project_root` would answer to.
+///
+/// Ordered so that rows do not move between reads — directory enumeration is in no
+/// particular order — with the machine's own commands before the built-in ones: a command
+/// someone wrote is the one they are looking for.
+pub fn list_slash_commands(
+    home_directory: &Path,
+    project_root: Option<&Path>,
+) -> Vec<SlashCommand> {
+    let mut commands = Vec::new();
+
+    if let Some(project_root) = project_root {
+        read_slash_commands_in(
+            &project_root.join(".claude").join("commands"),
+            SlashCommandScope::Project,
+            &mut commands,
+        );
+    }
+    read_slash_commands_in(
+        &home_directory.join(".claude").join("commands"),
+        SlashCommandScope::User,
+        &mut commands,
+    );
+
+    // Gathered by name first so that two commands of the same name are next to each other
+    // — `dedup_by` only removes neighbours — with the project's before the user's, which
+    // is the order the scopes are declared in and the order the CLI resolves them.
+    commands.sort_by(|left, right| (&left.name, left.scope).cmp(&(&right.name, right.scope)));
+    commands.dedup_by(|left, right| left.name == right.name);
+
+    commands.sort_by(|left, right| (left.scope, &left.name).cmp(&(right.scope, &right.name)));
+
+    for (name, description) in BUILTIN_SLASH_COMMANDS {
+        if commands.iter().any(|command| command.name == name) {
+            continue;
+        }
+        commands.push(SlashCommand {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            argument_hint: None,
+            scope: SlashCommandScope::Builtin,
+        });
+    }
+
+    commands
+}
+
+/// Appends every command under `directory`, including those in directories of their own,
+/// which the CLI names `<directory>:<command>`.
+fn read_slash_commands_in(
+    directory: &Path,
+    scope: SlashCommandScope,
+    commands: &mut Vec<SlashCommand>,
+) {
+    read_slash_commands_under(directory, scope, None, commands);
+}
+
+/// How deep a tree of command directories is walked.
+///
+/// A depth alone is not enough — a symlink cycle would still be walked to the bottom of
+/// it — but it is what stops an honestly deep tree from costing an unbounded walk, and
+/// it bounds the recursion whatever the filesystem does.
+const SLASH_COMMAND_DIRECTORY_DEPTH: usize = 8;
+
+fn read_slash_commands_under(
+    directory: &Path,
+    scope: SlashCommandScope,
+    namespace: Option<&str>,
+    commands: &mut Vec<SlashCommand>,
+) {
+    read_slash_commands_to_depth(
+        directory,
+        scope,
+        namespace,
+        commands,
+        SLASH_COMMAND_DIRECTORY_DEPTH,
+    )
+}
+
+fn read_slash_commands_to_depth(
+    directory: &Path,
+    scope: SlashCommandScope,
+    namespace: Option<&str>,
+    commands: &mut Vec<SlashCommand>,
+    depth_left: usize,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        // A machine with no commands of its own is the ordinary case, not a failure.
+        return;
+    };
+
+    for entry in entries {
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+
+        // `.git` and the like are the machine's own business, and a command the reader
+        // never wrote is not one they can be offered.
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            // A directory symlink pointing at an ancestor is walked forever otherwise,
+            // and the walk ends in a stack overflow rather than an error.
+            let Some(depth_left) = depth_left.checked_sub(1) else {
+                continue;
+            };
+            let nested = match namespace {
+                Some(namespace) => format!("{namespace}:{file_name}"),
+                None => file_name,
+            };
+            read_slash_commands_to_depth(&path, scope, Some(&nested), commands, depth_left);
+            continue;
+        }
+
+        let Some(stem) = file_name.strip_suffix(".md") else {
+            continue;
+        };
+        let name = match namespace {
+            Some(namespace) => format!("{namespace}:{stem}"),
+            None => stem.to_string(),
+        };
+        // One unreadable command must not hide the rest.
+        let Some(contents) = fs::read_to_string(&path).log_err() else {
+            continue;
+        };
+        let (description, argument_hint) = slash_command_front_matter(&contents);
+
+        commands.push(SlashCommand {
+            name,
+            description,
+            argument_hint,
+            scope,
+        });
+    }
+}
+
+/// The `description` and `argument-hint` a command's front matter records.
+///
+/// Read line by line rather than as YAML: only two keys are wanted, the file is a prompt
+/// with a header rather than a document, and a header this reader cannot parse should
+/// cost the description rather than the command.
+fn slash_command_front_matter(contents: &str) -> (Option<String>, Option<String>) {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (None, None);
+    }
+
+    let mut description = None;
+    let mut argument_hint = None;
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']).trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "description" => description = Some(value.to_string()),
+            "argument-hint" => argument_hint = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    (description, argument_hint)
+}
+
+/// One piece of a message as the terminal drew it.
+#[derive(Deserialize)]
+struct LiveMessagePiece {
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    index: u64,
+    #[serde(default)]
+    delta: String,
+}
+
+/// What the session is saying right now, assembled from the pieces the terminal drew.
+///
+/// `None` when nothing has been recorded, which includes a machine without the hook and a
+/// session that has not said anything since it was installed.
+pub fn read_live_message(home_directory: &Path, session_id: &str) -> Result<Option<String>> {
+    let Some(session_id) = single_path_component(session_id) else {
+        return Ok(None);
+    };
+    let path = home_directory
+        .join(".claude")
+        .join(LIVE_MESSAGES_DIRECTORY)
+        .join(format!("{session_id}.jsonl"));
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+
+    Ok(assemble_live_message(&contents))
+}
+
+/// Puts one message back together from the pieces recorded for it.
+///
+/// Only the newest message in the file is assembled: the file is truncated when a message
+/// begins, but a truncation that did not happen — the hook could not write, or a message
+/// began while the file was being read — would otherwise show two messages run together.
+///
+/// Pieces are ordered by the index they carry rather than by the order they were written,
+/// and a piece that is unreadable or repeats an index already seen is skipped: a line is
+/// appended while this is being read, so the last one is regularly half-written.
+fn assemble_live_message(contents: &str) -> Option<String> {
+    let mut pieces: Vec<LiveMessagePiece> = Vec::new();
+    for line in contents.lines() {
+        let Ok(piece) = serde_json::from_str::<LiveMessagePiece>(line) else {
+            continue;
+        };
+        pieces.push(piece);
+    }
+
+    let newest_message = pieces.last()?.message_id.clone();
+    if newest_message.is_some() {
+        pieces.retain(|piece| piece.message_id == newest_message);
+    } else {
+        // Nothing names which message these belong to, so the only boundary left is a
+        // message starting over. Taken as the last such start rather than by clearing as
+        // they are read, because the pieces are not in the order they are numbered.
+        let last_start = pieces
+            .iter()
+            .rposition(|piece| piece.index == 0)
+            .unwrap_or(0);
+        pieces.drain(..last_start);
+    }
+
+    pieces.sort_by_key(|piece| piece.index);
+    pieces.dedup_by_key(|piece| piece.index);
+
+    let message: String = pieces.into_iter().map(|piece| piece.delta).collect();
+    (!message.trim().is_empty()).then_some(message)
+}
+
+/// The question the hook last recorded for this session, if it recorded one.
+///
+/// A file left behind by a question that has since been answered is not filtered here:
+/// only the session's conversation says whether the call was answered, and this function
+/// is the one place that does not have it. The caller checks; see [`PendingQuestion`].
+pub fn read_pending_question(
+    home_directory: &Path,
+    session_id: &str,
+) -> Result<Option<PendingQuestion>> {
+    let Some(session_id) = single_path_component(session_id) else {
+        return Ok(None);
+    };
+    let path = home_directory
+        .join(".claude")
+        .join(PENDING_QUESTIONS_DIRECTORY)
+        .join(format!("{session_id}.json"));
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        // A session that has never asked anything leaves no file, which is the ordinary
+        // case rather than a failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+
+    parse_pending_question(&contents)
+        .with_context(|| format!("parsing {}", path.display()))
+        .or_else(|error| {
+            // The hook writes this file whole, but a reader that refused to draw anything
+            // because one payload was unreadable would lose the terminal mirror as well.
+            log::warn!("{error:#}");
+            Ok(None)
+        })
+}
+
+/// The shell script the hook runs. It records the call and decides nothing about it:
+/// anything on stdout would be read by the CLI as a ruling on the tool call it is
+/// watching, so this prints nothing and always succeeds.
+const QUESTION_HOOK_SOURCE: &str = r#"#!/bin/sh
+# Written by Zed. Records the question a session is waiting on, so that a reader outside
+# the terminal can draw it as something to click. The CLI writes nothing about a question
+# into its transcript until the question has been answered, so this is the only place the
+# structure of a waiting question can be read from.
+#
+# Nothing is printed and the exit status is always 0: this hook rules on nothing.
+payload=$(cat)
+directory="$HOME/.claude/pending-questions"
+mkdir -p "$directory" || exit 0
+session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
+# Not every machine a session runs on has python3, and a hook that silently recorded
+# nothing there would look exactly like a session that has never asked anything.
+if [ -z "$session" ]; then
+  session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+fi
+[ -n "$session" ] || exit 0
+case "$session" in */*|*..*) exit 0 ;; esac
+printf '%s' "$payload" > "$directory/$session.json.tmp" 2>/dev/null || exit 0
+mv "$directory/$session.json.tmp" "$directory/$session.json" 2>/dev/null || exit 0
+exit 0
+"#;
+
+/// The shell script that records what a session is saying as it says it.
+///
+/// The CLI does not write an assistant message into its transcript until the turn holding
+/// it is over, which on a long turn is tens of seconds after the words were on screen.
+/// This event carries them as they are drawn.
+///
+/// Each message starts again at index 0, which is the only thing keeping this file to one
+/// message: the first piece of a message truncates it and the rest are appended.
+const LIVE_MESSAGE_HOOK_SOURCE: &str = r#"#!/bin/sh
+# Written by Zed. Records what a session is saying while it says it, because the
+# transcript does not get the words until the turn is over.
+#
+# Nothing is printed and the exit status is always 0: this hook rules on nothing.
+payload=$(cat)
+directory="$HOME/.claude/live-messages"
+mkdir -p "$directory" || exit 0
+session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
+if [ -z "$session" ]; then
+  session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+fi
+[ -n "$session" ] || exit 0
+case "$session" in */*|*..*) exit 0 ;; esac
+
+file="$directory/$session.jsonl"
+# A message begins again at index 0, so its first piece is what clears the one before it.
+# Without this the file is every message the session has ever drawn.
+case "$payload" in
+  *'"index":0,'*|*'"index": 0,'*|*'"index":0}'*|*'"index": 0}'*) : > "$file" 2>/dev/null || exit 0 ;;
+esac
+# A message that somehow never starts over must not grow without limit.
+if [ -f "$file" ]; then
+  size=$(wc -c < "$file" 2>/dev/null || echo 0)
+  [ "$size" -lt 262144 ] || : > "$file" 2>/dev/null
+fi
+printf '%s\n' "$payload" >> "$file" 2>/dev/null || exit 0
+exit 0
+"#;
+
+/// The hooks Zed installs, as the event they answer and the script that answers it.
+///
+/// Both exist for the same reason — the CLI writes neither a waiting question nor the
+/// words of a turn in progress anywhere a reader can see them — so they are installed
+/// together and reported together. A machine with one and not the other is a machine
+/// where installing was interrupted, and is offered the install again.
+const INSTALLED_HOOKS: [(&str, &str, &str); 2] = [
+    (
+        "PreToolUse",
+        QUESTION_HOOK_SCRIPT,
+        QUESTION_HOOK_SOURCE_PLACEHOLDER,
+    ),
+    (
+        LIVE_MESSAGE_HOOK_EVENT,
+        LIVE_MESSAGE_HOOK_SCRIPT,
+        LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER,
+    ),
+];
+
+/// The two sources, kept out of [`INSTALLED_HOOKS`] because a `const` array cannot hold
+/// them by reference and repeating them would be two copies to keep in step.
+const QUESTION_HOOK_SOURCE_PLACEHOLDER: &str = "question";
+const LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER: &str = "live-message";
+
+fn hook_source(placeholder: &str) -> &'static str {
+    match placeholder {
+        LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER => LIVE_MESSAGE_HOOK_SOURCE,
+        _ => QUESTION_HOOK_SOURCE,
+    }
+}
+
+/// Only the question hook is matched to a tool; the message hook answers every message
+/// its event is raised for.
+fn hook_matcher(event: &str) -> Option<&'static str> {
+    (event == "PreToolUse").then_some(QUESTION_HOOK_TOOL)
+}
+
+/// Whether the hooks Zed installs are in place on this machine.
+pub fn question_hook_is_installed(home_directory: &Path) -> bool {
+    let Some(settings) = read_claude_settings(home_directory).log_err().flatten() else {
+        return false;
+    };
+
+    INSTALLED_HOOKS.iter().all(|(event, script, _)| {
+        let script = home_directory.join(".claude").join(script);
+        script.is_file() && settings_name_the_hook(&settings, event, &script.to_string_lossy())
+    })
+}
+
+fn read_claude_settings(home_directory: &Path) -> Result<Option<serde_json::Value>> {
+    let path = home_directory.join(".claude").join("settings.json");
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let settings = serde_json::from_str(&contents)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            Ok(Some(settings))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn settings_name_the_hook(settings: &serde_json::Value, event: &str, script: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command").and_then(serde_json::Value::as_str) == Some(script)
+                        })
+                    })
+            })
+        })
+}
+
+/// Installs the hook that records waiting questions, and reports the path the previous
+/// settings were copied to when there were settings to copy.
+///
+/// The settings file belongs to its user and holds everything else they have configured,
+/// so it is read, added to, and written back rather than replaced, and a copy of what was
+/// there is kept first. Installing twice changes nothing.
+pub fn install_question_hook(home_directory: &Path) -> Result<Option<PathBuf>> {
+    let claude_directory = home_directory.join(".claude");
+    let settings_path = claude_directory.join("settings.json");
+
+    // Written before the settings are touched: a settings file naming a script that is
+    // not there yet would have the CLI reporting a broken hook until this finished.
+    let mut commands = Vec::new();
+    for (event, script, source) in INSTALLED_HOOKS {
+        let script = claude_directory.join(script);
+        if let Some(parent) = script.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&script, hook_source(source))
+            .with_context(|| format!("writing {}", script.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("making {} executable", script.display()))?;
+        }
+        commands.push((event, script.to_string_lossy().into_owned()));
+    }
+
+    let existing = read_claude_settings(home_directory)?;
+    let missing: Vec<&(&str, String)> = commands
+        .iter()
+        .filter(|(event, command)| match &existing {
+            Some(settings) => !settings_name_the_hook(settings, event, command),
+            None => true,
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    let backup = match &existing {
+        Some(_) => {
+            let backup = settings_path.with_extension(format!("json.bak.{}", now_millis()));
+            fs::copy(&settings_path, &backup)
+                .with_context(|| format!("copying {} aside", settings_path.display()))?;
+            Some(backup)
+        }
+        None => None,
+    };
+
+    let mut settings = existing.unwrap_or_else(|| serde_json::json!({}));
+    let settings_object = settings
+        .as_object_mut()
+        .with_context(|| format!("{} does not hold a JSON object", settings_path.display()))?;
+    let hooks = settings_object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("`hooks` does not hold a JSON object")?;
+
+    for (event, command) in missing {
+        let mut hook = serde_json::json!({
+            "hooks": [{ "type": "command", "command": command }],
+        });
+        if let Some(matcher) = hook_matcher(event)
+            && let Some(hook) = hook.as_object_mut()
+        {
+            hook.insert("matcher".to_string(), serde_json::json!(matcher));
+        }
+        hooks
+            .entry(*event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .with_context(|| format!("`hooks.{event}` does not hold a JSON array"))?
+            .push(hook);
+    }
+
+    fs::write(&settings_path, format!("{:#}\n", settings))
+        .with_context(|| format!("writing {}", settings_path.display()))?;
+
+    Ok(backup)
+}
+
+/// Which agents of one workflow run that run's journal says have returned.
+///
+/// A run's agents carry no tool use id, and the `Workflow` call that started the run is
+/// answered the moment the run is launched rather than when it ends, so the session's own
+/// conversation cannot say when any one of them finishes. The journal the run writes
+/// beside its agents is the only record of that.
+#[derive(Debug, Default)]
+struct WorkflowJournal {
+    returned: HashSet<String>,
+}
+
+impl WorkflowJournal {
+    /// `None` when the run has written no journal this scan could read, which is the
+    /// ordinary state of a run in the moments after it launches.
+    fn read(directory: &Path) -> Option<Self> {
+        let path = directory.join(WORKFLOW_JOURNAL_FILE);
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                log::warn!("reading {}: {error}", path.display());
+                return None;
+            }
+        };
+
+        // Taken a line at a time: the journal is appended to while it is being read, so
+        // the last line is regularly half-written, and one unreadable line must not
+        // decide the state of every other agent in the run.
+        let mut returned = HashSet::default();
+        for line in contents.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if entry.get("type").and_then(serde_json::Value::as_str)
+                != Some(WORKFLOW_JOURNAL_RESULT_TYPE)
+            {
+                continue;
+            }
+            if let Some(agent_id) = entry.get("agentId").and_then(serde_json::Value::as_str) {
+                returned.insert(agent_id.to_string());
+            }
+        }
+
+        Some(Self { returned })
+    }
+
+    fn has_returned(&self, agent_id: &str) -> bool {
+        self.returned.contains(agent_id)
+    }
 }
 
 /// Every subagent conversation a session has spawned.
@@ -786,7 +1522,9 @@ pub async fn list_subagents(
 ///
 /// The scan is driven off the sidecars rather than the transcripts, because a transcript
 /// on its own says nothing about which agent wrote it, and because a run directory keeps
-/// a `journal.jsonl` beside its agents that pairs with no sidecar.
+/// a `journal.jsonl` beside its agents that pairs with no sidecar. That journal names no
+/// agent of its own to list, but it is what says which of the listed ones have returned;
+/// see [`WorkflowJournal`].
 fn read_subagents_in(
     directory: &Path,
     workflow_run_id: Option<&str>,
@@ -799,6 +1537,10 @@ fn read_subagents_in(
             return Err(error).with_context(|| format!("reading {}", directory.display()));
         }
     };
+
+    // One journal answers for every agent in the run, so it is read once here rather than
+    // once per agent. Only a run directory has one.
+    let journal = workflow_run_id.and_then(|_| WorkflowJournal::read(directory));
 
     for directory_entry in directory_entries {
         let Some(directory_entry) = directory_entry.log_err() else {
@@ -845,6 +1587,13 @@ fn read_subagents_in(
             meta,
             transcript_path,
             size,
+            // An agent the journal does not name has not returned: the sidecar this scan
+            // just read is written when the agent is spawned, before the journal records
+            // it starting, so the gap between the two files is the start of its work
+            // rather than the end of it.
+            workflow_agent_finished: journal
+                .as_ref()
+                .map(|journal| journal.has_returned(agent_id)),
         });
     }
 
@@ -1162,6 +1911,66 @@ pub enum PaneKey {
     Up,
     Down,
     Enter,
+    /// The digit that picks a numbered option outright, without walking to it first.
+    Choice(Digit),
+    /// Shift+Tab, which the CLI cycles its permission mode on. tmux calls it back-tab.
+    CyclePermissionMode,
+    /// Ctrl+C: takes back what has been typed into the CLI, and stops a turn it is
+    /// running.
+    Cancel,
+    /// Ctrl+D: quits the CLI, taking the session with it.
+    Quit,
+}
+
+/// The digits a numbered menu answers to.
+///
+/// A closed set rather than a number, for the same reason the rest of [`PaneKey`] is one:
+/// what this becomes is a key sent to a terminal, and a value that could be anything
+/// could be sent as something other than a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Digit {
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+}
+
+impl Digit {
+    /// The digit that picks the option at `index`, counting from zero as the options
+    /// themselves are. `None` past the ninth, which a menu does not number.
+    pub fn for_option(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Digit::One,
+            1 => Digit::Two,
+            2 => Digit::Three,
+            3 => Digit::Four,
+            4 => Digit::Five,
+            5 => Digit::Six,
+            6 => Digit::Seven,
+            7 => Digit::Eight,
+            8 => Digit::Nine,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Digit::One => "1",
+            Digit::Two => "2",
+            Digit::Three => "3",
+            Digit::Four => "4",
+            Digit::Five => "5",
+            Digit::Six => "6",
+            Digit::Seven => "7",
+            Digit::Eight => "8",
+            Digit::Nine => "9",
+        }
+    }
 }
 
 impl PaneKey {
@@ -1171,6 +1980,10 @@ impl PaneKey {
             PaneKey::Up => "Up",
             PaneKey::Down => "Down",
             PaneKey::Enter => "Enter",
+            PaneKey::Choice(digit) => digit.as_str(),
+            PaneKey::CyclePermissionMode => "BTab",
+            PaneKey::Cancel => "C-c",
+            PaneKey::Quit => "C-d",
         }
     }
 
@@ -1181,6 +1994,18 @@ impl PaneKey {
             "Up" => Some(PaneKey::Up),
             "Down" => Some(PaneKey::Down),
             "Enter" => Some(PaneKey::Enter),
+            "1" => Some(PaneKey::Choice(Digit::One)),
+            "2" => Some(PaneKey::Choice(Digit::Two)),
+            "3" => Some(PaneKey::Choice(Digit::Three)),
+            "4" => Some(PaneKey::Choice(Digit::Four)),
+            "5" => Some(PaneKey::Choice(Digit::Five)),
+            "6" => Some(PaneKey::Choice(Digit::Six)),
+            "7" => Some(PaneKey::Choice(Digit::Seven)),
+            "8" => Some(PaneKey::Choice(Digit::Eight)),
+            "9" => Some(PaneKey::Choice(Digit::Nine)),
+            "BTab" => Some(PaneKey::CyclePermissionMode),
+            "C-c" => Some(PaneKey::Cancel),
+            "C-d" => Some(PaneKey::Quit),
             _ => None,
         }
     }
@@ -2965,6 +3790,675 @@ mod tests {
         Ok(())
     }
 
+    /// A command written by someone is the one the reader is looking for, and a project's
+    /// own shadows the user's of the same name the way the CLI resolves them.
+    #[test]
+    fn a_machines_own_commands_come_before_the_built_in_ones() -> Result<()> {
+        let home_directory = temporary_directory("slash-commands");
+        let project_root = home_directory.join("project");
+
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("commands")
+                .join("review.md"),
+            "---\ndescription: The user's own review\n---\nbody",
+        );
+        write_file(
+            project_root
+                .join(".claude")
+                .join("commands")
+                .join("review.md"),
+            "---\ndescription: This project's review\nargument-hint: \"[pr]\"\n---\nbody",
+        );
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("commands")
+                .join("deep")
+                .join("audit.md"),
+            "no front matter here",
+        );
+        // A built-in the machine also defines must appear once, as the machine's.
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("commands")
+                .join("cost.md"),
+            "---\ndescription: My own cost\n---\nbody",
+        );
+
+        let commands = list_slash_commands(&home_directory, Some(&project_root));
+        let named = |name: &str| {
+            commands
+                .iter()
+                .filter(|command| command.name == name)
+                .collect::<Vec<_>>()
+        };
+
+        let review = named("review");
+        assert_eq!(review.len(), 1, "a name is one command, not two");
+        assert_eq!(
+            review.first().map(|command| command.scope),
+            Some(SlashCommandScope::Project),
+            "the project's own shadows the user's"
+        );
+        assert_eq!(
+            review
+                .first()
+                .and_then(|command| command.argument_hint.as_deref()),
+            Some("[pr]"),
+            "the quotes belong to the front matter, not to the hint"
+        );
+
+        assert_eq!(
+            named("deep:audit")
+                .first()
+                .map(|command| command.name.as_str()),
+            Some("deep:audit"),
+            "a command in a directory is named for the directory it is in"
+        );
+        assert_eq!(
+            named("deep:audit")
+                .first()
+                .and_then(|c| c.description.as_deref()),
+            None,
+            "a command with no front matter is still a command"
+        );
+
+        assert_eq!(
+            named("cost").first().map(|command| command.scope),
+            Some(SlashCommandScope::User),
+            "a name the machine defines is the machine's, not the built-in one"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.name == "clear"
+                    && command.scope == SlashCommandScope::Builtin),
+            "the built-in commands are still offered"
+        );
+
+        let machine_commands = commands
+            .iter()
+            .take_while(|command| command.scope != SlashCommandScope::Builtin)
+            .count();
+        assert_eq!(
+            machine_commands, 3,
+            "the project's `review`, and the user's `cost` and `deep:audit` — the user's \
+             `review` having been shadowed — all come before the built-in ones"
+        );
+        Ok(())
+    }
+
+    /// A machine with no commands of its own still answers to the built-in ones, and
+    /// listing nothing would leave the reader with an empty menu.
+    #[test]
+    fn a_machine_with_no_commands_of_its_own_still_has_the_built_in_ones() {
+        let home_directory = temporary_directory("slash-commands-none");
+        let commands = list_slash_commands(&home_directory, None);
+
+        assert_eq!(commands.len(), BUILTIN_SLASH_COMMANDS.len());
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.scope == SlashCommandScope::Builtin)
+        );
+    }
+
+    #[test]
+    fn test_slash_commands_ignores_hidden_and_avoids_symlink_cycles() {
+        let home_directory = temporary_directory("slash-commands-cycles");
+        let project_root = temporary_directory("slash-project-cycles");
+        let commands_dir = project_root.join(".claude").join("commands");
+        fs::create_dir_all(&commands_dir).unwrap();
+
+        write_file(
+            commands_dir.join("valid.md"),
+            "---\ndescription: Valid command\n---\nbody",
+        );
+        write_file(
+            commands_dir.join(".hidden.md"),
+            "---\ndescription: Hidden file\n---\nbody",
+        );
+
+        let hidden_dir = commands_dir.join(".git");
+        fs::create_dir_all(&hidden_dir).unwrap();
+        write_file(
+            hidden_dir.join("ignored.md"),
+            "---\ndescription: Hidden dir command\n---\nbody",
+        );
+
+        let commands = list_slash_commands(&home_directory, Some(&project_root));
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"valid"),
+            "expected `valid` command to be loaded"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with('.'))
+                .copied()
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "hidden files and hidden directories must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_live_message_hook_truncates_when_index_zero_has_no_trailing_comma() -> Result<()> {
+        let temp_dir = temporary_directory("hook-truncate-test");
+        let session_id = "test-session";
+        let live_dir = temp_dir.join(".claude").join("live-messages");
+        fs::create_dir_all(&live_dir)?;
+        let message_file = live_dir.join(format!("{session_id}.jsonl"));
+        write_file(
+            message_file.clone(),
+            "stale content from previous message\n",
+        );
+
+        let hook_path = temp_dir.join("hook.sh");
+        fs::write(&hook_path, LIVE_MESSAGE_HOOK_SOURCE)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))?;
+        }
+
+        let payload = r#"{"type":"content_block_start","session_id":"test-session","index":0}"#;
+
+        // The hook reads its payload from stdin, and the shell is what feeds it: the
+        // pattern under test is the shell's own `case` glob, so running it any other way
+        // would be testing a reimplementation of it rather than the hook that ships.
+        let status = smol::block_on(
+            smol::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
+                .arg("--")
+                .arg(payload)
+                .arg(&hook_path)
+                .env("HOME", &temp_dir)
+                .status(),
+        )?;
+        assert!(status.success(), "the hook must always exit 0");
+
+        let contents = fs::read_to_string(&message_file)?;
+        assert_eq!(
+            contents.lines().next(),
+            Some(payload),
+            "hook must truncate file on index:0 even when object ends without a comma"
+        );
+        Ok(())
+    }
+
+    /// The pieces of a message arrive in the order the terminal drew them, but the file
+    /// is appended to while it is read, so the order is not what this reads them by.
+    #[test]
+    fn a_message_is_put_back_together_in_the_order_its_pieces_are_numbered() {
+        let out_of_order = concat!(
+            r#"{"message_id":"m1","index":1,"final":false,"delta":" world"}"#,
+            "\n",
+            r#"{"message_id":"m1","index":0,"final":false,"delta":"hello"}"#,
+            "\n",
+            r#"{"message_id":"m1","index":2,"final":true,"delta":"!"}"#,
+            "\n",
+        );
+        assert_eq!(
+            assemble_live_message(out_of_order).as_deref(),
+            Some("hello world!")
+        );
+    }
+
+    /// A message beginning is what clears the one before it, and the hook truncates on
+    /// the same signal. When that truncation did not happen — the file could not be
+    /// written, or a message began while it was being read — two messages would otherwise
+    /// be shown run together as one.
+    #[test]
+    fn only_the_newest_message_in_the_file_is_assembled() {
+        let two_messages = concat!(
+            r#"{"message_id":"m1","index":0,"final":true,"delta":"the older one"}"#,
+            "\n",
+            r#"{"message_id":"m2","index":0,"final":false,"delta":"the newer"}"#,
+            "\n",
+            r#"{"message_id":"m2","index":1,"final":true,"delta":" one"}"#,
+            "\n",
+        );
+        assert_eq!(
+            assemble_live_message(two_messages).as_deref(),
+            Some("the newer one")
+        );
+    }
+
+    /// The last line is regularly half-written, because it is appended to while it is
+    /// being read. Losing the piece being written is right; losing the message is not.
+    #[test]
+    fn a_half_written_piece_costs_only_itself() {
+        let half_written = concat!(
+            r#"{"message_id":"m1","index":0,"final":false,"delta":"what is here"}"#,
+            "\n",
+            r#"{"message_id":"m1","index":1,"final":fal"#,
+        );
+        assert_eq!(
+            assemble_live_message(half_written).as_deref(),
+            Some("what is here")
+        );
+    }
+
+    /// Nothing recorded, and nothing but whitespace recorded, are both a session that has
+    /// nothing to show — and a blank block under the conversation is worse than none.
+    #[test]
+    fn a_message_of_nothing_is_not_a_message() {
+        assert_eq!(assemble_live_message(""), None);
+        assert_eq!(
+            assemble_live_message(r#"{"message_id":"m1","index":0,"delta":"   \n "}"#),
+            None
+        );
+        assert_eq!(assemble_live_message("not json at all\n"), None);
+    }
+
+    /// A piece repeated — the hook ran twice for it, or a read caught a rewrite — must not
+    /// double the words it carries.
+    #[test]
+    fn a_piece_recorded_twice_is_only_said_once() {
+        let repeated = concat!(
+            r#"{"message_id":"m1","index":0,"final":false,"delta":"once"}"#,
+            "\n",
+            r#"{"message_id":"m1","index":1,"final":false,"delta":" only"}"#,
+            "\n",
+            r#"{"message_id":"m1","index":1,"final":false,"delta":" only"}"#,
+            "\n",
+        );
+        assert_eq!(
+            assemble_live_message(repeated).as_deref(),
+            Some("once only")
+        );
+    }
+
+    /// Captured from a real session that was waiting on this call, so that the shape the
+    /// CLI actually writes is what this parse is held to.
+    const RECORDED_QUESTION: &str = r#"{
+      "session_id": "a83d6fef-bfe3-42ee-b1a5-6d9fe13a8c4c",
+      "transcript_path": "/home/coder/.claude/projects/-tmp-askq/a83d6fef.jsonl",
+      "cwd": "/tmp/askq-hook-test",
+      "permission_mode": "auto",
+      "effort": { "level": "high" },
+      "hook_event_name": "PreToolUse",
+      "tool_name": "AskUserQuestion",
+      "tool_input": {
+        "questions": [
+          {
+            "question": "Which project shape should the example use?",
+            "header": "Project shape",
+            "options": [
+              { "label": "Next.js + React", "description": "Pages and API routes" },
+              { "label": "Node CLI", "description": "  " },
+              { "label": "Go service" }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "Which extras should be on?",
+            "header": "Extras",
+            "options": [
+              { "label": "CodeGraph index", "description": "Symbols and blast radius" },
+              { "label": "Regression gate", "description": "Blind tests, tsc, lint" }
+            ],
+            "multiSelect": true
+          }
+        ]
+      },
+      "tool_use_id": "toolu_01LgCXEavHobAUwqivtgDLvs"
+    }"#;
+
+    /// Every part of this is something the panel draws, and a field that reads back empty
+    /// or defaults quietly costs a question its options or its meaning, so each is
+    /// asserted rather than the parse merely succeeding.
+    #[test]
+    fn a_recorded_question_keeps_its_options_and_which_of_them_take_several() -> Result<()> {
+        let question = parse_pending_question(RECORDED_QUESTION)?
+            .context("the recorded payload is a question to draw")?;
+
+        assert_eq!(question.tool_use_id, "toolu_01LgCXEavHobAUwqivtgDLvs");
+        assert_eq!(question.questions.len(), 2);
+
+        let first = question
+            .questions
+            .first()
+            .context("the first question survived the parse")?;
+        assert_eq!(first.header, "Project shape");
+        assert_eq!(
+            first.question,
+            "Which project shape should the example use?"
+        );
+        assert!(!first.multi_select);
+        assert_eq!(
+            first
+                .options
+                .iter()
+                .map(|option| (option.label.as_str(), option.description.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Next.js + React", Some("Pages and API routes")),
+                // A description of nothing but whitespace is no description: drawing it
+                // leaves a blank second line under the option.
+                ("Node CLI", None),
+                ("Go service", None),
+            ]
+        );
+
+        let second = question
+            .questions
+            .get(1)
+            .context("the second question survived the parse")?;
+        assert!(
+            second.multi_select,
+            "a question that takes several answers is drawn with checkboxes rather than \
+             one that takes one, so losing this flag draws the wrong control"
+        );
+        Ok(())
+    }
+
+    /// The panel tells a question that is still waiting from one already answered by
+    /// looking for the tool result that answers this id, so a payload without one cannot
+    /// be drawn as waiting no matter what else it holds.
+    #[test]
+    fn a_payload_that_names_no_call_is_not_a_question_to_draw() -> Result<()> {
+        let without_id = RECORDED_QUESTION.replace("tool_use_id", "some_other_field");
+        assert_eq!(parse_pending_question(&without_id)?, None);
+        Ok(())
+    }
+
+    /// Options are the whole of what the panel offers. A question with none is one the
+    /// reader could look at but not answer, which is worse than leaving it to the
+    /// terminal, and the last question left standing being empty must not be papered over
+    /// by the others.
+    #[test]
+    fn a_question_with_nothing_to_pick_is_left_to_the_terminal() -> Result<()> {
+        let no_options = r#"{"tool_use_id":"toolu_01","tool_input":{"questions":[
+            {"question":"q","header":"h","options":[],"multiSelect":false}]}}"#;
+        assert_eq!(parse_pending_question(no_options)?, None);
+
+        let no_questions = r#"{"tool_use_id":"toolu_01","tool_input":{"questions":[]}}"#;
+        assert_eq!(parse_pending_question(no_questions)?, None);
+
+        // One question with options and one without: the one that can be drawn is kept,
+        // rather than the empty one taking the whole payload down with it.
+        let mixed = r#"{"tool_use_id":"toolu_01","tool_input":{"questions":[
+            {"question":"a","header":"A","options":[],"multiSelect":false},
+            {"question":"b","header":"B","options":[{"label":"only"}],"multiSelect":false}]}}"#;
+        let parsed = parse_pending_question(mixed)?.context("the answerable question is kept")?;
+        assert_eq!(
+            parsed
+                .questions
+                .iter()
+                .map(|question| question.header.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B"]
+        );
+        Ok(())
+    }
+
+    /// The settings file is the user's and holds everything else they have configured, so
+    /// installing has to add to it rather than write over it, and has to leave a copy of
+    /// what was there.
+    #[test]
+    fn installing_the_hook_keeps_the_rest_of_the_settings_and_copies_them_aside() -> Result<()> {
+        let home_directory = temporary_directory("question-hook-install");
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(
+            settings_path.clone(),
+            r#"{"model":"opus[1m]","hooks":{"UserPromptSubmit":[{"hooks":[
+                {"type":"command","command":"codegraph prompt-hook"}]}]}}"#,
+        );
+
+        assert!(
+            !question_hook_is_installed(&home_directory),
+            "nothing is installed before installing it"
+        );
+
+        let backup = install_question_hook(&home_directory)?
+            .context("settings that existed are copied aside")?;
+        assert!(
+            backup.is_file(),
+            "the copy has to exist to be worth anything"
+        );
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        assert_eq!(
+            settings.get("model").and_then(serde_json::Value::as_str),
+            Some("opus[1m]"),
+            "a setting this install knows nothing about must survive it"
+        );
+        assert_eq!(
+            settings
+                .pointer("/hooks/UserPromptSubmit/0/hooks/0/command")
+                .and_then(serde_json::Value::as_str),
+            Some("codegraph prompt-hook"),
+            "another hook of another event must survive it"
+        );
+        assert!(question_hook_is_installed(&home_directory));
+
+        let script = home_directory.join(".claude").join(QUESTION_HOOK_SCRIPT);
+        assert!(script.is_file(), "the hook has to have something to run");
+        Ok(())
+    }
+
+    /// The button offering to install is drawn from what is installed, so a second press
+    /// — or a press against settings someone else has already added it to — must not
+    /// leave the hook named twice or bury the settings under a pile of copies.
+    #[test]
+    fn installing_the_hook_a_second_time_changes_nothing() -> Result<()> {
+        let home_directory = temporary_directory("question-hook-twice");
+        install_question_hook(&home_directory)?;
+        let after_first = fs::read_to_string(home_directory.join(".claude").join("settings.json"))?;
+
+        assert_eq!(
+            install_question_hook(&home_directory)?,
+            None,
+            "nothing was changed, so nothing had to be copied aside"
+        );
+        assert_eq!(
+            fs::read_to_string(home_directory.join(".claude").join("settings.json"))?,
+            after_first,
+            "the settings are the same file they were"
+        );
+        Ok(())
+    }
+
+    /// A machine with no settings at all is a machine the hook can still be installed on:
+    /// refusing there would leave a fresh account unable to press the button.
+    #[test]
+    fn the_hook_installs_onto_a_machine_with_no_settings_yet() -> Result<()> {
+        let home_directory = temporary_directory("question-hook-fresh");
+        assert_eq!(
+            install_question_hook(&home_directory)?,
+            None,
+            "there were no settings to copy aside"
+        );
+        assert!(question_hook_is_installed(&home_directory));
+        Ok(())
+    }
+
+    /// The file the hook leaves behind is written when a question is asked and never
+    /// rewritten when it is answered, so a session id that could name a file outside the
+    /// directory it belongs to must not be followed.
+    #[test]
+    fn a_recorded_question_is_read_back_for_the_session_that_asked_it() -> Result<()> {
+        let home_directory = temporary_directory("question-read-back");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join(PENDING_QUESTIONS_DIRECTORY)
+                .join(format!("{REAL_SESSION_ID}.json")),
+            RECORDED_QUESTION,
+        );
+
+        let question = read_pending_question(&home_directory, REAL_SESSION_ID)?
+            .context("the session's recorded question is read back")?;
+        assert_eq!(question.tool_use_id, "toolu_01LgCXEavHobAUwqivtgDLvs");
+
+        assert_eq!(
+            read_pending_question(&home_directory, "no-such-session")?,
+            None,
+            "a session that has asked nothing has no question waiting"
+        );
+        for rejected in IDS_THAT_NAME_MORE_THAN_ONE_ENTRY {
+            assert_eq!(
+                read_pending_question(&home_directory, rejected)?,
+                None,
+                "`{rejected}` must not be followed out of the directory"
+            );
+        }
+        Ok(())
+    }
+
+    /// The journal is the only record of a workflow agent having returned, so what it
+    /// says has to reach the listing agent by agent rather than run by run.
+    #[test]
+    fn a_runs_journal_says_which_of_its_agents_have_returned() -> Result<()> {
+        let home_directory = temporary_directory("subagent-journal");
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        let returned = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a2222e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        // An agent listed by a sidecar the journal has not reached yet: the run started
+        // it, and its result has not been written.
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a3333e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        // An agent of no run at all, which no journal answers for.
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            transcript_contents,
+        );
+        write_file(
+            returned.with_file_name(WORKFLOW_JOURNAL_FILE),
+            "{\"type\":\"launched\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a1111e203ec41bc73\",\"label\":\"copy:a\"}\n\
+             {\"type\":\"result\",\"agentId\":\"a1111e203ec41bc73\",\"result\":\"done\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a2222e203ec41bc73\",\"label\":\"copy:b\"}\n",
+        );
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        let states: Vec<(&str, Option<bool>)> = subagents
+            .iter()
+            .map(|subagent| (subagent.agent_id.as_str(), subagent.workflow_agent_finished))
+            .collect();
+
+        assert_eq!(
+            states,
+            vec![
+                (REAL_AGENT_ID, None),
+                ("a1111e203ec41bc73", Some(true)),
+                ("a2222e203ec41bc73", Some(false)),
+                ("a3333e203ec41bc73", Some(false)),
+            ],
+            "only the agent the journal recorded a result for has returned, and the agent \
+             belonging to no run is answered by no journal at all"
+        );
+        Ok(())
+    }
+
+    /// A run writes its journal after it has spawned its first agents, so a run with no
+    /// journal yet is a run that has only just started rather than one with nothing in
+    /// it. Reporting its agents as returned would draw a starting run as a finished one.
+    #[test]
+    fn a_run_that_has_written_no_journal_reports_none_of_its_agents_as_returned() -> Result<()> {
+        let home_directory = temporary_directory("subagent-journal-missing");
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        assert_eq!(
+            subagents
+                .iter()
+                .map(|subagent| subagent.workflow_agent_finished)
+                .collect::<Vec<_>>(),
+            vec![None],
+            "no journal to read is not the same as a journal saying the agent returned"
+        );
+        Ok(())
+    }
+
+    /// The journal is appended to while it is read, so its last line is regularly
+    /// half-written, and the writer ships independently of this reader and adds entry
+    /// types between releases. Either one must cost only the line it is on.
+    #[test]
+    fn a_journal_line_this_reader_cannot_use_costs_only_that_line() -> Result<()> {
+        let home_directory = temporary_directory("subagent-journal-partial");
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        let first = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a2222e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_file(
+            first.with_file_name(WORKFLOW_JOURNAL_FILE),
+            "{\"type\":\"somethingThisVersionHasNeverSeen\",\"agentId\":\"a2222e203ec41bc73\"}\n\
+             {\"type\":\"result\",\"agentId\":\"a1111e203ec41bc73\",\"result\":\"done\"}\n\
+             {\"type\":\"result\",\"agentId\":\"a2222e2",
+        );
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        assert_eq!(
+            subagents
+                .iter()
+                .map(|subagent| (subagent.agent_id.as_str(), subagent.workflow_agent_finished))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a1111e203ec41bc73", Some(true)),
+                ("a2222e203ec41bc73", Some(false)),
+            ],
+            "the readable result still counts, the half-written one does not, and neither \
+             agent was dropped from the listing"
+        );
+        Ok(())
+    }
+
     /// Without the workflow scan the third row is missing; without the sort the rows
     /// arrive in whatever order the directory happens to enumerate; and without the
     /// per-row skip the broken sidecar takes the whole listing with it.
@@ -3376,5 +4870,51 @@ mod tests {
         assert_eq!(third.lines, vec!["{\"uuid\":\"agent-9\"}".to_string()]);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pane_key_tests {
+    use super::*;
+
+    /// The key name is what crosses the connection between the panel and the machine the
+    /// session runs on: the panel writes it with `tmux_name` and the other end rebuilds
+    /// the key with `from_tmux_name`. A variant either side does not agree on is a
+    /// button that silently does nothing.
+    #[test]
+    fn test_every_pane_key_survives_the_name_it_crosses_a_connection_as() {
+        let keys = [
+            PaneKey::Up,
+            PaneKey::Down,
+            PaneKey::Enter,
+            PaneKey::Choice(Digit::One),
+            PaneKey::Choice(Digit::Nine),
+            PaneKey::CyclePermissionMode,
+            PaneKey::Cancel,
+            PaneKey::Quit,
+        ];
+
+        for key in keys {
+            assert_eq!(
+                PaneKey::from_tmux_name(key.tmux_name()),
+                Some(key),
+                "{:?} did not survive being written as {:?}",
+                key,
+                key.tmux_name()
+            );
+        }
+    }
+
+    /// The set is closed on purpose: a name that reached this from a registration, or
+    /// from a connection, must not become a keystroke of its own choosing.
+    #[test]
+    fn test_a_name_that_is_not_one_of_the_keys_is_refused() {
+        for name in ["C-z", "kill", "BTab ", "btab", "Enter Enter", "", "C-C"] {
+            assert_eq!(
+                PaneKey::from_tmux_name(name),
+                None,
+                "{name:?} was accepted as a key to send"
+            );
+        }
     }
 }

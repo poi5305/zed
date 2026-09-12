@@ -64,7 +64,12 @@ actions!(
         /// Interrupts the selected Claude Code session, as Escape does in the terminal.
         Interrupt,
         /// Opens the Claude sessions conversation as a tab in the editor area.
-        OpenInEditor
+        OpenInEditor,
+        /// Puts the previous message sent to this session back in the message box, as Up
+        /// does in the terminal.
+        PreviousMessage,
+        /// Walks back down the messages already sent, towards the box's own draft.
+        NextMessage
     ]
 );
 

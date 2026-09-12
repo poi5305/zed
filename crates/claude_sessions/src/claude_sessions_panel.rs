@@ -38,8 +38,9 @@ use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::TerminalView;
 use theme::Appearance;
 use ui::{
-    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes, Scrollbars,
-    SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
+    Button, ButtonStyle, Checkbox, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes,
+    Scrollbars, SelectableButton as _, TintColor, ToggleState, Tooltip, WithScrollbar as _,
+    prelude::*,
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
@@ -47,11 +48,13 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use zed_actions::editor::{MoveDown, MoveUp};
+
 use crate::{
-    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, OpenInEditor,
-    RegisteredSession, SendMessage, SubagentSummary, ToggleFocus, TranscriptRecord,
-    TranscriptTarget, Usage, rates_for_model,
-    session_registry::PaneKey,
+    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, NextMessage, OpenInEditor,
+    PreviousMessage, RegisteredSession, SendMessage, SubagentSummary, ToggleFocus,
+    TranscriptRecord, TranscriptTarget, Usage, rates_for_model,
+    session_registry::{Digit, PaneKey, Question, SlashCommand, SlashCommandScope},
     session_registry::{tmux_session_name, workflow_run_id_in_tool_result},
     session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
     transcript::Spend,
@@ -117,6 +120,7 @@ const USER_RECORD_TYPE: &str = "user";
 const THINKING_BLOCK_TYPE: &str = "thinking";
 const TOOL_USE_BLOCK_TYPE: &str = "tool_use";
 const TOOL_RESULT_BLOCK_TYPE: &str = "tool_result";
+const IMAGE_BLOCK_TYPE: &str = "image";
 
 /// The two blocks Claude Code writes into a user record for a slash command. Unlike
 /// [`INJECTED_WRAPPERS`] these are not cut out: what is inside them is the command the
@@ -183,6 +187,48 @@ const PANE_MIRROR_LINES: usize = 14;
 /// Multiples of the text's own size, for the lines within a paragraph.
 const CONVERSATION_LINE_HEIGHT: f32 = 1.5;
 
+/// What Claude Code writes beside the permission mode it is in, at the foot of its
+/// screen: `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents`.
+const PERMISSION_MODE_HINT: &str = "(shift+tab to cycle)";
+
+/// Said in place of the mode's name when the screen does not carry one. The CLI writes
+/// the line above only for the modes it considers worth announcing, so its absence is
+/// the ordinary mode rather than a session whose mode is unknowable.
+const UNNAMED_PERMISSION_MODE: &str = "Permission mode";
+
+/// Longer than any mode Claude Code has named, and short enough that a line of the
+/// conversation quoting the hint is not mistaken for the footer.
+const MAX_PERMISSION_MODE_CHARACTERS: usize = 40;
+
+/// The mode that turns the permission prompts off altogether. Named here only to draw
+/// its button as the warning it is.
+const BYPASSING_PERMISSIONS: &str = "bypass";
+
+/// The permission mode the session is in, read off the foot of its own screen.
+///
+/// The name is taken out of the line rather than matched against a list of the modes,
+/// because Claude Code renames them — what was `accept edits` is `auto mode` now — and a
+/// list would quietly show nothing the first time one changed.
+fn permission_mode(pane_contents: &str) -> Option<SharedString> {
+    // Searched from the bottom: the hint sits in the CLI's footer, and anything above
+    // that which happens to quote it is conversation.
+    pane_contents.lines().rev().find_map(|line| {
+        let before_hint = line.split(PERMISSION_MODE_HINT).next()?;
+        if before_hint.len() == line.len() {
+            return None;
+        }
+        let named = before_hint.trim();
+        // `on` is the line's own grammar rather than part of the mode's name.
+        let named = named.strip_suffix(" on").unwrap_or(named).trim_end();
+        // The glyphs the CLI marks the mode with are decoration, and differ per mode.
+        let mode = named
+            .trim_start_matches(|character: char| !character.is_alphanumeric())
+            .trim_end();
+        (!mode.is_empty() && mode.chars().count() <= MAX_PERMISSION_MODE_CHARACTERS)
+            .then(|| SharedString::from(mode.to_string()))
+    })
+}
+
 /// What the toolbar says about the session, left to right: the model answering it, the
 /// effort it is answering at, how much context its newest answer was given, and what it
 /// has cost.
@@ -208,6 +254,22 @@ fn session_facts(spend: &Spend) -> Vec<SharedString> {
         } else {
             format!("{context} ctx")
         }));
+    }
+    // What the session has spent, as against what it is carrying: the context figure
+    // above is the size of one request, and says nothing about how much work has gone
+    // through the session to reach it.
+    let read = spend
+        .usage
+        .input_tokens
+        .saturating_add(spend.usage.cache_read_tokens)
+        .saturating_add(spend.usage.cache_write_1h_tokens)
+        .saturating_add(spend.usage.cache_write_5m_tokens);
+    if read > 0 || spend.usage.output_tokens > 0 {
+        facts.push(SharedString::from(format!(
+            "{} in · {} out",
+            compact_token_count(read),
+            compact_token_count(spend.usage.output_tokens)
+        )));
     }
     if let Some(cost) = session_cost(spend) {
         facts.push(cost);
@@ -298,6 +360,114 @@ fn compact_token_count(tokens: u64) -> String {
         0..=9_999 => format!("{tokens}"),
         10_000..=999_999 => format!("{}K", tokens / 1_000),
         _ => format!("{:.1}M", tokens as f64 / 1_000_000.),
+    }
+}
+
+/// Which way the arrow key moves the cursor when the box holds a draft rather than a
+/// recalled message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorDirection {
+    Up,
+    Down,
+}
+
+/// What an arrow key does to the message box, decided before anything is touched.
+#[derive(Debug, PartialEq)]
+enum HistoryStep {
+    /// Put this message in the box, standing at `index` in the history.
+    Recall { index: usize, message: SharedString },
+    /// Empty the box: the walk is back where it started.
+    Draft,
+    /// The key belongs to the cursor — the box holds a draft the reader is writing, and
+    /// a message box that threw a half-written message away would be worse than no
+    /// history at all.
+    MoveCursor(CursorDirection),
+    /// The walk has run out of history this way; the box keeps what it is holding.
+    Stay,
+}
+
+/// The messages the reader has already sent, newest first.
+///
+/// Read back out of the conversation rather than remembered as they are sent: this panel
+/// is opened on sessions it has sent nothing to, and the terminal's Up walks the whole
+/// session either way.
+fn message_history(entries: &[Entry]) -> Vec<SharedString> {
+    let mut history: Vec<SharedString> = Vec::new();
+    for entry in entries.iter().rev() {
+        let EntryKind::Message {
+            role: MessageRole::User,
+            source,
+            ..
+        } = &entry.kind
+        else {
+            continue;
+        };
+        let text = source.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // Consecutive repeats are one entry, as a shell's history has them: a message
+        // sent twice is not two things to walk past.
+        if history.last().is_some_and(|last| last.as_ref() == text) {
+            continue;
+        }
+        history.push(SharedString::from(text.to_string()));
+    }
+    history
+}
+
+/// Where in the history the box is standing, or `None` when what it holds is the
+/// reader's own draft.
+///
+/// The recorded position and the box's contents are checked against each other rather
+/// than the position being trusted on its own: the moment the reader edits a recalled
+/// message it is a draft again, and the arrows are the cursor's.
+fn standing_in_history(at: Option<usize>, history: &[SharedString], typed: &str) -> Option<usize> {
+    at.filter(|index| history.get(*index).is_some_and(|message| message == typed))
+}
+
+fn step_back_through_history(
+    history: &[SharedString],
+    at: Option<usize>,
+    typed: &str,
+) -> HistoryStep {
+    let older = match standing_in_history(at, history, typed) {
+        Some(index) => index + 1,
+        // An empty box is where a walk starts, whether or not one was under way: the
+        // reader cleared what they had.
+        None if typed.is_empty() => 0,
+        None => return HistoryStep::MoveCursor(CursorDirection::Up),
+    };
+
+    match history.get(older) {
+        Some(message) => HistoryStep::Recall {
+            index: older,
+            message: message.clone(),
+        },
+        None => HistoryStep::Stay,
+    }
+}
+
+fn step_forward_through_history(
+    history: &[SharedString],
+    at: Option<usize>,
+    typed: &str,
+) -> HistoryStep {
+    let Some(index) = standing_in_history(at, history, typed) else {
+        return HistoryStep::MoveCursor(CursorDirection::Down);
+    };
+
+    // Walked back past the newest message, which is where the walk started.
+    let Some(newer) = index.checked_sub(1) else {
+        return HistoryStep::Draft;
+    };
+
+    match history.get(newer) {
+        Some(message) => HistoryStep::Recall {
+            index: newer,
+            message: message.clone(),
+        },
+        None => HistoryStep::Stay,
     }
 }
 
@@ -418,9 +588,10 @@ pub struct ClaudeSessionsPanel {
     /// True for the copy opened as an editor tab, which is already where opening one
     /// would take the reader.
     in_pane: bool,
-    /// Whether the session's terminal is showing. Open by default: the prompts it
-    /// carries are the ones that stop a session until they are answered, and a reader who
-    /// does not know one is waiting reads the session as stuck.
+    /// Whether the session's terminal is showing. Closed by default: what it carried
+    /// that the conversation did not — a question waiting to be answered, the words of a
+    /// turn still running — is drawn as this panel's own now, so the terminal is the way
+    /// back to the raw screen rather than the way to read the session.
     pane_expanded: bool,
     /// The terminal attached to the selected session's tmux pane, and the session it
     /// belongs to. Attaching is asynchronous and the reader can select another session
@@ -430,10 +601,40 @@ pub struct ClaudeSessionsPanel {
     /// How tall the terminal section is. Dragged by its top edge, and kept here rather
     /// than measured, because the reader's choice has to survive every redraw.
     terminal_height: Pixels,
-    /// Whether the message input is showing. Closed by default: the terminal above it
-    /// takes typing directly, and this is the second way to say the same thing — worth
-    /// having for a message pasted from elsewhere, not worth the room when it is idle.
+    /// Whether the message input is showing. Open by default: with the terminal closed
+    /// this is where the session is answered, and a question that arrives has nowhere to
+    /// draw itself if this is shut.
     input_expanded: bool,
+    /// How far up the messages already sent the reader has walked with the Up key, as
+    /// the terminal's own history walks. `None` while the box holds their own draft.
+    history_index: Option<usize>,
+    /// Whether the Quit button has been pressed once already. Quitting ends the session
+    /// and nothing gives it back, so the first press arms the button rather than
+    /// sending anything.
+    quit_armed: bool,
+    /// The answer being filled in for the question on screen, for a question that takes
+    /// several. Kept here rather than read back from the terminal because nothing is sent
+    /// until the whole answer is submitted: until then the terminal knows nothing about
+    /// what has been ticked.
+    ticked: Option<TickedAnswer>,
+    /// The call the reader chose to answer in their own words rather than by picking, so
+    /// that choosing it for one question does not leave the next one waiting for typing.
+    typing_answer_for: Option<SharedString>,
+    /// The slash commands the selected session answers to, as the machine it runs on last
+    /// listed them. Read once per session rather than per keystroke: the files behind
+    /// them change far less often than the reader types.
+    slash_commands: Vec<SlashCommand>,
+    /// Held so that dropping it cancels a listing that is still running.
+    _listing_slash_commands: Task<()>,
+    /// Held so that dropping it cancels an answer that is still being keyed into the
+    /// pane, and so that a second press cannot interleave with the first.
+    _answering: Task<()>,
+    /// What installing the hook did, kept on screen afterwards because it says where the
+    /// settings it changed were copied to. Cleared when a question can be read, which is
+    /// the install having taken effect.
+    hook_install_note: Option<SharedString>,
+    /// Held so that dropping it cancels an install that is still running.
+    _installing_hook: Task<()>,
     /// Held so that dropping it cancels an attach that is still running.
     _terminal_attach: Task<()>,
     /// See [`UnreadBelow`].
@@ -851,16 +1052,29 @@ impl ClaudeSessionsPanel {
         let Some(panel) = workspace.panel::<Self>(cx) else {
             return;
         };
-        let (fs, source, project_root, process_id) = {
+        let (fs, source, project_root, process_id, target) = {
             let panel = panel.read(cx);
+            let store = panel.store.read(cx);
             (
                 panel.fs.clone(),
                 panel.source.clone(),
                 panel.project_root.clone(),
-                panel.store.read(cx).selected(),
+                store.selected(),
+                // What the reader is looking at, not just which session it belongs to: a
+                // tab opened from an agent's conversation is opened to read that agent.
+                store.transcript_target().clone(),
             )
         };
-        Self::reveal_session_in_pane(workspace, fs, source, project_root, process_id, window, cx);
+        Self::reveal_session_in_pane(
+            workspace,
+            fs,
+            source,
+            project_root,
+            process_id,
+            target,
+            window,
+            cx,
+        );
     }
 
     /// Brings the tab that reads `process_id` forward, opening one when the window has
@@ -872,6 +1086,7 @@ impl ClaudeSessionsPanel {
     fn reveal_in_pane(
         &mut self,
         process_id: Option<u32>,
+        target: TranscriptTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -888,10 +1103,23 @@ impl ClaudeSessionsPanel {
                 source,
                 project_root,
                 process_id,
+                target,
                 window,
                 cx,
             );
         });
+    }
+
+    /// Opens one of the session's agent conversations as a tab of its own, so that a run
+    /// of several can be watched beside the conversation that started it.
+    fn open_agent_in_pane(
+        &mut self,
+        target: TranscriptTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let process_id = self.store.read(cx).selected();
+        self.reveal_in_pane(process_id, target, window, cx);
     }
 
     /// One tab per session, identified by the process it is reading.
@@ -911,14 +1139,20 @@ impl ClaudeSessionsPanel {
         source: Arc<dyn SessionSource>,
         project_root: Option<PathBuf>,
         process_id: Option<u32>,
+        target: TranscriptTarget,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         // Bound before the call below so that the iterator's borrow of the workspace has
         // ended by the time the item is activated through it.
-        let existing = workspace
-            .items_of_type::<Self>(cx)
-            .find(|item| item.read(cx).store.read(cx).selected() == process_id);
+        //
+        // Matched on the conversation as well as the session: two agents of one session
+        // are two things to read, and a tab showing one of them is not the tab for the
+        // other.
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let store = item.read(cx).store.read(cx);
+            store.selected() == process_id && *store.transcript_target() == target
+        });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
             return;
@@ -930,6 +1164,10 @@ impl ClaudeSessionsPanel {
                 let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
                 if let Some(process_id) = process_id {
                     store.select(process_id, cx);
+                }
+                // After selecting, which follows the session's own conversation.
+                if target != TranscriptTarget::Main {
+                    store.select_transcript_target(target, cx);
                 }
                 store
             });
@@ -976,7 +1214,7 @@ impl ClaudeSessionsPanel {
             editor
         });
 
-        Self {
+        let mut this = Self {
             workspace,
             focus_handle: cx.focus_handle(),
             fs,
@@ -985,17 +1223,26 @@ impl ClaudeSessionsPanel {
             message_editor,
             project_root,
             in_pane: false,
-            pane_expanded: true,
+            pane_expanded: false,
             terminal: None,
             terminal_process_id: None,
             terminal_height: DEFAULT_TERMINAL_HEIGHT,
-            input_expanded: false,
+            input_expanded: true,
+            history_index: None,
+            quit_armed: false,
+            ticked: None,
+            typing_answer_for: None,
+            slash_commands: Vec::new(),
+            _listing_slash_commands: Task::ready(()),
+            _answering: Task::ready(()),
+            hook_install_note: None,
+            _installing_hook: Task::ready(()),
             _terminal_attach: Task::ready(()),
             entries: Vec::new(),
             pending_sends: PendingSends::default(),
             activity: Activity::Idle,
             agent_calls: HashMap::default(),
-            list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+            list_state: scroll_tracking_list_state(cx),
             session_list_expanded: true,
             unread_below: UnreadBelow::default(),
             scrolled_to_end: true,
@@ -1011,7 +1258,11 @@ impl ClaudeSessionsPanel {
             loaded_outputs: HashMap::default(),
             output_loads: HashMap::default(),
             _store_subscription: store_subscription,
-        }
+        };
+        // Read once here rather than per keystroke: the files behind these change far
+        // less often than the reader types.
+        this.load_slash_commands(cx);
+        this
     }
 
     fn select_session(&mut self, process_id: u32, cx: &mut Context<Self>) {
@@ -1030,6 +1281,10 @@ impl ClaudeSessionsPanel {
         self.unread_below.reset();
         self.list_state.scroll_to_end();
         self.scrolled_to_end = true;
+        // Both are about the session being left: a place in its history, and a quit
+        // aimed at it. Neither means anything against the one arrived at.
+        self.history_index = None;
+        self.quit_armed = false;
     }
 
     /// Follows another of the selected session's conversations, from a chip or from the
@@ -1150,6 +1405,320 @@ impl ClaudeSessionsPanel {
             // failure itself, so nothing here waits for the answer.
             store.send_input(SessionInput::Key(key), cx).detach()
         });
+    }
+
+    /// Quits the session's CLI, as Ctrl+D does in the terminal — but only on the second
+    /// press.
+    ///
+    /// The first press arms the button and sends nothing. This ends the session, and a
+    /// session ended by a stray click cannot be got back: what it was doing is over, and
+    /// what it knew is only in its transcript.
+    fn quit_session(&mut self, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
+
+        if !self.quit_armed {
+            self.quit_armed = true;
+            cx.notify();
+            return;
+        }
+
+        self.quit_armed = false;
+        self.send_pane_key(PaneKey::Quit, cx);
+    }
+
+    /// Puts the previous message sent to this session in the box, as Up does in the
+    /// terminal.
+    fn recall_previous_message(
+        &mut self,
+        _: &PreviousMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let history = message_history(&self.entries);
+        let typed = self.message_editor.read(cx).text(cx);
+        let step = step_back_through_history(&history, self.history_index, &typed);
+        self.take_history_step(step, window, cx);
+    }
+
+    /// Walks back down towards the box's own draft, as Down does in the terminal.
+    fn recall_next_message(
+        &mut self,
+        _: &NextMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let history = message_history(&self.entries);
+        let typed = self.message_editor.read(cx).text(cx);
+        let step = step_forward_through_history(&history, self.history_index, &typed);
+        self.take_history_step(step, window, cx);
+    }
+
+    fn take_history_step(
+        &mut self,
+        step: HistoryStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match step {
+            HistoryStep::Stay => return,
+            HistoryStep::MoveCursor(direction) => {
+                self.message_editor
+                    .update(cx, |editor, cx| match direction {
+                        CursorDirection::Up => editor.move_up(&MoveUp, window, cx),
+                        CursorDirection::Down => editor.move_down(&MoveDown, window, cx),
+                    });
+                return;
+            }
+            HistoryStep::Draft => {
+                self.history_index = None;
+                String::new()
+            }
+            HistoryStep::Recall { index, message } => {
+                self.history_index = Some(index);
+                message.to_string()
+            }
+        };
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Reads the slash commands the machine holds, once, in the background.
+    ///
+    /// The files behind them change far less often than the reader types, so this is not
+    /// redone per keystroke — and a listing that fails leaves the menu with what it had,
+    /// which for a first read is nothing and for a later one is still true enough to
+    /// choose from.
+    fn load_slash_commands(&mut self, cx: &mut Context<Self>) {
+        let list = self.source.list_slash_commands(self.project_root.clone());
+        self._listing_slash_commands = cx.spawn(async move |this, cx| {
+            let Ok(commands) = list.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.slash_commands = commands;
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    /// The commands the menu is offering, or `None` when what is typed names none.
+    fn offered_slash_commands(&self, cx: &Context<Self>) -> Option<Vec<&SlashCommand>> {
+        if !self.can_send(cx) {
+            return None;
+        }
+        let typed = self.message_editor.read(cx).text(cx);
+        let named = slash_command_being_named(&typed)?;
+
+        let matches = matching_slash_commands(&self.slash_commands, named);
+        // Nothing matching is not a menu: the reader is typing a command this machine
+        // does not hold, and an empty box under the input says less than no box.
+        (!matches.is_empty()).then_some(matches)
+    }
+
+    /// Puts a command into the message box, ready for whatever it takes after its name.
+    ///
+    /// Not sent: a command that takes arguments is only half typed at this point, and one
+    /// that takes none is a keypress away from going.
+    fn use_slash_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let takes_arguments = self
+            .slash_commands
+            .iter()
+            .find(|command| command.name == name)
+            .is_some_and(|command| command.argument_hint.is_some());
+        let text = if takes_arguments {
+            format!("/{name} ")
+        } else {
+            format!("/{name}")
+        };
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Installs the hook that records waiting questions on the machine the sessions run
+    /// on.
+    ///
+    /// What it did stays on screen afterwards: it changed a file the user owns, and where
+    /// the copy of it went is the thing they would want to know. A session already
+    /// running may have read its settings before this, so the note says so rather than
+    /// leaving a reader wondering why nothing changed.
+    fn install_question_hook(&mut self, cx: &mut Context<Self>) {
+        let install = self.store.read(cx).install_question_hook();
+
+        self.hook_install_note = Some(SharedString::from("Installing…"));
+        self._installing_hook = cx.spawn(async move |this, cx| {
+            let result = install.await;
+            this.update(cx, |this, cx| {
+                this.hook_install_note = Some(match result {
+                    Ok(Some(backup)) => SharedString::from(format!(
+                        "Installed. Your settings were copied to {}. Sessions already \
+                         running pick it up when they next start.",
+                        backup.display()
+                    )),
+                    Ok(None) => SharedString::from(
+                        "Installed. Sessions already running pick it up when they next \
+                         start.",
+                    ),
+                    Err(error) => SharedString::from(format!("Could not install: {error:#}")),
+                });
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    /// The question the selected session is waiting on, and which of its questions is
+    /// being asked.
+    ///
+    /// A question the hook recorded is only waiting until its call is answered: the hook
+    /// records a question being asked and has no way to record it being answered, so a
+    /// file left behind by an answered call is told apart by the conversation having the
+    /// result that answers it.
+    fn waiting_question(&self, cx: &Context<Self>) -> Option<(Question, usize, SharedString)> {
+        let store = self.store.read(cx);
+        let recorded = store.recorded_question()?;
+        let answered = store
+            .main_transcript()
+            .active_path()
+            .iter()
+            .any(|record| tool_result_ids(record).contains(&recorded.tool_use_id.as_str()));
+        if answered {
+            return None;
+        }
+
+        let index = question_being_asked(
+            store.pane_contents().map(SharedString::as_ref),
+            &recorded.questions,
+        );
+        let question = recorded.questions.get(index)?.clone();
+        Some((
+            question,
+            index,
+            SharedString::from(recorded.tool_use_id.clone()),
+        ))
+    }
+
+    /// Answers the question on screen by picking one option, which a numbered menu takes
+    /// as the whole answer.
+    fn pick_option(&mut self, option_index: usize, cx: &mut Context<Self>) {
+        let Some(keys) = keys_for_single_choice(option_index) else {
+            return;
+        };
+        self.send_answer(keys, cx);
+    }
+
+    /// Ticks or unticks one option of a question that takes several. Nothing is sent: the
+    /// answer leaves when it is submitted.
+    fn toggle_tick(&mut self, option_index: usize, cx: &mut Context<Self>) {
+        let Some((_, question_index, tool_use_id)) = self.waiting_question(cx) else {
+            return;
+        };
+
+        let ticked = match &mut self.ticked {
+            Some(ticked)
+                if ticked.tool_use_id == tool_use_id && ticked.question_index == question_index =>
+            {
+                ticked
+            }
+            // Ticks belong to the question they were made on, so a different question —
+            // or a different call — starts an answer of its own rather than inheriting.
+            _ => self.ticked.insert(TickedAnswer {
+                tool_use_id,
+                question_index,
+                ticked: HashSet::default(),
+            }),
+        };
+
+        if !ticked.ticked.remove(&option_index) {
+            ticked.ticked.insert(option_index);
+        }
+        cx.notify();
+    }
+
+    fn submit_ticked(&mut self, cx: &mut Context<Self>) {
+        let Some((question, question_index, tool_use_id)) = self.waiting_question(cx) else {
+            return;
+        };
+        let option_count = question.options.len();
+
+        let Some(ticked) = self.ticked.as_ref().filter(|ticked| {
+            ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
+        }) else {
+            return;
+        };
+        let Some(keys) = keys_for_several_choices(&ticked.ticked, option_count) else {
+            return;
+        };
+
+        self.ticked = None;
+        self.send_answer(keys, cx);
+    }
+
+    /// Takes the reader to typing their own answer, which the terminal offers as one more
+    /// row below the options it was given.
+    fn answer_in_own_words(&mut self, cx: &mut Context<Self>) {
+        let Some((question, _, tool_use_id)) = self.waiting_question(cx) else {
+            return;
+        };
+        let already_ticked = self
+            .ticked
+            .as_ref()
+            .filter(|ticked| ticked.tool_use_id == tool_use_id)
+            .map(|ticked| ticked.ticked.clone())
+            .unwrap_or_default();
+        let Some(keys) = keys_for_own_words(
+            &already_ticked,
+            question.options.len(),
+            question.multi_select,
+        ) else {
+            return;
+        };
+
+        // The ticks have left with the answer; a question drawn again after this starts
+        // its own.
+        self.ticked = None;
+
+        self.typing_answer_for = Some(tool_use_id);
+        self.input_expanded = true;
+        self.send_answer(keys, cx);
+    }
+
+    /// Keys one answer into the pane, one key at a time.
+    ///
+    /// Sequenced rather than sent at once because the terminal reads each key against the
+    /// menu it has drawn, and held in a field so that a second press replaces the first
+    /// instead of interleaving with it.
+    fn send_answer(&mut self, keys: Vec<PaneKey>, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
+
+        let store = self.store.clone();
+        self._answering = cx.spawn(async move |_, cx| {
+            for key in keys {
+                // The store has gone, or the send failed and the store has already
+                // reported it. Either way the rest of the sequence would be answering a
+                // menu that is no longer the one it was built for.
+                let sent =
+                    store.update(cx, |store, cx| store.send_input(SessionInput::Key(key), cx));
+                if sent.await.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(ANSWER_KEY_INTERVAL).await;
+            }
+        });
+        cx.notify();
     }
 
     fn toggle_input(&mut self, cx: &mut Context<Self>) {
@@ -1528,6 +2097,9 @@ impl ClaudeSessionsPanel {
                     .unwrap_or_else(|| session.session_id.clone())
             });
         let summary = collapsed_sessions_summary(sessions.len(), selected_name.as_deref());
+        // Offered only once there is a machine to install onto: with no session listed,
+        // nothing has said which machine the button would be for.
+        let offer_question_hook = !store.question_hook_installed() && !sessions.is_empty();
         let is_expanded = self.session_list_expanded;
 
         v_flex()
@@ -1564,6 +2136,27 @@ impl ClaudeSessionsPanel {
                                     .color(Color::Muted)
                                     .single_line(),
                             )
+                            .when(offer_question_hook, |this| {
+                                this.child(
+                                    Button::new(
+                                        "claude-sessions-install-question-hook",
+                                        "Enable questions",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                                    .tooltip(Tooltip::text(
+                                        "A question a session is waiting on is written \
+                                         nowhere until it has been answered. This adds a \
+                                         hook that records them, so they can be answered \
+                                         here. Your settings are copied aside first.",
+                                    ))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.install_question_hook(cx)
+                                        }),
+                                    ),
+                                )
+                            })
                             .when(!self.in_pane, |this| {
                                 this.child(
                                     IconButton::new(
@@ -1588,6 +2181,14 @@ impl ClaudeSessionsPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Error),
                     ),
+                )
+            })
+            .when_some(self.hook_install_note.clone(), |this, note| {
+                this.child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
                 )
             })
             .when(is_expanded, |this| {
@@ -1733,7 +2334,9 @@ impl ClaudeSessionsPanel {
             .tooltip(Tooltip::text(format!("pid {process_id}")))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_session(process_id, cx);
-                this.reveal_in_pane(Some(process_id), window, cx);
+                // Selecting a session in the dock is asking for that session's own
+                // conversation, whichever one the dock happened to be reading.
+                this.reveal_in_pane(Some(process_id), TranscriptTarget::Main, window, cx);
             }))
     }
 
@@ -1881,6 +2484,13 @@ impl ClaudeSessionsPanel {
             .map(|summary| AgentCardRow {
                 label: agent_chip_label(summary),
                 state: agent_state(summary, &main_path),
+                phase: summary
+                    .meta
+                    .workflow_phase
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|phase| !phase.is_empty())
+                    .map(|phase| SharedString::from(phase.to_string())),
                 target: TranscriptTarget::Subagent {
                     agent_id: summary.agent_id.clone(),
                     workflow_run_id: summary.workflow_run_id.clone(),
@@ -1899,6 +2509,12 @@ impl ClaudeSessionsPanel {
         let (state_note, state_color) = match card.state {
             AgentState::Running => ("Running", Color::Success),
             AgentState::Finished => ("Finished", Color::Muted),
+        };
+        // An agent that recorded no phase says nothing about one: a card reading
+        // `Running · unknown` is less than a card reading `Running`.
+        let state_note = match card.phase {
+            Some(phase) => SharedString::from(format!("{state_note} · {phase}")),
+            None => SharedString::from(state_note),
         };
         let target = card.target;
 
@@ -1919,18 +2535,104 @@ impl ClaudeSessionsPanel {
                     ),
             )
             .child(
-                Button::new(
-                    SharedString::from(format!("claude-session-open-agent-{key}-{index}")),
-                    "Open",
-                )
-                .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
-                .label_size(LabelSize::XSmall)
-                .tooltip(Tooltip::text("Read this agent's conversation"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_transcript_target(target.clone(), cx)
-                })),
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("claude-session-open-agent-{key}-{index}")),
+                            "Open",
+                        )
+                        .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text("Read this agent's conversation here"))
+                        .on_click({
+                            let target = target.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.select_transcript_target(target.clone(), cx)
+                            })
+                        }),
+                    )
+                    // A run of several agents is worth watching beside the conversation
+                    // that started it, rather than in place of it.
+                    .when(!self.in_pane, |this| {
+                        this.child(
+                            IconButton::new(
+                                SharedString::from(format!(
+                                    "claude-session-open-agent-tab-{key}-{index}"
+                                )),
+                                IconName::ArrowUpRight,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Read this agent in a tab of its own"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_agent_in_pane(target.clone(), window, cx)
+                                },
+                            )),
+                        )
+                    }),
             )
             .into_any_element()
+    }
+
+    /// What the session is saying right now, drawn under the conversation until the
+    /// conversation itself has it.
+    ///
+    /// The CLI does not write an assistant message into its transcript until the turn
+    /// carrying it is over, so on a long turn the panel is tens of seconds behind the
+    /// terminal. This is the same words, read from what the terminal drew.
+    ///
+    /// Drawn below the conversation rather than spliced into it: the words change several
+    /// times a second while the turn runs, and an entry in the list would remeasure the
+    /// whole conversation each time.
+    fn render_live_message(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        // An agent's conversation is read from its own file and streams nowhere, so this
+        // would be the session talking under an agent's transcript.
+        if !matches!(store.transcript_target(), TranscriptTarget::Main) {
+            return None;
+        }
+
+        let live = store.live_message()?;
+        let live = live.trim();
+        if live.is_empty() {
+            return None;
+        }
+
+        // Once the turn is over the same words arrive in the conversation as a record of
+        // their own, and drawing both would show the message twice. Only the newest few
+        // entries are checked: the words arrive at the end or not at all.
+        let already_in_the_conversation = self.entries.iter().rev().take(8).any(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::Message {
+                    role: MessageRole::Assistant,
+                    source,
+                    ..
+                } if source.trim() == live
+            )
+        });
+        if already_in_the_conversation {
+            return None;
+        }
+
+        Some(
+            v_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_0p5()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    Label::new("Saying now")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(SharedString::from(live.to_string())).size(LabelSize::Small))
+                .into_any_element(),
+        )
     }
 
     fn render_transcript_section(
@@ -2107,6 +2809,10 @@ impl ClaudeSessionsPanel {
         // another machine away, and the input has to be usable again at once.
         self.message_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
+        // The walk up the history ended when what it found was sent, and the message
+        // just sent is about to become its newest entry.
+        self.history_index = None;
+        self.quit_armed = false;
         // Drawn from here rather than when the send is answered: the CLI writes the
         // user's record only when it starts the turn, so on a busy session the text
         // would be nowhere at all for as long as that turn takes.
@@ -2146,6 +2852,9 @@ impl ClaudeSessionsPanel {
             return;
         }
 
+        // Stopping the session is the opposite of ending it: a quit aimed at it must
+        // not stay armed behind this.
+        self.quit_armed = false;
         self.store.update(cx, |store, cx| {
             // There is no text to hand back for an interrupt, and the store reports the
             // failure itself, so nothing here waits for the answer.
@@ -2418,6 +3127,316 @@ impl ClaudeSessionsPanel {
         )
     }
 
+    /// The commands what is typed could be naming, drawn as rows to pick from.
+    ///
+    /// Sits between the message box and the buttons under it, which is where the reader
+    /// is looking while they type. Picking one fills the box rather than sending it: a
+    /// command that takes arguments is only half typed when its name is.
+    fn render_slash_commands(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Taken by value here: the rows outlive the borrow of the commands, because each
+        // row's handler carries the name it will put in the box.
+        let rows: Vec<(SharedString, Option<SharedString>, SharedString, String)> = self
+            .offered_slash_commands(cx)?
+            .into_iter()
+            .map(|command| {
+                let scope = match command.scope {
+                    SlashCommandScope::Builtin => "built in",
+                    SlashCommandScope::Project => "this project",
+                    SlashCommandScope::User => "yours",
+                };
+                let shown = match command.argument_hint.as_deref() {
+                    Some(hint) => format!("/{} {hint}", command.name),
+                    None => format!("/{}", command.name),
+                };
+                (
+                    SharedString::from(shown),
+                    command.description.clone().map(SharedString::from),
+                    SharedString::from(scope),
+                    command.name.clone(),
+                )
+            })
+            .collect();
+
+        let mut menu = v_flex().w_full().px_2().pb_1().gap_0p5().child(
+            Label::new("Commands")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+
+        for (index, (name, description, scope, command_name)) in rows.into_iter().enumerate() {
+            menu = menu.child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .justify_between()
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("claude-session-slash-{index}")),
+                            name,
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            description
+                                .clone()
+                                .unwrap_or_else(|| SharedString::from("Put this in the box")),
+                        ))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.use_slash_command(&command_name, window, cx)
+                            },
+                        )),
+                    )
+                    .child(
+                        Label::new(scope)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+        }
+
+        Some(menu.into_any_element())
+    }
+
+    /// The question the session is waiting on, drawn as something to answer.
+    ///
+    /// Sits above the message box rather than replacing it: a question always offers
+    /// typing an answer of your own as well, and a reader who wants to say something else
+    /// entirely is not stopped from doing it.
+    /// Sends the answers the terminal has listed back, or throws them away and starts
+    /// the call's questions again.
+    fn confirm_answers(&mut self, send: bool, cx: &mut Context<Self>) {
+        let Some(keys) = keys_for_confirmation(send) else {
+            return;
+        };
+        self.ticked = None;
+        self.send_answer(keys, cx);
+    }
+
+    /// Whether the terminal is on the screen that asks whether to send the answers.
+    ///
+    /// A call that has already returned is not waiting on anything, so a screen left
+    /// over from one is not drawn as a choice: what the panel offers has to be something
+    /// pressing it would actually do.
+    fn answers_are_being_confirmed(&self, cx: &Context<Self>) -> bool {
+        let store = self.store.read(cx);
+        let Some(recorded) = store.recorded_question() else {
+            return false;
+        };
+        let answered = store
+            .main_transcript()
+            .active_path()
+            .iter()
+            .any(|record| tool_result_ids(record).contains(&recorded.tool_use_id.as_str()));
+        if answered {
+            return false;
+        }
+
+        store
+            .pane_contents()
+            .is_some_and(|pane| answers_awaiting_confirmation(pane))
+    }
+
+    /// The last step of a call that asked several questions, drawn as the two things it
+    /// offers.
+    fn render_answer_confirmation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let can_send = self.can_send(cx);
+
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .pb_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Chat)
+                            .size(IconSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new("Every question answered")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    ),
+            )
+            .child(Label::new(REVIEW_PROMPT).size(LabelSize::Small))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        Button::new("claude-session-answers-send", REVIEW_SUBMIT_ROW)
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!can_send)
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .tooltip(Tooltip::text("Send these answers to the session"))
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_answers(true, cx))),
+                    )
+                    .child(
+                        Button::new("claude-session-answers-cancel", REVIEW_CANCEL_ROW)
+                            .label_size(LabelSize::XSmall)
+                            .disabled(!can_send)
+                            .tooltip(Tooltip::text("Throw these answers away and ask again"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.confirm_answers(false, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_question(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Drawn instead of the questions, not beside them: at this point every question
+        // has been answered and the last one drawn on its own would be the only thing on
+        // screen that is not what the terminal is waiting for.
+        if self.answers_are_being_confirmed(cx) {
+            return Some(self.render_answer_confirmation(cx));
+        }
+
+        let (question, question_index, tool_use_id) = self.waiting_question(cx)?;
+        let can_send = self.can_send(cx);
+        let multi_select = question.multi_select;
+        let option_count = question.options.len();
+        let ticked: HashSet<usize> = self
+            .ticked
+            .as_ref()
+            .filter(|ticked| {
+                ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
+            })
+            .map(|ticked| ticked.ticked.clone())
+            .unwrap_or_default();
+
+        let mut section = v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .pb_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Chat)
+                            .size(IconSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new(if question.header.trim().is_empty() {
+                            SharedString::from("Waiting on you")
+                        } else {
+                            SharedString::from(question.header.clone())
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                    )
+                    // Which of several questions this is. A call with one question says
+                    // nothing, because "1 of 1" is not a thing a reader needs told.
+                    .when_some(
+                        self.store
+                            .read(cx)
+                            .recorded_question()
+                            .map(|recorded| recorded.questions.len())
+                            .filter(|count| *count > 1),
+                        |this, count| {
+                            this.child(
+                                Label::new(format!("{} of {count}", question_index + 1))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                Label::new(SharedString::from(question.question.clone())).size(LabelSize::Small),
+            );
+
+        for (option_index, option) in question.options.iter().enumerate() {
+            let is_ticked = ticked.contains(&option_index);
+            let label = SharedString::from(option.label.clone());
+            // A question taking several answers is filled in and then submitted, so its
+            // options are ticked; one taking a single answer is over the moment an option
+            // is pressed, so its options are pressed.
+            let control = if multi_select {
+                Checkbox::new(
+                    SharedString::from(format!("claude-session-option-{option_index}")),
+                    ToggleState::from(is_ticked),
+                )
+                .label(label)
+                .label_size(LabelSize::XSmall)
+                .disabled(!can_send)
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_tick(option_index, cx)))
+                .into_any_element()
+            } else {
+                Button::new(
+                    SharedString::from(format!("claude-session-option-{option_index}")),
+                    label,
+                )
+                .label_size(LabelSize::XSmall)
+                .disabled(!can_send)
+                .tooltip(Tooltip::text("Answer with this"))
+                .on_click(cx.listener(move |this, _, _, cx| this.pick_option(option_index, cx)))
+                .into_any_element()
+            };
+
+            section = section.child(
+                v_flex()
+                    .w_full()
+                    .child(control)
+                    // Under the option rather than beside it: a description is a sentence
+                    // and the panel is narrow, and beside it the two wrap into each other.
+                    .when_some(option.description.clone(), |this, description| {
+                        this.child(
+                            div().pl_4().child(
+                                Label::new(SharedString::from(description))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    }),
+            );
+        }
+
+        section = section.child(
+            h_flex()
+                .w_full()
+                .gap_1()
+                // The dock is narrow and these two do not fit side by side in it at every
+                // width; without this `Submit` is the one drawn off the edge.
+                .flex_wrap()
+                .child(
+                    Button::new("claude-session-answer-typed", "Type something")
+                        .label_size(LabelSize::XSmall)
+                        .disabled(!can_send)
+                        .tooltip(Tooltip::text("Answer in your own words, in the box below"))
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_in_own_words(cx))),
+                )
+                .when(multi_select, |this| {
+                    this.child(
+                        // The count is in the label rather than only in the tooltip: the
+                        // button is disabled until something is ticked, and a grey button
+                        // that says nothing reads as one that is not there.
+                        Button::new(
+                            "claude-session-answer-submit",
+                            format!("Submit {}/{option_count}", ticked.len()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        // Nothing ticked is not an answer, and submitting it would
+                        // send a walk to `Submit` that answers nothing.
+                        .disabled(!can_send || ticked.is_empty())
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .tooltip(Tooltip::text(format!(
+                            "Send {} of {option_count}",
+                            ticked.len()
+                        )))
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_ticked(cx))),
+                    )
+                }),
+        );
+
+        Some(section.into_any_element())
+    }
+
     fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_send = self.can_send(cx);
         // A session that is answering is the one case where interrupting is what the
@@ -2429,8 +3448,24 @@ impl ClaudeSessionsPanel {
         let is_reading_an_agent =
             matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
         let note = input_note(can_send, is_reading_an_agent, has_selection);
+        // The terminal's own controls, drawn here because the terminal is closed by
+        // default now: without them the only way to change the permission mode, or to
+        // take back what the CLI is holding, is to open the terminal and press the key.
+        let mode = store
+            .pane_contents()
+            .and_then(|contents| permission_mode(contents));
+        let bypassing = mode
+            .as_ref()
+            .is_some_and(|mode| mode.to_lowercase().contains(BYPASSING_PERMISSIONS));
+        let mode_label = mode.unwrap_or_else(|| SharedString::from(UNNAMED_PERMISSION_MODE));
+        let quit_armed = self.quit_armed;
 
-        let expanded = self.input_expanded;
+        // A question stops the session until it is answered, so the block that answers it
+        // opens itself: a reader who does not know one is waiting reads the session as
+        // stuck, and the answer is behind a disclosure they have no reason to open.
+        let question = self.render_question(cx);
+        let slash_commands = self.render_slash_commands(cx);
+        let expanded = self.input_expanded || question.is_some();
 
         v_flex()
             .w_full()
@@ -2441,6 +3476,8 @@ impl ClaudeSessionsPanel {
             .key_context("ClaudeSessionsInput")
             .on_action(cx.listener(Self::send_message))
             .on_action(cx.listener(Self::interrupt_session))
+            .on_action(cx.listener(Self::recall_previous_message))
+            .on_action(cx.listener(Self::recall_next_message))
             .child(
                 h_flex()
                     .px_2()
@@ -2457,6 +3494,7 @@ impl ClaudeSessionsPanel {
                     ),
             )
             .when(expanded, |this| this.p_2().gap_1())
+            .children(question)
             .when_some(note.filter(|_| expanded), |this, note| {
                 this.child(
                     h_flex()
@@ -2484,6 +3522,7 @@ impl ClaudeSessionsPanel {
                     ),
                 )
             })
+            .children(slash_commands.filter(|_| expanded))
             .when(expanded, |this| {
                 this.child(
                     h_flex()
@@ -2491,41 +3530,102 @@ impl ClaudeSessionsPanel {
                         .px_2()
                         .pb_2()
                         .gap_1()
-                        .justify_end()
+                        .justify_between()
                         .child(
-                            Button::new(
-                                "claude-session-interrupt",
-                                if is_answering { "Stop" } else { "Esc" },
-                            )
-                            .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
-                            .label_size(LabelSize::XSmall)
-                            .disabled(!can_send)
-                            .when(is_answering, |this| {
-                                this.style(ButtonStyle::Tinted(TintColor::Error))
-                            })
-                            .tooltip(Tooltip::for_action_title(
-                                if is_answering {
-                                    "Stop this session"
-                                } else {
-                                    "Interrupt this session"
-                                },
-                                &Interrupt,
-                            ))
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.interrupt_session(&Interrupt, window, cx)
-                                },
-                            )),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("claude-session-permission-mode", mode_label)
+                                        .start_icon(
+                                            Icon::new(IconName::ArrowCircle).size(IconSize::XSmall),
+                                        )
+                                        .label_size(LabelSize::XSmall)
+                                        .disabled(!can_send)
+                                        // Tinted only while the prompts are off: that is
+                                        // the mode whose consequences a reader who forgot
+                                        // they were in it would meet by surprise.
+                                        .when(bypassing, |this| {
+                                            this.style(ButtonStyle::Tinted(TintColor::Warning))
+                                        })
+                                        .tooltip(Tooltip::text(
+                                            "Cycle this session's permission mode, as \
+                                             shift+tab does in the terminal",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.send_pane_key(PaneKey::CyclePermissionMode, cx)
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("claude-session-cancel", IconName::Stop)
+                                        .icon_size(IconSize::XSmall)
+                                        .disabled(!can_send)
+                                        .tooltip(Tooltip::text(
+                                            "Send Ctrl+C: takes back what the terminal is \
+                                             holding, and stops the turn it is running",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.send_pane_key(PaneKey::Cancel, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new(
+                                        "claude-session-quit",
+                                        if quit_armed { "Quit?" } else { "Quit" },
+                                    )
+                                    .start_icon(Icon::new(IconName::Power).size(IconSize::XSmall))
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(!can_send)
+                                    .when(quit_armed, |this| {
+                                        this.style(ButtonStyle::Tinted(TintColor::Error))
+                                    })
+                                    .tooltip(Tooltip::text(if quit_armed {
+                                        "Press again to send Ctrl+D, which ends this session"
+                                    } else {
+                                        "Send Ctrl+D, which ends this session"
+                                    }))
+                                    .on_click(cx.listener(|this, _, _, cx| this.quit_session(cx))),
+                                ),
                         )
                         .child(
-                            Button::new("claude-session-send", "Send")
-                                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
-                                .label_size(LabelSize::XSmall)
-                                .disabled(!can_send)
-                                .tooltip(Tooltip::text("Send to this session"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.send_message(&SendMessage, window, cx)
-                                })),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new(
+                                        "claude-session-interrupt",
+                                        if is_answering { "Stop" } else { "Esc" },
+                                    )
+                                    .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(!can_send)
+                                    .when(is_answering, |this| {
+                                        this.style(ButtonStyle::Tinted(TintColor::Error))
+                                    })
+                                    .tooltip(Tooltip::for_action_title(
+                                        if is_answering {
+                                            "Stop this session"
+                                        } else {
+                                            "Interrupt this session"
+                                        },
+                                        &Interrupt,
+                                    ))
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.interrupt_session(&Interrupt, window, cx)
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    Button::new("claude-session-send", "Send")
+                                        .start_icon(
+                                            Icon::new(IconName::Send).size(IconSize::XSmall),
+                                        )
+                                        .label_size(LabelSize::XSmall)
+                                        .disabled(!can_send)
+                                        .tooltip(Tooltip::text("Send to this session"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.send_message(&SendMessage, window, cx)
+                                        })),
+                                ),
                         ),
                 )
             })
@@ -2695,7 +3795,24 @@ impl ClaudeSessionsPanel {
                 // whether it is still going, is the part of an `Agent` call worth seeing
                 // without opening anything.
                 let cards = self.agent_cards(&key, cx);
+                // A run spawns agents as it goes, so the count is the run's shape so far
+                // rather than what it will end up being. Only a run has one: a `Task`
+                // call spawns the single agent its own card already accounts for.
+                let run_note = self
+                    .agent_calls
+                    .get(&key)
+                    .filter(|call| call.is_workflow && !cards.is_empty())
+                    .map(|_| workflow_run_note(&cards));
                 let mut element = v_flex().w_full().child(header).children(body);
+                if let Some(run_note) = run_note {
+                    element = element.child(
+                        div().w_full().px_2().pb_1().child(
+                            Label::new(run_note)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    );
+                }
                 for (card_index, card) in cards.into_iter().enumerate() {
                     element = element.child(self.render_agent_card(&key, card_index, card, cx));
                 }
@@ -3318,6 +4435,7 @@ impl Render for ClaudeSessionsPanel {
                         .child(self.render_conversation_toolbar(cx))
                         .children(self.render_agent_chips(cx))
                         .child(self.render_transcript_section(window, cx))
+                        .children(self.render_live_message(cx))
                         .children(self.render_activity())
                         .children(
                             self.render_terminal(cx)
@@ -3696,9 +4814,33 @@ fn user_message_entries(path: &[&TranscriptRecord]) -> Vec<Entry> {
     let mut entries = Vec::new();
 
     for (path_index, record) in path.iter().enumerate() {
+        let base_key = match record.uuid.as_ref() {
+            Some(uuid) => SharedString::from(uuid.clone()),
+            None => SharedString::from(format!("path-{path_index}")),
+        };
+
+        // A message typed while the session was answering is written as an attachment
+        // and never as a user record, so it is the only record that message will ever
+        // get. Left out here, the send that carried it is paired with nothing and its
+        // `Sending…` message stays on screen for the rest of the session, beside the
+        // conversation drawing the very same words.
+        if record.record_type == ATTACHMENT_RECORD_TYPE {
+            if let Some(prompt) = queued_command_prompt(record) {
+                entries.push(Entry {
+                    key: base_key,
+                    kind: EntryKind::Message {
+                        role: MessageRole::User,
+                        source: prompt,
+                        usage: None,
+                    },
+                });
+            }
+            continue;
+        }
+
         // A record of another kind holds no message the user typed: an assistant record
         // is the model's, and the two subtypes below are drawn as something other than a
-        // message. Attachments are of their own record type and are excluded with them.
+        // message.
         if record.record_type != USER_RECORD_TYPE
             || matches!(
                 record.subtype.as_deref(),
@@ -3708,10 +4850,6 @@ fn user_message_entries(path: &[&TranscriptRecord]) -> Vec<Entry> {
             continue;
         }
 
-        let base_key = match record.uuid.as_ref() {
-            Some(uuid) => SharedString::from(uuid.clone()),
-            None => SharedString::from(format!("path-{path_index}")),
-        };
         match record
             .raw
             .get("message")
@@ -3899,6 +5037,261 @@ enum AgentState {
     Finished,
 }
 
+/// How many commands the menu offers at once. Enough to choose from without the menu
+/// taking the room the conversation is in.
+const SLASH_COMMAND_ROWS: usize = 8;
+
+/// The part of what has been typed that is a command being named, or `None` when what is
+/// typed is not naming one.
+///
+/// Only a message that is nothing but a command names one: `/` partway through a sentence
+/// is a path, a date, or a fraction, and a menu that opened on those would be in the way
+/// of ordinary typing. A command with its arguments already typed is no longer being
+/// named either — the reader has moved on to what it takes.
+fn slash_command_being_named(text: &str) -> Option<&str> {
+    let text = text.strip_prefix('/')?;
+    if text.starts_with('/') {
+        return None;
+    }
+    (!text.contains(char::is_whitespace)).then_some(text)
+}
+
+/// The commands worth offering for what has been typed, best first.
+///
+/// A command whose name starts with what was typed is what the reader is reaching for; one
+/// that merely contains it is offered behind those, because a name is usually typed from
+/// its beginning. Beyond that the order the machine listed them in stands, which puts the
+/// commands someone wrote before the built-in ones.
+fn matching_slash_commands<'commands>(
+    commands: &'commands [SlashCommand],
+    typed: &str,
+) -> Vec<&'commands SlashCommand> {
+    let typed = typed.to_lowercase();
+    let mut starting = Vec::new();
+    let mut containing = Vec::new();
+
+    for command in commands {
+        let name = command.name.to_lowercase();
+        if name.starts_with(&typed) {
+            starting.push(command);
+        } else if !typed.is_empty() && name.contains(&typed) {
+            containing.push(command);
+        }
+    }
+
+    starting.extend(containing);
+    starting.truncate(SLASH_COMMAND_ROWS);
+    starting
+}
+
+/// The conversation list, told to report where the reader is whenever they move.
+///
+/// The list cannot answer [`ListState::is_scrolled_to_end`] until every item it holds has
+/// been measured, and a conversation that is still arriving always holds one that has
+/// not — so asking it is answered with `None` for as long as the session keeps talking,
+/// and a reader who scrolled up during that is never noticed to have done so. The scroll
+/// event says which items are visible, which needs no measuring.
+fn scroll_tracking_list_state(cx: &mut Context<ClaudeSessionsPanel>) -> ListState {
+    let list_state = ListState::new(0, ListAlignment::Bottom, px(1024.));
+    list_state.set_scroll_handler({
+        let panel = cx.weak_entity();
+        move |event, _window, cx| {
+            let at_end = event.visible_range.end >= event.count;
+            panel
+                .update(cx, |panel, _| {
+                    panel.scrolled_to_end = at_end;
+                    // Arriving back at the bottom is having read what landed there.
+                    if at_end {
+                        panel.unread_below.scrolled(true);
+                    }
+                })
+                .log_err();
+        }
+    });
+    list_state
+}
+
+/// Which question of a call the terminal is asking now.
+///
+/// A call carrying several questions is asked one at a time, and the terminal names them
+/// in a strip along the top with the answered ones ticked. Counting the ticks is the only
+/// thing read out of that strip: the reader is being asked the first one that is not.
+///
+/// A call with one question draws no strip, and a terminal that cannot be read leaves the
+/// reader on the first question, which is where a call starts.
+/// Which of a call's questions the pane is showing.
+///
+/// The strip of marks along the top counts what has been answered, but it scrolls — the
+/// arrows it is drawn between are the terminal saying so. On a narrow window only some
+/// of the questions fit and the marks for the rest are not drawn at all, so counting
+/// them reads the wrong question and the reader is shown the options of one they
+/// answered several questions ago.
+///
+/// The question's own text is on screen whatever the window is doing, so it is what the
+/// index is read from. The marks are the fallback for a pane that does not carry the
+/// text — one scrolled past it, or a question drawn too narrow to hold it.
+fn question_being_asked(pane: Option<&str>, questions: &[Question]) -> usize {
+    let Some(pane) = pane else {
+        return 0;
+    };
+
+    question_named_on_screen(pane, questions).unwrap_or_else(|| questions_marked_answered(pane))
+}
+
+/// The question whose text is drawn lowest on the screen.
+///
+/// Lowest rather than first: the pane holds the questions already answered above the one
+/// being asked, and the newest of anything in a terminal is at the bottom.
+fn question_named_on_screen(pane: &str, questions: &[Question]) -> Option<usize> {
+    // Compared without any of the whitespace, because the terminal wraps a question to
+    // the window's width — and wraps text with no spaces in it, which is most of the
+    // questions this panel is read with, by breaking mid-sentence.
+    let screen = without_whitespace(pane);
+
+    questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let asked = without_whitespace(&question.question);
+            if asked.is_empty() {
+                return None;
+            }
+            Some((screen.rfind(&asked)?, index))
+        })
+        .max()
+        .map(|(_, index)| index)
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn questions_marked_answered(pane: &str) -> usize {
+    pane.lines()
+        .rev()
+        .find(|line| line.contains(QUESTION_ANSWERED_MARK) || line.contains(QUESTION_PENDING_MARK))
+        .map(|strip| strip.matches(QUESTION_ANSWERED_MARK).count())
+        .unwrap_or(0)
+}
+
+/// The screen Claude Code draws once the last question of a call has been answered: the
+/// answers listed back, and a choice between sending them and starting again.
+///
+/// The call is still waiting at this point — the tool has returned nothing — so a panel
+/// that only knows about questions draws the last one over a screen it no longer
+/// describes, and the one thing the terminal is waiting for has no button at all.
+const REVIEW_PROMPT: &str = "Ready to submit your answers?";
+const REVIEW_SUBMIT_ROW: &str = "Submit answers";
+const REVIEW_CANCEL_ROW: &str = "Cancel";
+
+/// Whether the pane is showing that screen.
+///
+/// Both the question and the rows it offers are required: the words alone turn up in
+/// what a session says, and the prompt without its rows is a screen caught half-drawn.
+/// `capture-pane` reads the visible screen rather than the scrollback, so what is found
+/// here is what the terminal is showing now.
+fn answers_awaiting_confirmation(pane: &str) -> bool {
+    let Some(after_prompt) = pane.rfind(REVIEW_PROMPT).map(|at| &pane[at..]) else {
+        return false;
+    };
+    after_prompt.contains(REVIEW_SUBMIT_ROW) && after_prompt.contains(REVIEW_CANCEL_ROW)
+}
+
+/// The keys that answer that screen. Its rows are numbered, and a numbered menu takes
+/// the digit as the whole answer.
+fn keys_for_confirmation(send: bool) -> Option<Vec<PaneKey>> {
+    keys_for_single_choice(if send { 0 } else { 1 })
+}
+
+/// The marks the terminal puts beside each question in its strip: answered, and not.
+const QUESTION_ANSWERED_MARK: &str = "☒";
+const QUESTION_PENDING_MARK: &str = "☐";
+
+/// The keys that answer a question by picking one option outright.
+///
+/// A numbered menu takes the digit as the whole answer, which is why a single-answer
+/// question costs one keypress and needs to know nothing about where the cursor is.
+fn keys_for_single_choice(option_index: usize) -> Option<Vec<PaneKey>> {
+    Some(vec![PaneKey::Choice(Digit::for_option(option_index)?)])
+}
+
+/// The keys that take the reader to typing their own answer.
+///
+/// `Type something` is drawn as one more row after the options the model gave, and is
+/// numbered along with them. In a menu taking one answer its digit is the whole answer
+/// and the box opens at once; in a menu taking several the digit only ticks the row, so
+/// the answer has to be submitted like any other, carrying whatever else was ticked.
+fn keys_for_own_words(
+    ticked: &HashSet<usize>,
+    option_count: usize,
+    several: bool,
+) -> Option<Vec<PaneKey>> {
+    if !several {
+        return keys_for_single_choice(option_count);
+    }
+
+    let mut with_own_words = ticked.clone();
+    with_own_words.insert(option_count);
+    keys_for_several_choices(&with_own_words, option_count)
+}
+
+/// The rows Claude Code draws below the options of a question taking several answers:
+/// `Type something`, `Submit`, and `Chat about this`.
+const ROWS_BELOW_THE_OPTIONS: usize = 3;
+
+/// The keys that answer a question taking several options.
+///
+/// Each tick is that option's digit, which toggles it. Unlike the menu for a question
+/// taking one answer, the digit does **not** move the cursor, so where the cursor stands
+/// when the ticks are done is not knowable from the ticks — counting the walk to
+/// `Submit` from the last ticked option lands `Enter` on whichever row it reaches,
+/// ticking an option the reader never chose or opening `Type something`.
+///
+/// So the walk does not count from anywhere. Down stops on the last row rather than
+/// wrapping, so walking further than the menu is tall puts the cursor on `Chat about
+/// this` from wherever it was, and `Submit` is the row above it.
+fn keys_for_several_choices(ticked: &HashSet<usize>, option_count: usize) -> Option<Vec<PaneKey>> {
+    if ticked.is_empty() {
+        return None;
+    }
+
+    // Sorted only so that the keys are the same sequence for the same answer, which is
+    // what makes them worth reading in a test or a log.
+    let mut ticks: Vec<usize> = ticked.iter().copied().collect();
+    ticks.sort_unstable();
+
+    let mut keys = Vec::new();
+    for option_index in ticks {
+        keys.push(PaneKey::Choice(Digit::for_option(option_index)?));
+    }
+
+    for _ in 0..option_count + ROWS_BELOW_THE_OPTIONS {
+        keys.push(PaneKey::Down);
+    }
+    keys.push(PaneKey::Up);
+    keys.push(PaneKey::Enter);
+    Some(keys)
+}
+
+/// The answer being filled in for one question that takes several options.
+struct TickedAnswer {
+    /// The call and the question within it these ticks are for. A question replaced by
+    /// the next one of the same call must not inherit them, and neither must a question
+    /// of another call entirely.
+    tool_use_id: SharedString,
+    question_index: usize,
+    ticked: HashSet<usize>,
+}
+
+/// How long to leave between the keys of one answer.
+///
+/// The terminal redraws its menu between keypresses and reads the next key against what
+/// it has drawn, so keys sent faster than it redraws are answered against the wrong
+/// menu. This is the cost of answering through a terminal rather than an API.
+const ANSWER_KEY_INTERVAL: Duration = Duration::from_millis(120);
+
 /// A `tool_use` block that spawned conversations of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentCall {
@@ -3910,14 +5303,35 @@ struct AgentCall {
 struct AgentCardRow {
     label: SharedString,
     state: AgentState,
+    /// The phase of the run this agent belongs to, for an agent of a `Workflow` run that
+    /// recorded one. A run of several phases is otherwise a row of cards that say nothing
+    /// about which part of the run they are.
+    phase: Option<SharedString>,
     target: TranscriptTarget,
+}
+
+/// What the line above a `Workflow` call's cards says the run is doing: how many agents
+/// it has spawned so far, and how many of those are still working.
+fn workflow_run_note(cards: &[AgentCardRow]) -> SharedString {
+    let running = cards
+        .iter()
+        .filter(|card| card.state == AgentState::Running)
+        .count();
+    let agents = if cards.len() == 1 { "agent" } else { "agents" };
+    // A run with nothing left running has either finished or is between phases, and
+    // `0 running` reads as a claim about which one it is.
+    if running == 0 {
+        return SharedString::from(format!("{} {agents} · none running", cards.len()));
+    }
+    SharedString::from(format!("{} {agents} · {running} running", cards.len()))
 }
 
 /// Whether one of the selected session's agents is still working.
 ///
-/// Read off the session's own conversation, never the agent's: an agent's transcript
-/// ends when the agent stops writing and records nothing about having returned. The one
-/// place the end of an agent is written down is the result of the call that spawned it.
+/// Never read off the agent's own transcript: it ends when the agent stops writing and
+/// records nothing about having returned. What says an agent is over depends on how it
+/// was spawned — a `Task` agent by the result of its call, a `Workflow` agent by the
+/// journal its run writes, because that call is answered while the run is still going.
 fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> AgentState {
     if let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() {
         let answered = main_path
@@ -3930,31 +5344,22 @@ fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> Ag
         };
     }
 
-    // A `Workflow` run's agents record no tool use id, so the end of the run is the only
-    // thing that says they are over, and the run announces itself by id in the result of
-    // the `Workflow` call.
-    if let Some(workflow_run_id) = summary.workflow_run_id.as_deref() {
-        return if workflow_run_is_announced_as_over(workflow_run_id, main_path) {
-            AgentState::Finished
-        } else {
-            AgentState::Running
+    // A `Workflow` run's agents record no tool use id, and the call that started the run
+    // is answered the moment the run is launched rather than when it ends, so the
+    // conversation holds nothing that says one of them is over. The run's own journal is
+    // the only record of that, and the machine the run happened on has already read it.
+    if summary.workflow_run_id.is_some() {
+        return match summary.workflow_agent_finished {
+            Some(true) => AgentState::Finished,
+            // No journal to read, or one that does not name this agent yet. Both are
+            // states a run passes through while it is working, so neither is it ending.
+            Some(false) | None => AgentState::Running,
         };
     }
 
     // Neither id, so nothing in the conversation pairs with this agent at all. A chip
     // that pulses for the rest of the session is worse than one that never pulses.
     AgentState::Finished
-}
-
-fn workflow_run_is_announced_as_over(
-    workflow_run_id: &str,
-    main_path: &[&TranscriptRecord],
-) -> bool {
-    main_path.iter().any(|record| {
-        tool_result_texts(record).into_iter().any(|(_, text)| {
-            workflow_run_id_in_tool_result(&text).as_deref() == Some(workflow_run_id)
-        })
-    })
 }
 
 /// Every `tool_result` block a record holds, as the id of the call it answers and the
@@ -4322,9 +5727,19 @@ fn append_record(
                 usage: None,
             });
             entries.push(Entry {
-                key: base_key,
+                key: base_key.clone(),
                 kind,
             });
+            for (index, block) in queued_command_images(record).into_iter().enumerate() {
+                let key = SharedString::from(format!("{base_key}-image-{index}"));
+                // Keyed off the record's own cache key so that a decoded image survives
+                // the conversation being rebuilt around it, as every other one does.
+                let image_cache_key = cache_key
+                    .as_ref()
+                    .map(|cache_key| SharedString::from(format!("{cache_key}-image-{index}")));
+                let kind = cache.kind(image_cache_key.as_ref(), || image_kind(block));
+                entries.push(Entry { key, kind });
+            }
             return;
         }
 
@@ -4656,9 +6071,7 @@ fn queued_command_prompt(record: &TranscriptRecord) -> Option<SharedString> {
     }
 
     // A message with an image in it is recorded as content blocks rather than as a
-    // string, and the blocks hold the image's base64 as well as the text. Only the text
-    // is taken: read as a string the whole thing is skipped, and drawn whole it would be
-    // a screenful of encoded image.
+    // string, and the blocks carry the image's base64 beside the text.
     let prompt = match attachment.get("prompt")? {
         Value::String(prompt) => prompt.trim().to_string(),
         Value::Array(blocks) => blocks
@@ -4673,9 +6086,29 @@ fn queued_command_prompt(record: &TranscriptRecord) -> Option<SharedString> {
 
     // Same rule as the conversation's own records: a queued `<task-notification>` is the
     // CLI telling itself a background command finished, not a message anyone typed.
-    // Same rule as the conversation's own records: a queued `<task-notification>` is the
-    // CLI telling itself a background command finished, not a message anyone typed.
     user_visible_text(&prompt).map(SharedString::from)
+}
+
+/// The images pasted into a message that was queued behind a running turn.
+///
+/// They are only here. The user record the CLI writes when the turn finishes carries no
+/// content at all, so an image dropped from the attachment is one the reader never sees
+/// again — however plainly it is still on their terminal.
+fn queued_command_images(record: &TranscriptRecord) -> Vec<&Value> {
+    let Some(attachment) = record.raw.get("attachment") else {
+        return Vec::new();
+    };
+    if attachment.get("type").and_then(Value::as_str) != Some(QUEUED_COMMAND_ATTACHMENT) {
+        return Vec::new();
+    }
+
+    let Some(Value::Array(blocks)) = attachment.get("prompt") else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some(IMAGE_BLOCK_TYPE))
+        .collect()
 }
 
 fn attachment_item(
@@ -5368,6 +6801,649 @@ mod tests {
             "message": { "content": text },
         })
         .to_string()
+    }
+
+    /// The mode is read out of the CLI's own footer, which is the only place it is
+    /// written down: nothing in the transcript says which mode a session is answering
+    /// in.
+    #[test]
+    fn permission_mode_is_read_out_of_the_line_the_cli_writes_it_on() {
+        let screen = |footer: &str| format!("some conversation\n\n\u{2500}\u{2500}\n{footer}");
+
+        assert_eq!(
+            permission_mode(&screen(
+                "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents"
+            ))
+            .as_deref(),
+            Some("auto mode"),
+            "the glyphs and the trailing `on` are the line's, not the mode's name"
+        );
+        assert_eq!(
+            permission_mode(&screen("  \u{23f8} plan mode on (shift+tab to cycle)")).as_deref(),
+            Some("plan mode")
+        );
+        assert_eq!(
+            permission_mode(&screen(
+                "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)"
+            ))
+            .as_deref(),
+            Some("bypass permissions"),
+            "a mode whose own name ends in `s` must not lose it with the trailing `on`"
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_trims_trailing_whitespace_before_on() {
+        let screen = "some conversation\n\n\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode  on (shift+tab to cycle)";
+        assert_eq!(
+            permission_mode(screen).as_deref(),
+            Some("auto mode"),
+            "extra whitespace before `on` must not leave trailing spaces in the mode name"
+        );
+    }
+
+    /// A screen with no such line is the ordinary mode, which the CLI announces by
+    /// saying nothing. Naming it here would be inventing a name Claude Code does not
+    /// use.
+    #[test]
+    fn permission_mode_is_unknown_when_the_screen_does_not_say_it() {
+        assert_eq!(permission_mode("").as_deref(), None);
+        assert_eq!(
+            permission_mode("\u{276f} \n\n  ? for shortcuts").as_deref(),
+            None
+        );
+    }
+
+    /// The conversation is mirrored on the same screen the footer is, so a message that
+    /// quotes the hint sits in the same text this reads. The footer is the last line to
+    /// carry it, and anything implausibly long for a mode name is not one.
+    #[test]
+    fn permission_mode_is_taken_from_the_footer_rather_than_the_conversation_above_it() {
+        let screen = concat!(
+            "  I pressed shift+tab and it said `old mode on (shift+tab to cycle)`, which\n",
+            "  is not what I expected at all when I was reading the manual for it\n",
+            "\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
+        );
+        assert_eq!(
+            permission_mode(screen).as_deref(),
+            Some("auto mode"),
+            "the footer is the bottom-most line carrying the hint"
+        );
+
+        let only_a_long_quote = concat!(
+            "  the manual explains at some length that the line reads `whatever mode the ",
+            "session happens to be in on (shift+tab to cycle)` when it is on\n"
+        );
+        assert_eq!(
+            permission_mode(only_a_long_quote).as_deref(),
+            None,
+            "text far too long to be a mode name must not be shown as one"
+        );
+    }
+
+    /// What the session has spent is not what it is carrying: the context figure is the
+    /// size of one request, and says nothing about the work that has gone through the
+    /// session to reach it.
+    #[test]
+    fn the_toolbar_says_the_tokens_the_session_has_spent() {
+        let spend = Spend {
+            usage: Usage {
+                input_tokens: 12_000,
+                cache_read_tokens: 480_000,
+                cache_write_5m_tokens: 40_000,
+                cache_write_1h_tokens: 8_000,
+                output_tokens: 63_000,
+                ..Default::default()
+            },
+            answers: 4,
+            context_tokens: 94_000,
+            ..Default::default()
+        };
+
+        assert!(
+            session_facts(&spend).contains(&SharedString::from("540K in \u{b7} 63K out")),
+            "every kind of input counts towards what was read, got {:?}",
+            session_facts(&spend)
+        );
+    }
+
+    /// The pane carries every strip the session has drawn, and the one being answered is
+    /// the last of them. Reading the first instead answers against a question the reader
+    /// settled turns ago, and draws the options of the wrong one.
+    #[test]
+    fn the_question_being_asked_is_the_last_strip_on_the_screen_not_the_first() {
+        let pane = concat!(
+            "\u{2190}  \u{2612} Architecture  \u{2612} Database  \u{2714} Submit  \u{2192}\n",
+            "\n",
+            "Which database should we use?\n",
+            "Claude answered: Postgres.\n",
+            "\n",
+            "\u{2190}  \u{2612} Project shape  \u{2610} Extras  \u{2714} Submit  \u{2192}\n",
+            "\n",
+            "Which extras should be on?\n"
+        );
+
+        assert_eq!(
+            question_being_asked(Some(pane), &[]),
+            1,
+            "the live strip has one question answered, and the settled one above it has two"
+        );
+    }
+
+    /// A message typed while the session was answering carries its image the same way
+    /// any other message does — the attachment's `prompt` is content blocks rather than
+    /// a string when there is one. Reading only the text out of those blocks drops the
+    /// image the reader pasted, and it is nowhere else: the user record written when the
+    /// turn ends carries no content at all.
+    #[test]
+    fn a_message_queued_with_an_image_keeps_the_image() {
+        let queued = serde_json::json!({
+            "type": "attachment",
+            "uuid": "q1",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": [
+                    {"type": "text", "text": "look at this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8=",
+                        },
+                    },
+                ],
+            },
+        })
+        .to_string();
+
+        let entries = entries_of(&[&queued]);
+
+        assert_eq!(
+            message_sources(&entries),
+            vec![SharedString::from("look at this")],
+            "the words typed with the image are still the message"
+        );
+        assert_eq!(
+            decoded_image(&entries).bytes,
+            b"hello".to_vec(),
+            "the image pasted with them must be drawn too"
+        );
+    }
+
+    /// After the last question of a call is answered, Claude Code does not return the
+    /// answers — it draws every one of them back and asks whether to send them. Until
+    /// that is answered the call is still waiting, and the panel drew the last question
+    /// on: a reader looking at the panel had no button for the one thing the terminal
+    /// was waiting for.
+    #[test]
+    fn the_screen_that_asks_whether_to_send_the_answers_is_recognised() {
+        let review = concat!(
+            "Review your answers\n",
+            "\n",
+            "  \u{25cf} which extras?\n",
+            "    \u{2192} A, B\n",
+            "\n",
+            "Ready to submit your answers?\n",
+            "\n",
+            "\u{276f} 1. Submit answers\n",
+            "  2. Cancel\n"
+        );
+
+        assert!(answers_awaiting_confirmation(review));
+    }
+
+    /// Every other screen a session can be on must not be read as that one — a question
+    /// still being answered least of all, because drawing the confirmation over it would
+    /// send the call before the reader had chosen anything.
+    #[test]
+    fn no_other_screen_is_read_as_the_one_that_sends_the_answers() {
+        for screen in [
+            "",
+            "\u{276f} 1. [ ] A\n  2. [ ] B\n     Next\n",
+            // The words on their own, in something the session was saying.
+            "I will ask whether you are ready to submit your answers once I have them\n",
+            // The prompt without the rows: a screen part-way through being redrawn.
+            "Ready to submit your answers?\n",
+        ] {
+            assert!(
+                !answers_awaiting_confirmation(screen),
+                "{screen:?} was read as the confirmation screen"
+            );
+        }
+    }
+
+    fn question_named(header: &str, asked: &str) -> Question {
+        Question {
+            header: header.to_string(),
+            question: asked.to_string(),
+            options: Vec::new(),
+            multi_select: false,
+        }
+    }
+
+    /// The strip of marks scrolls: on a narrow window the terminal draws the arrows and
+    /// only as many questions as fit, so the marks say the first question is being asked
+    /// while the third one is on screen. Counting them showed the reader the options of a
+    /// question they had answered two questions ago — and widening the window "fixed" it,
+    /// which is how the strip gave itself away.
+    #[test]
+    fn the_question_being_asked_is_read_from_its_text_not_from_the_strip_that_scrolls() {
+        let questions = [
+            question_named(
+                "\u{8a9e}\u{7cfb}",
+                "\u{8981}\u{51fa}\u{54ea}\u{4e9b}\u{8a9e}\u{7cfb}？",
+            ),
+            question_named(
+                "\u{7247}\u{578b}",
+                "\u{7247}\u{578b}\u{600e}\u{9ebc}\u{6392}？",
+            ),
+            question_named(
+                "\u{7d20}\u{6750}",
+                "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}？",
+            ),
+        ];
+
+        let narrow = concat!(
+            "\u{2190}  \u{2612} \u{8a9e}\u{7cfb}  \u{2192}\n",
+            "\n",
+            "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}？\n",
+            "\n",
+            "  1. [ ] \u{6cbf}\u{7528}\u{73fe}\u{6709}\u{7d20}\u{6750}\u{5eab}\n"
+        );
+
+        assert_eq!(
+            question_being_asked(Some(narrow), &questions),
+            2,
+            "the third question's text is on screen, whatever the strip had room to draw"
+        );
+    }
+
+    /// The terminal wraps a question to the width it has, and breaks mid-sentence when
+    /// the text has no spaces to break at. A match that needs the line intact reads a
+    /// wrapped question as absent and falls back to the marks that are wrong.
+    #[test]
+    fn a_question_wrapped_across_lines_is_still_the_one_being_asked() {
+        let questions = [
+            question_named("a", "first question"),
+            question_named(
+                "b",
+                "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}\u{5f97}\u{6bd4}\u{8f03}\u{5feb}",
+            ),
+        ];
+        let wrapped = concat!(
+            "\u{2190}  \u{2612} a  \u{2192}\n",
+            "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\n",
+            "\u{9ebc}\u{53d6}\u{5f97}\u{6bd4}\u{8f03}\u{5feb}\n"
+        );
+
+        assert_eq!(question_being_asked(Some(wrapped), &questions), 1);
+    }
+
+    /// The questions already answered are above the one being asked, so the text of an
+    /// earlier one is on the same screen. The lowest is the live one.
+    #[test]
+    fn an_earlier_questions_text_in_the_scrollback_is_not_the_one_being_asked() {
+        let questions = [
+            question_named("a", "which database?"),
+            question_named("b", "which extras?"),
+        ];
+        let pane = concat!(
+            "which database?\n",
+            "Claude answered: Postgres.\n",
+            "\u{2190}  \u{2612} a  \u{2610} b  \u{2192}\n",
+            "which extras?\n"
+        );
+
+        assert_eq!(question_being_asked(Some(pane), &questions), 1);
+    }
+
+    /// A pane carrying none of the questions' text falls back to the marks, which is
+    /// still better than answering the first question by default.
+    #[test]
+    fn a_pane_that_names_no_question_falls_back_to_the_marks() {
+        let questions = [question_named("a", "which database?")];
+        let pane = "\u{2190}  \u{2612} a  \u{2610} b  \u{2714} Submit  \u{2192}\nsomething else entirely\n";
+
+        assert_eq!(question_being_asked(Some(pane), &questions), 1);
+    }
+
+    /// The mode's name is what is left after the line's own grammar is taken off it, and
+    /// the CLI pads that line to the width of the screen.
+    #[test]
+    fn the_permission_mode_carries_none_of_the_lines_padding() {
+        for line in [
+            "  \u{23f5}\u{23f5} auto mode  on (shift+tab to cycle)",
+            "  \u{23f5}\u{23f5} auto mode   (shift+tab to cycle)",
+            "\u{23f5}\u{23f5}  auto mode on  (shift+tab to cycle)",
+        ] {
+            assert_eq!(
+                permission_mode(line).as_deref(),
+                Some("auto mode"),
+                "{line:?} was read as {:?}",
+                permission_mode(line)
+            );
+        }
+    }
+
+    /// A session that has not answered yet has spent nothing, and a zero says less than
+    /// nothing at all.
+    #[test]
+    fn the_toolbar_says_no_tokens_for_a_session_that_has_not_answered() {
+        let spend = Spend::default();
+        assert!(
+            !session_facts(&spend)
+                .iter()
+                .any(|fact| fact.contains("in \u{b7}")),
+            "got {:?}",
+            session_facts(&spend)
+        );
+    }
+
+    fn history_of(messages: &[&str]) -> Vec<SharedString> {
+        messages
+            .iter()
+            .map(|message| SharedString::from(message.to_string()))
+            .collect()
+    }
+
+    /// The history is the reader's own messages in the conversation, newest first, which
+    /// is the order Up walks them in.
+    #[test]
+    fn the_history_is_the_readers_own_messages_newest_first() {
+        let entries = entries_of(&[
+            &user_message_line("u1", "first"),
+            &serde_json::json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "message": { "content": [{"type": "text", "text": "an answer"}] },
+            })
+            .to_string(),
+            &user_message_line("u2", "second"),
+            &user_message_line("u3", "second"),
+            &user_message_line("u4", "third"),
+        ]);
+
+        assert_eq!(
+            message_history(&entries),
+            history_of(&["third", "second", "first"]),
+            "the session's own answers are not the reader's history, and a message \
+             repeated back to back is one entry"
+        );
+    }
+
+    /// The walk starts at the newest message and runs out at the oldest, rather than
+    /// wrapping round to the newest again: a reader holding Up would never know they
+    /// had reached the end.
+    #[test]
+    fn walking_back_stops_at_the_oldest_message() {
+        let history = history_of(&["newest", "middle", "oldest"]);
+
+        assert_eq!(
+            step_back_through_history(&history, None, ""),
+            HistoryStep::Recall {
+                index: 0,
+                message: "newest".into()
+            }
+        );
+        assert_eq!(
+            step_back_through_history(&history, Some(0), "newest"),
+            HistoryStep::Recall {
+                index: 1,
+                message: "middle".into()
+            }
+        );
+        assert_eq!(
+            step_back_through_history(&history, Some(2), "oldest"),
+            HistoryStep::Stay,
+            "there is nothing older, and the box must keep what it is holding"
+        );
+        assert_eq!(
+            step_back_through_history(&[], None, ""),
+            HistoryStep::Stay,
+            "a session with nothing sent to it has nothing to recall"
+        );
+    }
+
+    /// Walking forward ends at the empty box the walk started from, not at the newest
+    /// message: otherwise the reader can never get back to typing something new.
+    #[test]
+    fn walking_forward_ends_at_the_empty_box_the_walk_started_from() {
+        let history = history_of(&["newest", "middle", "oldest"]);
+
+        assert_eq!(
+            step_forward_through_history(&history, Some(2), "oldest"),
+            HistoryStep::Recall {
+                index: 1,
+                message: "middle".into()
+            }
+        );
+        assert_eq!(
+            step_forward_through_history(&history, Some(0), "newest"),
+            HistoryStep::Draft
+        );
+    }
+
+    /// The arrows belong to the cursor while the box holds something the reader wrote.
+    /// This is the property the whole design turns on: a half-written message must
+    /// never be thrown away by pressing Up.
+    #[test]
+    fn a_draft_in_the_box_keeps_the_arrow_keys_for_the_cursor() {
+        let history = history_of(&["newest", "middle"]);
+
+        assert_eq!(
+            step_back_through_history(&history, None, "half a thought"),
+            HistoryStep::MoveCursor(CursorDirection::Up)
+        );
+        assert_eq!(
+            step_forward_through_history(&history, None, "half a thought"),
+            HistoryStep::MoveCursor(CursorDirection::Down)
+        );
+        assert_eq!(
+            step_back_through_history(&history, Some(0), "newest, and then some"),
+            HistoryStep::MoveCursor(CursorDirection::Up),
+            "a recalled message the reader has edited is a draft of theirs"
+        );
+        assert_eq!(
+            step_forward_through_history(&history, Some(0), "newest, and then some"),
+            HistoryStep::MoveCursor(CursorDirection::Down)
+        );
+    }
+
+    /// A position recorded against a conversation that has since grown, or that the
+    /// reader has left, must not be read as standing somewhere in the new one.
+    #[test]
+    fn a_position_that_no_longer_matches_the_box_is_not_walked_from() {
+        let history = history_of(&["newest", "middle"]);
+
+        assert_eq!(
+            step_back_through_history(&history, Some(9), ""),
+            HistoryStep::Recall {
+                index: 0,
+                message: "newest".into()
+            },
+            "an empty box starts the walk again rather than trusting the position"
+        );
+        assert_eq!(
+            step_forward_through_history(&history, Some(9), ""),
+            HistoryStep::MoveCursor(CursorDirection::Down)
+        );
+    }
+
+    /// The menu Claude Code draws for a question taking several answers, as measured
+    /// from a real one rather than assumed.
+    ///
+    /// The rows below the options are `Type something`, `Submit` and `Chat about this`.
+    /// A digit toggles its own row and leaves the cursor where it was — which is the
+    /// fact the first version of this got wrong. Down stops on the last row rather than
+    /// wrapping, and Up from the first row wraps to the last numbered row.
+    struct SeveralChoicesMenu {
+        option_count: usize,
+        cursor: usize,
+        ticked: HashSet<usize>,
+        activated: Option<usize>,
+    }
+
+    impl SeveralChoicesMenu {
+        fn new(option_count: usize, cursor: usize) -> Self {
+            Self {
+                option_count,
+                cursor,
+                ticked: HashSet::default(),
+                activated: None,
+            }
+        }
+
+        /// `Type something` is the row after the options, and is numbered like them.
+        fn last_numbered_row(&self) -> usize {
+            self.option_count
+        }
+
+        fn submit_row(&self) -> usize {
+            self.option_count + 1
+        }
+
+        /// The options, `Type something`, `Submit`, and `Chat about this`.
+        fn rows(&self) -> usize {
+            self.option_count + 3
+        }
+
+        fn toggle(&mut self, row: usize) {
+            if !self.ticked.remove(&row) {
+                self.ticked.insert(row);
+            }
+        }
+
+        fn press(&mut self, key: PaneKey) {
+            match key {
+                PaneKey::Choice(_) => {
+                    let row: usize = key
+                        .tmux_name()
+                        .parse::<usize>()
+                        .expect("a choice is sent as its digit")
+                        - 1;
+                    assert!(
+                        row <= self.last_numbered_row(),
+                        "the menu has no row {}, so the digit for it answers nothing",
+                        row + 1
+                    );
+                    self.toggle(row);
+                }
+                PaneKey::Down => self.cursor = (self.cursor + 1).min(self.rows() - 1),
+                PaneKey::Up => {
+                    self.cursor = self
+                        .cursor
+                        .checked_sub(1)
+                        .unwrap_or(self.last_numbered_row())
+                }
+                PaneKey::Enter => self.activated = Some(self.cursor),
+                other => panic!("the menu was sent {other:?}, which is not one of its keys"),
+            }
+        }
+
+        fn play(&mut self, keys: &[PaneKey]) {
+            for key in keys {
+                self.press(*key);
+            }
+        }
+    }
+
+    /// The property the whole sequence turns on: a digit does not move the cursor, so
+    /// where the walk to `Submit` starts is not knowable from the ticks. Counting rows
+    /// from the last ticked option put `Enter` on whatever row it happened to reach —
+    /// ticking an option the reader never chose, or opening `Type something`.
+    #[test]
+    fn submitting_several_choices_reaches_submit_from_wherever_the_cursor_was() {
+        let option_count = 4;
+        let ticked: HashSet<usize> = HashSet::from_iter([0, 1]);
+        let keys = keys_for_several_choices(&ticked, option_count)
+            .expect("two ticked options are an answer");
+
+        for starting_cursor in 0..option_count + 3 {
+            let mut menu = SeveralChoicesMenu::new(option_count, starting_cursor);
+            menu.play(&keys);
+
+            assert_eq!(
+                menu.activated,
+                Some(menu.submit_row()),
+                "starting on row {starting_cursor}, Enter landed on row {:?} rather than \
+                 Submit on row {}",
+                menu.activated,
+                menu.submit_row()
+            );
+            assert_eq!(
+                menu.ticked, ticked,
+                "starting on row {starting_cursor}, the answer submitted was {:?} rather \
+                 than the {:?} that were ticked",
+                menu.ticked, ticked
+            );
+        }
+    }
+
+    /// The same holds for one tick and for every option ticked: neither end of the
+    /// menu is a special case the walk gets right by luck.
+    #[test]
+    fn submitting_reaches_submit_for_any_set_of_ticks() {
+        for option_count in 1..=5 {
+            for ticks in [vec![0], vec![option_count - 1], (0..option_count).collect()] {
+                let ticked: HashSet<usize> = ticks.iter().copied().collect();
+                let keys = keys_for_several_choices(&ticked, option_count)
+                    .expect("a ticked option is an answer");
+
+                let mut menu = SeveralChoicesMenu::new(option_count, 0);
+                menu.play(&keys);
+                assert_eq!(
+                    menu.activated,
+                    Some(menu.submit_row()),
+                    "with {option_count} options and {ticks:?} ticked, Enter landed on \
+                     {:?} rather than Submit on row {}",
+                    menu.activated,
+                    menu.submit_row()
+                );
+                assert_eq!(menu.ticked, ticked);
+            }
+        }
+    }
+
+    /// `Type something` is one more numbered row in a menu that takes several answers,
+    /// so its digit only ticks it: the box to type in opens when the answer is
+    /// submitted. Sending the digit alone leaves the reader with a ticked row and
+    /// nowhere to type.
+    #[test]
+    fn typing_an_answer_to_a_several_choices_question_submits_the_row_rather_than_ticking_it() {
+        let option_count = 3;
+        let already_ticked: HashSet<usize> = HashSet::from_iter([0]);
+        let keys = keys_for_own_words(&already_ticked, option_count, true)
+            .expect("typing is always an answer");
+
+        let mut menu = SeveralChoicesMenu::new(option_count, 0);
+        menu.play(&keys);
+
+        assert_eq!(
+            menu.activated,
+            Some(menu.submit_row()),
+            "Enter landed on {:?} rather than Submit on row {}",
+            menu.activated,
+            menu.submit_row()
+        );
+        assert_eq!(
+            menu.ticked,
+            HashSet::from_iter([0, option_count]),
+            "what is submitted must be the ticks the reader made plus `Type something`"
+        );
+    }
+
+    /// A question taking one answer is a different menu: the digit is the whole answer,
+    /// and `Type something` opens the box outright.
+    #[test]
+    fn typing_an_answer_to_a_single_choice_question_is_one_keypress() {
+        let option_count = 3;
+        assert_eq!(
+            keys_for_own_words(&HashSet::default(), option_count, false),
+            keys_for_single_choice(option_count),
+            "nothing is ticked and nothing is walked past in a menu taking one answer"
+        );
     }
 
     fn message_sources(entries: &[Entry]) -> Vec<SharedString> {
@@ -6452,6 +8528,7 @@ mod tests {
             },
             transcript_path: PathBuf::from("/nowhere/agent.jsonl"),
             size: 0,
+            workflow_agent_finished: None,
         }
     }
 
@@ -6507,42 +8584,259 @@ mod tests {
         );
     }
 
-    /// A `Workflow` run's agents carry no `tool_use_id` of their own, so the only thing
-    /// pairing them with the conversation is the run id the tool result announces.
+    /// A `Workflow` run's agents carry no `tool_use_id` of their own, and the call that
+    /// started the run is answered while the run is still going, so the conversation is
+    /// not what says they are over. The run's journal is, and the machine the run
+    /// happened on has already read it into the summary.
     #[test]
-    fn a_workflow_agent_runs_until_its_run_id_is_announced_as_answered() {
-        let summary = subagent("a1", Some("wf_b529a29d-562"), None);
+    fn a_workflow_agent_is_over_when_its_runs_journal_says_it_returned() {
         let call = tool_use_line("m2", "toolu_09", "Workflow", serde_json::json!({}));
+        let opening = user_message_line("m1", "go");
+        let conversation: [&str; 2] = [&opening, &call];
 
+        let mut returned = subagent("a1", Some("wf_b529a29d-562"), None);
+        returned.workflow_agent_finished = Some(true);
         assert_eq!(
-            state_of(&summary, &[&user_message_line("m1", "go"), &call]),
-            AgentState::Running,
-            "the run has not been announced as over, so its agents are still working"
-        );
-
-        let answer = tool_result_line_with_content(
-            "m3",
-            "toolu_09",
-            "Workflow complete.\nRun ID: wf_b529a29d-562\n3 agents finished.",
-        );
-        assert_eq!(
-            state_of(&summary, &[&user_message_line("m1", "go"), &call, &answer]),
+            state_of(&returned, &conversation),
             AgentState::Finished,
-            "the run id in the tool result is the run having ended"
+            "the journal recorded this agent's result, which is the agent having returned"
         );
 
-        let other_run = tool_result_line_with_content(
+        let mut working = subagent("a1", Some("wf_b529a29d-562"), None);
+        working.workflow_agent_finished = Some(false);
+        assert_eq!(
+            state_of(&working, &conversation),
+            AgentState::Running,
+            "the journal has no result for this agent, so it has not returned"
+        );
+    }
+
+    /// The sidecar this scan lists an agent from is written when the agent is spawned,
+    /// before the run's journal records it starting, and a run that has only just
+    /// launched may have written no journal at all. Both gaps are the beginning of an
+    /// agent's work, and calling either one of them the end draws a working run as done.
+    #[test]
+    fn a_workflow_agent_no_journal_accounts_for_is_taken_to_be_working() {
+        let call = tool_use_line("m2", "toolu_09", "Workflow", serde_json::json!({}));
+        let opening = user_message_line("m1", "go");
+        let conversation: [&str; 2] = [&opening, &call];
+
+        let unaccounted = subagent("a1", Some("wf_b529a29d-562"), None);
+        assert_eq!(
+            unaccounted.workflow_agent_finished, None,
+            "the scan found no journal to account for this agent"
+        );
+        assert_eq!(state_of(&unaccounted, &conversation), AgentState::Running);
+    }
+
+    /// `Workflow` runs in the background and its call is answered the moment the run
+    /// starts, so the `Run ID:` the answer carries announces a run that has only just
+    /// begun. Reading that announcement as the run being over draws every agent of a
+    /// running workflow as finished for as long as it runs.
+    #[test]
+    fn a_workflow_run_that_has_only_been_launched_is_still_running() {
+        let summary = subagent("a1", Some("wf_b25f31ee-cab"), None);
+        let call = tool_use_line("m2", "toolu_09", "Workflow", serde_json::json!({}));
+        // Verbatim from a `Workflow` call that was still running when it was captured.
+        let launch = tool_result_line_with_content(
             "m3",
             "toolu_09",
-            "Workflow complete.\nRun ID: wf_something-else",
+            "Workflow launched in background. Task ID: w2gew6q96\n\
+             Summary: write the copy for the fifteen pair pages\n\
+             Transcript dir: /home/coder/.claude/projects/-slug/session/subagents/workflows/wf_b25f31ee-cab\n\
+             Run ID: wf_b25f31ee-cab\n\
+             \n\
+             You will be notified when it completes. Use /workflows to watch live progress.",
+        );
+
+        assert_eq!(
+            state_of(&summary, &[&user_message_line("m1", "go"), &call, &launch]),
+            AgentState::Running,
+            "the run id is announced when the run starts, so the announcement is not the run ending"
+        );
+    }
+
+    fn card(state: AgentState) -> AgentCardRow {
+        AgentCardRow {
+            label: SharedString::from("copy:batch-a"),
+            state,
+            phase: None,
+            target: TranscriptTarget::Main,
+        }
+    }
+
+    /// Captured from a terminal asking the second of two questions. The strip is the only
+    /// thing read out of the screen, so the rest is here to show it is not.
+    const TWO_QUESTION_PANE: &str = "\
+←  ☒ Project shape  ☐ Extras  ✔ Submit  →
+
+Which extras should be on?
+
+❯ 1. [ ] CodeGraph index
+  Symbols and blast radius
+  2. [ ] Regression gate
+     Submit
+
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
+
+    fn command(name: &str, scope: SlashCommandScope) -> SlashCommand {
+        SlashCommand {
+            name: name.to_string(),
+            description: None,
+            argument_hint: None,
+            scope,
+        }
+    }
+
+    /// A slash partway through a sentence is a path, a date, or a fraction. A menu that
+    /// opened on those would be in the way of every message that mentions a file.
+    #[test]
+    fn only_a_message_that_is_nothing_but_a_command_is_naming_one() {
+        assert_eq!(slash_command_being_named("/comp"), Some("comp"));
+        assert_eq!(
+            slash_command_being_named("/"),
+            Some(""),
+            "a slash on its own is the whole menu, which is what it is for"
+        );
+
+        assert_eq!(slash_command_being_named("look at src/main.rs"), None);
+        assert_eq!(
+            slash_command_being_named("/compact now"),
+            None,
+            "once the arguments are being typed the name is settled"
         );
         assert_eq!(
-            state_of(
-                &summary,
-                &[&user_message_line("m1", "go"), &call, &other_run]
-            ),
-            AgentState::Running,
-            "another run ending says nothing about this one"
+            slash_command_being_named("//"),
+            None,
+            "a doubled slash is not a command being named"
+        );
+        assert_eq!(slash_command_being_named(""), None);
+        assert_eq!(slash_command_being_named("compact"), None);
+    }
+
+    /// A name is usually typed from its beginning, so what starts with it is what the
+    /// reader is reaching for; what merely contains it is worth offering, but behind.
+    #[test]
+    fn commands_starting_with_what_was_typed_come_before_ones_merely_containing_it() {
+        let commands = vec![
+            command("review", SlashCommandScope::Project),
+            command("code-review", SlashCommandScope::User),
+            command("resume", SlashCommandScope::Builtin),
+            command("clear", SlashCommandScope::Builtin),
+        ];
+
+        let names: Vec<&str> = matching_slash_commands(&commands, "re")
+            .into_iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["review", "resume", "code-review"]);
+
+        assert_eq!(
+            matching_slash_commands(&commands, "REV")
+                .into_iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["review", "code-review"],
+            "what was typed is matched however it was capitalised"
+        );
+
+        assert_eq!(
+            matching_slash_commands(&commands, "").len(),
+            4,
+            "a slash on its own offers everything"
+        );
+        assert!(
+            matching_slash_commands(&commands, "nothing-by-this-name").is_empty(),
+            "a command this machine does not hold offers no rows, and an empty menu is \
+             not drawn at all"
+        );
+    }
+
+    /// The menu takes room the conversation is in, so it offers a screenful at most —
+    /// and must not go on drawing rows past that when everything matches.
+    #[test]
+    fn the_menu_offers_at_most_a_screenful() {
+        let commands: Vec<SlashCommand> = (0..SLASH_COMMAND_ROWS + 5)
+            .map(|index| command(&format!("command-{index}"), SlashCommandScope::User))
+            .collect();
+
+        assert_eq!(
+            matching_slash_commands(&commands, "").len(),
+            SLASH_COMMAND_ROWS
+        );
+    }
+
+    /// A call carrying one question draws no strip at all, and the reader is on its only
+    /// question. Counting nothing as "some other question" would draw the wrong one.
+    #[test]
+    fn a_call_with_one_question_leaves_the_reader_on_it() {
+        let single = "\
+ ☐ Options
+
+Pick one:
+
+❯ 1. Alpha
+  2. Beta
+
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+        assert_eq!(question_being_asked(Some(single), &[]), 0);
+        assert_eq!(
+            question_being_asked(None, &[]),
+            0,
+            "a terminal that could not be read leaves the reader where a call starts"
+        );
+        assert_eq!(
+            question_being_asked(Some("no question is on this screen at all"), &[]),
+            0
+        );
+    }
+
+    /// The strip ticks the questions already answered, so the one being asked is the
+    /// count of ticks. Reading it wrong draws the reader the options of another question.
+    #[test]
+    fn the_question_being_asked_is_the_one_after_the_answered_ones() {
+        assert_eq!(question_being_asked(Some(TWO_QUESTION_PANE), &[]), 1);
+
+        let none_answered = TWO_QUESTION_PANE.replace('☒', "☐");
+        assert_eq!(question_being_asked(Some(&none_answered), &[]), 0);
+
+        let both_answered = TWO_QUESTION_PANE.replacen('☐', "☒", 1);
+        assert_eq!(question_being_asked(Some(&both_answered), &[]), 2);
+    }
+
+    /// Nothing ticked is not an answer: walking to `Submit` and pressing it would submit
+    /// an empty one.
+    ///
+    /// What the rest of this test used to assert — the exact walk, counted from the last
+    /// ticked option — was measured against a real menu and found wrong; a digit does not
+    /// move the cursor there. The menu simulator above covers the walk now, against the
+    /// behaviour that was measured rather than against a key sequence.
+    #[test]
+    fn nothing_ticked_is_not_an_answer() {
+        assert_eq!(keys_for_several_choices(&HashSet::default(), 3), None);
+    }
+
+    /// The line above a run's cards is the part a reader sees without opening anything,
+    /// so it has to count what is working rather than what was spawned.
+    #[test]
+    fn the_line_above_a_runs_cards_counts_what_is_still_working() {
+        assert_eq!(
+            workflow_run_note(&[card(AgentState::Running), card(AgentState::Finished)]).as_ref(),
+            "2 agents · 1 running"
+        );
+        assert_eq!(
+            workflow_run_note(&[card(AgentState::Running)]).as_ref(),
+            "1 agent · 1 running",
+            "one agent is an agent, not agents"
+        );
+        assert_eq!(
+            workflow_run_note(&[card(AgentState::Finished), card(AgentState::Finished)]).as_ref(),
+            "2 agents · none running",
+            "a run between phases has spawned nothing new yet, and `0 running` reads as a \
+             claim that the run is over"
         );
     }
 
@@ -7702,6 +9996,108 @@ mod tests {
         );
     }
 
+    /// The records `pair_with` is matched against in the panel, which are not the ones
+    /// the conversation is drawn from — the bug below lived in the gap between the two.
+    fn user_message_entries_of(json_lines: &[&str]) -> Vec<Entry> {
+        let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        user_message_entries(&path)
+    }
+
+    /// A message typed while the session was answering is recorded as an attachment and
+    /// never as a user record — that is the only place its text is ever written. Left out
+    /// of what a send is paired against, its `Sending…` message stays on screen for the
+    /// rest of the session while the conversation draws the very same words beside it.
+    #[test]
+    fn a_pending_message_goes_when_it_arrives_as_a_queued_message() {
+        let queued = serde_json::json!({
+            "type": "attachment",
+            "uuid": "b",
+            "parentUuid": "a",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "run the tests",
+            },
+        })
+        .to_string();
+
+        let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "run the tests", &before);
+
+        let after =
+            user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
+        pending_sends.pair_with(&after);
+
+        assert!(
+            pending_sends.is_empty(),
+            "the queued record is the message arriving, and it is the only record it \
+             will ever get"
+        );
+    }
+
+    /// The same for a message queued with an image in it, whose text is one block of
+    /// several rather than the whole of the field.
+    #[test]
+    fn a_pending_message_goes_when_it_arrives_as_a_queued_message_with_an_image() {
+        let queued = serde_json::json!({
+            "type": "attachment",
+            "uuid": "b",
+            "parentUuid": "a",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": [
+                    {"type": "text", "text": "look at this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8=",
+                        },
+                    },
+                ],
+            },
+        })
+        .to_string();
+
+        let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember(7, "look at this", &before);
+
+        let after =
+            user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
+        pending_sends.pair_with(&after);
+
+        assert!(pending_sends.is_empty());
+    }
+
+    /// The key has to be the one the conversation draws that record under, or the entry
+    /// the send was paired with is not the entry on screen.
+    #[test]
+    fn a_queued_message_is_keyed_the_same_way_in_both_lists() {
+        let queued = serde_json::json!({
+            "type": "attachment",
+            "uuid": "b",
+            "parentUuid": "a",
+            "attachment": {"type": "queued_command", "prompt": "run the tests"},
+        })
+        .to_string();
+
+        let keys_of = |entries: Vec<Entry>| -> Vec<SharedString> {
+            entries
+                .into_iter()
+                .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
+                .map(|entry| entry.key)
+                .collect()
+        };
+
+        assert_eq!(
+            keys_of(user_message_entries_of(&[&queued])),
+            keys_of(entries_of(&[&queued])),
+        );
+    }
+
     #[test]
     fn a_pending_message_goes_when_its_record_arrives() {
         let before = entries_of(&[&user_message_line("a", "an earlier message")]);
@@ -8079,7 +10475,30 @@ mod tests {
                 },
                 transcript_path: self.home_directory.join("agent-a1.jsonl"),
                 size: 1,
+                workflow_agent_finished: None,
             }]))
+        }
+
+        fn pending_question(
+            &self,
+            _session_id: String,
+        ) -> Task<anyhow::Result<crate::session_source::QuestionState>> {
+            Task::ready(Ok(crate::session_source::QuestionState {
+                question: None,
+                hook_installed: false,
+                live_message: None,
+            }))
+        }
+
+        fn install_question_hook(&self) -> Task<anyhow::Result<Option<PathBuf>>> {
+            Task::ready(Ok(None))
+        }
+
+        fn list_slash_commands(
+            &self,
+            _project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<Vec<SlashCommand>>> {
+            Task::ready(Ok(Vec::new()))
         }
 
         fn tail_subagent(
@@ -8167,6 +10586,15 @@ mod tests {
                     });
 
                     ClaudeSessionsPanel {
+                        history_index: None,
+                        quit_armed: false,
+                        ticked: None,
+                        typing_answer_for: None,
+                        slash_commands: Vec::new(),
+                        _listing_slash_commands: Task::ready(()),
+                        _answering: Task::ready(()),
+                        hook_install_note: None,
+                        _installing_hook: Task::ready(()),
                         workspace: WeakEntity::new_invalid(),
                         focus_handle: cx.focus_handle(),
                         fs: fs::FakeFs::new(cx.background_executor().clone()),

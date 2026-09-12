@@ -20,9 +20,24 @@ use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
 
 use crate::session_registry::{
-    self, PaneKey, RegisteredSession, SessionSummary, SubagentMeta, SubagentSummary, TailProgress,
-    TailState, TranscriptSpend, read_subagent_transcript_tail, read_transcript_tail,
+    self, PaneKey, PendingQuestion, Question, QuestionOption, RegisteredSession, SessionSummary,
+    SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress, TailState,
+    TranscriptSpend, read_subagent_transcript_tail, read_transcript_tail,
 };
+
+/// What the machine a session runs on can say about questions.
+///
+/// `hook_installed` is carried beside the question because their meanings differ: a
+/// machine that records nothing has no question to report whether or not one is waiting,
+/// and a reader told only `None` would draw a session that is blocked on its user as one
+/// with nothing to answer.
+pub struct QuestionState {
+    pub question: Option<PendingQuestion>,
+    pub hook_installed: bool,
+    /// What the session is saying right now, which the transcript will not hold until the
+    /// turn it belongs to is over.
+    pub live_message: Option<String>,
+}
 
 /// What the user asked to send to a session. `Escape` carries no text because it is an
 /// interrupt, not a message.
@@ -58,6 +73,21 @@ pub trait SessionSource: Send + Sync + 'static {
 
     /// Every subagent conversation the session has spawned.
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>>;
+
+    /// The question the session is waiting on, and whether the machine it runs on records
+    /// questions at all. A question that is waiting is written nowhere the conversation
+    /// can be read from, so a machine without the hook has nothing to answer with and the
+    /// reader is told so rather than shown an empty panel.
+    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>>;
+
+    /// Installs the hook that records waiting questions on the machine the sessions run
+    /// on, reporting where the settings that were there were copied to. Installing twice
+    /// changes nothing.
+    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>>;
+
+    /// The slash commands a session in this project answers to.
+    fn list_slash_commands(&self, project_root: Option<PathBuf>)
+    -> Task<Result<Vec<SlashCommand>>>;
 
     /// Follows one subagent's conversation. The three ids name the file rather than a
     /// path doing it, because only the machine the agent ran on can turn them into one,
@@ -119,6 +149,36 @@ impl SessionSource for LocalSource {
         let home_directory = self.home_directory.clone();
         self.executor.spawn(async move {
             session_registry::list_subagents(&home_directory, &session_id).await
+        })
+    }
+
+    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            Ok(QuestionState {
+                question: session_registry::read_pending_question(&home_directory, &session_id)?,
+                hook_installed: session_registry::question_hook_is_installed(&home_directory),
+                live_message: session_registry::read_live_message(&home_directory, &session_id)?,
+            })
+        })
+    }
+
+    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { session_registry::install_question_hook(&home_directory) })
+    }
+
+    fn list_slash_commands(
+        &self,
+        project_root: Option<PathBuf>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            Ok(session_registry::list_slash_commands(
+                &home_directory,
+                project_root.as_deref(),
+            ))
         })
     }
 
@@ -219,6 +279,61 @@ impl SessionSource for RemoteSource {
                 .subagents
                 .into_iter()
                 .map(subagent_summary_from_proto)
+                .collect())
+        })
+    }
+
+    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
+        let request = self.client.request(proto::GetClaudePendingQuestion {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+        });
+
+        self.executor.spawn(async move {
+            let response = request.await?;
+            Ok(QuestionState {
+                question: pending_question_from_proto(&response),
+                hook_installed: response.hook_installed,
+                live_message: response.live_message.clone(),
+            })
+        })
+    }
+
+    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
+        let request = self.client.request(proto::InstallClaudeQuestionHook {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        });
+
+        self.executor
+            .spawn(async move { Ok(request.await?.backup_path.map(PathBuf::from)) })
+    }
+
+    fn list_slash_commands(
+        &self,
+        project_root: Option<PathBuf>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        let request = self.client.request(proto::ListClaudeSlashCommands {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            project_root: project_root.map(|root| root.to_string_lossy().into_owned()),
+        });
+
+        self.executor.spawn(async move {
+            Ok(request
+                .await?
+                .commands
+                .into_iter()
+                .map(|command| SlashCommand {
+                    name: command.name,
+                    description: command.description,
+                    argument_hint: command.argument_hint,
+                    scope: match command.scope {
+                        1 => SlashCommandScope::Project,
+                        2 => SlashCommandScope::User,
+                        // A scope this version has never seen says nothing about where
+                        // the command came from, which is what `Builtin` says.
+                        _ => SlashCommandScope::Builtin,
+                    },
+                })
                 .collect())
         })
     }
@@ -384,7 +499,48 @@ fn subagent_summary_from_proto(subagent: proto::ClaudeSubagent) -> SubagentSumma
             .map(PathBuf::from)
             .unwrap_or_default(),
         size: subagent.size,
+        workflow_agent_finished: subagent.workflow_agent_finished,
     }
+}
+
+/// The question a response carries, or `None` when it carries none.
+///
+/// A response naming no call is not a question this side can draw: whether a question is
+/// still waiting is answered by looking for the tool result that answers its id, and
+/// without one there is nothing to look for. A question with no options left is dropped
+/// for the same reason the far end drops it — there would be nothing to pick.
+fn pending_question_from_proto(
+    response: &proto::GetClaudePendingQuestionResponse,
+) -> Option<PendingQuestion> {
+    let tool_use_id = response
+        .tool_use_id
+        .as_deref()
+        .filter(|id| !id.is_empty())?
+        .to_string();
+
+    let questions: Vec<Question> = response
+        .questions
+        .iter()
+        .filter(|question| !question.options.is_empty())
+        .map(|question| Question {
+            header: question.header.clone(),
+            question: question.question.clone(),
+            options: question
+                .options
+                .iter()
+                .map(|option| QuestionOption {
+                    label: option.label.clone(),
+                    description: option.description.clone(),
+                })
+                .collect(),
+            multi_select: question.multi_select,
+        })
+        .collect();
+
+    (!questions.is_empty()).then_some(PendingQuestion {
+        tool_use_id,
+        questions,
+    })
 }
 
 fn tail_progress_from_proto(response: proto::TailClaudeTranscriptResponse) -> TailProgress {
@@ -537,6 +693,7 @@ mod tests {
                     .to_string(),
             ),
             size: 4096,
+            workflow_agent_finished: Some(false),
         }
     }
 
@@ -561,6 +718,12 @@ mod tests {
             summary.meta.workflow_phase.as_deref(),
             Some("Wave 5"),
             "the phase is what pairs a workflow's agents with the wave that spawned them"
+        );
+        assert_eq!(
+            summary.workflow_agent_finished,
+            Some(false),
+            "only the machine the run happened on reads its journal, so what it found has \
+             to survive the crossing rather than be worked out again on this side"
         );
         assert_eq!(
             summary.transcript_path,

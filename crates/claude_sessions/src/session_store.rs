@@ -19,10 +19,10 @@ use util::ResultExt as _;
 
 use crate::{
     session_registry::{
-        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend,
-        attach_arguments, pane_target,
+        PendingQuestion, RegisteredSession, SubagentSummary, TailProgress, TailState,
+        TranscriptSpend, attach_arguments, pane_target,
     },
-    session_source::{SessionInput, SessionListing, SessionSource},
+    session_source::{QuestionState, SessionInput, SessionListing, SessionSource},
     transcript::{Transcript, parse_record},
 };
 
@@ -114,6 +114,18 @@ pub struct ClaudeSessionStore {
     /// recording it — a prompt waiting for an answer, the messages queued behind the
     /// running turn, the status line — is only here.
     pane_contents: Option<SharedString>,
+    /// The question the hook beside the selected session last recorded, whether or not it
+    /// is still waiting to be answered. Whether it is, is not something this file can
+    /// say — see [`Self::recorded_question`].
+    recorded_question: Option<PendingQuestion>,
+    /// Whether the machine the selected session runs on records questions at all. A
+    /// machine without the hook reports no question whether or not one is waiting, which
+    /// is a different thing from a session with nothing to answer.
+    question_hook_installed: bool,
+    /// What the selected session is saying right now. The transcript does not hold an
+    /// assistant message until the turn carrying it is over, which on a long turn is tens
+    /// of seconds after the words were on screen.
+    live_message: Option<SharedString>,
     _registry_poll: Task<()>,
     _transcript_poll: Task<()>,
     _pane_poll: Task<()>,
@@ -178,6 +190,9 @@ impl ClaudeSessionStore {
             transcript_resets: 0,
             error: None,
             pane_contents: None,
+            recorded_question: None,
+            question_hook_installed: false,
+            live_message: None,
             _registry_poll: Task::ready(()),
             _transcript_poll: Task::ready(()),
             _pane_poll: Task::ready(()),
@@ -442,16 +457,23 @@ impl ClaudeSessionStore {
         })
     }
 
-    /// Reads the selected session's pane while it has one. A failure clears what was
-    /// read rather than being reported as an error: the pane is a supplement to the
-    /// conversation, and a session whose pane cannot be read is still readable.
+    /// Reads what the selected session is showing rather than what it has written: its
+    /// pane, and the question it is waiting on. Both are read on the same beat because
+    /// both are the state of the session right now, and a question that appeared without
+    /// the pane under it catching up would draw the two disagreeing.
+    ///
+    /// A failure to read the pane clears what was read rather than being reported as an
+    /// error: the pane is a supplement to the conversation, and a session whose pane
+    /// cannot be read is still readable.
     fn spawn_pane_poll(&self, cx: &mut Context<Self>) -> Task<()> {
         let source = self.source.clone();
 
         cx.spawn(async move |this, cx| {
             loop {
                 // The only exit: the store has been dropped, so nothing is left to update.
-                let Ok(pane_target) = this.read_with(cx, |this, _| this.pane_target()) else {
+                let Ok((pane_target, session_id)) = this.read_with(cx, |this, _| {
+                    (this.pane_target(), this.selected_session_id())
+                }) else {
                     break;
                 };
 
@@ -459,9 +481,16 @@ impl ClaudeSessionStore {
                     Some(pane_target) => source.capture_pane(pane_target).await.ok(),
                     None => None,
                 };
+                let question = match session_id {
+                    Some(session_id) => source.pending_question(session_id).await.log_err(),
+                    None => None,
+                };
 
                 if this
-                    .update(cx, |this, cx| this.apply_pane_contents(contents, cx))
+                    .update(cx, |this, cx| {
+                        this.apply_pane_contents(contents, cx);
+                        this.apply_question_state(question, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -470,6 +499,59 @@ impl ClaudeSessionStore {
                 cx.background_executor().timer(PANE_POLL_INTERVAL).await;
             }
         })
+    }
+
+    /// A read that failed leaves what was last known standing: reporting "no hook" for a
+    /// machine that could not be reached would offer to install one that is already
+    /// there, and reporting "no question" would take a waiting question off the screen
+    /// over a single dropped read.
+    fn apply_question_state(&mut self, state: Option<QuestionState>, cx: &mut Context<Self>) {
+        let Some(state) = state else {
+            return;
+        };
+        let live_message = state
+            .live_message
+            .map(|message| SharedString::from(message.trim_end().to_string()))
+            .filter(|message| !message.is_empty());
+        if self.recorded_question == state.question
+            && self.question_hook_installed == state.hook_installed
+            && self.live_message == live_message
+        {
+            return;
+        }
+        self.recorded_question = state.question;
+        self.question_hook_installed = state.hook_installed;
+        self.live_message = live_message;
+        cx.notify();
+    }
+
+    /// The question the hook last recorded for the selected session.
+    ///
+    /// Whether it is still waiting is not answered here: the hook records a question
+    /// being asked and has no way to record it being answered, so the caller looks for
+    /// the tool result that answers [`PendingQuestion::tool_use_id`] in the session's own
+    /// conversation.
+    pub fn recorded_question(&self) -> Option<&PendingQuestion> {
+        self.recorded_question.as_ref()
+    }
+
+    pub fn question_hook_installed(&self) -> bool {
+        self.question_hook_installed
+    }
+
+    /// What the selected session is saying right now, ahead of its transcript.
+    ///
+    /// Whether the transcript has caught up is not answered here: the words arrive in the
+    /// conversation as an ordinary record, and the caller that draws both is the one that
+    /// can tell they are the same words.
+    pub fn live_message(&self) -> Option<&SharedString> {
+        self.live_message.as_ref()
+    }
+
+    /// Installs the hook on the machine the sessions run on, reporting where the settings
+    /// that were there were copied to.
+    pub fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
+        self.source.install_question_hook()
     }
 
     fn apply_pane_contents(&mut self, contents: Option<String>, cx: &mut Context<Self>) {
@@ -1006,6 +1088,40 @@ mod tests {
                 workflow_run_id.as_deref(),
                 state,
             ))
+        }
+
+        fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
+            Task::ready(Ok(QuestionState {
+                question: crate::session_registry::read_pending_question(
+                    &self.home_directory,
+                    &session_id,
+                )
+                .unwrap_or(None),
+                hook_installed: crate::session_registry::question_hook_is_installed(
+                    &self.home_directory,
+                ),
+                live_message: crate::session_registry::read_live_message(
+                    &self.home_directory,
+                    &session_id,
+                )
+                .unwrap_or(None),
+            }))
+        }
+
+        fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
+            Task::ready(crate::session_registry::install_question_hook(
+                &self.home_directory,
+            ))
+        }
+
+        fn list_slash_commands(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<Result<Vec<crate::session_registry::SlashCommand>>> {
+            Task::ready(Ok(crate::session_registry::list_slash_commands(
+                &self.home_directory,
+                project_root.as_deref(),
+            )))
         }
 
         fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
