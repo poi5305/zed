@@ -22,14 +22,14 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
-use editor::Editor;
+use editor::{Editor, EditorEvent, actions::Paste};
 use fs::Fs;
 use gpui::{
-    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, DragMoveEvent,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, Length,
-    ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent, Pixels, Rems,
-    Render, Subscription, Task, TextStyleRefinement, WeakEntity, img, list, pulsating_between,
-    relative,
+    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ClipboardEntry,
+    DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image,
+    ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
+    Pixels, Rems, Render, Subscription, Task, TextStyleRefinement, WeakEntity, img, list,
+    pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
@@ -52,8 +52,8 @@ use zed_actions::editor::{MoveDown, MoveUp};
 
 use crate::{
     ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, NextMessage, OpenInEditor,
-    PreviousMessage, RegisteredSession, SendMessage, SubagentSummary, ToggleFocus,
-    TranscriptRecord, TranscriptTarget, Usage, rates_for_model,
+    PasteIntoMessage, PreviousMessage, RegisteredSession, SendMessage, SubagentSummary,
+    ToggleFocus, TranscriptRecord, TranscriptTarget, Usage, rates_for_model,
     session_registry::{Digit, PaneKey, Question, SlashCommand, SlashCommandScope},
     session_registry::{tmux_session_name, workflow_run_id_in_tool_result},
     session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
@@ -361,6 +361,33 @@ fn compact_token_count(tokens: u64) -> String {
         10_000..=999_999 => format!("{}K", tokens / 1_000),
         _ => format!("{:.1}M", tokens as f64 / 1_000_000.),
     }
+}
+
+/// The file a partly typed `@` names, or `None` when nothing is being named.
+///
+/// Read from the end of what is typed rather than from the caret: a mention is finished
+/// by picking one, and the one being typed is always the last thing in the box.
+/// Whitespace ends a mention, and a `@` with something other than whitespace in front of
+/// it is not one at all — which is what keeps an email address from opening a menu.
+fn file_being_named(text: &str) -> Option<&str> {
+    let at = text.rfind('@')?;
+    let before = text.get(..at)?;
+    if !before.is_empty() && !before.ends_with(char::is_whitespace) {
+        return None;
+    }
+
+    let named = text.get(at.saturating_add(1)..)?;
+    (!named.contains(char::is_whitespace)).then_some(named)
+}
+
+/// What is in the box once the `@` being typed is replaced by `path`.
+///
+/// A trailing space, because a mention is finished when it is picked: what follows is
+/// the sentence it is part of, not more of the path.
+fn message_with_mention(text: &str, path: &str) -> Option<String> {
+    let at = text.rfind('@')?;
+    let before = text.get(..at)?;
+    Some(format!("{before}@{path} "))
 }
 
 /// A step through the commands menu, or none at all when the highlight is only being
@@ -671,6 +698,18 @@ pub struct ClaudeSessionsPanel {
     /// The call the reader chose to answer in their own words rather than by picking, so
     /// that choosing it for one question does not leave the next one waiting for typing.
     typing_answer_for: Option<SharedString>,
+    /// The paths the `@` menu is offering, and the query they were listed for. Listed
+    /// on the machine the session runs on, so the answer arrives after the keystroke
+    /// that asked for it and has to say what it is an answer to.
+    file_matches: Vec<SharedString>,
+    file_matches_for: Option<String>,
+    file_highlight: usize,
+    dismissed_file_menu_for: Option<String>,
+    /// Held so that dropping it cancels a listing that is still running, and so that a
+    /// slower answer cannot land on top of a newer one.
+    _listing_files: Task<()>,
+    /// Held so that dropping it cancels a paste that is still being written.
+    _pasting: Task<()>,
     /// Which row of the commands menu the arrow keys are on. Kept as an index rather
     /// than as the command it names, because the menu is rebuilt from what is typed on
     /// every keystroke; see [`step_through_menu`].
@@ -732,6 +771,8 @@ pub struct ClaudeSessionsPanel {
     loaded_outputs: HashMap<SharedString, OutputLoad>,
     output_loads: HashMap<SharedString, Task<()>>,
     _store_subscription: Subscription,
+    /// Held so that the `@` menu is asked for files as the box changes.
+    _editor_subscription: Subscription,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1272,6 +1313,15 @@ impl ClaudeSessionsPanel {
             editor
         });
 
+        // The `@` menu needs a listing from the machine the session runs on, so unlike
+        // the commands menu it cannot be answered from what is already here: the ask has
+        // to be made when the box changes rather than when it is drawn.
+        let editor_subscription = cx.subscribe(&message_editor, |this, _, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                this.list_files_for_mention(cx);
+            }
+        });
+
         let mut this = Self {
             workspace,
             focus_handle: cx.focus_handle(),
@@ -1290,6 +1340,12 @@ impl ClaudeSessionsPanel {
             quit_armed: false,
             ticked: None,
             typing_answer_for: None,
+            file_matches: Vec::new(),
+            file_matches_for: None,
+            file_highlight: 0,
+            dismissed_file_menu_for: None,
+            _listing_files: Task::ready(()),
+            _pasting: Task::ready(()),
             slash_highlight: 0,
             dismissed_slash_menu_for: None,
             slash_commands: Vec::new(),
@@ -1318,6 +1374,7 @@ impl ClaudeSessionsPanel {
             loaded_outputs: HashMap::default(),
             output_loads: HashMap::default(),
             _store_subscription: store_subscription,
+            _editor_subscription: editor_subscription,
         };
         // Read once here rather than per keystroke: the files behind these change far
         // less often than the reader types.
@@ -1496,7 +1553,9 @@ impl ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.step_through_slash_menu(MenuStep::Up, cx) {
+        if self.step_through_slash_menu(MenuStep::Up, cx)
+            || self.step_through_file_menu(MenuStep::Up, cx)
+        {
             return;
         }
 
@@ -1513,7 +1572,9 @@ impl ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.step_through_slash_menu(MenuStep::Down, cx) {
+        if self.step_through_slash_menu(MenuStep::Down, cx)
+            || self.step_through_file_menu(MenuStep::Down, cx)
+        {
             return;
         }
 
@@ -1521,6 +1582,174 @@ impl ClaudeSessionsPanel {
         let typed = self.message_editor.read(cx).text(cx);
         let step = step_forward_through_history(&history, self.history_index, &typed);
         self.take_history_step(step, window, cx);
+    }
+
+    /// The files the `@` menu is offering, or `None` when nothing is being named.
+    ///
+    /// Listing runs on the machine the session runs on, so what is returned is whatever
+    /// the last answer was — kept beside the query it answered, so that the menu never
+    /// offers one query's files under another's name.
+    fn offered_files(&self, cx: &Context<Self>) -> Option<Vec<SharedString>> {
+        if !self.can_send(cx) {
+            return None;
+        }
+        let typed = self.message_editor.read(cx).text(cx);
+        if self.dismissed_file_menu_for.as_deref() == Some(typed.as_str()) {
+            return None;
+        }
+        let named = file_being_named(&typed)?;
+
+        if self.file_matches_for.as_deref() != Some(named) || self.file_matches.is_empty() {
+            return None;
+        }
+        Some(self.file_matches.clone())
+    }
+
+    /// Asks the machine the session runs on for the files a newly typed `@` names.
+    ///
+    /// Called after every change to the box rather than on a timer: the walk is bounded
+    /// on the other side, and a menu that lags the typing by a beat is one that offers
+    /// the wrong files.
+    fn list_files_for_mention(&mut self, cx: &mut Context<Self>) {
+        let typed = self.message_editor.read(cx).text(cx);
+        let Some(named) = file_being_named(&typed).map(str::to_string) else {
+            self.file_matches.clear();
+            self.file_matches_for = None;
+            self.file_highlight = 0;
+            self._listing_files = Task::ready(());
+            return;
+        };
+        if self.file_matches_for.as_deref() == Some(named.as_str()) {
+            return;
+        }
+
+        let Some(directory) = self.store.read(cx).session_directory() else {
+            return;
+        };
+        let list = self.source.list_session_files(directory, named.clone());
+        self._listing_files = cx.spawn(async move |this, cx| {
+            let Ok(paths) = list.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // Checked again here: the reader has typed on while this was in flight,
+                // and an answer to a query they have left is not the menu they want.
+                if file_being_named(&this.message_editor.read(cx).text(cx)) != Some(&named) {
+                    return;
+                }
+                this.file_matches = paths.into_iter().map(SharedString::from).collect();
+                this.file_matches_for = Some(named);
+                this.file_highlight = 0;
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    /// Puts a file's path in the box in place of the `@` being typed.
+    fn use_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.message_editor.read(cx).text(cx);
+        let Some(text) = message_with_mention(&typed, path) else {
+            return;
+        };
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_text(text.clone(), window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+        });
+        // The mention is finished, so the menu is too — and the text now ends in a space,
+        // which closes it anyway.
+        self.dismissed_file_menu_for = Some(text);
+        self.file_highlight = 0;
+        cx.notify();
+    }
+
+    /// The file the `@` menu's highlight is on.
+    fn highlighted_file(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let offered = self.offered_files(cx)?;
+        let at = step_through_menu(self.file_highlight, offered.len(), MenuStep::Stay);
+        offered.get(at).cloned()
+    }
+
+    /// Moves the `@` menu's highlight, and reports whether it was open to take the key.
+    fn step_through_file_menu(&mut self, step: MenuStep, cx: &mut Context<Self>) -> bool {
+        let Some(offered) = self.offered_files(cx).map(|offered| offered.len()) else {
+            return false;
+        };
+        self.file_highlight = step_through_menu(self.file_highlight, offered, step);
+        cx.notify();
+        true
+    }
+
+    fn dismiss_file_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.offered_files(cx).is_none() {
+            return false;
+        }
+        self.dismissed_file_menu_for = Some(self.message_editor.read(cx).text(cx));
+        self.file_highlight = 0;
+        cx.notify();
+        true
+    }
+
+    /// Pastes into the message box, writing an image out as a file the session can read.
+    ///
+    /// The terminal takes text and nothing else, so an image cannot be sent as itself.
+    /// Written where the session can open it and named in the message by its path, which
+    /// is what Claude Code reads a picture from anyway.
+    fn paste_into_message(
+        &mut self,
+        _: &PasteIntoMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let image = cx.read_from_clipboard().and_then(|item| {
+            item.entries().iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+        });
+
+        let Some(image) = image.filter(|_| self.can_send(cx)) else {
+            self.message_editor
+                .update(cx, |editor, cx| editor.paste(&Paste, window, cx));
+            return;
+        };
+
+        let name = format!(
+            "pasted-{}.{}",
+            now_millis().max(0),
+            image.format.extension()
+        );
+        let write = self.source.write_session_file(name, image.bytes);
+        self._pasting = cx.spawn_in(window, async move |this, cx| {
+            let written = write.await;
+            this.update_in(cx, |this, window, cx| match written {
+                Ok(path) => this.put_path_in_message_box(&path, window, cx),
+                Err(error) => {
+                    this.hook_install_note =
+                        Some(SharedString::from(format!("Pasting the image: {error:#}")));
+                    cx.notify();
+                }
+            })
+            .log_err();
+        });
+    }
+
+    /// Appends a path to what is in the box, which is what a pasted file is in a message.
+    fn put_path_in_message_box(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.message_editor.read(cx).text(cx);
+        let separator = if typed.is_empty() || typed.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        let text = format!("{typed}{separator}{path} ");
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+        });
+        cx.notify();
     }
 
     /// Moves the highlight, and reports whether the menu was open to take the key.
@@ -2905,6 +3134,12 @@ impl ClaudeSessionsPanel {
                 return;
             }
         }
+        // A mention is never whole until it is picked: what is typed is a query, and the
+        // path it names is the thing the session can open.
+        if let Some(path) = self.highlighted_file(cx) {
+            self.use_file(&path, window, cx);
+            return;
+        }
 
         let text = self.message_editor.read(cx).text(cx);
         if text.trim().is_empty() {
@@ -2969,7 +3204,7 @@ impl ClaudeSessionsPanel {
 
         // Escape puts the commands menu away first. Interrupting the session as well
         // would make closing a menu cost a turn.
-        if self.dismiss_slash_menu(cx) {
+        if self.dismiss_slash_menu(cx) || self.dismiss_file_menu(cx) {
             return;
         }
 
@@ -3340,6 +3575,56 @@ impl ClaudeSessionsPanel {
         Some(menu.into_any_element())
     }
 
+    /// The files the `@` being typed could be naming, drawn as rows to pick from.
+    fn render_file_matches(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let offered = self.offered_files(cx)?;
+        let highlighted = step_through_menu(self.file_highlight, offered.len(), MenuStep::Stay);
+
+        let mut menu = v_flex().w_full().px_2().pb_1().gap_0p5().child(
+            h_flex()
+                .w_full()
+                .gap_1()
+                .flex_wrap()
+                .justify_between()
+                .child(
+                    Label::new("Files")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("\u{2191}\u{2193} choose \u{b7} enter use \u{b7} esc close")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+
+        for (index, path) in offered.into_iter().take(FILE_MENU_ROWS).enumerate() {
+            let is_highlighted = index == highlighted;
+            let chosen = path.clone();
+            menu = menu.child(
+                h_flex()
+                    .w_full()
+                    .when(is_highlighted, |this| {
+                        this.rounded_sm().bg(cx.theme().colors().element_selected)
+                    })
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("claude-session-file-{index}")),
+                            path,
+                        )
+                        .toggle_state(is_highlighted)
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text("Name this file in the message"))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.use_file(&chosen, window, cx),
+                        )),
+                    ),
+            );
+        }
+
+        Some(menu.into_any_element())
+    }
+
     /// The question the session is waiting on, drawn as something to answer.
     ///
     /// Sits above the message box rather than replacing it: a question always offers
@@ -3608,6 +3893,7 @@ impl ClaudeSessionsPanel {
         // stuck, and the answer is behind a disclosure they have no reason to open.
         let question = self.render_question(cx);
         let slash_commands = self.render_slash_commands(cx);
+        let file_matches = self.render_file_matches(cx);
         let expanded = self.input_expanded || question.is_some();
 
         v_flex()
@@ -3621,6 +3907,7 @@ impl ClaudeSessionsPanel {
             .on_action(cx.listener(Self::interrupt_session))
             .on_action(cx.listener(Self::recall_previous_message))
             .on_action(cx.listener(Self::recall_next_message))
+            .on_action(cx.listener(Self::paste_into_message))
             .child(
                 h_flex()
                     .px_2()
@@ -3666,6 +3953,7 @@ impl ClaudeSessionsPanel {
                 )
             })
             .children(slash_commands.filter(|_| expanded))
+            .children(file_matches.filter(|_| expanded))
             .when(expanded, |this| {
                 this.child(
                     h_flex()
@@ -5183,6 +5471,10 @@ enum AgentState {
 /// How many commands the menu offers at once. Enough to choose from without the menu
 /// taking the room the conversation is in.
 const SLASH_COMMAND_ROWS: usize = 8;
+
+/// How many paths the `@` menu draws. The listing brings back more than this so that
+/// typing on narrows what is already here rather than waiting for another answer.
+const FILE_MENU_ROWS: usize = 8;
 
 /// The part of what has been typed that is a command being named, or `None` when what is
 /// typed is not naming one.
@@ -7155,6 +7447,54 @@ mod tests {
                 "{screen:?} was read as the confirmation screen"
             );
         }
+    }
+
+    /// A mention is the last `@` in the box with no whitespace after it. Read from the
+    /// caret instead, a reader who went back to fix a typo would open a menu over a
+    /// mention they had already picked.
+    #[test]
+    fn the_file_being_named_is_the_last_at_sign_in_the_box() {
+        assert_eq!(file_being_named("@"), Some(""));
+        assert_eq!(file_being_named("@src/pan"), Some("src/pan"));
+        assert_eq!(file_being_named("look at @src/pan"), Some("src/pan"));
+        assert_eq!(
+            file_being_named("@one.rs and @two"),
+            Some("two"),
+            "the one being typed is the last of them"
+        );
+    }
+
+    /// Whitespace ends a mention, and an `@` with a word in front of it is not one: an
+    /// email address in a message must not open a menu over what is being written.
+    #[test]
+    fn something_that_is_not_a_mention_opens_no_menu() {
+        assert_eq!(file_being_named(""), None);
+        assert_eq!(file_being_named("no mention here"), None);
+        assert_eq!(
+            file_being_named("@src/panel.rs is the one"),
+            None,
+            "a mention already picked is finished, and the space is what finished it"
+        );
+        assert_eq!(
+            file_being_named("mail andy@creatordb.app"),
+            None,
+            "an address is not a mention"
+        );
+    }
+
+    /// Picking one replaces the `@` being typed and nothing else in the box.
+    #[test]
+    fn picking_a_file_replaces_only_the_mention_being_typed() {
+        assert_eq!(
+            message_with_mention("look at @src/pan", "src/panel.rs").as_deref(),
+            Some("look at @src/panel.rs "),
+            "what was typed before it stays, and the space finishes it"
+        );
+        assert_eq!(
+            message_with_mention("@one.rs and @tw", "two.rs").as_deref(),
+            Some("@one.rs and @two.rs "),
+            "a mention already picked is not touched"
+        );
     }
 
     fn command_named(name: &str, argument_hint: Option<&str>) -> SlashCommand {
@@ -10703,6 +11043,21 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             Task::ready(Ok(None))
         }
 
+        fn list_session_files(
+            &self,
+            _directory: PathBuf,
+            _query: String,
+        ) -> Task<anyhow::Result<Vec<String>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn write_session_file(
+            &self,
+            _name: String,
+            _contents: Vec<u8>,
+        ) -> Task<anyhow::Result<String>> {
+            Task::ready(Err(anyhow::anyhow!("nothing is written in these tests")))
+        }
         fn list_slash_commands(
             &self,
             _project_root: Option<PathBuf>,
@@ -10793,12 +11148,26 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         editor.set_read_only(true);
                         editor
                     });
+                    let editor_subscription = cx.subscribe(
+                        &message_editor,
+                        |this: &mut ClaudeSessionsPanel, _, event, cx| {
+                            if matches!(event, EditorEvent::BufferEdited) {
+                                this.list_files_for_mention(cx);
+                            }
+                        },
+                    );
 
                     ClaudeSessionsPanel {
                         history_index: None,
                         quit_armed: false,
                         ticked: None,
                         typing_answer_for: None,
+                        file_matches: Vec::new(),
+                        file_matches_for: None,
+                        file_highlight: 0,
+                        dismissed_file_menu_for: None,
+                        _listing_files: Task::ready(()),
+                        _pasting: Task::ready(()),
                         slash_highlight: 0,
                         dismissed_slash_menu_for: None,
                         slash_commands: Vec::new(),
@@ -10840,6 +11209,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         loaded_outputs: HashMap::default(),
                         output_loads: HashMap::default(),
                         _store_subscription: store_subscription,
+                        _editor_subscription: editor_subscription,
                     }
                 })
             })

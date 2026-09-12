@@ -405,6 +405,12 @@ impl ClaudeSessionStore {
         })
     }
 
+    /// The working directory of the selected session, on the machine it runs on. What
+    /// `@` is resolved against, because a path is only a path where the session is.
+    pub fn session_directory(&self) -> Option<PathBuf> {
+        Some(self.selected_session()?.working_directory.clone())
+    }
+
     fn selected_session(&self) -> Option<&RegisteredSession> {
         let process_id = self.selected_process_id?;
         self.sessions
@@ -1114,6 +1120,17 @@ mod tests {
             ))
         }
 
+        fn list_session_files(
+            &self,
+            _directory: PathBuf,
+            _query: String,
+        ) -> Task<Result<Vec<String>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn write_session_file(&self, _name: String, _contents: Vec<u8>) -> Task<Result<String>> {
+            Task::ready(Err(anyhow::anyhow!("nothing is written in these tests")))
+        }
         fn list_slash_commands(
             &self,
             project_root: Option<PathBuf>,

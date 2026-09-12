@@ -89,6 +89,17 @@ pub trait SessionSource: Send + Sync + 'static {
     fn list_slash_commands(&self, project_root: Option<PathBuf>)
     -> Task<Result<Vec<SlashCommand>>>;
 
+    /// The paths under `directory` that a partly typed `@` names, relative to it.
+    ///
+    /// Walked on the machine the session runs on: the working directory is that
+    /// machine's, and a path this side could reach is not one the session can read.
+    fn list_session_files(&self, directory: PathBuf, query: String) -> Task<Result<Vec<String>>>;
+
+    /// Writes a file pasted into the message box where the session can read it, and
+    /// reports the path to give it. Only the name's last component is taken from here;
+    /// where it goes is the host's to decide.
+    fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>>;
+
     /// Follows one subagent's conversation. The three ids name the file rather than a
     /// path doing it, because only the machine the agent ran on can turn them into one,
     /// and it has to answer for the boundary they cross on every read.
@@ -179,6 +190,18 @@ impl SessionSource for LocalSource {
                 &home_directory,
                 project_root.as_deref(),
             ))
+        })
+    }
+
+    fn list_session_files(&self, directory: PathBuf, query: String) -> Task<Result<Vec<String>>> {
+        self.executor
+            .spawn(async move { Ok(session_registry::list_files_under(&directory, &query)) })
+    }
+
+    fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            session_registry::write_pasted_file(&home_directory, &name, &contents)
         })
     }
 
@@ -336,6 +359,26 @@ impl SessionSource for RemoteSource {
                 })
                 .collect())
         })
+    }
+
+    fn list_session_files(&self, directory: PathBuf, query: String) -> Task<Result<Vec<String>>> {
+        let request = self.client.request(proto::ListClaudeSessionFiles {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            directory: directory.to_string_lossy().into_owned(),
+            query,
+        });
+
+        self.executor.spawn(async move { Ok(request.await?.paths) })
+    }
+
+    fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>> {
+        let request = self.client.request(proto::WriteClaudeSessionFile {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            name,
+            contents,
+        });
+
+        self.executor.spawn(async move { Ok(request.await?.path) })
     }
 
     fn tail_subagent(
