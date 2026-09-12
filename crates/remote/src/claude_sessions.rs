@@ -952,6 +952,150 @@ pub fn list_slash_commands(
     commands
 }
 
+/// How deep the walk for `@` goes under a session's working directory.
+///
+/// Deep enough for the source tree of a real project, and bounded so that a symlink
+/// pointing at an ancestor cannot be walked forever.
+const MENTION_DIRECTORY_DEPTH: usize = 8;
+
+/// How many paths are reported. The menu shows a handful; the rest would be scrolled
+/// past, and counting them costs the whole tree.
+const MENTION_MATCH_LIMIT: usize = 50;
+
+/// How many entries are looked at before the walk gives up, whether or not it has found
+/// anything. A repository with a checked-in dependency tree is millions of files, and a
+/// keystroke must not cost a walk of it.
+const MENTION_VISIT_LIMIT: usize = 20_000;
+
+/// Directories that are never what someone means by `@`, and are the ones large enough
+/// to spend the whole visit budget. `.`-prefixed entries are skipped separately.
+const UNMENTIONED_DIRECTORIES: [&str; 8] = [
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+    ".git",
+    "Pods",
+];
+
+/// The paths under `directory` that `query` names, as the `@` menu offers them.
+///
+/// Matched on the path rather than on the file name alone, so that `src/claude` finds a
+/// file by where it is as well as by what it is called. Paths come back relative to
+/// `directory`, which is what a reader recognises and what the session resolves.
+pub fn list_files_under(directory: &Path, query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
+    walk_for_mentions(
+        directory,
+        directory,
+        &query,
+        MENTION_DIRECTORY_DEPTH,
+        &mut visited,
+        &mut matches,
+    );
+
+    // Shortest first: the file itself sorts above the ones buried under it, and a walk
+    // in directory order is in no order a reader would expect.
+    matches.sort_by(|left: &String, right: &String| {
+        (left.len(), left.as_str()).cmp(&(right.len(), right.as_str()))
+    });
+    matches.truncate(MENTION_MATCH_LIMIT);
+    matches
+}
+
+fn walk_for_mentions(
+    root: &Path,
+    directory: &Path,
+    query: &str,
+    depth_left: usize,
+    visited: &mut usize,
+    matches: &mut Vec<String>,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+
+    for entry in entries {
+        if *visited >= MENTION_VISIT_LIMIT {
+            return;
+        }
+        *visited += 1;
+
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') || UNMENTIONED_DIRECTORIES.contains(&name.as_str()) {
+            continue;
+        }
+
+        let path = entry.path();
+        // `is_dir` follows symlinks, which is what makes the depth the only thing
+        // standing between this and a cycle.
+        if path.is_dir() {
+            let Some(depth_left) = depth_left.checked_sub(1) else {
+                continue;
+            };
+            walk_for_mentions(root, &path, query, depth_left, visited, matches);
+            continue;
+        }
+
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        if query.is_empty() || relative.to_lowercase().contains(query) {
+            matches.push(relative.to_string());
+        }
+    }
+}
+
+/// Where a file pasted into the message box is put on the machine the session runs on.
+///
+/// Under the user's own `.claude` rather than in the project: a pasted screenshot is not
+/// part of anybody's repository, and a session whose working directory is read-only
+/// still has somewhere to put one.
+const PASTED_FILE_DIRECTORY: &str = "zed-pasted";
+
+/// Larger than any screenshot, and small enough that a paste cannot fill a disk.
+const MAX_PASTED_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Writes `contents` where the session can read it, and reports the path to give it.
+///
+/// The name is taken apart rather than trusted: it crosses a connection, and a session
+/// is not a place to write a path of someone else's choosing.
+pub fn write_pasted_file(home_directory: &Path, name: &str, contents: &[u8]) -> Result<String> {
+    anyhow::ensure!(
+        contents.len() <= MAX_PASTED_FILE_BYTES,
+        "the file is {} bytes, and the limit is {MAX_PASTED_FILE_BYTES}",
+        contents.len()
+    );
+
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .context("the file needs a name of its own")?;
+
+    let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
+    fs::create_dir_all(&directory).with_context(|| format!("creating {}", directory.display()))?;
+
+    let path = directory.join(name);
+    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
+
+    path.to_str()
+        .map(str::to_string)
+        .context("the path this was written to cannot be spelled for the session")
+}
+
 /// The file a skill's directory is a skill by virtue of holding.
 const SKILL_FILE: &str = "SKILL.md";
 
@@ -5230,6 +5374,174 @@ mod hook_freshness_tests {
     }
 
     static HOOK_FRESHNESS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    fn write(path: PathBuf, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("creating the parent directory");
+        }
+        fs::write(path, contents).expect("writing the fixture");
+    }
+
+    fn tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("zed-mention-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        root
+    }
+
+    /// `@` is matched on the whole path, not on the file name alone: what someone is
+    /// naming is often where a file is rather than what it is called.
+    #[test]
+    fn test_files_are_matched_on_their_whole_path() {
+        let root = tree("path");
+        write(root.join("crates").join("remote").join("session.rs"), "");
+        write(root.join("docs").join("session.md"), "");
+
+        assert_eq!(
+            list_files_under(&root, "remote/ses"),
+            vec!["crates/remote/session.rs".to_string()],
+            "a query naming a directory must find what is under it"
+        );
+
+        let by_name = list_files_under(&root, "session");
+        assert_eq!(
+            by_name,
+            vec![
+                "docs/session.md".to_string(),
+                "crates/remote/session.rs".to_string(),
+            ],
+            "the shorter path sorts first, so the file itself is above what is buried"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An empty query is every file, because the menu opens on `@` before anything has
+    /// been typed after it.
+    #[test]
+    fn test_an_empty_query_is_every_file() {
+        let root = tree("empty");
+        write(root.join("one.rs"), "");
+        write(root.join("two.rs"), "");
+
+        assert_eq!(
+            list_files_under(&root, ""),
+            vec!["one.rs".to_string(), "two.rs".to_string()]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The directories a repository is mostly made of are never what `@` means, and are
+    /// the ones big enough to spend the whole walk. A `.`-prefixed entry is the user's
+    /// own business the same way it is for commands.
+    #[test]
+    fn test_the_walk_skips_what_no_one_means_by_an_at_sign() {
+        let root = tree("skips");
+        write(root.join("wanted.rs"), "");
+        write(root.join("node_modules").join("wanted.rs"), "");
+        write(root.join("target").join("debug").join("wanted.rs"), "");
+        write(root.join(".git").join("wanted.rs"), "");
+        write(root.join(".hidden").join("wanted.rs"), "");
+
+        assert_eq!(
+            list_files_under(&root, "wanted"),
+            vec!["wanted.rs".to_string()],
+            "only the one outside them is a file anybody meant"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory symlink pointing at an ancestor is walked forever otherwise, and the
+    /// walk ends in a stack overflow rather than an error. The depth is what bounds it.
+    #[test]
+    #[cfg(unix)]
+    fn test_a_directory_that_contains_itself_is_not_walked_forever() {
+        let root = tree("cycle");
+        write(root.join("here.rs"), "");
+        std::os::unix::fs::symlink(&root, root.join("again")).expect("making the cycle");
+
+        let found = list_files_under(&root, "here");
+        assert!(
+            !found.is_empty() && found.len() <= MENTION_MATCH_LIMIT,
+            "the walk must end, and end with the file in it: got {found:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The name crosses a connection, so it is taken apart rather than trusted: a
+    /// session is not a place to write a path of someone else's choosing.
+    #[test]
+    fn test_a_pasted_file_is_written_under_the_name_it_is_given_and_nowhere_else() {
+        let home_directory = tree("pasted");
+        fs::create_dir_all(&home_directory).expect("creating the home");
+
+        let written = write_pasted_file(&home_directory, "shot.png", b"bytes")
+            .expect("writing the pasted file");
+        assert_eq!(
+            written,
+            home_directory
+                .join(".claude")
+                .join(PASTED_FILE_DIRECTORY)
+                .join("shot.png")
+                .to_string_lossy(),
+        );
+        assert_eq!(fs::read(&written).expect("reading it back"), b"bytes");
+
+        // A name that spells a path keeps only its last component, so however it is
+        // spelled it is written in the one directory and never above or beside it.
+        let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
+        for spelled in [
+            "../escaped.png",
+            "../../escaped.png",
+            "/etc/passwd",
+            "somewhere/else/shot2.png",
+            // A trailing slash is not part of a path component, so this is the name
+            // `somewhere` — odd, but inside the directory like every other.
+            "somewhere/",
+        ] {
+            let written = write_pasted_file(&home_directory, spelled, b"bytes")
+                .unwrap_or_else(|error| panic!("{spelled:?} was refused: {error:#}"));
+            let written = PathBuf::from(&written);
+            assert_eq!(
+                written.parent(),
+                Some(directory.as_path()),
+                "{spelled:?} was written to {written:?}, which is not the one directory"
+            );
+        }
+
+        // Nothing that is not a name at all, and nothing hidden: a dotfile is not what
+        // anybody pasted, and a name Claude Code would not list is one nobody can use.
+        for refused in ["", ".", "..", "/", ".hidden.png"] {
+            assert!(
+                write_pasted_file(&home_directory, refused, b"bytes").is_err(),
+                "{refused:?} was accepted as a name to write"
+            );
+        }
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A paste must not be able to fill the disk of the machine the session runs on.
+    #[test]
+    fn test_a_file_larger_than_the_limit_is_refused() {
+        let home_directory = tree("too-large");
+        fs::create_dir_all(&home_directory).expect("creating the home");
+
+        let too_large = vec![0u8; MAX_PASTED_FILE_BYTES + 1];
+        assert!(write_pasted_file(&home_directory, "huge.png", &too_large).is_err());
+        // The limit itself is allowed: a bound that refuses what it names is off by one.
+        let at_the_limit = vec![0u8; MAX_PASTED_FILE_BYTES];
+        assert!(write_pasted_file(&home_directory, "big.png", &at_the_limit).is_ok());
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
 }
 
 #[cfg(test)]

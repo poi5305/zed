@@ -1763,6 +1763,9 @@
       // the box holds a draft, so these do not cost multi-line editing its arrows.
       "up": "claude_sessions::PreviousMessage",
       "down": "claude_sessions::NextMessage",
+      // An image cannot be sent through a terminal as itself, so a paste that carries
+      // one is written out as a file and named in the message by its path.
+      "cmd-v": "claude_sessions::PasteIntoMessage",
     },
   },
 ]

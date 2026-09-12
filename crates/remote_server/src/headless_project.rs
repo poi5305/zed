@@ -311,6 +311,8 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_get_claude_pending_question);
         session.add_request_handler(cx.weak_entity(), Self::handle_install_claude_question_hook);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_slash_commands);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_session_files);
+        session.add_request_handler(cx.weak_entity(), Self::handle_write_claude_session_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
@@ -1497,7 +1499,9 @@ impl HeadlessProject {
                 remote::claude_sessions::read_live_message(&home_directory, &session_id)?;
 
             Ok(proto::GetClaudePendingQuestionResponse {
-                tool_use_id: question.as_ref().map(|question| question.tool_use_id.clone()),
+                tool_use_id: question
+                    .as_ref()
+                    .map(|question| question.tool_use_id.clone()),
                 questions: question
                     .map(|question| {
                         question
@@ -1537,6 +1541,43 @@ impl HeadlessProject {
             let backup = remote::claude_sessions::install_question_hook(&home_directory)?;
             Ok(proto::InstallClaudeQuestionHookResponse {
                 backup_path: backup.map(|path| path.to_string_lossy().into_owned()),
+            })
+        })
+        .await
+    }
+
+    async fn handle_list_claude_session_files(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ListClaudeSessionFiles>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListClaudeSessionFilesResponse> {
+        let directory = PathBuf::from(envelope.payload.directory);
+        let query = envelope.payload.query;
+
+        cx.background_spawn(async move {
+            Ok(proto::ListClaudeSessionFilesResponse {
+                paths: remote::claude_sessions::list_files_under(&directory, &query),
+            })
+        })
+        .await
+    }
+
+    async fn handle_write_claude_session_file(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::WriteClaudeSessionFile>,
+        cx: AsyncApp,
+    ) -> Result<proto::WriteClaudeSessionFileResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let name = envelope.payload.name;
+        let contents = envelope.payload.contents;
+
+        cx.background_spawn(async move {
+            Ok(proto::WriteClaudeSessionFileResponse {
+                path: remote::claude_sessions::write_pasted_file(
+                    &home_directory,
+                    &name,
+                    &contents,
+                )?,
             })
         })
         .await

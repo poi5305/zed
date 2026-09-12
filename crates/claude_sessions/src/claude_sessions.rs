@@ -69,7 +69,10 @@ actions!(
         /// does in the terminal.
         PreviousMessage,
         /// Walks back down the messages already sent, towards the box's own draft.
-        NextMessage
+        NextMessage,
+        /// Pastes into the message box, writing an image out where the session can read
+        /// it rather than dropping it.
+        PasteIntoMessage
     ]
 );
 
