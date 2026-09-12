@@ -1352,10 +1352,16 @@ pub fn question_hook_is_installed(home_directory: &Path) -> bool {
         return false;
     };
 
-    INSTALLED_HOOKS.iter().all(|(event, script, _)| {
+    INSTALLED_HOOKS.iter().all(|(event, script, placeholder)| {
         let script = home_directory.join(".claude").join(script);
         let command = shell_quote(script.to_string_lossy().as_ref());
-        script.is_file() && settings_name_the_hook(&settings, event, &command)
+        // The contents rather than the file's existence: these scripts are Zed's own,
+        // and a fix to one of them reaches a machine only by being written there again.
+        // A machine that installed an earlier version would otherwise be stuck on it
+        // for good, which is every machine a fix is written for.
+        let is_current = fs::read_to_string(&script)
+            .is_ok_and(|installed| installed == hook_source(placeholder));
+        is_current && settings_name_the_hook(&settings, event, &command)
     })
 }
 
@@ -5168,6 +5174,62 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod hook_freshness_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// A hook that is installed but out of date is not installed as far as this panel is
+    /// concerned.
+    ///
+    /// The script is Zed's own, and every fix to one of them reaches a machine only by
+    /// being written there again. Checking that the file exists and stopping there left
+    /// every machine that had ever installed a hook stuck on the version it first got —
+    /// which is every machine the fixes were written for.
+    #[test]
+    fn test_a_hook_script_from_an_older_version_does_not_count_as_installed() -> Result<()> {
+        let home_directory = std::env::temp_dir().join(format!(
+            "zed-hook-freshness-{}-{}",
+            std::process::id(),
+            HOOK_FRESHNESS_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::remove_dir_all(&home_directory).ok();
+        fs::create_dir_all(&home_directory)?;
+
+        install_question_hook(&home_directory)?;
+        assert!(
+            question_hook_is_installed(&home_directory),
+            "what was just installed must count as installed"
+        );
+
+        // What a machine that installed an earlier version has: the settings still name
+        // the hook, and the script is still a file.
+        let (_, script, _) = INSTALLED_HOOKS[0];
+        let script = home_directory.join(".claude").join(script);
+        fs::write(
+            &script,
+            "#!/bin/sh\n# an older version of this hook\nexit 0\n",
+        )?;
+
+        assert!(
+            !question_hook_is_installed(&home_directory),
+            "a script that is not the one this version writes is one the fixes have not \
+             reached, and the reader has to be offered the install again"
+        );
+
+        install_question_hook(&home_directory)?;
+        assert!(
+            question_hook_is_installed(&home_directory),
+            "installing again must bring it up to date rather than leave it behind"
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    static HOOK_FRESHNESS_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 }
 
 #[cfg(test)]
