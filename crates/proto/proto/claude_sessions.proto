@@ -47,6 +47,11 @@ message ClaudeSubagent {
   optional string workflow_phase = 8;
   optional string transcript_path = 9;
   uint64 size = 10;
+  // What the run's journal.jsonl says about this agent. Absent for an agent that belongs
+  // to no workflow run, and for one whose run has written no journal the scan could read.
+  // The session's own conversation cannot answer this: the Workflow call is answered when
+  // the run launches, not when it ends.
+  optional bool workflow_agent_finished = 11;
 }
 
 message ListClaudeSubagents {
@@ -56,6 +61,79 @@ message ListClaudeSubagents {
 
 message ListClaudeSubagentsResponse {
   repeated ClaudeSubagent subagents = 1;
+}
+
+// One option of a question a session is waiting on.
+message ClaudeQuestionOption {
+  string label = 1;
+  optional string description = 2;
+}
+
+// One question of a call a session is waiting on.
+message ClaudeQuestion {
+  // The short name the terminal shows in its tab strip, and what a reader picks one of
+  // several questions by.
+  string header = 1;
+  string question = 2;
+  repeated ClaudeQuestionOption options = 3;
+  bool multi_select = 4;
+}
+
+// Request the question a session is waiting on. The CLI writes nothing about a question
+// into its transcript until the question has been answered, so this is read from what a
+// PreToolUse hook recorded on the machine the session runs on.
+message GetClaudePendingQuestion {
+  uint64 project_id = 1;
+  string session_id = 2;
+}
+
+message GetClaudePendingQuestionResponse {
+  // What the session is saying right now, assembled from what the terminal has drawn.
+  // The transcript does not hold an assistant message until the turn is over, so on a
+  // long turn this is the only place the words exist.
+  optional string live_message = 4;
+  // Absent when the hook has recorded no question for this session, including when the
+  // hook is not installed at all.
+  optional string tool_use_id = 1;
+  repeated ClaudeQuestion questions = 2;
+  // Whether the hook that records questions is installed on that machine, so that a
+  // reader can offer to install it rather than silently showing nothing.
+  bool hook_installed = 3;
+}
+
+// One slash command a session answers to.
+message ClaudeSlashCommand {
+  // Without the leading slash, as the reader types it.
+  string name = 1;
+  optional string description = 2;
+  optional string argument_hint = 3;
+  // 0 built into the CLI, 1 the project's own, 2 the user's own. Anything else is read
+  // as built in, which is the scope that says the least about where it came from.
+  uint32 scope = 4;
+}
+
+// Request the slash commands a session in this project answers to. The CLI writes its
+// own commands down nowhere, so the machine lists what it holds and the caller adds the
+// built-in ones.
+message ListClaudeSlashCommands {
+  uint64 project_id = 1;
+  optional string project_root = 2;
+}
+
+message ListClaudeSlashCommandsResponse {
+  repeated ClaudeSlashCommand commands = 1;
+}
+
+// Request to install the hook that records waiting questions on the machine the sessions
+// run on. Installing twice changes nothing.
+message InstallClaudeQuestionHook {
+  uint64 project_id = 1;
+}
+
+message InstallClaudeQuestionHookResponse {
+  // Where the settings that were there were copied to, absent when there were none to
+  // copy or when the hook was already installed.
+  optional string backup_path = 1;
 }
 
 // Request to incrementally read the transcript of a Claude Code session.

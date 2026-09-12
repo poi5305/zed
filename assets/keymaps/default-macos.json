@@ -1759,6 +1759,10 @@
       // The button beside the input is labelled "Esc"; without this the key it names
       // does nothing.
       "escape": "claude_sessions::Interrupt",
+      // The terminal's own history keys. The handler moves the cursor instead whenever
+      // the box holds a draft, so these do not cost multi-line editing its arrows.
+      "up": "claude_sessions::PreviousMessage",
+      "down": "claude_sessions::NextMessage",
     },
   },
 ]

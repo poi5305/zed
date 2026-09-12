@@ -543,7 +543,13 @@ message Envelope {
     ListClaudeSubagents list_claude_subagents = 508;
     ListClaudeSubagentsResponse list_claude_subagents_response = 509;
     CaptureClaudePane capture_claude_pane = 510;
-    CaptureClaudePaneResponse capture_claude_pane_response = 511; // current max
+    CaptureClaudePaneResponse capture_claude_pane_response = 511;
+    GetClaudePendingQuestion get_claude_pending_question = 512;
+    GetClaudePendingQuestionResponse get_claude_pending_question_response = 513;
+    InstallClaudeQuestionHook install_claude_question_hook = 514;
+    InstallClaudeQuestionHookResponse install_claude_question_hook_response = 515;
+    ListClaudeSlashCommands list_claude_slash_commands = 516;
+    ListClaudeSlashCommandsResponse list_claude_slash_commands_response = 517; // current max
   }
 
   reserved 87 to 88;

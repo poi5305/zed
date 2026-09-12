@@ -308,6 +308,9 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_list_tmux_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_subagents);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_claude_pending_question);
+        session.add_request_handler(cx.weak_entity(), Self::handle_install_claude_question_hook);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_slash_commands);
         session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
@@ -1471,9 +1474,104 @@ impl HeadlessProject {
                     workflow_phase: summary.meta.workflow_phase,
                     transcript_path: Some(summary.transcript_path.to_string_lossy().into_owned()),
                     size: summary.size,
+                    workflow_agent_finished: summary.workflow_agent_finished,
                 })
                 .collect(),
         })
+    }
+
+    async fn handle_get_claude_pending_question(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetClaudePendingQuestion>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetClaudePendingQuestionResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
+
+        cx.background_spawn(async move {
+            let hook_installed =
+                remote::claude_sessions::question_hook_is_installed(&home_directory);
+            let question =
+                remote::claude_sessions::read_pending_question(&home_directory, &session_id)?;
+            let live_message =
+                remote::claude_sessions::read_live_message(&home_directory, &session_id)?;
+
+            Ok(proto::GetClaudePendingQuestionResponse {
+                tool_use_id: question.as_ref().map(|question| question.tool_use_id.clone()),
+                questions: question
+                    .map(|question| {
+                        question
+                            .questions
+                            .into_iter()
+                            .map(|question| proto::ClaudeQuestion {
+                                header: question.header,
+                                question: question.question,
+                                options: question
+                                    .options
+                                    .into_iter()
+                                    .map(|option| proto::ClaudeQuestionOption {
+                                        label: option.label,
+                                        description: option.description,
+                                    })
+                                    .collect(),
+                                multi_select: question.multi_select,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                hook_installed,
+                live_message,
+            })
+        })
+        .await
+    }
+
+    async fn handle_install_claude_question_hook(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::InstallClaudeQuestionHook>,
+        cx: AsyncApp,
+    ) -> Result<proto::InstallClaudeQuestionHookResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+
+        cx.background_spawn(async move {
+            let backup = remote::claude_sessions::install_question_hook(&home_directory)?;
+            Ok(proto::InstallClaudeQuestionHookResponse {
+                backup_path: backup.map(|path| path.to_string_lossy().into_owned()),
+            })
+        })
+        .await
+    }
+
+    async fn handle_list_claude_slash_commands(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ListClaudeSlashCommands>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListClaudeSlashCommandsResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let project_root = envelope.payload.project_root.map(PathBuf::from);
+
+        cx.background_spawn(async move {
+            let commands = remote::claude_sessions::list_slash_commands(
+                &home_directory,
+                project_root.as_deref(),
+            );
+            Ok(proto::ListClaudeSlashCommandsResponse {
+                commands: commands
+                    .into_iter()
+                    .map(|command| proto::ClaudeSlashCommand {
+                        name: command.name,
+                        description: command.description,
+                        argument_hint: command.argument_hint,
+                        scope: match command.scope {
+                            remote::claude_sessions::SlashCommandScope::Builtin => 0,
+                            remote::claude_sessions::SlashCommandScope::Project => 1,
+                            remote::claude_sessions::SlashCommandScope::User => 2,
+                        },
+                    })
+                    .collect(),
+            })
+        })
+        .await
     }
 
     async fn handle_tail_claude_transcript(
