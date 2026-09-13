@@ -28,7 +28,8 @@ use gpui::{
     AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ClipboardEntry,
     DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image,
     ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
-    Pixels, Rems, Render, Subscription, Task, TextStyleRefinement, WeakEntity, img, list,
+    Pixels, Rems, Render, ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, img,
+    list,
     pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -61,6 +62,15 @@ use crate::{
 };
 
 const CLAUDE_SESSIONS_PANEL_KEY: &str = "ClaudeSessionsPanel";
+
+/// How tall, in rems, the box holding what the session is saying right now may grow
+/// before what does not fit is scrolled to instead.
+const LIVE_MESSAGE_MAX_HEIGHT_REMS: f32 = 10.;
+
+/// How far, in pixels, from the end of that box still counts as being at its end, so that
+/// a reader who has not scrolled it is followed to the newest words. A line is taller
+/// than this.
+const LIVE_MESSAGE_TAIL_PIXELS: f32 = 8.;
 
 const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 const LOCAL_COMMAND_SUBTYPE: &str = "local_command";
@@ -710,6 +720,11 @@ pub struct ClaudeSessionsPanel {
     /// per question rather than held open for as long as one is on screen; see
     /// [`ClaudeSessionsPanel::open_the_input_for_a_new_question`].
     opened_input_for_question: Option<SharedString>,
+    /// Where the reader has scrolled what the session is saying right now, and how long
+    /// that was when it was last looked at; see
+    /// [`ClaudeSessionsPanel::follow_the_live_message`].
+    live_message_scroll: ScrollHandle,
+    live_message_length: usize,
     /// The paths the `@` menu is offering, and the query they were listed for. Listed
     /// on the machine the session runs on, so the answer arrives after the keystroke
     /// that asked for it and has to say what it is an answer to.
@@ -1320,6 +1335,7 @@ impl ClaudeSessionsPanel {
             this.rebuild_entries(cx);
             this.sync_input_availability(cx);
             this.open_the_input_for_a_new_question(cx);
+            this.follow_the_live_message(cx);
             if this.in_pane {
                 cx.emit(ItemNameChanged);
             }
@@ -1364,6 +1380,8 @@ impl ClaudeSessionsPanel {
             ticked: None,
             typing_answer_for: None,
             opened_input_for_question: None,
+            live_message_scroll: ScrollHandle::new(),
+            live_message_length: 0,
             file_matches: Vec::new(),
             file_matches_for: None,
             file_highlight: 0,
@@ -3066,7 +3084,11 @@ impl ClaudeSessionsPanel {
     /// Drawn below the conversation rather than spliced into it: the words change several
     /// times a second while the turn runs, and an entry in the list would remeasure the
     /// whole conversation each time.
-    fn render_live_message(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn render_live_message(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let store = self.store.read(cx);
         // An agent's conversation is read from its own file and streams nowhere, so this
         // would be the session talking under an agent's transcript.
@@ -3110,9 +3132,58 @@ impl ClaudeSessionsPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(Label::new(SharedString::from(live.to_string())).size(LabelSize::Small))
+                // Capped rather than left to grow: a turn can spend a minute writing one
+                // message, and an uncapped box pushes the conversation it belongs under
+                // off the screen. What does not fit is scrolled to, which is also how the
+                // reader reaches the start of a message whose end they are being shown.
+                .child(
+                    div()
+                        .id("claude-session-live-message")
+                        .w_full()
+                        .max_h(rems(LIVE_MESSAGE_MAX_HEIGHT_REMS))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.live_message_scroll)
+                        .child(
+                            Label::new(SharedString::from(live.to_string()))
+                                .size(LabelSize::Small),
+                        )
+                        .custom_scrollbars(
+                            Scrollbars::new(ScrollAxes::Vertical)
+                                .tracked_scroll_handle(&self.live_message_scroll),
+                            window,
+                            cx,
+                        ),
+                )
                 .into_any_element(),
         )
+    }
+
+    /// Keeps the newest of what the session is saying in view.
+    ///
+    /// The words arrive a few at a time into a box that is only a few lines tall, so
+    /// without this the reader watches the opening of a message that is being written
+    /// somewhere below the fold. A reader who has scrolled away from the end is left
+    /// where they put themselves: they are reading something, and until the turn lands in
+    /// the conversation this box is the only place those words exist.
+    fn follow_the_live_message(&mut self, cx: &Context<Self>) {
+        let live_message_length = self
+            .store
+            .read(cx)
+            .live_message()
+            .map_or(0, |live_message| live_message.len());
+        if live_message_length == self.live_message_length {
+            return;
+        }
+
+        // A box that has not overflowed yet is at its end by definition, which is also
+        // the state every new message starts in.
+        let scroll = &self.live_message_scroll;
+        let was_at_the_end =
+            scroll.max_offset().y + scroll.offset().y < px(LIVE_MESSAGE_TAIL_PIXELS);
+        self.live_message_length = live_message_length;
+        if was_at_the_end {
+            scroll.scroll_to_bottom();
+        }
     }
 
     fn render_transcript_section(
@@ -5047,7 +5118,7 @@ impl Render for ClaudeSessionsPanel {
                         .child(self.render_conversation_toolbar(cx))
                         .children(self.render_agent_chips(cx))
                         .child(self.render_transcript_section(window, cx))
-                        .children(self.render_live_message(cx))
+                        .children(self.render_live_message(window, cx))
                         .children(self.render_activity())
                         .children(
                             (!reading_an_agent)
@@ -11839,6 +11910,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         ticked: None,
                         typing_answer_for: None,
                         opened_input_for_question: None,
+                        live_message_scroll: ScrollHandle::new(),
+                        live_message_length: 0,
                         file_matches: Vec::new(),
                         file_matches_for: None,
                         file_highlight: 0,
