@@ -736,18 +736,41 @@ impl ClaudeSessionStore {
         self.sessions = sessions;
 
         match selected_session_id {
-            // A different `sessionId` on the same pid means the user ran `/clear`, so the
-            // old conversation must be dropped rather than appended to.
-            Some(session_id) => {
-                if self.followed_session_id.as_deref() != Some(session_id.as_str()) {
+            Some(session_id) => match self.followed_session_id.as_deref() {
+                // Nothing was being followed yet, which is where a store pointed at a
+                // session before any scan had listed it starts — a tab opened straight
+                // onto one of that session's agents is exactly that. Learning which
+                // session it is reading is not the session changing, so only the id is
+                // filled in and the conversation it was opened for is left alone.
+                None => {
+                    self.followed_session_id = Some(session_id);
+                    changed = true;
+                }
+                // A different `sessionId` on the same pid means the user ran `/clear`, so
+                // the old conversation must be dropped rather than appended to.
+                Some(followed) if followed != session_id => {
                     self.follow_this_sessions_main_conversation();
                     changed = true;
                 }
-            }
+                Some(_) => {}
+            },
             None => {
                 if self.selected_process_id.is_some() {
                     self.selected_process_id = None;
-                    self.follow_this_sessions_main_conversation();
+                    // A tab opened onto one of the session's agents goes on showing that
+                    // agent's conversation once the session has exited: the records are on
+                    // disk and reading them is the whole of what the tab is for. Only what
+                    // cannot outlive the session goes with it — its pane, the question it
+                    // was waiting on, and the words it was part-way through saying — and
+                    // the tail stops, because a session that has exited writes no more.
+                    if matches!(self.transcript_target, TranscriptTarget::Subagent { .. }) {
+                        self.followed_session_id = None;
+                        self.pane_contents = None;
+                        self.recorded_question = None;
+                        self.live_message = None;
+                    } else {
+                        self.follow_this_sessions_main_conversation();
+                    }
                     changed = true;
                 }
             }
@@ -2081,6 +2104,143 @@ mod tests {
     const FLAT_AGENT_ID: &str = "a0000e203ec41bc73";
     const WORKFLOW_AGENT_ID: &str = "a1111e203ec41bc73";
     const WORKFLOW_RUN_ID: &str = "wf_b529a29d-562";
+
+    /// Everything a tab opened straight onto one of a session's agents is built with, in
+    /// the order the tab builds it: the session is selected and the agent chosen before
+    /// any scan has listed either.
+    fn store_opened_onto_the_flat_agent(
+        source: Arc<FakeSource>,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<ClaudeSessionStore> {
+        cx.new(|cx| {
+            let mut store = ClaudeSessionStore::new(source, None, cx);
+            store.select(81, cx);
+            store.select_transcript_target(reading_the_flat_agent(), cx);
+            store
+        })
+    }
+
+    fn reading_the_flat_agent() -> TranscriptTarget {
+        TranscriptTarget::Subagent {
+            agent_id: FLAT_AGENT_ID.to_string(),
+            workflow_run_id: None,
+        }
+    }
+
+    fn uuids_on_screen(store: &ClaudeSessionStore) -> Vec<String> {
+        store
+            .transcript()
+            .active_path()
+            .iter()
+            .filter_map(|record| record.uuid.clone())
+            .collect()
+    }
+
+    /// Writes one session with one agent under it, and reports the home directory and a
+    /// source reading it.
+    fn a_session_with_an_agent(label: &str) -> (PathBuf, Arc<FakeSource>) {
+        let home_directory = temporary_directory(label);
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("81.json"),
+            &registration_json(81, "agent-session"),
+        );
+        write_transcript(
+            &home_directory,
+            "agent-session",
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
+        write_subagent(
+            &home_directory,
+            "agent-session",
+            None,
+            FLAT_AGENT_ID,
+            "{\"type\":\"user\",\"isSidechain\":true,\"uuid\":\"f1\"}\n",
+        );
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(vec![81]),
+        ));
+        (home_directory, source)
+    }
+
+    /// The bug: a tab opened onto one of a session's agents selects the session and then
+    /// the agent, both before any scan has run, so the store follows no session id yet.
+    /// The first scan to arrive read that as the session having changed under it — the
+    /// test for `/clear` — and started the session's own conversation over, so a tab
+    /// opened to read an agent opened onto that agent's parent instead.
+    #[gpui::test]
+    async fn test_a_store_opened_onto_an_agent_keeps_it_through_the_first_scan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_home_directory, source) = a_session_with_an_agent("agent-tab");
+        let store = store_opened_onto_the_flat_agent(source, cx);
+
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.transcript_target(),
+                &reading_the_flat_agent(),
+                "the first scan only named the session the store was already pointed at, \
+                 which is not the session changing"
+            );
+            assert_eq!(
+                uuids_on_screen(store),
+                vec!["f1".to_string()],
+                "so what is on screen is the agent's conversation, not its session's"
+            );
+        });
+    }
+
+    /// An agent's records are on disk and go on being readable after the session that
+    /// spawned it has exited, which is the whole of what a tab reading one is for. What
+    /// cannot outlive the session goes: nothing is selected any more, so nothing offers
+    /// the session's other conversations.
+    #[gpui::test]
+    async fn test_an_agents_conversation_outlives_the_session_that_spawned_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (home_directory, source) = a_session_with_an_agent("agent-outlives");
+        let store = store_opened_onto_the_flat_agent(source, cx);
+
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(uuids_on_screen(store), vec!["f1".to_string()]);
+        });
+
+        std::fs::remove_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("81.json"),
+        )
+        .expect("ending the session");
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.selected(), None, "the session is gone from the registry");
+            assert_eq!(
+                store.transcript_target(),
+                &reading_the_flat_agent(),
+                "but what the tab was opened to read is still what it is reading"
+            );
+            assert_eq!(
+                uuids_on_screen(store),
+                vec!["f1".to_string()],
+                "and the records it had read are still on screen"
+            );
+        });
+    }
 
     /// The whole of what this round adds to the store: the selected session's agents are
     /// listed, one of them can be followed instead of the session's own conversation, and

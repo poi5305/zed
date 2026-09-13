@@ -667,6 +667,10 @@ pub struct ClaudeSessionsPanel {
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
     session_list_expanded: bool,
+    /// The sessions whose agent rows are folded away, by process id. Held as what is
+    /// closed rather than as what is open, so that a session listed for the first time
+    /// arrives showing what it is running rather than hiding it.
+    collapsed_session_agents: HashSet<u32>,
     /// True for the copy opened as an editor tab, which is already where opening one
     /// would take the reader.
     in_pane: bool,
@@ -1364,6 +1368,7 @@ impl ClaudeSessionsPanel {
             agent_calls: HashMap::default(),
             list_state: scroll_tracking_list_state(cx),
             session_list_expanded: true,
+            collapsed_session_agents: HashSet::default(),
             unread_below: UnreadBelow::default(),
             scrolled_to_end: true,
             expanded: HashSet::default(),
@@ -1409,18 +1414,6 @@ impl ClaudeSessionsPanel {
         self.ticked = None;
         self.typing_answer_for = None;
         self._answering = Task::ready(());
-    }
-
-    /// Follows another of the selected session's conversations, from a chip or from the
-    /// card under the call that started it.
-    ///
-    /// Everything the reader is owed about the conversation they are leaving is settled
-    /// the same way selecting another session settles it: another conversation is another
-    /// thing to read, and what they are shown of it is its newest end.
-    fn select_transcript_target(&mut self, target: TranscriptTarget, cx: &mut Context<Self>) {
-        self.show_the_newest_of_another_conversation();
-        self.store
-            .update(cx, |store, cx| store.select_transcript_target(target, cx));
     }
 
     /// Attaches a terminal to the selected session's pane, so that the CLI can be typed
@@ -2073,6 +2066,14 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
+    /// Folds one session's agent rows away, or brings them back.
+    fn toggle_session_agents(&mut self, process_id: u32, cx: &mut Context<Self>) {
+        if !self.collapsed_session_agents.remove(&process_id) {
+            self.collapsed_session_agents.insert(process_id);
+        }
+        cx.notify();
+    }
+
     /// Takes the reader to the newest of the conversation, which is what the count of
     /// what arrived below their window offers.
     fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
@@ -2443,6 +2444,32 @@ impl ClaudeSessionsPanel {
         // nothing has said which machine the button would be for.
         let offer_question_hook = !store.question_hook_installed() && !sessions.is_empty();
         let is_expanded = self.session_list_expanded;
+        // Built while the store is borrowed and before any click handler is, because a
+        // read of the store and the `cx.listener` calls below cannot be held at once. The
+        // conversation the agent states are judged against is walked once for the whole
+        // list rather than once per row, and it is the selected session's, which is why
+        // no other session's agents are judged against it.
+        let agent_rows: Vec<Vec<SessionAgentRow>> = {
+            let store = self.store.read(cx);
+            let open_target = store.transcript_target().clone();
+            let main_path = store.main_transcript().active_path();
+            sessions
+                .iter()
+                .map(|session| {
+                    let main_path: &[&TranscriptRecord] =
+                        if selected_process_id == Some(session.process_id) {
+                            &main_path
+                        } else {
+                            &[]
+                        };
+                    session_agent_rows(
+                        store.subagents_of(&session.session_id),
+                        main_path,
+                        &open_target,
+                    )
+                })
+                .collect()
+        };
 
         v_flex()
             .child(
@@ -2548,12 +2575,34 @@ impl ClaudeSessionsPanel {
                                 ),
                             )
                         })
-                        .children(sessions.iter().enumerate().map(|(index, session)| {
-                            let is_selected = selected_process_id == Some(session.process_id);
-                            v_flex()
-                                .child(self.render_session_row(index, session, is_selected, cx))
-                                .children(self.render_session_agent_rows(session, cx))
-                        })),
+                        .children(sessions.iter().enumerate().zip(agent_rows).map(
+                            |((index, session), agents)| {
+                                let is_selected = selected_process_id == Some(session.process_id);
+                                let process_id = session.process_id;
+                                // A session with nothing to fold gets no disclosure: a
+                                // control that hides nothing reads as a claim that the
+                                // session has agents behind it.
+                                let agents_shown = (!agents.is_empty())
+                                    .then(|| !self.collapsed_session_agents.contains(&process_id));
+                                v_flex()
+                                    .child(self.render_session_row(
+                                        index,
+                                        session,
+                                        is_selected,
+                                        agents_shown,
+                                        cx,
+                                    ))
+                                    .children(
+                                        (agents_shown == Some(true))
+                                            .then(|| {
+                                                self.render_session_agent_rows(
+                                                    process_id, agents, cx,
+                                                )
+                                            })
+                                            .unwrap_or_default(),
+                                    )
+                            },
+                        )),
                 )
             })
     }
@@ -2567,12 +2616,10 @@ impl ClaudeSessionsPanel {
     /// context that the click handlers need to be registered against.
     fn render_session_agent_rows(
         &self,
-        session: &RegisteredSession,
+        process_id: u32,
+        rows: Vec<SessionAgentRow>,
         cx: &mut Context<Self>,
     ) -> Vec<ListItem> {
-        let process_id = session.process_id;
-        let rows = session_agent_rows(self.store.read(cx).subagents_of(&session.session_id));
-
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| match row {
@@ -2617,6 +2664,9 @@ impl ClaudeSessionsPanel {
         index: usize,
         session: &RegisteredSession,
         is_selected: bool,
+        // `Some` when the session has agent rows under it, saying whether they are
+        // showing; `None` when it has none and so nothing to fold away.
+        agents_shown: Option<bool>,
         cx: &mut Context<Self>,
     ) -> ListItem {
         let process_id = session.process_id;
@@ -2676,10 +2726,26 @@ impl ClaudeSessionsPanel {
             indicator.into_any_element()
         };
 
+        // The disclosure sits inside the row rather than in `ListItem::toggle`, which
+        // draws it outside the item's left edge — off the panel entirely for a row at the
+        // top level of the list.
+        let start_slot = h_flex()
+            .gap_0p5()
+            .children(agents_shown.map(|shown| {
+                Disclosure::new(
+                    SharedString::from(format!("claude-session-agents-{index}")),
+                    shown,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_session_agents(process_id, cx)
+                }))
+            }))
+            .child(indicator);
+
         ListItem::new(SharedString::from(format!("claude-session-{index}")))
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(is_selected)
-            .start_slot(indicator)
+            .start_slot(start_slot)
             .child(
                 v_flex()
                     .gap_0p5()
@@ -2750,16 +2816,22 @@ impl ClaudeSessionsPanel {
         let (subagents, target, states) = {
             let store = self.store.read(cx);
             store.selected()?;
-            let subagents = store.subagents().to_vec();
+            let target = store.transcript_target().clone();
             // The states come off the session's own conversation, which is followed
             // whichever one is on screen, so a chip stays truthful while its own agent's
             // records are the ones being drawn.
             let main_path = store.main_transcript().active_path();
+            let subagents: Vec<SubagentSummary> = store
+                .subagents()
+                .iter()
+                .filter(|summary| agent_row_is_offered(summary, &main_path, &target))
+                .cloned()
+                .collect();
             let states: Vec<AgentState> = subagents
                 .iter()
                 .map(|summary| agent_state(summary, &main_path))
                 .collect();
-            (subagents, store.transcript_target().clone(), states)
+            (subagents, target, states)
         };
 
         if subagents.is_empty() && target == TranscriptTarget::Main {
@@ -2807,9 +2879,10 @@ impl ClaudeSessionsPanel {
         Some(row.into_any_element())
     }
 
-    /// One chip. An agent that has returned stays on the row rather than being taken off
-    /// it — its conversation is the thing worth reading afterwards — and says so by being
-    /// the quiet one.
+    /// One chip. Clicking one opens that conversation as a tab of its own rather than
+    /// retargeting this one: a run of several agents is watched beside the conversation
+    /// that started it, and a tab that swapped what it was showing under the reader would
+    /// make watching two of them impossible.
     fn render_agent_chip(
         &self,
         id: &str,
@@ -2835,9 +2908,9 @@ impl ClaudeSessionsPanel {
         .when_some(tooltip, |this, tooltip| {
             this.tooltip(Tooltip::text(tooltip))
         })
-        .on_click(
-            cx.listener(move |this, _, _, cx| this.select_transcript_target(target.clone(), cx)),
-        );
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_agent_in_pane(target.clone(), window, cx)
+        }));
 
         if !is_running {
             return button.into_any_element();
@@ -2877,11 +2950,13 @@ impl ClaudeSessionsPanel {
 
         let store = self.store.read(cx);
         let main_path = store.main_transcript().active_path();
+        let open_target = store.transcript_target();
         subagents_of_call(call, store.subagents(), &main_path)
             .into_iter()
             .map(|summary| AgentCardRow {
                 label: agent_chip_label(summary),
                 state: agent_state(summary, &main_path),
+                offered: agent_row_is_offered(summary, &main_path, open_target),
                 phase: summary
                     .meta
                     .workflow_phase
@@ -2932,42 +3007,21 @@ impl ClaudeSessionsPanel {
                             .color(state_color),
                     ),
             )
+            // A run of several agents is worth watching beside the conversation that
+            // started it, rather than in place of it, so the one thing the card offers is
+            // a tab of the agent's own. Offered from a tab as well as from the dock: a tab
+            // reading one agent is what the reader opens the next one from.
             .child(
-                h_flex()
-                    .flex_none()
-                    .gap_0p5()
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("claude-session-open-agent-{key}-{index}")),
-                            "Open",
-                        )
-                        .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text("Read this agent's conversation here"))
-                        .on_click({
-                            let target = target.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.select_transcript_target(target.clone(), cx)
-                            })
-                        }),
-                    )
-                    // A run of several agents is worth watching beside the conversation
-                    // that started it, rather than in place of it. Offered from a tab as
-                    // well as from the dock: a tab reading one agent is what the reader
-                    // opens the next one from.
-                    .child(
-                        IconButton::new(
-                            SharedString::from(format!(
-                                "claude-session-open-agent-tab-{key}-{index}"
-                            )),
-                            IconName::ArrowUpRight,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Read this agent in a tab of its own"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_agent_in_pane(target.clone(), window, cx)
-                        })),
-                    ),
+                Button::new(
+                    SharedString::from(format!("claude-session-open-agent-{key}-{index}")),
+                    "Open",
+                )
+                .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
+                .label_size(LabelSize::XSmall)
+                .tooltip(Tooltip::text("Read this agent in a tab of its own"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_agent_in_pane(target.clone(), window, cx)
+                })),
             )
             .into_any_element()
     }
@@ -4327,8 +4381,13 @@ impl ClaudeSessionsPanel {
                         );
                     }
                     for card in cards_of_phase {
-                        element =
-                            element.child(self.render_agent_card(&key, card_index, card, cx));
+                        // The index goes on counting past a card that is not drawn, so
+                        // that an agent returning does not hand its element id to the
+                        // card after it.
+                        if card.offered {
+                            element =
+                                element.child(self.render_agent_card(&key, card_index, card, cx));
+                        }
                         card_index += 1;
                     }
                 }
@@ -4935,7 +4994,18 @@ impl Render for ClaudeSessionsPanel {
     /// an editor tab draws the conversation of the selected one, because a transcript is
     /// not readable at the width of a dock and the list is what the dock is for.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.in_pane {
+        // An agent's conversation is a record of something already said to something that
+        // is not listening: the only thing there is to type into is the session's own
+        // pane, and a reply sent from under an agent's records would arrive in a
+        // conversation the reader is not looking at. So a tab reading one is read-only,
+        // which is also what leaves it readable after the session it belonged to has
+        // exited — neither the pane nor the input outlives the session.
+        let reading_an_agent = matches!(
+            self.store.read(cx).transcript_target(),
+            TranscriptTarget::Subagent { .. }
+        );
+
+        if self.in_pane && !reading_an_agent {
             // Both halves of what decides it — the selection and whether the terminal is
             // showing — are known here, and this runs on every change to either.
             self.sync_terminal(window, cx);
@@ -4954,10 +5024,17 @@ impl Render for ClaudeSessionsPanel {
                         .children(self.render_live_message(cx))
                         .children(self.render_activity())
                         .children(
-                            self.render_terminal(cx)
-                                .or_else(|| self.render_pane_mirror(cx)),
+                            (!reading_an_agent)
+                                .then(|| {
+                                    self.render_terminal(cx)
+                                        .or_else(|| self.render_pane_mirror(cx))
+                                })
+                                .flatten(),
                         )
-                        .child(self.render_input(cx))
+                        .children(
+                            (!reading_an_agent)
+                                .then(|| self.render_input(cx).into_any_element()),
+                        )
                 } else {
                     this.child(self.render_session_section(cx))
                 }
@@ -4996,7 +5073,7 @@ impl Item for ClaudeSessionsPanel {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         let store = self.store.read(cx);
         let selected = store.selected();
-        store
+        let session_name = store
             .sessions()
             .iter()
             .find(|session| selected == Some(session.process_id))
@@ -5010,7 +5087,36 @@ impl Item for ClaudeSessionsPanel {
                     None => SharedString::from(name),
                 }
             })
-            .unwrap_or_else(|| "Claude Sessions".into())
+            .unwrap_or_else(|| SharedString::from("Claude Sessions"));
+
+        // Each of a session's agents is opened as a tab of its own, so naming them all
+        // after the session would leave the reader with several tabs reading the same
+        // name and no way to tell which held which conversation.
+        let TranscriptTarget::Subagent {
+            agent_id,
+            workflow_run_id,
+        } = store.transcript_target()
+        else {
+            return session_name;
+        };
+        // The summary is gone once the session it belonged to has exited, and the tab
+        // outlives that, so the id it was opened for is what is left to name it by.
+        let agent = store
+            .subagents()
+            .iter()
+            .find(|summary| {
+                summary.agent_id == *agent_id && summary.workflow_run_id == *workflow_run_id
+            })
+            .map(agent_chip_label)
+            .unwrap_or_else(|| {
+                SharedString::from(
+                    agent_id
+                        .chars()
+                        .take(AGENT_ID_CHIP_CHARACTERS)
+                        .collect::<String>(),
+                )
+            });
+        SharedString::from(format!("{session_name} · {agent}"))
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -5825,6 +5931,10 @@ struct AgentCall {
 struct AgentCardRow {
     label: SharedString,
     state: AgentState,
+    /// Whether the card is drawn at all; see [`agent_row_is_offered`]. A card that is not
+    /// offered is still built, because the line above the cards and the heading above each
+    /// phase count what the run spawned rather than what is left on screen.
+    offered: bool,
     /// The phase of the run this agent belongs to, for an agent of a `Workflow` run that
     /// recorded one. A run of several phases is otherwise a row of cards that say nothing
     /// about which part of the run they are.
@@ -5958,12 +6068,20 @@ enum SessionAgentRow {
 ///
 /// The order within a group is the order the scan produced (by agent id), which is stable
 /// across polls so that rows do not move while a reader is looking at them.
-fn session_agent_rows(subagents: &[SubagentSummary]) -> Vec<SessionAgentRow> {
+///
+/// Only the agents still worth opening are drawn; see [`agent_row_is_offered`], which is
+/// what `main_path` and `open_target` are for.
+fn session_agent_rows(
+    subagents: &[SubagentSummary],
+    main_path: &[&TranscriptRecord],
+    open_target: &TranscriptTarget,
+) -> Vec<SessionAgentRow> {
     let mut rows = Vec::new();
 
     for summary in subagents
         .iter()
         .filter(|summary| summary.workflow_run_id.is_none())
+        .filter(|summary| agent_row_is_offered(summary, main_path, open_target))
     {
         rows.push(SessionAgentRow::Agent {
             label: agent_chip_label(summary),
@@ -5993,16 +6111,29 @@ fn session_agent_rows(subagents: &[SubagentSummary]) -> Vec<SessionAgentRow> {
             .iter()
             .filter(|other| other.workflow_run_id.as_ref() == Some(workflow_run_id))
             .collect();
+        // Counted over the whole run rather than over the rows drawn under it: the
+        // agents that have returned are gone from the list, not from the run, so a run
+        // half-way through says `2/4 done` rather than `0/2 done`.
         let finished = agents_of_run
             .iter()
             .filter(|agent| agent.workflow_agent_finished == Some(true))
             .count();
+        let offered: Vec<&SubagentSummary> = agents_of_run
+            .iter()
+            .copied()
+            .filter(|agent| agent_row_is_offered(agent, main_path, open_target))
+            .collect();
+        // A run every agent of which has returned would be a heading with nothing under
+        // it, which is a row that opens nothing.
+        if offered.is_empty() {
+            continue;
+        }
 
         rows.push(SessionAgentRow::WorkflowRun {
             label: workflow_run_label(workflow_run_id),
             note: SharedString::from(format!("{finished}/{} done", agents_of_run.len())),
         });
-        for agent in agents_of_run {
+        for agent in offered {
             rows.push(SessionAgentRow::Agent {
                 label: agent_chip_label(agent),
                 note: session_agent_row_note(agent),
@@ -6016,6 +6147,33 @@ fn session_agent_rows(subagents: &[SubagentSummary]) -> Vec<SessionAgentRow> {
     }
 
     rows
+}
+
+/// Whether an agent is still worth offering a way into its conversation.
+///
+/// An agent that has returned is taken off every list it was on: what a row, a chip or a
+/// card offers is a conversation to open, and a session that has run twenty agents would
+/// otherwise bury the ones still working under the ones that are over. The conversation
+/// the asking view is itself reading is the exception — it is opened already, and taking
+/// it off the row it is named on would leave the reader looking at something no control
+/// admits exists.
+///
+/// A session that is not the one being followed is judged against an empty conversation,
+/// which is what [`agent_state`] reads to decide a `Task` agent is over, so such an agent
+/// is kept: offering one that has returned is better than hiding one that is working.
+fn agent_row_is_offered(
+    summary: &SubagentSummary,
+    main_path: &[&TranscriptRecord],
+    open_target: &TranscriptTarget,
+) -> bool {
+    let is_open = match open_target {
+        TranscriptTarget::Main => false,
+        TranscriptTarget::Subagent {
+            agent_id,
+            workflow_run_id,
+        } => *agent_id == summary.agent_id && *workflow_run_id == summary.workflow_run_id,
+    };
+    is_open || agent_state(summary, main_path) == AgentState::Running
 }
 
 /// A run id is `wf_` and a hash, all of which is too wide for a dock and none of which a
@@ -9583,6 +9741,7 @@ mod tests {
         AgentCardRow {
             label: SharedString::from("copy:batch-a"),
             state,
+            offered: state == AgentState::Running,
             phase: None,
             target: TranscriptTarget::Main,
         }
@@ -11587,6 +11746,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         agent_calls: HashMap::default(),
                         list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
                         session_list_expanded: true,
+                        collapsed_session_agents: HashSet::default(),
                         unread_below: UnreadBelow::default(),
                         scrolled_to_end: true,
                         expanded: HashSet::default(),
@@ -11695,7 +11855,14 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         panel: &Entity<ClaudeSessionsPanel>,
         cx: &mut gpui::TestAppContext,
     ) {
-        panel.update(cx, |panel, cx| panel.select_transcript_target(target, cx));
+        // What opening an agent as a tab of its own builds that tab's store to be, with
+        // no workspace to open a tab in.
+        panel.update(cx, |panel, cx| {
+            panel.show_the_newest_of_another_conversation();
+            panel
+                .store
+                .update(cx, |store, cx| store.select_transcript_target(target, cx));
+        });
         cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
     }
@@ -12002,13 +12169,15 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let mut first_of_run = subagent("a1", Some("wf_d276fc57-977"), None);
         first_of_run.meta.description = Some("stage-A".to_string());
         first_of_run.meta.workflow_phase = Some("Wait A".to_string());
+        // Returned, so it is counted by the heading and drawn nowhere; see
+        // `an_agent_that_has_returned_is_taken_off_the_session_list`.
         first_of_run.workflow_agent_finished = Some(true);
         let mut second_of_run = subagent("a2", Some("wf_d276fc57-977"), None);
         second_of_run.meta.description = Some("stage-B".to_string());
         second_of_run.meta.workflow_phase = Some("Wait B".to_string());
         second_of_run.workflow_agent_finished = Some(false);
 
-        let rows = session_agent_rows(&[plain, first_of_run, second_of_run]);
+        let rows = session_agent_rows(&[plain, first_of_run, second_of_run], &[], &READING_NOTHING);
 
         assert_eq!(
             rows,
@@ -12027,15 +12196,6 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     note: SharedString::from("1/2 done"),
                 },
                 SessionAgentRow::Agent {
-                    label: SharedString::from("stage-A"),
-                    note: Some(SharedString::from("Finished · Wait A")),
-                    indent_level: 2,
-                    target: TranscriptTarget::Subagent {
-                        agent_id: "a1".to_string(),
-                        workflow_run_id: Some("wf_d276fc57-977".to_string()),
-                    },
-                },
-                SessionAgentRow::Agent {
                     label: SharedString::from("stage-B"),
                     note: Some(SharedString::from("Running · Wait B")),
                     indent_level: 2,
@@ -12045,8 +12205,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     },
                 },
             ],
-            "the session's own agent stays at the top level and the run's two agents sit \
-             under a heading counting how many have returned"
+            "the session's own agent stays at the top level and the run's one agent still \
+             working sits under a heading counting both of them"
         );
     }
 
@@ -12071,23 +12231,104 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn two_runs_are_two_groups() {
         let first = subagent("a1", Some("wf_1"), None);
         let mut second = subagent("a2", Some("wf_2"), None);
-        second.workflow_agent_finished = Some(true);
+        second.workflow_agent_finished = Some(false);
 
-        let rows = session_agent_rows(&[first, second]);
+        let rows = session_agent_rows(&[first, second], &[], &READING_NOTHING);
 
-        let headings: Vec<(&str, &str)> = rows
-            .iter()
+        assert_eq!(
+            headings_of(&rows),
+            vec![("Workflow 1", "0/1 done"), ("Workflow 2", "0/1 done")],
+            "each run counts only its own agents"
+        );
+    }
+
+    /// The target of a view that is reading a session's own conversation, which is what
+    /// the dock reads and what every session but the selected one is drawn against.
+    const READING_NOTHING: TranscriptTarget = TranscriptTarget::Main;
+
+    fn headings_of(rows: &[SessionAgentRow]) -> Vec<(&str, &str)> {
+        rows.iter()
             .filter_map(|row| match row {
                 SessionAgentRow::WorkflowRun { label, note } => {
                     Some((label.as_ref(), note.as_ref()))
                 }
                 SessionAgentRow::Agent { .. } => None,
             })
-            .collect();
+            .collect()
+    }
+
+    fn labels_of(rows: &[SessionAgentRow]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|row| match row {
+                SessionAgentRow::Agent { label, .. } => Some(label.as_ref()),
+                SessionAgentRow::WorkflowRun { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A row is a way into a conversation, and a conversation that has stopped changing
+    /// is not one the list goes on offering. The run's heading still counts the agent,
+    /// because it is gone from the list rather than from the run.
+    #[test]
+    fn an_agent_that_has_returned_is_taken_off_the_session_list() {
+        let mut returned = subagent("a1", Some("wf_1"), None);
+        returned.meta.description = Some("stage-A".to_string());
+        returned.workflow_agent_finished = Some(true);
+        let mut working = subagent("a2", Some("wf_1"), None);
+        working.meta.description = Some("stage-B".to_string());
+        working.workflow_agent_finished = Some(false);
+
+        let rows = session_agent_rows(&[returned, working], &[], &READING_NOTHING);
+
+        assert_eq!(labels_of(&rows), vec!["stage-B"]);
         assert_eq!(
-            headings,
-            vec![("Workflow 1", "0/1 done"), ("Workflow 2", "1/1 done")],
-            "each run counts only its own agents"
+            headings_of(&rows),
+            vec![("Workflow 1", "1/2 done")],
+            "the heading counts what the run spawned, not what is left on the list"
+        );
+    }
+
+    /// A run every agent of which has returned would be a heading with nothing under it,
+    /// which is a row that opens nothing.
+    #[test]
+    fn a_run_that_is_over_leaves_the_session_list_entirely() {
+        let mut only = subagent("a1", Some("wf_1"), None);
+        only.workflow_agent_finished = Some(true);
+
+        assert_eq!(
+            session_agent_rows(&[only], &[], &READING_NOTHING),
+            Vec::new()
+        );
+    }
+
+    /// Taking the row of the conversation on screen away from under the reader would
+    /// leave them looking at something no control admits exists.
+    #[test]
+    fn the_agent_being_read_keeps_its_row_after_it_returns() {
+        let mut returned = subagent("a1", Some("wf_1"), None);
+        returned.meta.description = Some("stage-A".to_string());
+        returned.workflow_agent_finished = Some(true);
+
+        let reading_it = TranscriptTarget::Subagent {
+            agent_id: "a1".to_string(),
+            workflow_run_id: Some("wf_1".to_string()),
+        };
+        let rows = session_agent_rows(&[returned], &[], &reading_it);
+
+        assert_eq!(labels_of(&rows), vec!["stage-A"]);
+    }
+
+    /// A `Task` agent is only known to be over from the tool result in its own session's
+    /// conversation, and the list holds that conversation for one session at a time. An
+    /// agent of any other session must be offered rather than hidden on a guess.
+    #[test]
+    fn a_task_agent_of_an_unread_session_is_offered() {
+        let mut agent = subagent("a0", None, Some("toolu_01"));
+        agent.meta.description = Some("look at the file".to_string());
+
+        assert_eq!(
+            labels_of(&session_agent_rows(&[agent], &[], &READING_NOTHING)),
+            vec!["look at the file"],
         );
     }
 
@@ -12100,7 +12341,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let only_of_second = subagent("a2", Some("wf_2"), None);
         let second_of_first = subagent("a3", Some("wf_1"), None);
 
-        let rows = session_agent_rows(&[first_of_first, only_of_second, second_of_first]);
+        let rows = session_agent_rows(
+            &[first_of_first, only_of_second, second_of_first],
+            &[],
+            &READING_NOTHING,
+        );
 
         let outline: Vec<String> = rows
             .iter()
