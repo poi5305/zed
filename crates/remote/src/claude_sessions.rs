@@ -2369,18 +2369,24 @@ fn mirror_arguments(session_name: &str, window_target: &str, mirror_name: &str) 
 /// of another that is still in flight.
 static PASTE_BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the send of `text` has to travel as a bracketed paste.
+/// Every send travels as a bracketed paste, whatever it holds.
 ///
-/// Bracketed paste exists to keep the newlines of a multi-line message from being read as
-/// submissions, so a message without one has nothing for it to protect — and asking for it
-/// anyway is not free. The sequence that opens a bracketed paste puts the pane's TUI into
-/// paste mode, where everything arriving is accumulated as pasted content rather than
-/// shown as it is typed, and only the closing sequence takes it out again. A pane left in
-/// that state swallows what its user types next: the characters reach Claude Code but
-/// never appear on screen. A single line goes without it, so the common case never enters
-/// that state at all.
-fn needs_bracketed_paste(text: &str) -> bool {
-    text.contains('\n')
+/// This used to be asked only for a multi-line message, on the grounds that bracketed
+/// paste exists to keep newlines from being read as submissions. That is one of two
+/// things it does. The other is telling the pane's TUI where the pasted content ends —
+/// and without that, a TUI that tells typing from pasting by how fast the bytes arrive
+/// has to guess. Claude Code guesses, and it reads the `Enter` this send makes to submit
+/// the message as one more byte of the burst that carried the message: the message stays
+/// in the input box with a newline on the end, waiting for a submission that already
+/// happened, and joins whatever the user types next as one prompt.
+///
+/// Guessing is only wrong for a burst long enough to look pasted, which a single-line
+/// message can easily be, so there is no line to draw here that a real message will not
+/// cross. What that argued against — a pane left in paste mode, swallowing what its user
+/// types next — needs tmux to die between the opening sequence and the closing one, which
+/// it writes as one paste, and is the same exposure every multi-line send already has.
+fn needs_bracketed_paste(_text: &str) -> bool {
+    true
 }
 
 /// The arguments of the one tmux invocation a send performs.
@@ -3885,10 +3891,14 @@ mod tests {
         );
     }
 
-    /// Bracketed paste puts the pane's TUI into paste mode until the closing sequence
-    /// lands, and a message with no newline in it has nothing for that mode to protect.
+    /// Captured from a send that did not arrive: Claude Code tells typing from pasting by
+    /// how fast the bytes reach it, so an unbracketed burst long enough to look pasted
+    /// swallowed the `Enter` that follows it as one more byte of the paste. The message
+    /// sat in the input box with a newline on the end and went out joined to whatever the
+    /// user typed next, as one prompt — the session's own `last-prompt` record held both
+    /// messages with a \r between them.
     #[test]
-    fn only_a_multi_line_send_asks_tmux_for_a_bracketed_paste() {
+    fn every_send_asks_tmux_for_a_bracketed_paste() {
         let asked_for: Vec<(&str, bool)> = ["one line", "line one\nline two", "trailing\n"]
             .into_iter()
             .map(|text| (text, needs_bracketed_paste(text)))
@@ -3896,20 +3906,16 @@ mod tests {
         assert_eq!(
             asked_for,
             vec![
-                // No newline to protect, so the pane is never put into paste mode.
-                ("one line", false),
+                // The one that used to go without, and the one that was reported.
+                ("one line", true),
                 ("line one\nline two", true),
                 ("trailing\n", true),
             ],
-            "bracketed paste is what keeps a newline from submitting the message early, \
-             and only a message that has one needs it"
+            "a single line can be a burst long enough to be read as a paste, so there is \
+             no length at which guessing is safe"
         );
 
-        let single_line = send_text_arguments("zed-claude-1-0", "%12", false);
-        assert!(
-            !single_line.iter().any(|argument| argument == "-p"),
-            "a single-line send must not ask for a bracketed paste, but it runs {single_line:?}"
-        );
+        let single_line = send_text_arguments("zed-claude-1-0", "%12", needs_bracketed_paste("one line"));
         assert_eq!(
             single_line,
             vec![
@@ -3920,6 +3926,7 @@ mod tests {
                 ";",
                 "paste-buffer",
                 "-d",
+                "-p",
                 "-b",
                 "zed-claude-1-0",
                 "-t",
@@ -3930,8 +3937,8 @@ mod tests {
                 "%12",
                 "Enter",
             ],
-            "dropping `-p` must be the only difference: one command list, `-d` kept, \
-             the three steps in the same order"
+            "`-p` is the whole difference, and the `Enter` still rides the same command \
+             list so that a concurrent send cannot slip between the paste and it"
         );
     }
 

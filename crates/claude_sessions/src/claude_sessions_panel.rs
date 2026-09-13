@@ -322,11 +322,21 @@ fn answer_summary(usage: Usage, rates: ModelRates) -> String {
             compact_token_count(usage.cache_read_tokens)
         ));
     }
-    let cache_write = usage
-        .cache_write_1h_tokens
-        .saturating_add(usage.cache_write_5m_tokens);
-    if cache_write > 0 {
-        parts.push(format!("{} cache write", compact_token_count(cache_write)));
+    // Split by how long what it wrote lives, which is both what it cost — an hour at
+    // twice the input rate, five minutes at a quarter more — and how long the next answer
+    // has to start before it pays to write the same thing again. A record that reported
+    // no split reads as five minutes here, because that is the length it is priced at;
+    // see `Usage::from_record`.
+    for (tokens, ttl) in [
+        (usage.cache_write_1h_tokens, "1h"),
+        (usage.cache_write_5m_tokens, "5m"),
+    ] {
+        if tokens > 0 {
+            parts.push(format!(
+                "{} cache write ({ttl})",
+                compact_token_count(tokens)
+            ));
+        }
     }
     parts.push(format!("{} out", compact_token_count(usage.output_tokens)));
     if usage.thinking_tokens > 0 {
@@ -9064,7 +9074,49 @@ mod tests {
             answer_summary(usage, rates),
             // The cache write dominates: 27,456 tokens at twice the input rate is
             // $0.275 of the $0.302, while the 29,592 read tokens are $0.015.
-            "$0.30 · 2 in · 29K cache read · 27K cache write · 488 out · (335 thinking)"
+            "$0.30 · 2 in · 29K cache read · 27K cache write (1h) · 488 out · (335 thinking)"
+        );
+    }
+
+    /// The two lengths are priced differently and expire differently, and the line said
+    /// neither: a reader could not tell what the write had cost, nor how long the next
+    /// answer had to start before it paid for the same thing again.
+    #[test]
+    fn the_cost_line_says_how_long_a_cache_write_lives() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+
+        let five_minutes = Usage {
+            cache_write_5m_tokens: 10_000,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            answer_summary(five_minutes, rates),
+            // 10,000 tokens at a quarter more than the $5 input rate.
+            "$0.06 · 10K cache write (5m) · 10 out"
+        );
+
+        let an_hour = Usage {
+            cache_write_1h_tokens: 10_000,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            answer_summary(an_hour, rates),
+            // The same tokens at twice that rate, which is what the label is for.
+            "$0.10 · 10K cache write (1h) · 10 out"
+        );
+
+        let both = Usage {
+            cache_write_1h_tokens: 10_000,
+            cache_write_5m_tokens: 2_000,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            answer_summary(both, rates),
+            "$0.11 · 10K cache write (1h) · 2000 cache write (5m) · 10 out",
+            "an answer that wrote both is two figures, because they expire at two times"
         );
     }
 
