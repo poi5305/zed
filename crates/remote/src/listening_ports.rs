@@ -479,10 +479,10 @@ mod tests {
     fn test_parse_lsof_output_reads_listening_rows() {
         let contents = "\
 COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
-node      12345 andy   23u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:3000 (LISTEN)
-node      12345 andy   24u  IPv6 0xabcdef1234567890      0t0  TCP [::1]:3000 (LISTEN)
-python3   99999 andy    3u  IPv4 0x000000000000beef      0t0  TCP *:8000 (LISTEN)
-ssh         777 andy    5u  IPv4 0x000000000000cafe      0t0  TCP 127.0.0.1:52000->127.0.0.1:22 (ESTABLISHED)
+node      12345 user   23u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:3000 (LISTEN)
+node      12345 user   24u  IPv6 0xabcdef1234567890      0t0  TCP [::1]:3000 (LISTEN)
+python3   99999 user    3u  IPv4 0x000000000000beef      0t0  TCP *:8000 (LISTEN)
+ssh         777 user    5u  IPv4 0x000000000000cafe      0t0  TCP 127.0.0.1:52000->127.0.0.1:22 (ESTABLISHED)
 ";
 
         assert_eq!(
@@ -511,11 +511,11 @@ ssh         777 andy    5u  IPv4 0x000000000000cafe      0t0  TCP 127.0.0.1:5200
         let contents = "\
 COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 (LISTEN)
-node      12345 andy   23u  IPv4 0x1 0t0  TCP 127.0.0.1:notaport (LISTEN)
-node      12345 andy   23u  IPv4 0x1 0t0  TCP 127.0.0.1:99999 (LISTEN)
-node      12345 andy   23u  IPv4 0x1 0t0  TCP nocolonhere (LISTEN)
+node      12345 user   23u  IPv4 0x1 0t0  TCP 127.0.0.1:notaport (LISTEN)
+node      12345 user   23u  IPv4 0x1 0t0  TCP 127.0.0.1:99999 (LISTEN)
+node      12345 user   23u  IPv4 0x1 0t0  TCP nocolonhere (LISTEN)
 
-node      12345 andy   23u  IPv4 0x1 0t0  TCP 127.0.0.1:4321 (LISTEN)
+node      12345 user   23u  IPv4 0x1 0t0  TCP 127.0.0.1:4321 (LISTEN)
 ";
 
         assert_eq!(

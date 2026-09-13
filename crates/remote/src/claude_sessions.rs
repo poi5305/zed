@@ -2650,7 +2650,7 @@ mod tests {
     }
 
     const SAMPLE_ONE_JSON: &str = r#"{"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
- "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,
+ "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789007244364,
  "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","peerProtocol":1,
  "peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],
  "kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
@@ -2660,7 +2660,7 @@ mod tests {
  "bridgeSessionId":"session_01Tf2BzmxZDH3YKYpdxtSrpD"}"#;
 
     const SAMPLE_TWO_JSON: &str = r#"{"pid":17694,"sessionId":"095bcff6-b9a8-4584-a3c6-861f16c9a807",
- "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789008783382,
+ "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789008783382,
  "procStart":"Thu Sep 10 02:53:02 2026","version":"2.1.267","peerProtocol":1,
  "peerFeatures":["notify_idle"],"kind":"interactive","entrypoint":"cli",
  "pidDomain":"darwin","messagingSocketPath":"/tmp/cc-socks/17694.sock",
@@ -2675,7 +2675,7 @@ mod tests {
         assert_eq!(session.session_id, "4e2e3600-89c0-4cd5-9994-525c708559ab");
         assert_eq!(
             session.working_directory,
-            PathBuf::from("/Users/andy/go/src/github.com/poi5305/zed")
+            PathBuf::from("/Users/user/go/src/github.com/example/zed")
         );
         assert_eq!(session.process_start, "Thu Sep 10 02:27:23 2026");
         assert_eq!(session.version, "2.1.267");
@@ -2702,7 +2702,7 @@ mod tests {
     #[test]
     fn test_parse_with_unknown_fields() -> anyhow::Result<()> {
         let json_with_future_field = r#"{"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
- "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,
+ "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789007244364,
  "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","peerProtocol":1,
  "peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],
  "kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
@@ -2720,7 +2720,7 @@ mod tests {
     #[test]
     fn test_parse_missing_session_id_returns_error() {
         let json_missing_session_id = r#"{"pid":10064,
- "cwd":"/Users/andy/go/src/github.com/poi5305/zed",
+ "cwd":"/Users/user/go/src/github.com/example/zed",
  "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267",
  "kind":"interactive"}"#;
 
@@ -2797,7 +2797,7 @@ mod tests {
 
     #[test]
     fn test_visible_sessions_filters_and_sorts() -> anyhow::Result<()> {
-        let project_root = Path::new("/Users/andy/go/src/github.com/poi5305/zed");
+        let project_root = Path::new("/Users/user/go/src/github.com/example/zed");
 
         let mut session_non_interactive = parse_registered_session(SAMPLE_ONE_JSON)?;
         session_non_interactive.process_id = 1;
@@ -2819,12 +2819,12 @@ mod tests {
         let mut session_other_project_no_name = parse_registered_session(SAMPLE_ONE_JSON)?;
         session_other_project_no_name.process_id = 5;
         session_other_project_no_name.name = None;
-        session_other_project_no_name.working_directory = PathBuf::from("/Users/andy/other");
+        session_other_project_no_name.working_directory = PathBuf::from("/Users/user/other");
 
         let mut session_other_project_zebra = parse_registered_session(SAMPLE_ONE_JSON)?;
         session_other_project_zebra.process_id = 6;
         session_other_project_zebra.name = Some("zebra".to_string());
-        session_other_project_zebra.working_directory = PathBuf::from("/Users/andy/other");
+        session_other_project_zebra.working_directory = PathBuf::from("/Users/user/other");
 
         let sessions = vec![
             session_other_project_zebra,
@@ -2886,7 +2886,7 @@ mod tests {
 
     #[test]
     fn sessions_that_tie_on_name_are_ordered_by_process_id() -> anyhow::Result<()> {
-        let project_root = Path::new("/Users/andy/go/src/github.com/poi5305/zed");
+        let project_root = Path::new("/Users/user/go/src/github.com/example/zed");
 
         let mut same_name_higher_pid = parse_registered_session(SAMPLE_ONE_JSON)?;
         same_name_higher_pid.process_id = 900;
@@ -2901,12 +2901,12 @@ mod tests {
         let mut unnamed_higher_pid = parse_registered_session(SAMPLE_ONE_JSON)?;
         unnamed_higher_pid.process_id = 400;
         unnamed_higher_pid.name = None;
-        unnamed_higher_pid.working_directory = PathBuf::from("/Users/andy/other");
+        unnamed_higher_pid.working_directory = PathBuf::from("/Users/user/other");
 
         let mut unnamed_lower_pid = parse_registered_session(SAMPLE_ONE_JSON)?;
         unnamed_lower_pid.process_id = 300;
         unnamed_lower_pid.name = None;
-        unnamed_lower_pid.working_directory = PathBuf::from("/Users/andy/other");
+        unnamed_lower_pid.working_directory = PathBuf::from("/Users/user/other");
 
         // The order the directory listing happened to hand them over, which is what the
         // ordering must not depend on.

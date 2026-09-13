@@ -621,13 +621,13 @@ mod tests {
         proto::ClaudeSession {
             process_id: 4321,
             session_id: "abc-123".to_string(),
-            working_directory: "/home/andy/project".to_string(),
+            working_directory: "/home/user/project".to_string(),
             version: "2.1.267".to_string(),
             name: Some("alpha".to_string()),
             status: Some("busy".to_string()),
             updated_at: Some(1_759_000_000_000),
             tmux_target: Some("main:@3.%7".to_string()),
-            transcript_path: Some("/home/andy/.claude/projects/p/abc-123.jsonl".to_string()),
+            transcript_path: Some("/home/user/.claude/projects/p/abc-123.jsonl".to_string()),
             context_tokens: 0,
             total_cost_usd: None,
         }
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(summary.session.session_id, "abc-123");
         assert_eq!(
             summary.session.working_directory,
-            PathBuf::from("/home/andy/project")
+            PathBuf::from("/home/user/project")
         );
         assert_eq!(summary.session.version, "2.1.267");
         assert_eq!(summary.session.name.as_deref(), Some("alpha"));
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(summary.session.tmux_target.as_deref(), Some("main:@3.%7"));
         assert_eq!(
             summary.transcript_path,
-            Some(PathBuf::from("/home/andy/.claude/projects/p/abc-123.jsonl"))
+            Some(PathBuf::from("/home/user/.claude/projects/p/abc-123.jsonl"))
         );
 
         // The three fields the wire message does not carry: the far end already
@@ -732,7 +732,7 @@ mod tests {
             model: Some("opus".to_string()),
             workflow_phase: Some("Wave 5".to_string()),
             transcript_path: Some(
-                "/home/andy/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
+                "/home/user/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
                     .to_string(),
             ),
             size: 4096,
@@ -771,7 +771,7 @@ mod tests {
         assert_eq!(
             summary.transcript_path,
             PathBuf::from(
-                "/home/andy/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
+                "/home/user/.claude/projects/p/session/subagents/workflows/wf_b529a29d-562/agent-af090e203ec41bc73.jsonl"
             )
         );
         assert_eq!(summary.size, 4096);
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn tail_progress_crosses_the_wire_field_for_field() {
         let progress = tail_progress_from_proto(proto::TailClaudeTranscriptResponse {
-            path: Some("/home/andy/.claude/projects/p/abc-123.jsonl".to_string()),
+            path: Some("/home/user/.claude/projects/p/abc-123.jsonl".to_string()),
             start_offset: 1024,
             offset: 2048,
             pending: b"{\"type\":\"user\"".to_vec(),
@@ -826,7 +826,7 @@ mod tests {
 
         assert_eq!(
             progress.path,
-            Some(PathBuf::from("/home/andy/.claude/projects/p/abc-123.jsonl"))
+            Some(PathBuf::from("/home/user/.claude/projects/p/abc-123.jsonl"))
         );
         assert_eq!(progress.start_offset, 1024);
         assert_eq!(progress.offset, 2048);

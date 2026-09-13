@@ -1045,16 +1045,16 @@ mod tests {
 
     #[test]
     fn test_connection_label_prefers_the_nickname() {
-        let mut named = connection("example.com", Some("andy"), Some(2222));
+        let mut named = connection("example.com", Some("user"), Some(2222));
         assert_eq!(
             connection_label(&ForwardConnection::Ssh(named.clone())),
-            "andy@example.com:2222"
+            "user@example.com:2222"
         );
 
         named.nickname = Some("  ".to_string());
         assert_eq!(
             connection_label(&ForwardConnection::Ssh(named.clone())),
-            "andy@example.com:2222",
+            "user@example.com:2222",
             "a blank nickname is not a name"
         );
 
@@ -1074,9 +1074,9 @@ mod tests {
     #[test]
     fn test_find_connection_matches_host_username_and_port() {
         let connections = vec![
-            connection("example.com", Some("andy"), Some(2222)),
+            connection("example.com", Some("user"), Some(2222)),
             connection("example.com", Some("root"), Some(2222)),
-            connection("example.com", Some("andy"), None),
+            connection("example.com", Some("user"), None),
         ];
 
         assert_eq!(
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(
             find_connection(
                 &connections,
-                &connection("other.com", Some("andy"), Some(2222)).connection_key()
+                &connection("other.com", Some("user"), Some(2222)).connection_key()
             ),
             None
         );
@@ -1130,7 +1130,7 @@ mod tests {
     fn test_connection_key_is_built_from_every_transport() {
         let ssh = connection_key_for_options(&RemoteConnectionOptions::Ssh(SshConnectionOptions {
             host: "example.com".into(),
-            username: Some("andy".to_string()),
+            username: Some("user".to_string()),
             port: Some(2222),
             ..SshConnectionOptions::default()
         }));
@@ -1138,20 +1138,20 @@ mod tests {
             ssh,
             Some(ConnectionKey::Ssh {
                 host: "example.com".to_string(),
-                username: Some("andy".to_string()),
+                username: Some("user".to_string()),
                 port: Some(2222),
             })
         );
 
         let wsl = connection_key_for_options(&RemoteConnectionOptions::Wsl(WslConnectionOptions {
             distro_name: "Ubuntu".to_string(),
-            user: Some("andy".to_string()),
+            user: Some("user".to_string()),
         }));
         assert_eq!(
             wsl,
             Some(ConnectionKey::Wsl {
                 distro_name: "Ubuntu".to_string(),
-                user: Some("andy".to_string()),
+                user: Some("user".to_string()),
             })
         );
 
@@ -1195,10 +1195,10 @@ mod tests {
         assert_eq!(
             connection_label(&ForwardConnection::Ssh(connection(
                 "example.com",
-                Some("andy"),
+                Some("user"),
                 Some(2222)
             ))),
-            "andy@example.com:2222"
+            "user@example.com:2222"
         );
         assert_eq!(
             connection_label(&ForwardConnection::Wsl(wsl_connection("Ubuntu", None))),
@@ -1207,9 +1207,9 @@ mod tests {
         assert_eq!(
             connection_label(&ForwardConnection::Wsl(wsl_connection(
                 "Ubuntu",
-                Some("andy")
+                Some("user")
             ))),
-            "andy@Ubuntu"
+            "user@Ubuntu"
         );
         assert_eq!(
             connection_label(&ForwardConnection::DevContainer(dev_container_connection(
@@ -1222,12 +1222,12 @@ mod tests {
     #[test]
     fn test_find_connection_locates_entries_in_every_list() {
         let ssh_connections = vec![
-            connection("example.com", Some("andy"), Some(2222)),
+            connection("example.com", Some("user"), Some(2222)),
             connection("other.com", None, None),
         ];
         let wsl_connections = vec![
             wsl_connection("Ubuntu", None),
-            wsl_connection("Ubuntu", Some("andy")),
+            wsl_connection("Ubuntu", Some("user")),
         ];
         let dev_containers = vec![
             dev_container_connection("api", "aaa"),
@@ -1261,7 +1261,7 @@ mod tests {
                 &ssh_connections,
                 &ConnectionKey::Wsl {
                     distro_name: "example.com".to_string(),
-                    user: Some("andy".to_string()),
+                    user: Some("user".to_string()),
                 }
             ),
             None,
@@ -1272,7 +1272,7 @@ mod tests {
     #[test]
     fn test_port_forwards_for_key_mut_routes_to_the_matching_list() {
         let mut remote = RemoteSettingsContent {
-            ssh_connections: Some(vec![connection("example.com", Some("andy"), Some(2222))]),
+            ssh_connections: Some(vec![connection("example.com", Some("user"), Some(2222))]),
             wsl_connections: Some(vec![wsl_connection("Ubuntu", None)]),
             dev_container_connections: Some(vec![dev_container_connection("web", "abc123")]),
             ..RemoteSettingsContent::default()
@@ -1280,7 +1280,7 @@ mod tests {
 
         let ssh_key = ConnectionKey::Ssh {
             host: "example.com".to_string(),
-            username: Some("andy".to_string()),
+            username: Some("user".to_string()),
             port: Some(2222),
         };
         port_forwards_for_key_mut(&mut remote, &ssh_key, None)
@@ -1472,7 +1472,7 @@ mod tests {
     fn test_a_forward_for_a_connection_with_no_entry_writes_one() {
         let mut remote = RemoteSettingsContent::default();
         let key = ConnectionKey::Ssh {
-            host: "coder-vscode.coder.elggum.com--poi5305--andy.main".to_string(),
+            host: "coder-vscode.coder.example.com--user--dev.main".to_string(),
             username: None,
             port: None,
         };
@@ -1527,10 +1527,10 @@ mod tests {
         assert_eq!(
             connection_label_for_key(&ConnectionKey::Ssh {
                 host: "example.com".to_string(),
-                username: Some("andy".to_string()),
+                username: Some("user".to_string()),
                 port: Some(2222),
             }),
-            "andy@example.com:2222"
+            "user@example.com:2222"
         );
         assert_eq!(
             connection_label_for_key(&ConnectionKey::Wsl {

@@ -7558,7 +7558,7 @@ mod tests {
             "a mention already picked is finished, and the space is what finished it"
         );
         assert_eq!(
-            file_being_named("mail andy@creatordb.app"),
+            file_being_named("mail user@example.com"),
             None,
             "an address is not a mention"
         );
@@ -9046,19 +9046,19 @@ mod tests {
     #[test]
     fn a_bash_call_is_drawn_as_the_command_it_runs() {
         let input = json_text(&serde_json::json!({
-            "command": "cd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply",
+            "command": "cd /Users/user/zed && npx ts-node scripts/migrate.ts --apply",
             "description": "Run the migration",
         }));
         let display = tool_input_display(BASH_TOOL_NAME, &input);
 
         assert_eq!(
             display.text.as_ref(),
-            "cd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply",
+            "cd /Users/user/zed && npx ts-node scripts/migrate.ts --apply",
             "the command itself is what the call is"
         );
         assert_eq!(
             display.code_block().as_ref(),
-            "```bash\ncd /Users/andy/zed && npx ts-node scripts/migrate.ts --apply\n```",
+            "```bash\ncd /Users/user/zed && npx ts-node scripts/migrate.ts --apply\n```",
             "a command is handed to the markdown element as shell, not as the JSON around it"
         );
     }
@@ -9791,7 +9791,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn structured_persisted_fields_inline_stdout_and_offer_the_full_output() {
         let output_path = paths::home_dir()
-            .join(".claude/projects/-Users-andy-zed/4e2e3600/tool-results/b7vd9w357.txt");
+            .join(".claude/projects/-Users-user-zed/4e2e3600/tool-results/b7vd9w357.txt");
         let body = tool_result_body(&structured_persisted_result(&output_path));
 
         let ToolResultBody::Persisted(persisted) = &body else {
@@ -9842,12 +9842,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         // and in a sub-agent's.
         let inside: Vec<PathBuf> = vec![
             paths::home_dir()
-                .join(".claude/projects/-Users-andy-zed/4e2e3600/tool-results/b7vd9w357.txt"),
+                .join(".claude/projects/-Users-user-zed/4e2e3600/tool-results/b7vd9w357.txt"),
             paths::home_dir().join(
-                ".claude/projects/-Users-andy-zed/4e2e3600/tool-results/hook-6ffbcaa5-stdout.txt",
+                ".claude/projects/-Users-user-zed/4e2e3600/tool-results/hook-6ffbcaa5-stdout.txt",
             ),
             paths::home_dir().join(
-                ".claude/projects/-Users-andy-zed/4e2e3600/subagents/tool-results/b7vd9w357.txt",
+                ".claude/projects/-Users-user-zed/4e2e3600/subagents/tool-results/b7vd9w357.txt",
             ),
         ];
         let wrongly_refused: Vec<&PathBuf> = inside
@@ -10042,7 +10042,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
 
         let inside = paths::home_dir()
-            .join(".claude/projects/-Users-andy-zed/4e2e3600/tool-results/hook-6ffb-stdout.txt");
+            .join(".claude/projects/-Users-user-zed/4e2e3600/tool-results/hook-6ffb-stdout.txt");
         let ToolResultBody::Persisted(persisted) = tool_result_body(&placeholder_result(&inside))
         else {
             panic!("the placeholder must still be recognized without structured fields");
@@ -10130,7 +10130,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         };
 
         let inside = paths::home_dir()
-            .join(".claude/projects/-Users-andy/0f3b76a8/tool-results/hook-f975cad9-stdout.txt");
+            .join(".claude/projects/-Users-user/0f3b76a8/tool-results/hook-f975cad9-stdout.txt");
         let plain = r#"{"type":"attachment","uuid":"b","attachment":{"type":"environment"},
              "rendered":[{"content":"env text"}]}"#;
         let outside = PathBuf::from("/tmp/tool-results/hook-f975cad9-stdout.txt");
@@ -10360,7 +10360,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     "t1",
                     "Read",
                     serde_json::json!({
-                        "file_path": "/Users/andy/zed/crates/claude_sessions/src/session_store.rs",
+                        "file_path": "/Users/user/zed/crates/claude_sessions/src/session_store.rs",
                     }),
                 ),
             ]),
@@ -11695,4 +11695,5 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             "a fixture with no user messages in it would hold nothing together"
         );
     }
+
 }

@@ -44,7 +44,7 @@ thinking block、結構化 tool result。
     {
       "pid": 10064,
       "sessionId": "4e2e3600-89c0-4cd5-9994-525c708559ab",
-      "cwd": "/Users/andy/go/src/github.com/poi5305/zed",
+      "cwd": "/Users/user/go/src/github.com/example/zed",
       "startedAt": 1789007244364,
       "procStart": "Thu Sep 10 02:27:23 2026",
       "version": "2.1.267",
@@ -525,7 +525,7 @@ A.2 WP1 —— session_registry.rs（純函式）
 輸入：`~/.claude/sessions/<pid>.json` 的檔案內容字串。實測樣本（原文照抄）：
 
     {"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
-     "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,
+     "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789007244364,
      "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","peerProtocol":1,
      "peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],
      "kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
@@ -537,7 +537,7 @@ A.2 WP1 —— session_registry.rs（純函式）
 第二個實測樣本**沒有 `tmux` 欄位**（子 session）：
 
     {"pid":17694,"sessionId":"095bcff6-b9a8-4584-a3c6-861f16c9a807",
-     "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789008783382,
+     "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789008783382,
      "procStart":"Thu Sep 10 02:53:02 2026","version":"2.1.267","peerProtocol":1,
      "peerFeatures":[...],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin",
      "messagingSocketPath":"/tmp/cc-socks/17694.sock","name":"zed-28",
@@ -1226,7 +1226,7 @@ D.3 實機驗收結果
   registrations read: 7      visible sessions: 7      liveness 全部 Live
   transcript 找到 6 / 7
 
-唯一沒有 transcript 的是 `andy-type-50`（`entrypoint: "sdk-ts"`，
+唯一沒有 transcript 的是 `user-type-50`（`entrypoint: "sdk-ts"`，
 SDK 起的 session）——`~/.claude/projects/*/9171f86a-….jsonl` 確認不存在，
 不是 glob 寫錯。這正是正文 §2 步驟 4 要求的「標成 no transcript
 而不是丟掉」的情形。
