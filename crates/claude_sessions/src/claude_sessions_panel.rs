@@ -73,6 +73,12 @@ const LIVE_MESSAGE_MAX_HEIGHT_REMS: f32 = 10.;
 const LIVE_MESSAGE_TAIL_PIXELS: f32 = 8.;
 
 const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
+
+/// The field every record Claude Code writes carries the time in, as RFC 3339 in UTC.
+const TIMESTAMP_FIELD: &str = "timestamp";
+
+/// Hours and minutes on a 24-hour clock, which is what an answer's line has room for.
+const CLOCK_FORMAT: &str = "%H:%M";
 const LOCAL_COMMAND_SUBTYPE: &str = "local_command";
 
 /// Timing the CLI writes for its own use: how long a turn took and how many messages
@@ -297,10 +303,14 @@ fn session_facts(spend: &Spend) -> Vec<SharedString> {
 /// usage read here has already been separated from it, and a session's model changes
 /// rarely enough that the newest one is the right guess for all of them. Nothing is said
 /// at all for a model with no known rates.
-fn answer_cost(usage: Usage, store: &ClaudeSessionStore) -> Option<SharedString> {
+fn answer_cost(
+    usage: Usage,
+    answered_at: Option<&SharedString>,
+    store: &ClaudeSessionStore,
+) -> Option<SharedString> {
     let spend = store.transcript().spend();
     let rates = rates_for_model(spend.model.as_deref()?)?;
-    Some(SharedString::from(answer_summary(usage, rates)))
+    Some(SharedString::from(answer_summary(usage, rates, answered_at)))
 }
 
 /// The line drawn under an answer when the reader has asked what it cost.
@@ -310,8 +320,19 @@ fn answer_cost(usage: Usage, store: &ClaudeSessionStore) -> Option<SharedString>
 /// cache read at a tenth of it — so one combined "in" figure says nothing about where an
 /// answer's money went. Each is left out when it is zero, which keeps the line short on
 /// the answers that only read from the cache.
-fn answer_summary(usage: Usage, rates: ModelRates) -> String {
-    let mut parts = vec![format_usd(usage.cost(rates))];
+fn answer_summary(
+    usage: Usage,
+    rates: ModelRates,
+    answered_at: Option<&SharedString>,
+) -> String {
+    // First, because it is what the rest of the line is dated by: the cache write below
+    // says how long what this answer wrote lives, and that is only an expiry once there
+    // is a time to count it from.
+    let mut parts: Vec<String> = answered_at
+        .map(|answered_at| answered_at.to_string())
+        .into_iter()
+        .collect();
+    parts.push(format_usd(usage.cost(rates)));
 
     if usage.input_tokens > 0 {
         parts.push(format!("{} in", compact_token_count(usage.input_tokens)));
@@ -376,6 +397,24 @@ fn format_usd(amount: f64) -> String {
     } else {
         format!("${amount:.0}")
     }
+}
+
+/// When a record was written, on the reader's own clock.
+///
+/// Claude Code writes the timestamp in UTC, and a reader comparing it against the length
+/// of the cache entry the same answer wrote — five minutes or an hour — is doing that
+/// against the clock on their wall. `None` for a record carrying no timestamp, or one
+/// this cannot read: a wrong time is worse than none, because nothing about it looks
+/// wrong.
+fn answered_at(raw: &Value) -> Option<SharedString> {
+    let written = raw.get(TIMESTAMP_FIELD).and_then(Value::as_str)?;
+    let written = chrono::DateTime::parse_from_rfc3339(written).ok()?;
+    Some(SharedString::from(
+        written
+            .with_timezone(&chrono::Local)
+            .format(CLOCK_FORMAT)
+            .to_string(),
+    ))
 }
 
 /// Token counts as a reader reads them: `535K`, `2.3M`.
@@ -828,6 +867,10 @@ enum EntryKind {
         /// What the answer this message is part of was billed. `None` for the reader's
         /// own messages, which are not billed on their own.
         usage: Option<Usage>,
+        /// When the answer this message is part of was written, as the local clock read
+        /// it. `None` for a record that carries no timestamp, and for the reader's own
+        /// messages.
+        answered_at: Option<SharedString>,
     },
     Thinking {
         source: SharedString,
@@ -4303,6 +4346,7 @@ impl ClaudeSessionsPanel {
                 role,
                 source,
                 usage,
+                answered_at,
             } => {
                 // The recap a compaction writes is the length of the conversation it
                 // replaced, and it arrives at the top of what the reader is about to
@@ -4345,7 +4389,9 @@ impl ClaudeSessionsPanel {
                     .show_costs
                     .then_some(usage)
                     .flatten()
-                    .and_then(|usage| answer_cost(usage, self.store.read(cx)));
+                    .and_then(|usage| {
+                        answer_cost(usage, answered_at.as_ref(), self.store.read(cx))
+                    });
                 v_flex()
                     .w_full()
                     .px_4()
@@ -5561,6 +5607,7 @@ fn user_message_entries(path: &[&TranscriptRecord]) -> Vec<Entry> {
                         role: MessageRole::User,
                         source: prompt,
                         usage: None,
+                        answered_at: None,
                     },
                 });
             }
@@ -6740,6 +6787,7 @@ fn append_record(
                     role: MessageRole::User,
                     source: prompt,
                     usage: None,
+                    answered_at: None,
                 });
                 entries.push(Entry {
                     key: base_key.clone(),
@@ -6923,6 +6971,7 @@ fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
         role,
         source: SharedString::from(source),
         usage: Usage::from_record(&record.raw),
+        answered_at: answered_at(&record.raw),
     })
 }
 
@@ -9071,10 +9120,51 @@ mod tests {
         };
 
         assert_eq!(
-            answer_summary(usage, rates),
+            answer_summary(usage, rates, None),
             // The cache write dominates: 27,456 tokens at twice the input rate is
             // $0.275 of the $0.302, while the 29,592 read tokens are $0.015.
             "$0.30 · 2 in · 29K cache read · 27K cache write (1h) · 488 out · (335 thinking)"
+        );
+    }
+
+    /// A cache write's length is only an expiry once there is a time to count it from,
+    /// and the reader counts from their own clock rather than from UTC.
+    #[test]
+    fn the_cost_line_says_when_the_answer_came_back() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        let usage = Usage {
+            cache_write_1h_tokens: 10_000,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        // Written by Claude Code as RFC 3339 in UTC; read back on whichever clock the
+        // reader is on, which is what makes "(1h)" mean an hour from something.
+        let written = answered_at(&serde_json::json!({
+            "timestamp": "2026-09-13T15:11:12.113Z"
+        }))
+        .expect("a record carrying a timestamp says when it was written");
+
+        let expected_local = chrono::DateTime::parse_from_rfc3339("2026-09-13T15:11:12.113Z")
+            .expect("the fixture parses")
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(written.as_ref(), expected_local);
+
+        assert_eq!(
+            answer_summary(usage, rates, Some(&written)),
+            format!("{expected_local} · $0.10 · 10K cache write (1h) · 10 out"),
+            "the time leads the line, because everything after it is dated by it"
+        );
+    }
+
+    /// A wrong time is worse than none: nothing about one looks wrong.
+    #[test]
+    fn a_record_with_no_readable_timestamp_says_no_time() {
+        assert_eq!(answered_at(&serde_json::json!({})), None);
+        assert_eq!(
+            answered_at(&serde_json::json!({ "timestamp": "not a time" })),
+            None
         );
     }
 
@@ -9091,7 +9181,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            answer_summary(five_minutes, rates),
+            answer_summary(five_minutes, rates, None),
             // 10,000 tokens at a quarter more than the $5 input rate.
             "$0.06 · 10K cache write (5m) · 10 out"
         );
@@ -9102,7 +9192,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            answer_summary(an_hour, rates),
+            answer_summary(an_hour, rates, None),
             // The same tokens at twice that rate, which is what the label is for.
             "$0.10 · 10K cache write (1h) · 10 out"
         );
@@ -9114,7 +9204,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            answer_summary(both, rates),
+            answer_summary(both, rates, None),
             "$0.11 · 10K cache write (1h) · 2000 cache write (5m) · 10 out",
             "an answer that wrote both is two figures, because they expire at two times"
         );
@@ -9131,7 +9221,7 @@ mod tests {
         };
 
         assert_eq!(
-            answer_summary(usage, rates),
+            answer_summary(usage, rates, None),
             "$0.05 · 100K cache read · 50 out",
             "no fresh input, no cache write, and no thinking to report"
         );
