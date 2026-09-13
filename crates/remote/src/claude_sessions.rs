@@ -676,6 +676,7 @@ const SUBAGENT_TRANSCRIPT_SUFFIX: &str = ".jsonl";
 const WORKFLOW_RUN_ID_LABEL: &str = "Run ID:";
 const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
 const WORKFLOW_JOURNAL_RESULT_TYPE: &str = "result";
+const WORKFLOW_JOURNAL_STARTED_TYPE: &str = "started";
 const PENDING_QUESTIONS_DIRECTORY: &str = "pending-questions";
 const QUESTION_HOOK_SCRIPT: &str = "hooks/record-pending-question.sh";
 const QUESTION_HOOK_TOOL: &str = "AskUserQuestion";
@@ -1637,6 +1638,9 @@ pub fn install_question_hook(home_directory: &Path) -> Result<Option<PathBuf>> {
 #[derive(Debug, Default)]
 struct WorkflowJournal {
     returned: HashSet<String>,
+    /// Where each agent's `started` entry sits in the journal, which is the order the run
+    /// actually started them in. Agent ids are hashes, so nothing else recovers it.
+    started_at: HashMap<String, usize>,
 }
 
 impl WorkflowJournal {
@@ -1657,25 +1661,45 @@ impl WorkflowJournal {
         // the last line is regularly half-written, and one unreadable line must not
         // decide the state of every other agent in the run.
         let mut returned = HashSet::default();
+        let mut started_at = HashMap::default();
         for line in contents.lines() {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if entry.get("type").and_then(serde_json::Value::as_str)
-                != Some(WORKFLOW_JOURNAL_RESULT_TYPE)
-            {
+            let Some(agent_id) = entry.get("agentId").and_then(serde_json::Value::as_str) else {
                 continue;
-            }
-            if let Some(agent_id) = entry.get("agentId").and_then(serde_json::Value::as_str) {
-                returned.insert(agent_id.to_string());
+            };
+            match entry.get("type").and_then(serde_json::Value::as_str) {
+                Some(WORKFLOW_JOURNAL_RESULT_TYPE) => {
+                    returned.insert(agent_id.to_string());
+                }
+                // A run that resumes writes a second `started` for an agent it is
+                // replaying, and the first is the one that placed it among the others.
+                Some(WORKFLOW_JOURNAL_STARTED_TYPE) => {
+                    let next_position = started_at.len();
+                    started_at
+                        .entry(agent_id.to_string())
+                        .or_insert(next_position);
+                }
+                _ => continue,
             }
         }
 
-        Some(Self { returned })
+        Some(Self {
+            returned,
+            started_at,
+        })
     }
 
     fn has_returned(&self, agent_id: &str) -> bool {
         self.returned.contains(agent_id)
+    }
+
+    /// Where the run started this agent, or `None` for one the journal does not name yet —
+    /// its sidecar is written before the journal records it starting, so this is the
+    /// ordinary state of an agent in the moments after it is spawned.
+    fn started_at(&self, agent_id: &str) -> Option<usize> {
+        self.started_at.get(agent_id).copied()
     }
 }
 
@@ -1694,10 +1718,102 @@ pub async fn list_subagents(
         // means it has spawned no subagents rather than that the scan failed.
         return Ok(Vec::new());
     };
-    let subagents_directory = session_directory.join(SUBAGENTS_DIRECTORY);
-
     let mut subagents = Vec::new();
-    read_subagents_in(&subagents_directory, None, &mut subagents)?;
+    read_subagents_for_session(&session_directory, &mut subagents)?;
+    sort_subagents(&mut subagents);
+
+    Ok(subagents)
+}
+
+/// The subagents of several sessions at once, keyed by session id.
+///
+/// Walks `<home>/.claude/projects` once and matches directory names against the ids
+/// asked for, rather than calling [`list_subagents`] per session: that function searches
+/// the whole projects directory for each id, which the panel's poll would repeat for
+/// every session on screen every second.
+///
+/// Every id asked for is present in the result, mapping to an empty list when that
+/// session has no directory or no agents, so a caller never has to tell "scanned and
+/// found none" from "not scanned".
+pub async fn list_subagents_for_sessions(
+    home_directory: &Path,
+    session_ids: &[String],
+) -> Result<HashMap<String, Vec<SubagentSummary>>> {
+    let mut subagents_by_session: HashMap<String, Vec<SubagentSummary>> = session_ids
+        .iter()
+        .cloned()
+        .map(|session_id| (session_id, Vec::new()))
+        .collect();
+    let requested_session_ids: HashSet<&str> = session_ids
+        .iter()
+        .filter_map(|session_id| single_path_component(session_id))
+        .collect();
+    if requested_session_ids.is_empty() {
+        return Ok(subagents_by_session);
+    }
+
+    let projects_directory = home_directory.join(".claude").join("projects");
+    let project_entries = match fs::read_dir(&projects_directory) {
+        Ok(project_entries) => project_entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(subagents_by_session);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", projects_directory.display()));
+        }
+    };
+
+    for project_entry in project_entries {
+        let Some(project_entry) = project_entry.log_err() else {
+            continue;
+        };
+        let project_directory = project_entry.path();
+        if !project_directory.is_dir() {
+            continue;
+        }
+        // One project directory that cannot be read must not hide the sessions every
+        // other project holds, so the failure is logged and that project alone is skipped.
+        let Some(session_entries) = fs::read_dir(&project_directory)
+            .with_context(|| format!("reading {}", project_directory.display()))
+            .log_err()
+        else {
+            continue;
+        };
+        for session_entry in session_entries {
+            let Some(session_entry) = session_entry.log_err() else {
+                continue;
+            };
+            if !session_entry.path().is_dir() {
+                continue;
+            }
+            let Ok(session_id) = session_entry.file_name().into_string() else {
+                continue;
+            };
+            if !requested_session_ids.contains(session_id.as_str()) {
+                continue;
+            }
+            if let Some(subagents) = subagents_by_session.get_mut(&session_id) {
+                // Same isolation as an unreadable project directory: one session whose
+                // `subagents` path cannot be listed must not hide every other session
+                // this walk already found, or has yet to find.
+                read_subagents_for_session(&session_entry.path(), subagents).log_err();
+            }
+        }
+    }
+
+    for subagents in subagents_by_session.values_mut() {
+        sort_subagents(subagents);
+    }
+
+    Ok(subagents_by_session)
+}
+
+fn read_subagents_for_session(
+    session_directory: &Path,
+    subagents: &mut Vec<SubagentSummary>,
+) -> Result<()> {
+    let subagents_directory = session_directory.join(SUBAGENTS_DIRECTORY);
+    read_subagents_in(&subagents_directory, None, subagents)?;
 
     let workflows_directory = subagents_directory.join(WORKFLOWS_DIRECTORY);
     match fs::read_dir(&workflows_directory) {
@@ -1720,7 +1836,7 @@ pub async fn list_subagents(
                 read_subagents_in(
                     &directory_entry.path(),
                     Some(workflow_run_id),
-                    &mut subagents,
+                    subagents,
                 )?;
             }
         }
@@ -1733,11 +1849,17 @@ pub async fn list_subagents(
         }
     }
 
-    subagents.sort_by(|left, right| {
-        (&left.workflow_run_id, &left.agent_id).cmp(&(&right.workflow_run_id, &right.agent_id))
-    });
+    Ok(())
+}
 
-    Ok(subagents)
+/// Gathers each run's agents together without disturbing the order they were read in.
+///
+/// Only the run id is compared: `sort_by` is stable, so the order [`read_subagents_in`]
+/// left each group in — the journal's for a run, the agent id's for the session's own
+/// agents — survives. Sorting by agent id here as well would undo it, and an agent id is
+/// a hash that says nothing about when its agent started.
+fn sort_subagents(subagents: &mut [SubagentSummary]) {
+    subagents.sort_by(|left, right| left.workflow_run_id.cmp(&right.workflow_run_id));
 }
 
 /// Appends every subagent whose meta sidecar sits directly in `directory`.
@@ -1763,6 +1885,9 @@ fn read_subagents_in(
     // One journal answers for every agent in the run, so it is read once here rather than
     // once per agent. Only a run directory has one.
     let journal = workflow_run_id.and_then(|_| WorkflowJournal::read(directory));
+    // What this call appends is ordered on its own at the end: the caller passes the same
+    // vector for every run, and one run's order is no business of another's.
+    let appended_from = subagents.len();
 
     for directory_entry in directory_entries {
         let Some(directory_entry) = directory_entry.log_err() else {
@@ -1818,6 +1943,26 @@ fn read_subagents_in(
                 .map(|journal| journal.has_returned(agent_id)),
         });
     }
+
+    // Directory enumeration is in no particular order, so what this call appended is put
+    // in one before it is handed back. A run is ordered by its journal, because that is
+    // the order the reader watched the agents start in and the only record of it; an
+    // agent the journal does not name yet goes after the ones it does, by id so that two
+    // such agents do not swap places between polls. A session's own agents have no
+    // journal, so the id is all there is to order them by.
+    subagents[appended_from..].sort_by(|left, right| {
+        let position_of = |summary: &SubagentSummary| {
+            journal
+                .as_ref()
+                .and_then(|journal| journal.started_at(&summary.agent_id))
+        };
+        match (position_of(left), position_of(right)) {
+            (Some(left_position), Some(right_position)) => left_position.cmp(&right_position),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.agent_id.cmp(&right.agent_id),
+        }
+    });
 
     Ok(())
 }
@@ -3804,10 +3949,30 @@ mod tests {
         meta_contents: &str,
         transcript_contents: &str,
     ) -> PathBuf {
+        write_subagent_in_project(
+            home_directory,
+            "-some-slug",
+            session_id,
+            workflow_run_id,
+            agent_id,
+            meta_contents,
+            transcript_contents,
+        )
+    }
+
+    fn write_subagent_in_project(
+        home_directory: &Path,
+        project_directory: &str,
+        session_id: &str,
+        workflow_run_id: Option<&str>,
+        agent_id: &str,
+        meta_contents: &str,
+        transcript_contents: &str,
+    ) -> PathBuf {
         let mut directory = home_directory
             .join(".claude")
             .join("projects")
-            .join("-some-slug")
+            .join(project_directory)
             .join(session_id)
             .join("subagents");
         if let Some(workflow_run_id) = workflow_run_id {
@@ -4995,6 +5160,230 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn list_subagents_for_sessions_reads_each_session_across_projects() -> Result<()> {
+        let home_directory = temporary_directory("subagent-listing-many-sessions");
+        let plain_session_id = "plain-session";
+        let workflow_session_id = "workflow-session";
+        let empty_session_id = "empty-session";
+        let missing_session_id = "missing-session";
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        let plain_transcript = write_subagent_in_project(
+            &home_directory,
+            "-first-project",
+            plain_session_id,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            transcript_contents,
+        );
+        let workflow_transcript = write_subagent_in_project(
+            &home_directory,
+            "-second-project",
+            workflow_session_id,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_file(
+            workflow_transcript.with_file_name(WORKFLOW_JOURNAL_FILE),
+            "{\"type\":\"result\",\"agentId\":\"a1111e203ec41bc73\"}\n",
+        );
+        std::fs::create_dir_all(
+            home_directory
+                .join(".claude")
+                .join("projects")
+                .join("-third-project")
+                .join(empty_session_id),
+        )?;
+
+        let session_ids = vec![
+            plain_session_id.to_string(),
+            workflow_session_id.to_string(),
+            empty_session_id.to_string(),
+            missing_session_id.to_string(),
+        ];
+        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &session_ids,
+        ))?;
+
+        assert_eq!(subagents_by_session.len(), session_ids.len());
+        let plain_subagents = subagents_by_session
+            .get(plain_session_id)
+            .context("the plain session has a result entry")?;
+        assert_eq!(plain_subagents.len(), 1);
+        assert_eq!(plain_subagents[0].agent_id, REAL_AGENT_ID);
+        assert_eq!(plain_subagents[0].transcript_path, plain_transcript);
+
+        let workflow_subagents = subagents_by_session
+            .get(workflow_session_id)
+            .context("the workflow session has a result entry")?;
+        assert_eq!(workflow_subagents.len(), 1);
+        assert_eq!(workflow_subagents[0].workflow_run_id.as_deref(), Some(REAL_WORKFLOW_RUN_ID));
+        assert_eq!(workflow_subagents[0].transcript_path, workflow_transcript);
+        assert_eq!(workflow_subagents[0].workflow_agent_finished, Some(true));
+
+        assert!(
+            subagents_by_session
+                .get(empty_session_id)
+                .context("the session without a subagents directory has a result entry")?
+                .is_empty()
+        );
+        assert!(
+            subagents_by_session
+                .get(missing_session_id)
+                .context("the session without a directory has a result entry")?
+                .is_empty()
+        );
+
+        Ok(())
+    }
+
+    /// One session whose `subagents` path cannot be read must not hide the agents every
+    /// other session holds: the panel draws them all from this one scan, and a
+    /// `subagents` path that is not a directory is a property of that session alone.
+    #[test]
+    fn list_subagents_for_sessions_keeps_other_sessions_when_one_cannot_be_read() -> Result<()> {
+        let home_directory = temporary_directory("subagent-listing-one-blocked");
+        let readable_session_id = "readable-session";
+        let blocked_session_id = "blocked-session";
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        write_subagent_in_project(
+            &home_directory,
+            "-readable-project",
+            readable_session_id,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            transcript_contents,
+        );
+
+        let blocked_session_directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-blocked-project")
+            .join(blocked_session_id);
+        std::fs::create_dir_all(&blocked_session_directory)?;
+        // Not a directory: `read_dir` fails with something other than NotFound, which is
+        // the class of error the scan used to return for the whole map.
+        std::fs::write(blocked_session_directory.join("subagents"), "not a directory")?;
+
+        let session_ids = vec![
+            readable_session_id.to_string(),
+            blocked_session_id.to_string(),
+        ];
+        let result = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &session_ids,
+        ));
+        let subagents_by_session = match result {
+            Ok(subagents_by_session) => subagents_by_session,
+            Err(error) => panic!(
+                "expected Ok so the readable session is still listed, got Err({error:#})"
+            ),
+        };
+
+        let readable_agent_ids: Vec<&str> = subagents_by_session
+            .get(readable_session_id)
+            .map(|subagents| {
+                subagents
+                    .iter()
+                    .map(|subagent| subagent.agent_id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            readable_agent_ids,
+            vec![REAL_AGENT_ID],
+            "the readable session's agent must still be listed, got {readable_agent_ids:?}; \
+             keys were {:?}",
+            subagents_by_session.keys().collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            subagents_by_session
+                .get(blocked_session_id)
+                .map(Vec::len),
+            Some(0),
+            "the blocked session stays a key mapping to no agents, got {:?}",
+            subagents_by_session.get(blocked_session_id)
+        );
+
+        Ok(())
+    }
+
+    /// Session ids as Claude Code writes them are a UUID, which is one path component.
+    /// The filter that rejects `..` and separators must not drop those, and a rejected
+    /// id must still appear in the result as an empty list rather than failing the scan.
+    #[test]
+    fn list_subagents_for_sessions_accepts_a_uuid_and_keeps_rejected_ids_empty() -> Result<()> {
+        let home_directory = temporary_directory("subagent-listing-id-filter");
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+
+        let mut session_ids = vec![REAL_SESSION_ID.to_string()];
+        session_ids.extend(
+            IDS_THAT_NAME_MORE_THAN_ONE_ENTRY
+                .iter()
+                .map(|session_id| (*session_id).to_string()),
+        );
+
+        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &session_ids,
+        ))
+        .unwrap_or_else(|error| {
+            panic!(
+                "a mix of a real session id and rejected ids must be Ok, got Err({error:#})"
+            )
+        });
+
+        assert_eq!(
+            subagents_by_session.len(),
+            session_ids.len(),
+            "every asked-for id must be a key, got {:?}",
+            subagents_by_session.keys().collect::<Vec<_>>()
+        );
+
+        let listed_agent_ids: Vec<&str> = subagents_by_session
+            .get(REAL_SESSION_ID)
+            .map(|subagents| {
+                subagents
+                    .iter()
+                    .map(|subagent| subagent.agent_id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            listed_agent_ids,
+            vec![REAL_AGENT_ID],
+            "the real UUID session id must be scanned, not dropped as an unsafe path; \
+             got {listed_agent_ids:?}"
+        );
+
+        for rejected_id in IDS_THAT_NAME_MORE_THAN_ONE_ENTRY {
+            assert_eq!(
+                subagents_by_session.get(rejected_id).map(Vec::len),
+                Some(0),
+                "{rejected_id:?} must remain an empty entry rather than being joined onto \
+                 a path, got {:?}",
+                subagents_by_session.get(rejected_id)
+            );
+        }
+
+        Ok(())
+    }
+
     /// A transcript that has not been flushed yet must not drop the agent from the
     /// listing, because its sidecar is written first and the panel has to show the agent
     /// as soon as it exists.
@@ -5316,6 +5705,71 @@ mod tests {
         );
         assert_eq!(third.lines, vec!["{\"uuid\":\"agent-9\"}".to_string()]);
 
+        Ok(())
+    }
+
+    /// Captured from a real `parallel()` run: three agents in one phase, then one in
+    /// another. Their ids sort into a different order than they started in, which is what
+    /// makes the journal the only record of the order a reader should see them in.
+    #[test]
+    fn a_runs_agents_are_listed_in_the_order_the_journal_started_them() -> Result<()> {
+        let home_directory = temporary_directory("subagent-journal-order");
+        let session_id = "parallel-session";
+        let workflow_run_id = "wf_145c9932-8c7";
+        let started_in_order = ["a9f5821990bd75881", "ae82337df519e5f65", "a687e098981ffb2e2"];
+
+        for (agent_id, phase) in started_in_order
+            .iter()
+            .map(|agent_id| (*agent_id, "Fan out"))
+            .chain([("ae7502cee18bbe2b4", "Collect")])
+        {
+            write_subagent(
+                &home_directory,
+                session_id,
+                Some(workflow_run_id),
+                agent_id,
+                &format!(
+                    r#"{{"agentType":"workflow-subagent","description":"{agent_id}","workflowPhase":"{phase}"}}"#
+                ),
+                "",
+            );
+        }
+
+        let run_directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-some-slug")
+            .join(session_id)
+            .join("subagents")
+            .join("workflows")
+            .join(workflow_run_id);
+        let mut journal = String::from("{\"type\":\"launched\"}\n");
+        for agent_id in started_in_order
+            .iter()
+            .chain(["ae7502cee18bbe2b4"].iter())
+        {
+            journal.push_str(&format!(
+                "{{\"type\":\"started\",\"agentId\":\"{agent_id}\",\"phase\":\"Fan out\"}}\n"
+            ));
+        }
+        std::fs::write(run_directory.join("journal.jsonl"), journal)?;
+
+        let listed = smol::block_on(list_subagents(&home_directory, session_id))?;
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|summary| summary.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "a9f5821990bd75881",
+                "ae82337df519e5f65",
+                "a687e098981ffb2e2",
+                "ae7502cee18bbe2b4",
+            ],
+            "the journal started them alpha, beta, gamma, collect; sorting by agent id \
+             would put gamma first and collect third"
+        );
         Ok(())
     }
 }
@@ -5690,4 +6144,5 @@ mod pane_key_tests {
             );
         }
     }
+
 }
