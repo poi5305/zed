@@ -84,10 +84,14 @@ pub struct ClaudeSessionStore {
     /// rather than being looked for here.
     transcript_paths: HashMap<u32, PathBuf>,
     selected_process_id: Option<u32>,
-    /// The subagent conversations of the selected session, as the last scan of it found
-    /// them. Empty while nothing is selected: only the selected session is scanned, so
-    /// there is nothing to report about the others.
-    subagents: Vec<SubagentSummary>,
+    /// The subagent conversations of every listed session, as the last scan found them,
+    /// keyed by session id. Every session is scanned rather than only the selected one,
+    /// because the list draws each session's agents under it.
+    ///
+    /// Keyed by session rather than held as one list so that switching sessions shows the
+    /// agents of the one switched to straight away, and so that an agent id is only ever
+    /// read back under the session whose directory it names.
+    subagents_by_session: HashMap<String, Vec<SubagentSummary>>,
     transcript_target: TranscriptTarget,
     /// The `sessionId` both conversations are read under, or `None` while no session is
     /// selected — which is what keeps an unselected session from being read at all. It
@@ -182,7 +186,7 @@ impl ClaudeSessionStore {
             transcript_paths: HashMap::default(),
             session_spend: HashMap::default(),
             selected_process_id: None,
-            subagents: Vec::new(),
+            subagents_by_session: HashMap::default(),
             transcript_target: TranscriptTarget::Main,
             followed_session_id: None,
             main_conversation: FollowedConversation::new(Transcript::new(), 0),
@@ -245,7 +249,19 @@ impl ClaudeSessionStore {
     /// The subagent conversations of the selected session, ordered as the scan found
     /// them: by run id and then agent id, so rows do not move between polls.
     pub fn subagents(&self) -> &[SubagentSummary] {
-        &self.subagents
+        match self.selected_session() {
+            Some(session) => self.subagents_of(&session.session_id),
+            None => &[],
+        }
+    }
+
+    /// The same for any listed session, which is what lets the list draw the agents of a
+    /// session the reader has not selected. Empty for a session the last scan found none
+    /// for, and for one it did not cover.
+    pub fn subagents_of(&self, session_id: &str) -> &[SubagentSummary] {
+        self.subagents_by_session
+            .get(session_id)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn transcript_target(&self) -> &TranscriptTarget {
@@ -439,19 +455,22 @@ impl ClaudeSessionStore {
                     break;
                 }
 
-                // Only the selected session's agents are looked for. Listing them costs a
-                // walk of that session's directory, and no other session's agents are on
-                // screen to be worth one.
-                let Ok(session_id) = this.read_with(cx, |this, _| this.selected_session_id())
-                else {
+                // Every listed session's agents are looked for, because the list draws
+                // them under each session rather than only under the selected one. One
+                // call rather than one per session: the scan walks the projects directory
+                // once and matches every id against it.
+                let Ok(session_ids) = this.read_with(cx, |this, _| {
+                    this.sessions
+                        .iter()
+                        .map(|session| session.session_id.clone())
+                        .collect::<Vec<_>>()
+                }) else {
                     break;
                 };
-                if let Some(session_id) = session_id {
-                    let subagents = source.list_subagents(session_id.clone()).await;
+                if !session_ids.is_empty() {
+                    let subagents = source.list_subagents_for_sessions(session_ids).await;
                     if this
-                        .update(cx, |this, cx| {
-                            this.apply_subagent_scan(&session_id, subagents, cx)
-                        })
+                        .update(cx, |this, cx| this.apply_subagent_scan(subagents, cx))
                         .is_err()
                     {
                         break;
@@ -741,16 +760,9 @@ impl ClaudeSessionStore {
 
     fn apply_subagent_scan(
         &mut self,
-        session_id: &str,
-        scan: Result<Vec<SubagentSummary>>,
+        scan: Result<HashMap<String, Vec<SubagentSummary>>>,
         cx: &mut Context<Self>,
     ) {
-        // The selection can move while the scan is in flight, and the agents of the
-        // session that was left are not the ones to show for the one selected now.
-        if self.selected_session_id().as_deref() != Some(session_id) {
-            return;
-        }
-
         let subagents = match scan {
             Ok(subagents) => subagents,
             Err(error) => {
@@ -765,10 +777,10 @@ impl ClaudeSessionStore {
             }
         };
 
-        // The scan runs every second whether or not the session spawned anything, so the
-        // view is only marked dirty when this one actually changed the list.
-        if self.subagents != subagents {
-            self.subagents = subagents;
+        // The scan runs every second whether or not any session spawned anything, so the
+        // view is only marked dirty when this one actually changed what is listed.
+        if self.subagents_by_session != subagents {
+            self.subagents_by_session = subagents;
             cx.notify();
         }
     }
@@ -776,13 +788,12 @@ impl ClaudeSessionStore {
     /// Starts over on the session's own conversation, dropping what was known about
     /// another one.
     ///
-    /// Every reason reading is rebuilt from outside a deliberate switch of target — the
-    /// user selecting another session, `/clear` giving this pid a new conversation, the
-    /// selected session disappearing — invalidates the subagents as well: their ids name
-    /// files under a session directory that is no longer the one being read.
+    /// The agent conversation being followed goes with it: its ids name files under a
+    /// session directory that is no longer the one being read. What the scan found is
+    /// keyed by session and so stays — the session switched away from still has the
+    /// agents it had, and the one switched to can draw its own without waiting a poll.
     fn follow_this_sessions_main_conversation(&mut self) {
         self.transcript_target = TranscriptTarget::Main;
-        self.subagents.clear();
         self.subagent_conversation = None;
         self.pane_contents = None;
         self.recorded_question = None;
@@ -904,6 +915,7 @@ mod tests {
     use crate::{
         session_registry::{
             HEARTBEAT_CUTOFF_MILLIS, SessionSummary, find_transcript, list_subagents,
+            list_subagents_for_sessions,
             normalize_whitespace, now_millis, read_registrations, read_subagent_transcript_tail,
             read_transcript_tail, visible_sessions,
         },
@@ -1079,6 +1091,16 @@ mod tests {
             Task::ready(smol::block_on(list_subagents(
                 &self.home_directory,
                 &session_id,
+            )))
+        }
+
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
+            Task::ready(smol::block_on(list_subagents_for_sessions(
+                &self.home_directory,
+                &session_ids,
             )))
         }
 

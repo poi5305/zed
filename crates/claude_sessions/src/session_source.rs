@@ -16,8 +16,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use collections::HashMap;
 use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
+use util::ResultExt as _;
 
 use crate::session_registry::{
     self, PaneKey, PendingQuestion, Question, QuestionOption, RegisteredSession, SessionSummary,
@@ -73,6 +75,20 @@ pub trait SessionSource: Send + Sync + 'static {
 
     /// Every subagent conversation the session has spawned.
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>>;
+
+    /// The same, for every listed session at once, keyed by session id.
+    ///
+    /// Separate from [`Self::list_subagents`] rather than a loop over it, because the
+    /// panel draws the agents of every session it lists: locating one session's directory
+    /// means searching the whole projects directory, and repeating that per session on
+    /// every poll is the cost this avoids.
+    ///
+    /// Every id asked for appears in the result, mapping to an empty list when that
+    /// session has spawned nothing, so a caller never has to tell "none" from "unknown".
+    fn list_subagents_for_sessions(
+        &self,
+        session_ids: Vec<String>,
+    ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>>;
 
     /// The question the session is waiting on, and whether the machine it runs on records
     /// questions at all. A question that is waiting is written nowhere the conversation
@@ -160,6 +176,16 @@ impl SessionSource for LocalSource {
         let home_directory = self.home_directory.clone();
         self.executor.spawn(async move {
             session_registry::list_subagents(&home_directory, &session_id).await
+        })
+    }
+
+    fn list_subagents_for_sessions(
+        &self,
+        session_ids: Vec<String>,
+    ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            session_registry::list_subagents_for_sessions(&home_directory, &session_ids).await
         })
     }
 
@@ -303,6 +329,46 @@ impl SessionSource for RemoteSource {
                 .into_iter()
                 .map(subagent_summary_from_proto)
                 .collect())
+        })
+    }
+
+    /// One request per session rather than one that names them all: the far end already
+    /// answers [`proto::ListClaudeSubagents`], and the scan this saves is the local one
+    /// over the projects directory, which the remote machine does per request anyway.
+    /// The requests are all issued before any is awaited, so they are in flight together.
+    fn list_subagents_for_sessions(
+        &self,
+        session_ids: Vec<String>,
+    ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
+        let requests = session_ids
+            .into_iter()
+            .map(|session_id| {
+                let request = self.client.request(proto::ListClaudeSubagents {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    session_id: session_id.clone(),
+                });
+                (session_id, request)
+            })
+            .collect::<Vec<_>>();
+
+        self.executor.spawn(async move {
+            let mut subagents_by_session = HashMap::default();
+            for (session_id, request) in requests {
+                // One session the far end cannot list must not hide every other
+                // session's agents: the dock draws them all, and an empty list for the
+                // one that failed is the same answer the local scan gives for a
+                // directory it could not read.
+                let subagents = match request.await.log_err() {
+                    Some(response) => response
+                        .subagents
+                        .into_iter()
+                        .map(subagent_summary_from_proto)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                subagents_by_session.insert(session_id, subagents);
+            }
+            Ok(subagents_by_session)
         })
     }
 

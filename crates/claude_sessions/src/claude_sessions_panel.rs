@@ -169,6 +169,10 @@ const WORKFLOW_TOOL_NAME: &str = "Workflow";
 /// whole chip.
 const AGENT_ID_CHIP_CHARACTERS: usize = 6;
 
+/// What every workflow run id starts with, dropped from a heading because every run in
+/// the list carries it and none of it tells two runs apart.
+const WORKFLOW_RUN_ID_PREFIX: &str = "wf_";
+
 const MAIN_CONVERSATION_CHIP: &str = "Main";
 const AGENT_READ_ONLY_NOTE: &str =
     "This is an agent's conversation, and can only be read. Switch to Main to reply.";
@@ -2546,10 +2550,66 @@ impl ClaudeSessionsPanel {
                         })
                         .children(sessions.iter().enumerate().map(|(index, session)| {
                             let is_selected = selected_process_id == Some(session.process_id);
-                            self.render_session_row(index, session, is_selected, cx)
+                            v_flex()
+                                .child(self.render_session_row(index, session, is_selected, cx))
+                                .children(self.render_session_agent_rows(session, cx))
                         })),
                 )
             })
+    }
+
+    /// The agents one listed session has spawned, drawn under its row so that a session
+    /// the reader has not opened still says what it is running. Opening one opens it as a
+    /// tab of that session's own, which is the only way to read two sessions' agents at
+    /// once.
+    ///
+    /// The summaries are taken before any element is built: reading the store borrows the
+    /// context that the click handlers need to be registered against.
+    fn render_session_agent_rows(
+        &self,
+        session: &RegisteredSession,
+        cx: &mut Context<Self>,
+    ) -> Vec<ListItem> {
+        let process_id = session.process_id;
+        let rows = session_agent_rows(self.store.read(cx).subagents_of(&session.session_id));
+
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| match row {
+                SessionAgentRow::WorkflowRun { label, note } => {
+                    ListItem::new(SharedString::from(format!(
+                        "claude-session-run-{process_id}-{index}"
+                    )))
+                    .spacing(ListItemSpacing::Sparse)
+                    .indent_level(1)
+                    .start_slot(
+                        Icon::new(IconName::ListTree)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(agent_row_body(label, Some(note), Color::Default))
+                }
+                SessionAgentRow::Agent {
+                    label,
+                    note,
+                    indent_level,
+                    target,
+                } => ListItem::new(SharedString::from(format!(
+                    "claude-session-agent-{process_id}-{index}"
+                )))
+                .spacing(ListItemSpacing::Sparse)
+                .indent_level(indent_level)
+                .start_slot(
+                    Icon::new(IconName::Thread)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.reveal_in_pane(Some(process_id), target.clone(), window, cx)
+                }))
+                .child(agent_row_body(label, note, Color::Muted)),
+            })
+            .collect()
     }
 
     fn render_session_row(
@@ -2892,24 +2952,22 @@ impl ClaudeSessionsPanel {
                         }),
                     )
                     // A run of several agents is worth watching beside the conversation
-                    // that started it, rather than in place of it.
-                    .when(!self.in_pane, |this| {
-                        this.child(
-                            IconButton::new(
-                                SharedString::from(format!(
-                                    "claude-session-open-agent-tab-{key}-{index}"
-                                )),
-                                IconName::ArrowUpRight,
-                            )
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Read this agent in a tab of its own"))
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.open_agent_in_pane(target.clone(), window, cx)
-                                },
+                    // that started it, rather than in place of it. Offered from a tab as
+                    // well as from the dock: a tab reading one agent is what the reader
+                    // opens the next one from.
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!(
+                                "claude-session-open-agent-tab-{key}-{index}"
                             )),
+                            IconName::ArrowUpRight,
                         )
-                    }),
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Read this agent in a tab of its own"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_agent_in_pane(target.clone(), window, cx)
+                        })),
+                    ),
             )
             .into_any_element()
     }
@@ -4249,8 +4307,30 @@ impl ClaudeSessionsPanel {
                         ),
                     );
                 }
-                for (card_index, card) in cards.into_iter().enumerate() {
-                    element = element.child(self.render_agent_card(&key, card_index, card, cx));
+                // A `Workflow` call can spawn any number of agents across several phases,
+                // and flattened they are a list of labels with nothing saying which part
+                // of the run each belongs to. Grouped, the phase is said once as a
+                // heading and the cards under it carry only their own state.
+                let is_workflow_call = self
+                    .agent_calls
+                    .get(&key)
+                    .is_some_and(|call| call.is_workflow);
+                let mut card_index = 0;
+                for (phase, cards_of_phase) in group_cards_by_phase(cards, is_workflow_call) {
+                    if let Some(phase) = phase {
+                        element = element.child(
+                            div().w_full().px_2().pb_0p5().child(
+                                Label::new(phase_heading(&phase, &cards_of_phase))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        );
+                    }
+                    for card in cards_of_phase {
+                        element =
+                            element.child(self.render_agent_card(&key, card_index, card, cx));
+                        card_index += 1;
+                    }
                 }
                 element.into_any_element()
             }
@@ -5802,6 +5882,204 @@ fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> Ag
     // Neither id, so nothing in the conversation pairs with this agent at all. A chip
     // that pulses for the rest of the session is worse than one that never pulses.
     AgentState::Finished
+}
+
+/// A run's cards split into the phases they belong to, in the order the phases first
+/// appear, with the phase taken off each card because the heading above it now says it.
+///
+/// `None` as a group's phase means the cards under it name no phase, which is every card
+/// of an `Agent` call and any agent of a run that recorded none: those are drawn without
+/// a heading, exactly as they were before runs were grouped.
+fn group_cards_by_phase(
+    cards: Vec<AgentCardRow>,
+    is_workflow_call: bool,
+) -> Vec<(Option<SharedString>, Vec<AgentCardRow>)> {
+    let mut groups: Vec<(Option<SharedString>, Vec<AgentCardRow>)> = Vec::new();
+
+    for mut card in cards {
+        // An `Agent` call spawns the one agent its card already accounts for, so its
+        // cards are never grouped and keep whatever their own card says.
+        let phase = if is_workflow_call { card.phase.take() } else { None };
+        // Matched against every group rather than only the one last opened: a phase that
+        // ran several agents at once has as many cards, and a later phase's card can sit
+        // between two of them, which merging only neighbours would draw as the same phase
+        // appearing twice.
+        match groups
+            .iter_mut()
+            .find(|(grouped_phase, _)| *grouped_phase == phase)
+        {
+            Some((_, cards_of_phase)) => cards_of_phase.push(card),
+            None => groups.push((phase, vec![card])),
+        }
+    }
+
+    groups
+}
+
+/// What a phase heading says: the phase, and how many of its agents have returned.
+fn phase_heading(phase: &SharedString, cards_of_phase: &[AgentCardRow]) -> SharedString {
+    let finished = cards_of_phase
+        .iter()
+        .filter(|card| card.state == AgentState::Finished)
+        .count();
+    SharedString::from(format!(
+        "{phase} · {finished}/{} done",
+        cards_of_phase.len()
+    ))
+}
+
+/// One line of the agent list drawn under a session's row.
+///
+/// A workflow run is a heading rather than something to open: the run itself has no
+/// conversation of its own, only the agents it spawned, so it carries no target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionAgentRow {
+    WorkflowRun {
+        label: SharedString,
+        note: SharedString,
+    },
+    Agent {
+        label: SharedString,
+        note: Option<SharedString>,
+        /// One deeper for an agent belonging to a run, so that the run's heading reads as
+        /// the thing its agents sit under.
+        indent_level: usize,
+        target: TranscriptTarget,
+    },
+}
+
+/// The agent list of one session: the agents it spawned itself, then each workflow run it
+/// started as a heading with that run's agents under it.
+///
+/// A run is drawn as a group rather than as more rows in one flat list because a single
+/// `Workflow` call can spawn any number of agents, and flattened among a session's own
+/// agents there is nothing to say which run an agent came from — only an opaque run id
+/// repeated on every row.
+///
+/// The order within a group is the order the scan produced (by agent id), which is stable
+/// across polls so that rows do not move while a reader is looking at them.
+fn session_agent_rows(subagents: &[SubagentSummary]) -> Vec<SessionAgentRow> {
+    let mut rows = Vec::new();
+
+    for summary in subagents
+        .iter()
+        .filter(|summary| summary.workflow_run_id.is_none())
+    {
+        rows.push(SessionAgentRow::Agent {
+            label: agent_chip_label(summary),
+            note: session_agent_row_note(summary),
+            indent_level: 1,
+            target: TranscriptTarget::Subagent {
+                agent_id: summary.agent_id.clone(),
+                workflow_run_id: None,
+            },
+        });
+    }
+
+    // Grouped by walking the runs in the order they first appear rather than by sorting
+    // into a map, so that the groups keep the scan's order and a run added between polls
+    // arrives at the end instead of reshuffling the ones above it.
+    let mut runs_drawn: Vec<&String> = Vec::new();
+    for summary in subagents {
+        let Some(workflow_run_id) = summary.workflow_run_id.as_ref() else {
+            continue;
+        };
+        if runs_drawn.contains(&workflow_run_id) {
+            continue;
+        }
+        runs_drawn.push(workflow_run_id);
+
+        let agents_of_run: Vec<&SubagentSummary> = subagents
+            .iter()
+            .filter(|other| other.workflow_run_id.as_ref() == Some(workflow_run_id))
+            .collect();
+        let finished = agents_of_run
+            .iter()
+            .filter(|agent| agent.workflow_agent_finished == Some(true))
+            .count();
+
+        rows.push(SessionAgentRow::WorkflowRun {
+            label: workflow_run_label(workflow_run_id),
+            note: SharedString::from(format!("{finished}/{} done", agents_of_run.len())),
+        });
+        for agent in agents_of_run {
+            rows.push(SessionAgentRow::Agent {
+                label: agent_chip_label(agent),
+                note: session_agent_row_note(agent),
+                indent_level: 2,
+                target: TranscriptTarget::Subagent {
+                    agent_id: agent.agent_id.clone(),
+                    workflow_run_id: agent.workflow_run_id.clone(),
+                },
+            });
+        }
+    }
+
+    rows
+}
+
+/// A run id is `wf_` and a hash, all of which is too wide for a dock and none of which a
+/// reader recognises. The heading says it is a workflow and keeps enough of the id to tell
+/// two runs of the same script apart.
+fn workflow_run_label(workflow_run_id: &str) -> SharedString {
+    let identifier = workflow_run_id
+        .strip_prefix(WORKFLOW_RUN_ID_PREFIX)
+        .unwrap_or(workflow_run_id);
+    SharedString::from(format!("Workflow {identifier}"))
+}
+
+/// The label and note of one agent row, laid out so that every row in the list puts its
+/// note in the same place.
+fn agent_row_body(
+    label: SharedString,
+    note: Option<SharedString>,
+    label_color: Color,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap_1()
+        .justify_between()
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(label_color)
+                .single_line(),
+        )
+        .children(
+            note.map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Hidden)),
+        )
+}
+
+/// What a session list row says beside an agent's name, or `None` when it can say
+/// nothing true about it.
+///
+/// A `Workflow` agent's run writes a journal recording which of its agents have returned,
+/// and that journal is read by the same scan that found the agent, so the row can say
+/// whether it is over and which phase it belongs to. A `Task` agent is only known to be
+/// over from the tool result in its own session's conversation — see [`agent_state`] —
+/// and the list reads no session's conversation but the selected one's. A row that said
+/// `Running` for an agent that returned an hour ago would be worse than one that says
+/// nothing, so it says nothing.
+fn session_agent_row_note(summary: &SubagentSummary) -> Option<SharedString> {
+    summary.workflow_run_id.as_ref()?;
+
+    let state = match summary.workflow_agent_finished {
+        Some(true) => "Finished",
+        // No journal to read, or one that does not name this agent yet. Both are states a
+        // run passes through while it is working.
+        Some(false) | None => "Running",
+    };
+    let phase = summary
+        .meta
+        .workflow_phase
+        .as_deref()
+        .map(str::trim)
+        .filter(|phase| !phase.is_empty());
+
+    Some(match phase {
+        Some(phase) => SharedString::from(format!("{state} · {phase}")),
+        None => SharedString::from(state),
+    })
 }
 
 /// Every `tool_result` block a record holds, as the id of the call it answers and the
@@ -11124,6 +11402,24 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             }]))
         }
 
+        /// The same one agent, under whichever session was asked for: these tests have
+        /// one session, and what they are about is which conversation is read rather than
+        /// which session an agent belongs to.
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<anyhow::Result<HashMap<String, Vec<SubagentSummary>>>> {
+            let mut subagents_by_session = HashMap::default();
+            for session_id in session_ids {
+                let listed = self.list_subagents(session_id.clone());
+                subagents_by_session.insert(
+                    session_id,
+                    smol::block_on(listed).unwrap_or_default(),
+                );
+            }
+            Task::ready(Ok(subagents_by_session))
+        }
+
         fn pending_question(
             &self,
             _session_id: String,
@@ -11693,6 +11989,221 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(
             !user_messages(&built).is_empty(),
             "a fixture with no user messages in it would hold nothing together"
+        );
+    }
+
+
+    /// A run can spawn any number of agents, so the list has to say which run each agent
+    /// came from rather than laying them out beside the session's own agents.
+    #[test]
+    fn a_workflow_runs_agents_are_grouped_under_the_run_that_spawned_them() {
+        let mut plain = subagent("a0", None, Some("toolu_01"));
+        plain.meta.description = Some("look at the file".to_string());
+        let mut first_of_run = subagent("a1", Some("wf_d276fc57-977"), None);
+        first_of_run.meta.description = Some("stage-A".to_string());
+        first_of_run.meta.workflow_phase = Some("Wait A".to_string());
+        first_of_run.workflow_agent_finished = Some(true);
+        let mut second_of_run = subagent("a2", Some("wf_d276fc57-977"), None);
+        second_of_run.meta.description = Some("stage-B".to_string());
+        second_of_run.meta.workflow_phase = Some("Wait B".to_string());
+        second_of_run.workflow_agent_finished = Some(false);
+
+        let rows = session_agent_rows(&[plain, first_of_run, second_of_run]);
+
+        assert_eq!(
+            rows,
+            vec![
+                SessionAgentRow::Agent {
+                    label: SharedString::from("look at the file"),
+                    note: None,
+                    indent_level: 1,
+                    target: TranscriptTarget::Subagent {
+                        agent_id: "a0".to_string(),
+                        workflow_run_id: None,
+                    },
+                },
+                SessionAgentRow::WorkflowRun {
+                    label: SharedString::from("Workflow d276fc57-977"),
+                    note: SharedString::from("1/2 done"),
+                },
+                SessionAgentRow::Agent {
+                    label: SharedString::from("stage-A"),
+                    note: Some(SharedString::from("Finished · Wait A")),
+                    indent_level: 2,
+                    target: TranscriptTarget::Subagent {
+                        agent_id: "a1".to_string(),
+                        workflow_run_id: Some("wf_d276fc57-977".to_string()),
+                    },
+                },
+                SessionAgentRow::Agent {
+                    label: SharedString::from("stage-B"),
+                    note: Some(SharedString::from("Running · Wait B")),
+                    indent_level: 2,
+                    target: TranscriptTarget::Subagent {
+                        agent_id: "a2".to_string(),
+                        workflow_run_id: Some("wf_d276fc57-977".to_string()),
+                    },
+                },
+            ],
+            "the session's own agent stays at the top level and the run's two agents sit \
+             under a heading counting how many have returned"
+        );
+    }
+
+    /// A `Task` agent's row must not claim to know whether it is over: the list reads no
+    /// conversation but the selected session's, and that is where the answer is.
+    #[test]
+    fn only_a_workflow_agents_row_says_whether_it_has_returned() {
+        let plain = subagent("a0", None, Some("toolu_01"));
+        assert_eq!(session_agent_row_note(&plain), None);
+
+        let mut of_run = subagent("a1", Some("wf_1"), None);
+        of_run.workflow_agent_finished = Some(false);
+        assert_eq!(
+            session_agent_row_note(&of_run),
+            Some(SharedString::from("Running")),
+            "a run's agent is known to be running from the journal, with no phase to name"
+        );
+    }
+
+    /// Two runs are two headings; one run's agents must not be counted into the other's.
+    #[test]
+    fn two_runs_are_two_groups() {
+        let first = subagent("a1", Some("wf_1"), None);
+        let mut second = subagent("a2", Some("wf_2"), None);
+        second.workflow_agent_finished = Some(true);
+
+        let rows = session_agent_rows(&[first, second]);
+
+        let headings: Vec<(&str, &str)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SessionAgentRow::WorkflowRun { label, note } => {
+                    Some((label.as_ref(), note.as_ref()))
+                }
+                SessionAgentRow::Agent { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            headings,
+            vec![("Workflow 1", "0/1 done"), ("Workflow 2", "1/1 done")],
+            "each run counts only its own agents"
+        );
+    }
+
+    /// The scan orders by agent id, so two runs can be interleaved in the input. Grouping
+    /// walks first-seen run ids and then collects every agent of that run, not only a
+    /// contiguous slice.
+    #[test]
+    fn a_runs_agents_are_grouped_even_when_they_are_not_adjacent() {
+        let first_of_first = subagent("a1", Some("wf_1"), None);
+        let only_of_second = subagent("a2", Some("wf_2"), None);
+        let second_of_first = subagent("a3", Some("wf_1"), None);
+
+        let rows = session_agent_rows(&[first_of_first, only_of_second, second_of_first]);
+
+        let outline: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                SessionAgentRow::WorkflowRun { label, .. } => format!("run:{label}"),
+                SessionAgentRow::Agent { target, .. } => match target {
+                    TranscriptTarget::Subagent { agent_id, .. } => {
+                        format!("agent:{agent_id}")
+                    }
+                    TranscriptTarget::Main => "main".to_string(),
+                },
+            })
+            .collect();
+        assert_eq!(
+            outline,
+            vec![
+                "run:Workflow 1".to_string(),
+                "agent:a1".to_string(),
+                "agent:a3".to_string(),
+                "run:Workflow 2".to_string(),
+                "agent:a2".to_string(),
+            ],
+            "both of wf_1's agents sit under its heading even though a2 was between them \
+             in the input; got {outline:?}"
+        );
+    }
+
+    /// The phase is said once above the cards rather than repeated on each of them.
+    #[test]
+    fn a_workflow_calls_cards_are_grouped_into_the_phases_they_belong_to() {
+        let mut first = card(AgentState::Finished);
+        first.phase = Some(SharedString::from("Wait A"));
+        let mut second = card(AgentState::Running);
+        second.phase = Some(SharedString::from("Wait B"));
+        let mut third = card(AgentState::Running);
+        third.phase = Some(SharedString::from("Wait B"));
+
+        let groups = group_cards_by_phase(vec![first, second, third], true);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(phase, cards)| (phase.as_ref().map(SharedString::as_ref), cards.len()))
+                .collect::<Vec<_>>(),
+            vec![(Some("Wait A"), 1), (Some("Wait B"), 2)]
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|(_, cards)| cards.iter().all(|card| card.phase.is_none())),
+            "the phase moves to the heading, so a card under one does not repeat it"
+        );
+        assert_eq!(
+            phase_heading(&SharedString::from("Wait B"), &groups[1].1),
+            SharedString::from("Wait B · 0/2 done")
+        );
+    }
+
+    /// An `Agent` call spawns one agent and has no phases; grouping must leave it alone.
+    #[test]
+    fn a_plain_agent_calls_cards_are_not_grouped() {
+        let mut only = card(AgentState::Running);
+        only.phase = Some(SharedString::from("Wait A"));
+
+        let groups = group_cards_by_phase(vec![only], false);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, None, "no heading is drawn for a call with no run");
+        assert_eq!(
+            groups[0].1[0].phase,
+            Some(SharedString::from("Wait A")),
+            "and the card keeps whatever it said"
+        );
+    }
+
+
+    /// Captured from a real `parallel()` run: `Fan out` spawned three agents and `Collect`
+    /// one, and sorted by agent id the `Collect` agent lands between two of the `Fan out`
+    /// ones. A phase must be one heading however its agents are interleaved.
+    #[test]
+    fn a_phase_whose_agents_are_not_adjacent_is_still_one_heading() {
+        let phases_in_agent_id_order = ["Fan out", "Fan out", "Collect", "Fan out"];
+        let cards: Vec<AgentCardRow> = phases_in_agent_id_order
+            .iter()
+            .map(|phase| {
+                let mut card = card(AgentState::Finished);
+                card.phase = Some(SharedString::from(*phase));
+                card
+            })
+            .collect();
+
+        let groups = group_cards_by_phase(cards, true);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(phase, cards)| (
+                    phase.as_ref().map(SharedString::as_ref).unwrap_or("<none>"),
+                    cards.len()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("Fan out", 3), ("Collect", 1)],
+            "the run has two phases, so the reader must see two headings"
         );
     }
 
