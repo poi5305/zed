@@ -707,7 +707,16 @@ pub struct SubagentMeta {
     pub model: Option<String>,
     #[serde(rename = "workflowPhase", default)]
     pub workflow_phase: Option<String>,
+    /// `background` for an agent whose `Task` call is answered the moment it is launched
+    /// rather than when it returns; see [`SubagentSummary::task_agent_finished`]. Absent
+    /// on an agent whose sidecar does not record one, which is most of them.
+    #[serde(rename = "requestShape", default)]
+    pub request_shape: Option<String>,
 }
+
+/// The `requestShape` of an agent that is launched and left to work, whose call is
+/// answered with `Async agent launched successfully` rather than with what it found.
+pub const BACKGROUND_REQUEST_SHAPE: &str = "background";
 
 /// An agent whose meta records no depth was spawned by the session itself.
 fn default_spawn_depth() -> u32 {
@@ -735,14 +744,20 @@ pub struct SubagentSummary {
     /// `Workflow` run. `None` for every other agent, and for one whose run has written no
     /// journal this scan could read.
     pub workflow_agent_finished: Option<bool>,
-    /// Whether the `Task` call that spawned this agent has been answered, which is the
-    /// only record there is of such an agent having returned. `None` for an agent that
-    /// records no `toolUseId` to look for, and for one whose session's conversation this
-    /// scan could not read.
+    /// Whether this `Task` agent has returned, read out of its own session's
+    /// conversation. `None` for an agent this scan could not answer for: one that belongs
+    /// to a workflow run, one that records no `toolUseId`, or one whose session's
+    /// conversation could not be read.
     ///
-    /// Answered by the scan rather than by the caller because the caller draws every
-    /// listed session's agents while following one session's conversation: for every
-    /// other session, this is the only answer there is.
+    /// What says an agent has returned depends on how it was spawned, which is why this
+    /// is answered here rather than by the caller. An agent run in the foreground returns
+    /// with the `tool_result` answering its call. One launched in the background —
+    /// `requestShape: background` — has that call answered the moment it launches, the
+    /// same way a `Workflow` call is, and what says it is over is the task notification
+    /// its session records when it stops.
+    ///
+    /// The caller could not answer either question for most of what it draws in any case:
+    /// it follows one session's conversation and draws every listed session's agents.
     pub task_agent_finished: Option<bool>,
 }
 
@@ -1839,27 +1854,43 @@ pub async fn list_subagents_for_sessions(
 fn resolve_task_agents(transcript_path: &Path, subagents: &mut [SubagentSummary]) {
     // Most sessions spawn no `Task` agent at all, and their conversation — which is the
     // largest file either side of this scan touches — is then never opened.
-    let wanted: HashSet<&str> = subagents
+    let any_task_agents = subagents
         .iter()
-        .filter(|summary| summary.workflow_run_id.is_none())
-        .filter_map(|summary| summary.meta.tool_use_id.as_deref())
-        .collect();
-    if wanted.is_empty() {
+        .any(|summary| summary.workflow_run_id.is_none() && summary.meta.tool_use_id.is_some());
+    if !any_task_agents {
         return;
     }
 
-    let Some(answered) = answered_tool_calls(transcript_path).log_err() else {
+    let Some(conversation) = read_session_conversation(transcript_path).log_err() else {
         return;
     };
     for summary in subagents.iter_mut() {
-        let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() else {
-            continue;
-        };
         if summary.workflow_run_id.is_some() {
             continue;
         }
-        summary.task_agent_finished = Some(answered.contains(tool_use_id));
+        let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() else {
+            continue;
+        };
+        summary.task_agent_finished = Some(
+            if summary.meta.request_shape.as_deref() == Some(BACKGROUND_REQUEST_SHAPE) {
+                conversation.notified_agents.contains(&summary.agent_id)
+            } else {
+                conversation.answered_calls.contains(tool_use_id)
+            },
+        );
     }
+}
+
+/// What one read of a session's conversation found about the agents it spawned.
+#[derive(Clone, Debug, Default)]
+struct SessionConversation {
+    /// The ids of the tool calls it holds an answer to.
+    answered_calls: HashSet<String>,
+    /// The agents a task notification in it names. A notification is written each time a
+    /// background agent stops, so an agent named here is one that has stopped at least
+    /// once — which is as close to "has returned" as this file gets, because the user can
+    /// send such an agent another message and start it again.
+    notified_agents: HashSet<String>,
 }
 
 /// What the last read of a conversation found, kept so that the poll behind this does not
@@ -1868,35 +1899,40 @@ fn resolve_task_agents(transcript_path: &Path, subagents: &mut [SubagentSummary]
 /// Trusted only while the file's length and modification time are still what they were
 /// when it was read: a conversation that has grown has to be read again, and its own
 /// metadata is the cheapest thing there is to notice that with. One entry per session
-/// read, holding the ids of the calls that conversation has answered.
-static ANSWERED_TOOL_CALLS: Mutex<Option<HashMap<PathBuf, (u64, Option<SystemTime>, HashSet<String>)>>> =
-    Mutex::new(None);
+/// read.
+static READ_CONVERSATIONS: Mutex<
+    Option<HashMap<PathBuf, (u64, Option<SystemTime>, SessionConversation)>>,
+> = Mutex::new(None);
 
-/// The ids of every tool call the conversation at `transcript_path` has answered.
-fn answered_tool_calls(transcript_path: &Path) -> Result<HashSet<String>> {
+/// Reads the conversation at `transcript_path` for what it says about its own agents.
+fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversation> {
     let metadata = fs::metadata(transcript_path)
         .with_context(|| format!("reading {}", transcript_path.display()))?;
     let stamp = (metadata.len(), metadata.modified().ok());
 
     // Poisoning would mean a panic while one of these was held, which is a panic in the
     // few lines below; the cache is then dropped rather than taking the scan with it.
-    if let Ok(cache) = ANSWERED_TOOL_CALLS.lock()
+    if let Ok(cache) = READ_CONVERSATIONS.lock()
         && let Some(cache) = cache.as_ref()
-        && let Some((length, modified, answered)) = cache.get(transcript_path)
+        && let Some((length, modified, conversation)) = cache.get(transcript_path)
         && (*length, *modified) == stamp
     {
-        return Ok(answered.clone());
+        return Ok(conversation.clone());
     }
 
     let file = fs::File::open(transcript_path)
         .with_context(|| format!("reading {}", transcript_path.display()))?;
-    let mut answered = HashSet::default();
+    let mut conversation = SessionConversation::default();
     for line in BufReader::new(file).lines() {
         // A conversation being appended to while it is read, or one holding a record
         // that is not valid UTF-8, still answers for every line that did read.
         let Some(line) = line.log_err() else {
             break;
         };
+        // A notification is text inside whichever record is carrying it — a queued
+        // command, an attachment, the message it finally arrives as — so it is read out
+        // of the line rather than out of any one field.
+        read_task_notification_ids(&line, &mut conversation.notified_agents);
         // Cheaper than parsing every record of a file this size, and no less exact: a
         // record holding no `tool_result` at all cannot answer anything.
         if !line.contains(TOOL_RESULT_BLOCK_TYPE) {
@@ -1921,21 +1957,36 @@ fn answered_tool_calls(transcript_path: &Path) -> Result<HashSet<String>> {
                 .get("tool_use_id")
                 .and_then(serde_json::Value::as_str)
             {
-                answered.insert(tool_use_id.to_string());
+                conversation.answered_calls.insert(tool_use_id.to_string());
             }
         }
     }
 
-    if let Ok(mut cache) = ANSWERED_TOOL_CALLS.lock() {
+    if let Ok(mut cache) = READ_CONVERSATIONS.lock() {
         cache.get_or_insert_with(HashMap::default).insert(
             transcript_path.to_path_buf(),
-            (stamp.0, stamp.1, answered.clone()),
+            (stamp.0, stamp.1, conversation.clone()),
         );
     }
-    Ok(answered)
+    Ok(conversation)
+}
+
+/// Every agent a task notification in `line` names.
+fn read_task_notification_ids(line: &str, into: &mut HashSet<String>) {
+    let mut rest = line;
+    while let Some(start) = rest.find(TASK_ID_OPENING_TAG) {
+        rest = &rest[start + TASK_ID_OPENING_TAG.len()..];
+        let Some(end) = rest.find(TASK_ID_CLOSING_TAG) else {
+            return;
+        };
+        into.insert(rest[..end].to_string());
+        rest = &rest[end..];
+    }
 }
 
 const TOOL_RESULT_BLOCK_TYPE: &str = "tool_result";
+const TASK_ID_OPENING_TAG: &str = "<task-id>";
+const TASK_ID_CLOSING_TAG: &str = "</task-id>";
 
 /// A session's own conversation, which sits beside the directory holding its agents and
 /// is named after it.
@@ -5314,6 +5365,113 @@ mod tests {
         )
     }
 
+    /// The sidecar of an agent launched with `Task` and left to work in the background,
+    /// which is what every agent this panel is watched with is. The `requestShape` is what
+    /// says its call is answered at launch rather than on return.
+    const SUBAGENT_META_BACKGROUND: &str = r#"{"agentType":"general-purpose",
+ "description":"印字然後等30分鐘",
+ "toolUseId":"toolu_01RjmJewYCiTYMAWE4JAsM61","spawnDepth":1,
+ "requestShape":"background","requestNonInteractive":true,"model":"opus"}"#;
+
+    const BACKGROUND_CALL_ID: &str = "toolu_01RjmJewYCiTYMAWE4JAsM61";
+
+    /// The sidecar of an agent run in the foreground, whose call is answered with what it
+    /// found. `SUBAGENT_META_GENERAL_PURPOSE` is not one: like every agent spawned from
+    /// this panel it records `requestShape: background`.
+    const SUBAGENT_META_FOREGROUND: &str = r#"{"agentType":"general-purpose",
+ "description":"Phase B adversarial review round 2",
+ "toolUseId":"toolu_01BEgVRSnksoz6YAyUWEEdeQ","spawnDepth":1,
+ "requestShape":"foreground","requestNonInteractive":false,"model":"opus"}"#;
+
+    /// Captured from a real run: the call of a background agent is answered within two
+    /// seconds of it launching, with an acknowledgement rather than with anything the
+    /// agent found.
+    fn async_launch_result_line(tool_use_id: &str, agent_id: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"uuid\":\"r1\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\
+             \"tool_use_id\":\"{tool_use_id}\",\"content\":[{{\"type\":\"text\",\"text\":\
+             \"Async agent launched successfully.\\nagentId: {agent_id}\"}}]}}]}}}}\n"
+        )
+    }
+
+    /// Captured from a real run: what a session records when a background agent stops.
+    fn task_notification_line(agent_id: &str, tool_use_id: &str) -> String {
+        format!(
+            "{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\
+             \"<task-notification>\\n<task-id>{agent_id}</task-id>\\n\
+             <tool-use-id>{tool_use_id}</tool-use-id>\\n<status>completed</status>\\n\
+             </task-notification>\"}}\n"
+        )
+    }
+
+    /// A background agent's call is answered the moment it launches, the same way a
+    /// `Workflow` call is, so the answer says nothing about the agent being over. Reading
+    /// it as the agent having returned takes every background agent off the list within
+    /// two seconds of it starting — which is every agent this panel is watched with.
+    #[test]
+    fn a_background_agent_is_over_when_its_session_is_notified_not_when_its_call_returns()
+    -> Result<()> {
+        let home_directory = temporary_directory("background-agent-state");
+        let working_session_id = "working-session";
+        let stopped_session_id = "stopped-session";
+        let agent_id = "a8fecd4de0ddace74";
+
+        for session_id in [working_session_id, stopped_session_id] {
+            write_subagent_in_project(
+                &home_directory,
+                "-a-project",
+                session_id,
+                None,
+                agent_id,
+                SUBAGENT_META_BACKGROUND,
+                "{\"type\":\"user\",\"isSidechain\":true}\n",
+            );
+        }
+        let project_directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-a-project");
+        let launched = async_launch_result_line(BACKGROUND_CALL_ID, agent_id);
+        write_file(
+            project_directory.join(format!("{working_session_id}.jsonl")),
+            &launched,
+        );
+        write_file(
+            project_directory.join(format!("{stopped_session_id}.jsonl")),
+            &format!(
+                "{launched}{}",
+                task_notification_line(agent_id, BACKGROUND_CALL_ID)
+            ),
+        );
+
+        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &[
+                working_session_id.to_string(),
+                stopped_session_id.to_string(),
+            ],
+        ))?;
+
+        assert_eq!(
+            subagents_by_session
+                .get(working_session_id)
+                .context("the working session has a result entry")?[0]
+                .task_agent_finished,
+            Some(false),
+            "its call was answered at launch, which is not the agent having returned"
+        );
+        assert_eq!(
+            subagents_by_session
+                .get(stopped_session_id)
+                .context("the stopped session has a result entry")?[0]
+                .task_agent_finished,
+            Some(true),
+            "its session was notified that it stopped, which is the only record of that"
+        );
+
+        Ok(())
+    }
+
     /// A `Task` agent's transcript ends when it stops writing and its sidecar is never
     /// touched again, so the only record of it having returned is the `tool_result`
     /// answering the call that spawned it — in the session's own conversation, which the
@@ -5332,7 +5490,7 @@ mod tests {
                 session_id,
                 None,
                 REAL_AGENT_ID,
-                SUBAGENT_META_GENERAL_PURPOSE,
+                SUBAGENT_META_FOREGROUND,
                 transcript_contents,
             );
         }
@@ -5391,7 +5549,7 @@ mod tests {
             session_id,
             None,
             REAL_AGENT_ID,
-            SUBAGENT_META_GENERAL_PURPOSE,
+            SUBAGENT_META_FOREGROUND,
             "{\"type\":\"user\",\"isSidechain\":true}\n",
         );
         let transcript_path = home_directory

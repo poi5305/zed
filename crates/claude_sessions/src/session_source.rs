@@ -597,6 +597,7 @@ fn subagent_summary_from_proto(subagent: proto::ClaudeSubagent) -> SubagentSumma
             spawn_depth: subagent.spawn_depth,
             model: subagent.model,
             workflow_phase: subagent.workflow_phase,
+            request_shape: subagent.request_shape,
         },
         // An empty path stands in for one the far end did not name. Nothing on this side
         // ever opens this path: a subagent's transcript is only ever read through
@@ -804,6 +805,7 @@ mod tests {
             ),
             size: 4096,
             workflow_agent_finished: Some(false),
+            request_shape: Some("background".to_string()),
             task_agent_finished: Some(true),
         }
     }

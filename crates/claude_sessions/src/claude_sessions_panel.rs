@@ -1190,10 +1190,18 @@ impl ClaudeSessionsPanel {
 
     /// Brings the tab that reads `process_id` forward, opening one when the window has
     /// none for it. Called from the dock, where selecting a session would otherwise
-    /// leave the reader with a selection and nowhere it is shown.
+    /// leave the reader with a selection and nowhere it is shown, and from a tab, which
+    /// is where the agents of the conversation on screen are offered.
     ///
     /// The fields are taken from `self` rather than read back off the workspace, which
     /// would read this entity while it is the one being updated.
+    ///
+    /// Deferred to the end of the effect cycle, which is what returns this panel to the
+    /// app: every call reaches here from a click handler, which holds the panel off the
+    /// entity map for as long as it runs, and looking for the tab to bring forward walks
+    /// every item of the workspace and reads it. Drawn as a tab, this panel is one of
+    /// them — and reading an entity that is in the middle of being updated is a panic,
+    /// so this crashed for every way into an agent offered from a tab.
     fn reveal_in_pane(
         &mut self,
         process_id: Option<u32>,
@@ -1207,17 +1215,19 @@ impl ClaudeSessionsPanel {
         let fs = self.fs.clone();
         let source = self.source.clone();
         let project_root = self.project_root.clone();
-        workspace.update(cx, |workspace, cx| {
-            Self::reveal_session_in_pane(
-                workspace,
-                fs,
-                source,
-                project_root,
-                process_id,
-                target,
-                window,
-                cx,
-            );
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                Self::reveal_session_in_pane(
+                    workspace,
+                    fs,
+                    source,
+                    project_root,
+                    process_id,
+                    target,
+                    window,
+                    cx,
+                );
+            });
         });
     }
 
@@ -5981,15 +5991,23 @@ fn workflow_run_note(cards: &[AgentCardRow]) -> SharedString {
 /// was spawned — a `Task` agent by the result of its call, a `Workflow` agent by the
 /// journal its run writes, because that call is answered while the run is still going.
 fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> AgentState {
+    // Preferred over anything read here: the scan read the agent's own session's
+    // conversation, which is the only one that answers for an agent of a session this
+    // panel is not following, and it knows how the agent was spawned — which decides
+    // what in that conversation means it has returned. See
+    // [`SubagentSummary::task_agent_finished`].
+    if let Some(finished) = summary.task_agent_finished {
+        return if finished {
+            AgentState::Finished
+        } else {
+            AgentState::Running
+        };
+    }
+
     if let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() {
-        // The conversation here is the followed session's, and the list draws every
-        // listed session's agents, so for all the others the scan's own reading of their
-        // conversation is the only answer there is. It also covers a call answered before
-        // a compaction, which severs the chain this path is walked along.
-        let answered = summary.task_agent_finished == Some(true)
-            || main_path
-                .iter()
-                .any(|record| tool_result_ids(record).contains(&tool_use_id));
+        let answered = main_path
+            .iter()
+            .any(|record| tool_result_ids(record).contains(&tool_use_id));
         return if answered {
             AgentState::Finished
         } else {
@@ -9641,6 +9659,7 @@ mod tests {
                 spawn_depth: 1,
                 model: None,
                 workflow_phase: None,
+                request_shape: None,
             },
             transcript_path: PathBuf::from("/nowhere/agent.jsonl"),
             size: 0,
@@ -11658,6 +11677,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     spawn_depth: 1,
                     model: None,
                     workflow_phase: None,
+                    request_shape: None,
                 },
                 transcript_path: self.home_directory.join("agent-a1.jsonl"),
                 size: 1,
