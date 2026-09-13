@@ -116,7 +116,7 @@ pub fn project_entry_element_id(group: &ProjectGroup, index: usize) -> String {
 /// Ordered here rather than in the file: `projects.json` holds projects in the order they
 /// were added, and an import writes them in the order of the file it read, neither of
 /// which is an order a reader can look a project up in. Compared without case, so that
-/// `andy-stocktw` and `Andy-stocktw` sit next to each other instead of in two blocks.
+/// `alpha-notes` and `Alpha-notes` sit next to each other instead of in two blocks.
 pub fn filter_projects(projects: &[ProjectEntry], query: &str) -> Vec<usize> {
     let lowercase_query = query.trim().to_lowercase();
     // Sorted as (name, index) pairs rather than by indexing back into `projects`, and the
@@ -379,15 +379,15 @@ mod tests {
     fn a_vscode_export_imports_its_hosts_as_ssh() {
         let import = import_vscode_projects(
             r#"[
-                {"name":"CDB-ewimg","rootPath":"/Users/andy/go/src/github.com/CreatorDB/ewimg",
+                {"name":"BETA-images","rootPath":"/Users/user/go/src/github.com/example/images",
                  "paths":[],"tags":[],"enabled":true,"profile":""},
-                {"name":"XR-robotmon (DB2)",
-                 "rootPath":"vscode-remote://ssh-remote+192.168.100.252/mnt/data/andy/robotmon",
+                {"name":"XR-scraper (DB2)",
+                 "rootPath":"vscode-remote://ssh-remote+192.168.0.2/mnt/data/user/scraper",
                  "paths":[],"tags":[],"enabled":true,"profile":""},
-                {"name":"CDB-agency (coder)",
-                 "rootPath":"vscode-remote://ssh-remote+coder-vscode.coder.elggum.com--poi5305--andy.main/home/coder/dashboard",
+                {"name":"BETA-dashboard (coder)",
+                 "rootPath":"vscode-remote://ssh-remote+coder-vscode.coder.example.com--user--dev.main/home/coder/dashboard",
                  "paths":[],"tags":[],"enabled":true,"profile":""},
-                {"name":"Ubuntu","rootPath":"vscode-remote://wsl+Ubuntu-22.04/home/andy/work",
+                {"name":"Ubuntu","rootPath":"vscode-remote://wsl+Ubuntu-22.04/home/user/work",
                  "paths":[],"tags":[],"enabled":true,"profile":""}
             ]"#,
         )
@@ -400,12 +400,12 @@ mod tests {
                 .map(|project| project.root_path.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "/Users/andy/go/src/github.com/CreatorDB/ewimg",
-                "ssh://192.168.100.252/mnt/data/andy/robotmon",
+                "/Users/user/go/src/github.com/example/images",
+                "ssh://192.168.0.2/mnt/data/user/scraper",
                 // A Coder workspace is reached through the host `coder config-ssh`
                 // writes, so it needs no handling of its own.
-                "ssh://coder-vscode.coder.elggum.com--poi5305--andy.main/home/coder/dashboard",
-                "wsl://Ubuntu-22.04/home/andy/work",
+                "ssh://coder-vscode.coder.example.com--user--dev.main/home/coder/dashboard",
+                "wsl://Ubuntu-22.04/home/user/work",
             ]
         );
         assert!(
@@ -430,7 +430,7 @@ mod tests {
             r#"[
                 {"name":"Container","rootPath":"vscode-remote://dev-container+7b2268/workspaces/app",
                  "paths":[],"tags":[],"enabled":true},
-                {"name":"Kept","rootPath":"/Users/andy/kept","paths":[],"tags":[],"enabled":true}
+                {"name":"Kept","rootPath":"/Users/user/kept","paths":[],"tags":[],"enabled":true}
             ]"#,
         )
         .expect("the file itself is readable");
@@ -481,15 +481,15 @@ mod tests {
     #[test]
     fn importing_twice_adds_only_what_is_new() {
         let mut existing = vec![ProjectEntry {
-            name: "CDB-ewimg".into(),
+            name: "BETA-images".into(),
             root_path: "/somewhere/else".into(),
             paths: Vec::new(),
             tags: vec!["work".into()],
             enabled: true,
         }];
         let imported = vec![
-            ProjectEntry::new("cdb-ewimg", "/Users/andy/ewimg"),
-            ProjectEntry::new("R-robotmon", "/Users/andy/robotmon"),
+            ProjectEntry::new("beta-images", "/Users/user/images"),
+            ProjectEntry::new("R-scraper", "/Users/user/scraper"),
         ];
 
         let merge = merge_imported_projects(&mut existing, imported);
@@ -511,7 +511,7 @@ mod tests {
             vec!["work".to_string()],
             "and keeps its tags"
         );
-        assert_eq!(existing[1].name, "R-robotmon");
+        assert_eq!(existing[1].name, "R-scraper");
     }
 
     #[test]
@@ -653,9 +653,9 @@ mod tests {
     fn projects_are_listed_by_name_whatever_order_the_file_holds_them_in() {
         let projects = vec![
             ProjectEntry::new("zed-fc", "/zed-fc"),
-            ProjectEntry::new("Andy-stocktw", "/stocktw"),
-            ProjectEntry::new("cdb-agency", "/agency"),
-            ProjectEntry::new("CDB-ewimg", "/ewimg"),
+            ProjectEntry::new("Alpha-notes", "/notes"),
+            ProjectEntry::new("beta-dashboard", "/dashboard"),
+            ProjectEntry::new("BETA-images", "/images"),
         ];
 
         let listed: Vec<&str> = filter_projects(&projects, "")
@@ -666,8 +666,8 @@ mod tests {
 
         assert_eq!(
             listed,
-            vec!["Andy-stocktw", "cdb-agency", "CDB-ewimg", "zed-fc"],
-            "ordered by name without case, so that the two CDB projects are together"
+            vec!["Alpha-notes", "beta-dashboard", "BETA-images", "zed-fc"],
+            "ordered by name without case, so that the two beta projects are together"
         );
     }
 

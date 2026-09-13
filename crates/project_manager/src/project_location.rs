@@ -254,7 +254,7 @@ fn import_vscode_remote(candidate: &str, rest: &str) -> Result<ImportedPath> {
     )
 }
 
-/// The drive letter of `/C:/Users/andy`, or `None` for a path that is not one.
+/// The drive letter of `/C:/Users/user`, or `None` for a path that is not one.
 fn windows_drive_path(path: &str) -> Option<char> {
     let mut characters = path.strip_prefix('/')?.chars();
     let drive = characters.next()?;
@@ -314,7 +314,7 @@ fn parse_candidate(candidate: &str) -> Result<(Option<RemoteConnectionOptions>, 
 
 /// Splits `scheme://rest`, or `None` when `candidate` is a plain path. A single
 /// leading character is never treated as a scheme so that the Windows drive
-/// letter of `C:\Users\andy\proj` cannot be mistaken for one.
+/// letter of `C:\Users\user\proj` cannot be mistaken for one.
 fn split_scheme(candidate: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = candidate.split_once("://")?;
     if scheme.len() < 2 {
@@ -673,22 +673,22 @@ mod tests {
     #[test]
     fn test_windows_drive_letters_are_not_schemes() {
         assert_eq!(
-            parse(r"C:\Users\andy\proj", &[]).expect("a Windows path is a local path"),
-            ProjectLocation::Local(vec![PathBuf::from(r"C:\Users\andy\proj")]),
+            parse(r"C:\Users\user\proj", &[]).expect("a Windows path is a local path"),
+            ProjectLocation::Local(vec![PathBuf::from(r"C:\Users\user\proj")]),
             "the `C:` of a Windows drive must never be read as a URI scheme"
         );
 
         assert_eq!(
-            parse(r"C://Users/andy/proj", &[]).expect("a Windows path with forward slashes"),
-            ProjectLocation::Local(vec![PathBuf::from(r"C://Users/andy/proj")]),
+            parse(r"C://Users/user/proj", &[]).expect("a Windows path with forward slashes"),
+            ProjectLocation::Local(vec![PathBuf::from(r"C://Users/user/proj")]),
             "a one-character prefix is a drive letter, not a scheme, even before `://`"
         );
 
         assert_eq!(
-            parse(r"C:\Users\andy\proj", &[r"D:\other"])
+            parse(r"C:\Users\user\proj", &[r"D:\other"])
                 .expect("two Windows drives are both local"),
             ProjectLocation::Local(vec![
-                PathBuf::from(r"C:\Users\andy\proj"),
+                PathBuf::from(r"C:\Users\user\proj"),
                 PathBuf::from(r"D:\other"),
             ]),
             "two drive letters do not count as two different hosts"
@@ -895,7 +895,7 @@ mod tests {
         for path in [
             "1c://server/share",
             "my_scheme://host/p",
-            r"\\?\C:\Users\andy\proj",
+            r"\\?\C:\Users\user\proj",
             r"\\server\share\proj",
         ] {
             assert_eq!(

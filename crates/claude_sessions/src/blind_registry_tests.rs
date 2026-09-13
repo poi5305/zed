@@ -4,7 +4,7 @@ mod blind_registry_tests {
     use std::path::PathBuf;
 
     const SAMPLE: &str = r#"{"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
-     "cwd":"/Users/andy/go/src/github.com/poi5305/zed","startedAt":1789007244364,
+     "cwd":"/Users/user/go/src/github.com/example/zed","startedAt":1789007244364,
      "procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","peerProtocol":1,
      "peerFeatures":["notify_idle"],"kind":"interactive","entrypoint":"cli",
      "pidDomain":"darwin","tmux":"zed:@6.%8",
@@ -91,7 +91,7 @@ mod blind_registry_tests {
         );
         assert_eq!(
             session.working_directory,
-            PathBuf::from("/Users/andy/go/src/github.com/poi5305/zed"),
+            PathBuf::from("/Users/user/go/src/github.com/example/zed"),
             "working_directory from cwd"
         );
         assert_eq!(
