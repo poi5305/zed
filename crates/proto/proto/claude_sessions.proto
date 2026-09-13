@@ -57,6 +57,9 @@ message ClaudeSubagent {
   // an agent that records no tool_use_id, and for one whose conversation could not be
   // read.
   optional bool task_agent_finished = 12;
+  // The requestShape the agent sidecar recorded, which says whether its Task call is
+  // answered when it launches or when it returns. Absent on most agents.
+  optional string request_shape = 13;
 }
 
 message ListClaudeSubagents {

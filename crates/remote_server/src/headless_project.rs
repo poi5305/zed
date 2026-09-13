@@ -1478,6 +1478,7 @@ impl HeadlessProject {
                     size: summary.size,
                     workflow_agent_finished: summary.workflow_agent_finished,
                     task_agent_finished: summary.task_agent_finished,
+                    request_shape: summary.meta.request_shape.clone(),
                 })
                 .collect(),
         })
