@@ -8,9 +8,12 @@
 
 use std::{
     fs,
-    io::{Read as _, Seek as _, SeekFrom},
+    io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -732,6 +735,15 @@ pub struct SubagentSummary {
     /// `Workflow` run. `None` for every other agent, and for one whose run has written no
     /// journal this scan could read.
     pub workflow_agent_finished: Option<bool>,
+    /// Whether the `Task` call that spawned this agent has been answered, which is the
+    /// only record there is of such an agent having returned. `None` for an agent that
+    /// records no `toolUseId` to look for, and for one whose session's conversation this
+    /// scan could not read.
+    ///
+    /// Answered by the scan rather than by the caller because the caller draws every
+    /// listed session's agents while following one session's conversation: for every
+    /// other session, this is the only answer there is.
+    pub task_agent_finished: Option<bool>,
 }
 
 /// A question a session has put to its user and is waiting on.
@@ -1720,6 +1732,7 @@ pub async fn list_subagents(
     };
     let mut subagents = Vec::new();
     read_subagents_for_session(&session_directory, &mut subagents)?;
+    resolve_task_agents(&session_transcript_path(&session_directory), &mut subagents);
     sort_subagents(&mut subagents);
 
     Ok(subagents)
@@ -1797,6 +1810,10 @@ pub async fn list_subagents_for_sessions(
                 // `subagents` path cannot be listed must not hide every other session
                 // this walk already found, or has yet to find.
                 read_subagents_for_session(&session_entry.path(), subagents).log_err();
+                resolve_task_agents(
+                    &session_transcript_path(&session_entry.path()),
+                    subagents,
+                );
             }
         }
     }
@@ -1806,6 +1823,128 @@ pub async fn list_subagents_for_sessions(
     }
 
     Ok(subagents_by_session)
+}
+
+/// Whether each `Task` agent's call has been answered in the session's own conversation.
+///
+/// A `Task` agent's transcript ends when it stops writing and records nothing about
+/// having returned, and its `meta.json` is written when it is spawned and never touched
+/// again. The `tool_result` answering the call that spawned it is the only record of it
+/// being over, and that lives in the session's own transcript, beside the directory this
+/// scan just walked.
+///
+/// A call answered anywhere in the file counts, rather than only along the conversation's
+/// active path: compaction severs the chain and a rewind abandons a branch, and neither
+/// un-runs the agent that call started.
+fn resolve_task_agents(transcript_path: &Path, subagents: &mut [SubagentSummary]) {
+    // Most sessions spawn no `Task` agent at all, and their conversation — which is the
+    // largest file either side of this scan touches — is then never opened.
+    let wanted: HashSet<&str> = subagents
+        .iter()
+        .filter(|summary| summary.workflow_run_id.is_none())
+        .filter_map(|summary| summary.meta.tool_use_id.as_deref())
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    let Some(answered) = answered_tool_calls(transcript_path).log_err() else {
+        return;
+    };
+    for summary in subagents.iter_mut() {
+        let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() else {
+            continue;
+        };
+        if summary.workflow_run_id.is_some() {
+            continue;
+        }
+        summary.task_agent_finished = Some(answered.contains(tool_use_id));
+    }
+}
+
+/// What the last read of a conversation found, kept so that the poll behind this does not
+/// read a multi-megabyte file every second for a session nothing has appended to.
+///
+/// Trusted only while the file's length and modification time are still what they were
+/// when it was read: a conversation that has grown has to be read again, and its own
+/// metadata is the cheapest thing there is to notice that with. One entry per session
+/// read, holding the ids of the calls that conversation has answered.
+static ANSWERED_TOOL_CALLS: Mutex<Option<HashMap<PathBuf, (u64, Option<SystemTime>, HashSet<String>)>>> =
+    Mutex::new(None);
+
+/// The ids of every tool call the conversation at `transcript_path` has answered.
+fn answered_tool_calls(transcript_path: &Path) -> Result<HashSet<String>> {
+    let metadata = fs::metadata(transcript_path)
+        .with_context(|| format!("reading {}", transcript_path.display()))?;
+    let stamp = (metadata.len(), metadata.modified().ok());
+
+    // Poisoning would mean a panic while one of these was held, which is a panic in the
+    // few lines below; the cache is then dropped rather than taking the scan with it.
+    if let Ok(cache) = ANSWERED_TOOL_CALLS.lock()
+        && let Some(cache) = cache.as_ref()
+        && let Some((length, modified, answered)) = cache.get(transcript_path)
+        && (*length, *modified) == stamp
+    {
+        return Ok(answered.clone());
+    }
+
+    let file = fs::File::open(transcript_path)
+        .with_context(|| format!("reading {}", transcript_path.display()))?;
+    let mut answered = HashSet::default();
+    for line in BufReader::new(file).lines() {
+        // A conversation being appended to while it is read, or one holding a record
+        // that is not valid UTF-8, still answers for every line that did read.
+        let Some(line) = line.log_err() else {
+            break;
+        };
+        // Cheaper than parsing every record of a file this size, and no less exact: a
+        // record holding no `tool_result` at all cannot answer anything.
+        if !line.contains(TOOL_RESULT_BLOCK_TYPE) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(blocks) = record
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some(TOOL_RESULT_BLOCK_TYPE)
+            {
+                continue;
+            }
+            if let Some(tool_use_id) = block
+                .get("tool_use_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                answered.insert(tool_use_id.to_string());
+            }
+        }
+    }
+
+    if let Ok(mut cache) = ANSWERED_TOOL_CALLS.lock() {
+        cache.get_or_insert_with(HashMap::default).insert(
+            transcript_path.to_path_buf(),
+            (stamp.0, stamp.1, answered.clone()),
+        );
+    }
+    Ok(answered)
+}
+
+const TOOL_RESULT_BLOCK_TYPE: &str = "tool_result";
+
+/// A session's own conversation, which sits beside the directory holding its agents and
+/// is named after it.
+fn session_transcript_path(session_directory: &Path) -> PathBuf {
+    // Built by appending rather than by `with_extension`, which would cut a directory
+    // name at its last dot instead of adding to it.
+    let mut file_name = session_directory.as_os_str().to_os_string();
+    file_name.push(".jsonl");
+    PathBuf::from(file_name)
 }
 
 fn read_subagents_for_session(
@@ -1941,6 +2080,10 @@ fn read_subagents_in(
             workflow_agent_finished: journal
                 .as_ref()
                 .map(|journal| journal.has_returned(agent_id)),
+            // Filled in once the whole session has been read; see
+            // [`resolve_task_agents`], which needs the session's conversation rather
+            // than anything in this directory.
+            task_agent_finished: None,
         });
     }
 
@@ -5155,6 +5298,130 @@ mod tests {
             workflow_subagent.size,
             transcript_contents.len() as u64,
             "the size has to be the transcript's, so a caller can tail from it"
+        );
+
+        Ok(())
+    }
+
+    /// The id of the call `SUBAGENT_META_GENERAL_PURPOSE` records as having spawned it.
+    const SPAWNING_CALL_ID: &str = "toolu_01BEgVRSnksoz6YAyUWEEdeQ";
+
+    /// One line of a session's own conversation answering `tool_use_id`.
+    fn tool_result_line(tool_use_id: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"uuid\":\"r1\",\"message\":{{\"content\":[\
+             {{\"type\":\"tool_result\",\"tool_use_id\":\"{tool_use_id}\",\"content\":\"done\"}}]}}}}\n"
+        )
+    }
+
+    /// A `Task` agent's transcript ends when it stops writing and its sidecar is never
+    /// touched again, so the only record of it having returned is the `tool_result`
+    /// answering the call that spawned it — in the session's own conversation, which the
+    /// panel holds for one session while drawing every session's agents.
+    #[test]
+    fn a_task_agents_call_is_looked_for_in_its_own_sessions_conversation() -> Result<()> {
+        let home_directory = temporary_directory("task-agent-state");
+        let answered_session_id = "answered-session";
+        let working_session_id = "working-session";
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        for session_id in [answered_session_id, working_session_id] {
+            write_subagent_in_project(
+                &home_directory,
+                "-a-project",
+                session_id,
+                None,
+                REAL_AGENT_ID,
+                SUBAGENT_META_GENERAL_PURPOSE,
+                transcript_contents,
+            );
+        }
+        let project_directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-a-project");
+        write_file(
+            project_directory.join(format!("{answered_session_id}.jsonl")),
+            &tool_result_line(SPAWNING_CALL_ID),
+        );
+        // The session that spawned it is still waiting on it, so its conversation holds
+        // an answer to some other call and none to this one.
+        write_file(
+            project_directory.join(format!("{working_session_id}.jsonl")),
+            &tool_result_line("toolu_01SomethingElse"),
+        );
+
+        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &[
+                answered_session_id.to_string(),
+                working_session_id.to_string(),
+            ],
+        ))?;
+
+        assert_eq!(
+            subagents_by_session
+                .get(answered_session_id)
+                .context("the answered session has a result entry")?[0]
+                .task_agent_finished,
+            Some(true),
+            "the call that spawned it has been answered, which is the agent having returned"
+        );
+        assert_eq!(
+            subagents_by_session
+                .get(working_session_id)
+                .context("the working session has a result entry")?[0]
+                .task_agent_finished,
+            Some(false),
+            "nothing has answered the call that spawned it, so it is still working"
+        );
+
+        Ok(())
+    }
+
+    /// The answer is cached against the conversation's length and modification time, so a
+    /// conversation that has since answered the call must not be served the old answer.
+    #[test]
+    fn a_call_answered_after_the_last_scan_is_read_again() -> Result<()> {
+        let home_directory = temporary_directory("task-agent-state-again");
+        let session_id = "late-answer-session";
+        write_subagent_in_project(
+            &home_directory,
+            "-a-project",
+            session_id,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+        let transcript_path = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-a-project")
+            .join(format!("{session_id}.jsonl"));
+        write_file(transcript_path.clone(), "{\"type\":\"user\",\"uuid\":\"m1\"}\n");
+
+        let scan = || -> Result<Option<bool>> {
+            let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+                &home_directory,
+                &[session_id.to_string()],
+            ))?;
+            Ok(subagents_by_session
+                .get(session_id)
+                .context("the session has a result entry")?[0]
+                .task_agent_finished)
+        };
+
+        assert_eq!(scan()?, Some(false));
+
+        let mut answered = std::fs::read_to_string(&transcript_path)?;
+        answered.push_str(&tool_result_line(SPAWNING_CALL_ID));
+        write_file(transcript_path, &answered);
+
+        assert_eq!(
+            scan()?,
+            Some(true),
+            "the conversation grew, so what the last scan read of it no longer stands"
         );
 
         Ok(())

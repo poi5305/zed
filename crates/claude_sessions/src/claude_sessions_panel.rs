@@ -706,6 +706,10 @@ pub struct ClaudeSessionsPanel {
     /// The call the reader chose to answer in their own words rather than by picking, so
     /// that choosing it for one question does not leave the next one waiting for typing.
     typing_answer_for: Option<SharedString>,
+    /// The call whose question the input was last opened for, so that it is opened once
+    /// per question rather than held open for as long as one is on screen; see
+    /// [`ClaudeSessionsPanel::open_the_input_for_a_new_question`].
+    opened_input_for_question: Option<SharedString>,
     /// The paths the `@` menu is offering, and the query they were listed for. Listed
     /// on the machine the session runs on, so the answer arrives after the keystroke
     /// that asked for it and has to say what it is an answer to.
@@ -1305,6 +1309,7 @@ impl ClaudeSessionsPanel {
         let store_subscription = cx.observe(&store, |this: &mut Self, _, cx| {
             this.rebuild_entries(cx);
             this.sync_input_availability(cx);
+            this.open_the_input_for_a_new_question(cx);
             if this.in_pane {
                 cx.emit(ItemNameChanged);
             }
@@ -1348,6 +1353,7 @@ impl ClaudeSessionsPanel {
             quit_armed: false,
             ticked: None,
             typing_answer_for: None,
+            opened_input_for_question: None,
             file_matches: Vec::new(),
             file_matches_for: None,
             file_highlight: 0,
@@ -1921,12 +1927,7 @@ impl ClaudeSessionsPanel {
     fn waiting_question(&self, cx: &Context<Self>) -> Option<(Question, usize, SharedString)> {
         let store = self.store.read(cx);
         let recorded = store.recorded_question()?;
-        let answered = store
-            .main_transcript()
-            .active_path()
-            .iter()
-            .any(|record| tool_result_ids(record).contains(&recorded.tool_use_id.as_str()));
-        if answered {
+        if call_is_answered(store.main_transcript(), &recorded.tool_use_id) {
             return None;
         }
 
@@ -2059,6 +2060,25 @@ impl ClaudeSessionsPanel {
     fn toggle_input(&mut self, cx: &mut Context<Self>) {
         self.input_expanded = !self.input_expanded;
         cx.notify();
+    }
+
+    /// Opens the input for a question that has just arrived, once.
+    ///
+    /// A question stops the session until it is answered, and a reader who does not know
+    /// one is waiting reads the session as stuck while the answer sits behind a
+    /// disclosure they have no reason to open. Only its arrival opens it, so the reader
+    /// can close it again and have it stay closed.
+    fn open_the_input_for_a_new_question(&mut self, cx: &mut Context<Self>) {
+        let asking = self
+            .waiting_question(cx)
+            .map(|(_, _, tool_use_id)| tool_use_id);
+        if self.opened_input_for_question == asking {
+            return;
+        }
+        self.opened_input_for_question = asking.clone();
+        if asking.is_some() {
+            self.input_expanded = true;
+        }
     }
 
     fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
@@ -3767,12 +3787,7 @@ impl ClaudeSessionsPanel {
         let Some(recorded) = store.recorded_question() else {
             return false;
         };
-        let answered = store
-            .main_transcript()
-            .active_path()
-            .iter()
-            .any(|record| tool_result_ids(record).contains(&recorded.tool_use_id.as_str()));
-        if answered {
+        if call_is_answered(store.main_transcript(), &recorded.tool_use_id) {
             return false;
         }
 
@@ -4005,13 +4020,14 @@ impl ClaudeSessionsPanel {
         let mode_label = mode.unwrap_or_else(|| SharedString::from(UNNAMED_PERMISSION_MODE));
         let quit_armed = self.quit_armed;
 
-        // A question stops the session until it is answered, so the block that answers it
-        // opens itself: a reader who does not know one is waiting reads the session as
-        // stuck, and the answer is behind a disclosure they have no reason to open.
         let question = self.render_question(cx);
         let slash_commands = self.render_slash_commands(cx);
         let file_matches = self.render_file_matches(cx);
-        let expanded = self.input_expanded || question.is_some();
+        // Whether a question is waiting is not part of this: a question opens the input
+        // when it arrives — see [`Self::open_the_input_for_a_new_question`] — and holding
+        // it open for as long as one is drawn takes the disclosure away from the reader,
+        // who then cannot put away a question the session has already moved past.
+        let expanded = self.input_expanded;
 
         v_flex()
             .w_full()
@@ -5966,9 +5982,14 @@ fn workflow_run_note(cards: &[AgentCardRow]) -> SharedString {
 /// journal its run writes, because that call is answered while the run is still going.
 fn agent_state(summary: &SubagentSummary, main_path: &[&TranscriptRecord]) -> AgentState {
     if let Some(tool_use_id) = summary.meta.tool_use_id.as_deref() {
-        let answered = main_path
-            .iter()
-            .any(|record| tool_result_ids(record).contains(&tool_use_id));
+        // The conversation here is the followed session's, and the list draws every
+        // listed session's agents, so for all the others the scan's own reading of their
+        // conversation is the only answer there is. It also covers a call answered before
+        // a compaction, which severs the chain this path is walked along.
+        let answered = summary.task_agent_finished == Some(true)
+            || main_path
+                .iter()
+                .any(|record| tool_result_ids(record).contains(&tool_use_id));
         return if answered {
             AgentState::Finished
         } else {
@@ -6147,6 +6168,20 @@ fn session_agent_rows(
     }
 
     rows
+}
+
+/// Whether the conversation holds the `tool_result` answering `tool_use_id`.
+///
+/// Read down the whole conversation rather than along the path the model can still see.
+/// Compaction deliberately severs that chain, so a call answered before one would read as
+/// unanswered against the active path for the rest of the session — and the file that
+/// records a question being asked is never deleted, so a question answered before a
+/// compaction would go on being drawn, pinning open the section that answers it.
+fn call_is_answered(transcript: &crate::Transcript, tool_use_id: &str) -> bool {
+    transcript
+        .full_path()
+        .iter()
+        .any(|record| tool_result_ids(record).contains(&tool_use_id))
 }
 
 /// Whether an agent is still worth offering a way into its conversation.
@@ -9610,6 +9645,7 @@ mod tests {
             transcript_path: PathBuf::from("/nowhere/agent.jsonl"),
             size: 0,
             workflow_agent_finished: None,
+            task_agent_finished: None,
         }
     }
 
@@ -9734,6 +9770,74 @@ mod tests {
             state_of(&summary, &[&user_message_line("m1", "go"), &call, &launch]),
             AgentState::Running,
             "the run id is announced when the run starts, so the announcement is not the run ending"
+        );
+    }
+
+    /// Captured from a session that was compacted after the question it was asking had
+    /// been answered: the call and its result are still in the file, but compaction cut
+    /// the chain the model reads, so they are not on the active path any more.
+    ///
+    /// The file recording a question being asked is never deleted, so reading the active
+    /// path left the question on screen for the rest of the session — and while one was
+    /// drawn the input section held itself open, so it could not be put away either.
+    #[test]
+    fn a_call_answered_before_a_compaction_is_still_answered() {
+        let lines = [
+            r#"{"type":"assistant","uuid":"a","message":{"content":[
+                {"type":"tool_use","id":"toolu_asked","name":"AskUserQuestion","input":{}}]}}"#,
+            r#"{"type":"user","uuid":"b","parentUuid":"a","message":{"content":[
+                {"type":"tool_result","tool_use_id":"toolu_asked","content":"Alpha"}]}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"c","logicalParentUuid":"b",
+                "compactMetadata":{"trigger":"manual","preTokens":792090,"postTokens":16995}}"#,
+            r#"{"type":"user","uuid":"d","parentUuid":"c","isCompactSummary":true,
+                "message":{"content":"This session is being continued"}}"#,
+        ];
+        let mut transcript = crate::Transcript::new();
+        transcript.absorb(lines.iter().map(|line| record(line)));
+
+        assert!(
+            !transcript
+                .active_path()
+                .iter()
+                .any(|record| tool_result_ids(record).contains(&"toolu_asked")),
+            "the fixture is only a fixture if compaction really did take the result off              the active path"
+        );
+        assert!(
+            call_is_answered(&transcript, "toolu_asked"),
+            "the call was answered before the compaction, and compaction does not un-answer              it"
+        );
+    }
+
+    /// A `Task` agent's call is answered in its own session's conversation, and the list
+    /// draws every session's agents while following one session's. For all the others the
+    /// scan's own reading of their conversation is the only answer there is.
+    #[test]
+    fn a_task_agent_of_an_unread_session_is_finished_when_the_scan_says_so() {
+        let mut agent = subagent("a0", None, Some("toolu_01"));
+        agent.task_agent_finished = Some(true);
+
+        assert_eq!(
+            agent_state(&agent, &[]),
+            AgentState::Finished,
+            "no conversation is held for this session, so the scan's answer is the answer"
+        );
+
+        let mut still_working = subagent("a1", None, Some("toolu_02"));
+        still_working.task_agent_finished = Some(false);
+        assert_eq!(agent_state(&still_working, &[]), AgentState::Running);
+    }
+
+    /// The row of an agent the scan reports as returned comes off the list of a session
+    /// nobody is reading, which is where the agents of a finished session pile up.
+    #[test]
+    fn a_finished_task_agent_of_an_unread_session_leaves_the_list() {
+        let mut agent = subagent("a0", None, Some("toolu_01"));
+        agent.meta.description = Some("印字然後等10分鐘".to_string());
+        agent.task_agent_finished = Some(true);
+
+        assert_eq!(
+            session_agent_rows(&[agent], &[], &READING_NOTHING),
+            Vec::new()
         );
     }
 
@@ -11558,6 +11662,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 transcript_path: self.home_directory.join("agent-a1.jsonl"),
                 size: 1,
                 workflow_agent_finished: None,
+                task_agent_finished: None,
             }]))
         }
 
@@ -11713,6 +11818,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         quit_armed: false,
                         ticked: None,
                         typing_answer_for: None,
+                        opened_input_for_question: None,
                         file_matches: Vec::new(),
                         file_matches_for: None,
                         file_highlight: 0,

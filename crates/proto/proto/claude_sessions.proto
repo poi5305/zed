@@ -52,6 +52,11 @@ message ClaudeSubagent {
   // The session's own conversation cannot answer this: the Workflow call is answered when
   // the run launches, not when it ends.
   optional bool workflow_agent_finished = 11;
+  // Whether the Task call that spawned this agent has been answered in the session's own
+  // conversation, which is the only record of such an agent having returned. Absent for
+  // an agent that records no tool_use_id, and for one whose conversation could not be
+  // read.
+  optional bool task_agent_finished = 12;
 }
 
 message ListClaudeSubagents {

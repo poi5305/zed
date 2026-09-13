@@ -1477,6 +1477,7 @@ impl HeadlessProject {
                     transcript_path: Some(summary.transcript_path.to_string_lossy().into_owned()),
                     size: summary.size,
                     workflow_agent_finished: summary.workflow_agent_finished,
+                    task_agent_finished: summary.task_agent_finished,
                 })
                 .collect(),
         })

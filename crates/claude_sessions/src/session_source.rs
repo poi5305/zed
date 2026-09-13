@@ -609,6 +609,7 @@ fn subagent_summary_from_proto(subagent: proto::ClaudeSubagent) -> SubagentSumma
             .unwrap_or_default(),
         size: subagent.size,
         workflow_agent_finished: subagent.workflow_agent_finished,
+        task_agent_finished: subagent.task_agent_finished,
     }
 }
 
@@ -803,6 +804,7 @@ mod tests {
             ),
             size: 4096,
             workflow_agent_finished: Some(false),
+            task_agent_finished: Some(true),
         }
     }
 
