@@ -6,7 +6,7 @@ use futures::{
     future::{BoxFuture, LocalBoxFuture},
     stream::BoxStream,
 };
-use gpui::{AnyEntity, AnyWeakEntity, AsyncApp, BackgroundExecutor, Entity, FutureExt as _};
+use gpui::{AnyEntity, AnyWeakEntity, App, AsyncApp, BackgroundExecutor, Entity, FutureExt as _};
 use parking_lot::Mutex;
 use proto::{
     AnyTypedEnvelope, EntityMessage, Envelope, EnvelopedMessage, LspRequestId, LspRequestMessage,
@@ -18,7 +18,7 @@ use std::{
         Arc, OnceLock,
         atomic::{self, AtomicU64},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone)]
@@ -86,6 +86,25 @@ pub trait ProtoClient: Send + Sync {
     fn has_wsl_interop(&self) -> bool;
 }
 
+/// Messages held because they arrived after `ChannelClient` started reading
+/// the socket and before `Project::remote` subscribed stores.
+///
+/// 64: that window is a constructor, not a subscription. The known early push
+/// is one `ExternalAgentsUpdated`; a burst already in the socket may add a
+/// handful of entity updates. 64 is more than ten times that, and a hard cap
+/// so a handshake that never reaches `Project::remote` (cancel, connect
+/// failure, reconnect loop) cannot grow for the client's lifetime.
+pub const MAX_QUEUED_EARLY_MESSAGES: usize = 64;
+
+/// How long those messages may be held waiting for `Project::remote`.
+///
+/// 30s: well above a slow constructor (seconds) and the same bound this
+/// connection already uses when a stream consumer has stopped reading.
+/// Past 30s this is no longer a handshake, and further envelopes must be
+/// reported unhandled again. Compared with `BackgroundExecutor::now` so
+/// tests can advance it.
+pub const MAX_QUEUED_EARLY_MESSAGES_AGE: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 pub struct ProtoMessageHandlerSet {
     pub entity_types_by_message_type: TypeIdHashMap<TypeId>,
@@ -93,6 +112,12 @@ pub struct ProtoMessageHandlerSet {
     pub entity_id_extractors: TypeIdHashMap<fn(&dyn AnyTypedEnvelope) -> u64>,
     pub entities_by_message_type: TypeIdHashMap<AnyWeakEntity>,
     pub message_handlers: TypeIdHashMap<ProtoMessageHandler>,
+    /// When true, messages that arrive before their handler or entity is
+    /// registered are held instead of reported as unhandled. SSH/WSL/Docker
+    /// start reading the socket before `Project::remote` can subscribe.
+    pub queue_early_messages: bool,
+    queued_messages: Vec<Box<dyn AnyTypedEnvelope>>,
+    queued_early_messages_since: Option<Instant>,
 }
 
 pub type ProtoMessageHandler = Arc<
@@ -112,6 +137,9 @@ impl ProtoMessageHandlerSet {
         self.entities_by_message_type.clear();
         self.entities_by_type_and_remote_id.clear();
         self.entity_id_extractors.clear();
+        self.queued_messages.clear();
+        self.queued_early_messages_since = None;
+        self.queue_early_messages = false;
     }
 
     fn add_message_handler(
@@ -153,27 +181,79 @@ impl ProtoMessageHandlerSet {
         cx: AsyncApp,
     ) -> Option<LocalBoxFuture<'static, Result<()>>> {
         let payload_type_id = message.payload_type_id();
+        let now = cx.background_executor().now();
         let mut this = this.lock();
-        let handler = this.message_handlers.get(&payload_type_id)?.clone();
+        let queue = this.queue_early_messages;
+        let Some(handler) = this.message_handlers.get(&payload_type_id).cloned() else {
+            return Self::maybe_queue(&mut this, message, queue, now);
+        };
         let entity = if let Some(entity) = this.entities_by_message_type.get(&payload_type_id) {
-            entity.upgrade()?
+            match entity.upgrade() {
+                Some(entity) => entity,
+                None => return Self::maybe_queue(&mut this, message, queue, now),
+            }
         } else {
-            let extract_entity_id = *this.entity_id_extractors.get(&payload_type_id)?;
-            let entity_type_id = *this.entity_types_by_message_type.get(&payload_type_id)?;
+            let Some(extract_entity_id) = this.entity_id_extractors.get(&payload_type_id).copied()
+            else {
+                return Self::maybe_queue(&mut this, message, queue, now);
+            };
+            let Some(entity_type_id) = this
+                .entity_types_by_message_type
+                .get(&payload_type_id)
+                .copied()
+            else {
+                return Self::maybe_queue(&mut this, message, queue, now);
+            };
             let entity_id = (extract_entity_id)(message.as_ref());
             match this
                 .entities_by_type_and_remote_id
-                .get_mut(&(entity_type_id, entity_id))?
+                .get_mut(&(entity_type_id, entity_id))
             {
-                EntityMessageSubscriber::Pending(pending) => {
+                Some(EntityMessageSubscriber::Pending(pending)) => {
                     pending.push(message);
                     return None;
                 }
-                EntityMessageSubscriber::Entity { handle } => handle.upgrade()?,
+                Some(EntityMessageSubscriber::Entity { handle }) => match handle.upgrade() {
+                    Some(entity) => entity,
+                    None => return Self::maybe_queue(&mut this, message, queue, now),
+                },
+                None => return Self::maybe_queue(&mut this, message, queue, now),
             }
         };
         drop(this);
         Some(handler(entity, message, client, cx))
+    }
+
+    fn maybe_queue(
+        this: &mut Self,
+        message: Box<dyn AnyTypedEnvelope>,
+        queue: bool,
+        now: Instant,
+    ) -> Option<LocalBoxFuture<'static, Result<()>>> {
+        if !queue {
+            return None;
+        }
+
+        let since = *this.queued_early_messages_since.get_or_insert(now);
+        if this.queued_messages.len() >= MAX_QUEUED_EARLY_MESSAGES
+            || now.saturating_duration_since(since) >= MAX_QUEUED_EARLY_MESSAGES_AGE
+        {
+            this.queue_early_messages = false;
+            return None;
+        }
+
+        this.queued_messages.push(message);
+        Some(async { Ok(()) }.boxed_local())
+    }
+
+    fn take_queued_early_messages(&mut self) -> Vec<Box<dyn AnyTypedEnvelope>> {
+        self.queue_early_messages = false;
+        self.queued_early_messages_since = None;
+        std::mem::take(&mut self.queued_messages)
+    }
+
+    pub fn queued_early_message_count(&self) -> usize {
+        self.queued_messages.len()
     }
 }
 
@@ -642,6 +722,38 @@ impl AnyProtoClient {
                 handle: entity.downgrade().into(),
             },
         );
+    }
+
+    /// Dispatches messages held because they arrived before this client had
+    /// handlers, then stops holding later ones. Call once the SSH/WSL/Docker
+    /// project has subscribed its stores.
+    pub fn flush_queued_early_messages(&self, cx: &App) {
+        let queued = {
+            let mut handlers = self.0.client.message_handler_set().lock();
+            handlers.take_queued_early_messages()
+        };
+        let async_cx = cx.to_async();
+        for message in queued {
+            let type_name = message.payload_type_name();
+            if let Some(future) = ProtoMessageHandlerSet::handle_message(
+                self.0.client.message_handler_set(),
+                message,
+                self.clone(),
+                async_cx.clone(),
+            ) {
+                cx.foreground_executor()
+                    .spawn(async move {
+                        if let Err(error) = future.await {
+                            tracing::error!(
+                                "error handling queued remote message. type:{type_name}, error:{error:#}"
+                            );
+                        }
+                    })
+                    .detach();
+            } else {
+                tracing::debug!("dropping queued remote message name:{type_name}");
+            }
+        }
     }
 
     pub fn has_wsl_interop(&self) -> bool {

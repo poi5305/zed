@@ -1388,7 +1388,10 @@ impl RemoteConnectionOptions {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use rpc::{ErrorCodeExt, proto::ErrorCode};
+    use rpc::{
+        AnyProtoClient, ErrorCodeExt, MAX_QUEUED_EARLY_MESSAGES, MAX_QUEUED_EARLY_MESSAGES_AGE,
+        proto::ErrorCode,
+    };
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {
@@ -1574,6 +1577,265 @@ mod tests {
         );
     }
 
+    /// ExternalAgentsUpdated is pushed as soon as the remote server has a session,
+    /// which is before this client has a Project to register AgentServerStore
+    /// handlers. Answering that push as "no handler" is not a failure of the
+    /// connection: it is the handshake order, and logging it at ERROR on every
+    /// SSH/WSL/Docker connect hides real errors.
+    #[gpui::test]
+    async fn an_external_agents_updated_push_before_handlers_is_not_answered_as_unhandled(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let remote_started = outgoing_rx
+            .next()
+            .with_timeout(Duration::from_secs(5), &cx.executor())
+            .await;
+        let remote_started = match remote_started {
+            Ok(Some(envelope)) => envelope,
+            other => panic!(
+                "ChannelClient sends RemoteStarted on startup; expected that envelope within 5s, got {other:?}"
+            ),
+        };
+        assert!(
+            matches!(
+                remote_started.payload,
+                Some(proto::envelope::Payload::RemoteStarted(_))
+            ),
+            "ChannelClient sends RemoteStarted on startup; expected that envelope, got {remote_started:?}"
+        );
+
+        incoming_tx
+            .unbounded_send(
+                proto::ExternalAgentsUpdated {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    names: vec!["claude".to_string()],
+                }
+                .into_envelope(1, None, None),
+            )
+            .expect("incoming channel should be open");
+
+        cx.run_until_parked();
+
+        let reply = outgoing_rx.next().now_or_never();
+        assert!(
+            reply.is_none(),
+            "ExternalAgentsUpdated is a one-way handshake push, not a request waiting \
+             for a handler; expected no outgoing envelope, got {reply:?}"
+        );
+
+        struct ReceivedAgents {
+            names: Vec<String>,
+        }
+
+        let received = cx.update(|cx| {
+            let received = cx.new(|_| ReceivedAgents { names: Vec::new() });
+            let proto_client = AnyProtoClient::from(client.clone());
+            proto_client.subscribe_to_entity(proto::REMOTE_SERVER_PROJECT_ID, &received);
+            proto_client.add_entity_message_handler(
+                |this: Entity<ReceivedAgents>,
+                 envelope: rpc::TypedEnvelope<proto::ExternalAgentsUpdated>,
+                 mut cx| async move {
+                    this.update(&mut cx, |this, _cx| {
+                        this.names = envelope.payload.names;
+                    });
+                    Ok(())
+                },
+            );
+            proto_client.flush_queued_early_messages(cx);
+            received
+        });
+        cx.run_until_parked();
+
+        let names = received.read_with(cx, |received, _| received.names.clone());
+        assert_eq!(
+            names,
+            vec!["claude".to_string()],
+            "the push that arrived before handlers must still be delivered once they exist; \
+             expected [\"claude\"], got {names:?}"
+        );
+
+        drop((client, incoming_tx));
+    }
+
+    /// A ChannelClient that never reaches Project::remote must not hold every
+    /// unmatched envelope for the rest of its life, and must not keep answering
+    /// those envelopes as handled. After the early-message cap, later pushes
+    /// are unhandled again — the ERROR that this queue exists to delay, not to
+    /// delete.
+    #[gpui::test]
+    async fn an_unflushed_early_message_queue_stops_growing_and_reports_later_messages_as_unhandled(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let remote_started = outgoing_rx
+            .next()
+            .with_timeout(Duration::from_secs(5), &cx.executor())
+            .await;
+        let remote_started = match remote_started {
+            Ok(Some(envelope)) => envelope,
+            other => panic!(
+                "ChannelClient sends RemoteStarted on startup; expected that envelope within 5s, got {other:?}"
+            ),
+        };
+        assert!(
+            matches!(
+                remote_started.payload,
+                Some(proto::envelope::Payload::RemoteStarted(_))
+            ),
+            "ChannelClient sends RemoteStarted on startup; expected that envelope, got {remote_started:?}"
+        );
+
+        let over_cap = MAX_QUEUED_EARLY_MESSAGES + 8;
+        for message_id in 1..=over_cap as u32 {
+            incoming_tx
+                .unbounded_send(
+                    proto::ExternalAgentsUpdated {
+                        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                        names: vec!["claude".to_string()],
+                    }
+                    .into_envelope(message_id, None, None),
+                )
+                .expect("incoming channel should be open");
+        }
+
+        cx.run_until_parked();
+
+        let held = client.message_handlers.lock().queued_early_message_count();
+        assert!(
+            held <= MAX_QUEUED_EARLY_MESSAGES,
+            "early-message queue must not grow without bound on a connection that never flushes; \
+             cap is {MAX_QUEUED_EARLY_MESSAGES}, held {held}"
+        );
+        assert_eq!(
+            held, MAX_QUEUED_EARLY_MESSAGES,
+            "the handshake allowance should be kept for a late flush; cap is {MAX_QUEUED_EARLY_MESSAGES}, held {held}"
+        );
+        assert!(
+            !client.message_handlers.lock().queue_early_messages,
+            "exceeding the cap must turn queueing off so later envelopes are unhandled again"
+        );
+
+        let mut unhandled = Vec::new();
+        while let Some(envelope) = outgoing_rx.next().now_or_never().flatten() {
+            match envelope.payload {
+                Some(proto::envelope::Payload::Error(_)) => {
+                    unhandled.push(envelope.responding_to);
+                }
+                other => panic!(
+                    "after the handshake pushes, only unhandled-error responses should go out; got {other:?}"
+                ),
+            }
+        }
+        let expected_unhandled: Vec<Option<u32>> = ((MAX_QUEUED_EARLY_MESSAGES as u32 + 1)
+            ..=over_cap as u32)
+            .map(Some)
+            .collect();
+        assert_eq!(
+            unhandled, expected_unhandled,
+            "envelopes past the cap must be reported unhandled (error response to their id), \
+             not swallowed as handled; expected {expected_unhandled:?}, got {unhandled:?}"
+        );
+
+        drop((client, incoming_tx));
+    }
+
+    /// The cap is there so a handshake that never completes cannot grow
+    /// forever. A Project::remote that is only a few seconds late is still
+    /// that handshake: the push must be delivered, not cut off by the bound.
+    #[gpui::test]
+    async fn a_slow_handshake_flush_within_the_early_message_bounds_still_delivers(
+        cx: &mut TestAppContext,
+    ) {
+        let slow_handshake = Duration::from_secs(5);
+        assert!(
+            slow_handshake < MAX_QUEUED_EARLY_MESSAGES_AGE,
+            "this delay is a slow handshake, not an expired one; bound is {:?}, delay is {:?}",
+            MAX_QUEUED_EARLY_MESSAGES_AGE,
+            slow_handshake
+        );
+
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let remote_started = outgoing_rx
+            .next()
+            .with_timeout(Duration::from_secs(5), &cx.executor())
+            .await;
+        let remote_started = match remote_started {
+            Ok(Some(envelope)) => envelope,
+            other => panic!(
+                "ChannelClient sends RemoteStarted on startup; expected that envelope within 5s, got {other:?}"
+            ),
+        };
+        assert!(
+            matches!(
+                remote_started.payload,
+                Some(proto::envelope::Payload::RemoteStarted(_))
+            ),
+            "ChannelClient sends RemoteStarted on startup; expected that envelope, got {remote_started:?}"
+        );
+
+        incoming_tx
+            .unbounded_send(
+                proto::ExternalAgentsUpdated {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    names: vec!["claude".to_string()],
+                }
+                .into_envelope(1, None, None),
+            )
+            .expect("incoming channel should be open");
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(slow_handshake);
+
+        struct ReceivedAgents {
+            names: Vec<String>,
+        }
+
+        let received = cx.update(|cx| {
+            let received = cx.new(|_| ReceivedAgents { names: Vec::new() });
+            let proto_client = AnyProtoClient::from(client.clone());
+            proto_client.subscribe_to_entity(proto::REMOTE_SERVER_PROJECT_ID, &received);
+            proto_client.add_entity_message_handler(
+                |this: Entity<ReceivedAgents>,
+                 envelope: rpc::TypedEnvelope<proto::ExternalAgentsUpdated>,
+                 mut cx| async move {
+                    this.update(&mut cx, |this, _cx| {
+                        this.names = envelope.payload.names;
+                    });
+                    Ok(())
+                },
+            );
+            proto_client.flush_queued_early_messages(cx);
+            received
+        });
+        cx.run_until_parked();
+
+        let names = received.read_with(cx, |received, _| received.names.clone());
+        assert_eq!(
+            names,
+            vec!["claude".to_string()],
+            "a flush that arrives inside the early-message bounds must still deliver the \
+             handshake push; expected [\"claude\"], got {names:?}"
+        );
+
+        drop((client, incoming_tx));
+    }
+
     /// One consumer that has stopped reading must not silence the whole connection.
     ///
     /// Every response on a connection is handed to its requester by one loop, and that
@@ -1605,20 +1867,24 @@ mod tests {
         // Issued and then left alone: the future is alive, holds its half of the
         // hand-off, and is never polled again. This is a consumer awaiting something
         // else, not one that has gone away — a dropped one is already handled.
-        let stalled =
-            client.request_dynamic(proto::Test { id: 1 }.into_envelope(0, None, None), "Test", true);
+        let stalled = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
         let _stalled = Box::pin(stalled);
 
-        let answered =
-            client.request_dynamic(proto::Test { id: 2 }.into_envelope(0, None, None), "Test", true);
+        let answered = client.request_dynamic(
+            proto::Test { id: 2 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
 
         cx.run_until_parked();
         let request_ids: Vec<u32> = sent
             .lock()
             .iter()
-            .filter(|envelope| {
-                matches!(envelope.payload, Some(proto::envelope::Payload::Test(_)))
-            })
+            .filter(|envelope| matches!(envelope.payload, Some(proto::envelope::Payload::Test(_))))
             .map(|envelope| envelope.id)
             .collect();
         assert_eq!(
@@ -1630,14 +1896,10 @@ mod tests {
         // The host answers both, the stalled one first, which is the order that puts the
         // stalled hand-off in front of the one that is being waited on.
         incoming_tx
-            .unbounded_send(
-                proto::Test { id: 11 }.into_envelope(500, Some(request_ids[0]), None),
-            )
+            .unbounded_send(proto::Test { id: 11 }.into_envelope(500, Some(request_ids[0]), None))
             .unwrap();
         incoming_tx
-            .unbounded_send(
-                proto::Test { id: 12 }.into_envelope(501, Some(request_ids[1]), None),
-            )
+            .unbounded_send(proto::Test { id: 12 }.into_envelope(501, Some(request_ids[1]), None))
             .unwrap();
 
         let answer = answered
@@ -1677,31 +1939,31 @@ mod tests {
             }
         });
 
-        let first =
-            client.request_dynamic(proto::Test { id: 1 }.into_envelope(0, None, None), "Test", true);
-        let second =
-            client.request_dynamic(proto::Test { id: 2 }.into_envelope(0, None, None), "Test", true);
+        let first = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        let second = client.request_dynamic(
+            proto::Test { id: 2 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
 
         cx.run_until_parked();
         let request_ids: Vec<u32> = sent
             .lock()
             .iter()
-            .filter(|envelope| {
-                matches!(envelope.payload, Some(proto::envelope::Payload::Test(_)))
-            })
+            .filter(|envelope| matches!(envelope.payload, Some(proto::envelope::Payload::Test(_))))
             .map(|envelope| envelope.id)
             .collect();
         assert_eq!(request_ids.len(), 2, "both requests are in flight");
 
         incoming_tx
-            .unbounded_send(
-                proto::Test { id: 21 }.into_envelope(500, Some(request_ids[0]), None),
-            )
+            .unbounded_send(proto::Test { id: 21 }.into_envelope(500, Some(request_ids[0]), None))
             .unwrap();
         incoming_tx
-            .unbounded_send(
-                proto::Test { id: 22 }.into_envelope(501, Some(request_ids[1]), None),
-            )
+            .unbounded_send(proto::Test { id: 22 }.into_envelope(501, Some(request_ids[1]), None))
             .unwrap();
 
         // Read out of order and after a delay: the responses were already delivered, so
@@ -1889,7 +2151,14 @@ impl ChannelClient {
             max_received: AtomicU32::new(0),
             response_channels: ResponseChannels::default(),
             stream_response_channels: StreamResponseChannels::default(),
-            message_handlers: Default::default(),
+            message_handlers: Mutex::new({
+                let mut handlers = ProtoMessageHandlerSet::default();
+                // The socket is read from the moment this client exists, which
+                // is before Project::remote can subscribe stores. Hold those
+                // envelopes instead of answering them as unhandled.
+                handlers.queue_early_messages = true;
+                handlers
+            }),
             buffer: Mutex::new(VecDeque::new()),
             name,
             executor: cx.background_executor().clone(),

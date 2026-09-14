@@ -1697,6 +1697,11 @@ impl Project {
             BreakpointStore::init(&remote_proto);
             GitStore::init(&remote_proto);
             AgentServerStore::init_remote(&remote_proto);
+            // The remote server can push ExternalAgentsUpdated as soon as it
+            // has a session, which is before this constructor runs. Those
+            // envelopes were held on the ChannelClient; deliver them now that
+            // the store is subscribed, rather than answering each as unhandled.
+            remote_proto.flush_queued_early_messages(cx);
 
             this
         })
