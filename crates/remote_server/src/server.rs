@@ -620,19 +620,29 @@ pub fn execute_run(
         .build_global()
         .unwrap();
 
+    // Two receivers of the one import, because they are awaited by callers that cannot
+    // share one: the node runtime consumes its receiver, while every request handler that
+    // shells out has to be able to wait for the same signal again on the next request.
     #[cfg(unix)]
-    let shell_env_loaded_rx = {
+    let (shell_env_loaded_rx, shell_environment_ready) = {
         let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+        let (shell_environment_ready_tx, shell_environment_ready_rx) = oneshot::channel();
         app.background_executor()
             .spawn(async {
                 util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
+                shell_environment_ready_tx.send(()).ok();
             })
             .detach();
-        Some(shell_env_loaded_rx)
+        (Some(shell_env_loaded_rx), shell_environment_ready_rx.shared())
     };
     #[cfg(windows)]
-    let shell_env_loaded_rx: Option<oneshot::Receiver<()>> = None;
+    let (shell_env_loaded_rx, shell_environment_ready): (Option<oneshot::Receiver<()>>, _) = {
+        // Nothing is imported on Windows, so the signal is already given.
+        let (shell_environment_ready_tx, shell_environment_ready_rx) = oneshot::channel();
+        shell_environment_ready_tx.send(()).ok();
+        (None, shell_environment_ready_rx.shared())
+    };
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
     let run = move |cx: &mut App| {
@@ -644,6 +654,7 @@ pub fn execute_run(
             .detach();
         }
         settings::init(cx);
+        headless_project::set_shell_environment_ready(shell_environment_ready.clone(), cx);
         let app_commit_sha = option_env!("ZED_COMMIT_SHA").map(|s| AppCommitSha::new(s.to_owned()));
         let app_version = AppVersion::load(
             env!("ZED_PKG_VERSION"),

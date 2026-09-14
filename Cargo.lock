@@ -18706,6 +18706,7 @@ dependencies = [
  "anyhow",
  "collections",
  "gpui",
+ "parking_lot",
  "remote",
  "rpc",
  "task",

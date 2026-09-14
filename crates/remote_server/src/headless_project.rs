@@ -9,7 +9,8 @@ use lsp::LanguageServerId;
 use extension::ExtensionHostProxy;
 use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, TaskExt};
+use futures::{FutureExt as _, channel::oneshot, future::Shared, select_biased};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Global, PromptLevel, TaskExt};
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
 use node_runtime::NodeRuntime;
@@ -47,7 +48,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
@@ -1371,6 +1372,7 @@ impl HeadlessProject {
         _envelope: TypedEnvelope<proto::ListTmuxSessions>,
         cx: AsyncApp,
     ) -> Result<proto::ListTmuxSessionsResponse> {
+        shell_environment_ready(&cx).await;
         // Listing shells out twice, so it is kept off the thread that serves
         // the rest of the session.
         let listing = cx
@@ -1727,6 +1729,7 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::CaptureClaudePane>,
         cx: AsyncApp,
     ) -> Result<proto::CaptureClaudePaneResponse> {
+        shell_environment_ready(&cx).await;
         // Sanitized before it reaches tmux, exactly as a send's target is: this drives
         // the same command with a value that came over the connection.
         let Some(pane_target) = remote::claude_sessions::pane_target(&envelope.payload.pane_target)
@@ -1751,6 +1754,7 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::SendClaudeInput>,
         cx: AsyncApp,
     ) -> Result<proto::Ack> {
+        shell_environment_ready(&cx).await;
         let request = envelope.payload;
         // The pane target must be sanitized before passing it to tmux to prevent command injection.
         let Some(sanitized_pane_target) =
@@ -1837,6 +1841,10 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::GetDirectoryEnvironment>,
         mut cx: AsyncApp,
     ) -> Result<proto::DirectoryEnvironment> {
+        // The second unbounded wait on this connection, and the one a terminal is held
+        // by: what is captured here is a login shell run in a directory, and which shell
+        // that is, and what `direnv` it finds, are looked up on this process's `PATH`.
+        shell_environment_ready(&cx).await;
         let shell = task::shell_from_proto(envelope.payload.shell.context("missing shell")?)?;
         let directory = PathBuf::from(envelope.payload.directory);
         let environment = this
@@ -2279,5 +2287,55 @@ mod tests {
             result.is_err(),
             "an invalid agent_id that fails path validation must return an error"
         );
+    }
+}
+
+/// The signal that the login shell's environment has been imported into this process.
+///
+/// The server accepts connections before that import finishes, and until it does `PATH`
+/// is whatever launched the process. On a macOS host that is `sshd`'s own path, which
+/// holds no Homebrew directory, so `tmux` is not found and a listing answers "this host
+/// has no tmux" rather than naming the sessions that are running. Nothing retries it: the
+/// panel lists once, so that answer is the one the user is left with.
+struct ShellEnvironmentReady(Shared<oneshot::Receiver<()>>);
+
+impl Global for ShellEnvironmentReady {}
+
+pub fn set_shell_environment_ready(ready: Shared<oneshot::Receiver<()>>, cx: &mut App) {
+    cx.set_global(ShellEnvironmentReady(ready));
+}
+
+/// How long a handler waits for that import before running its command anyway.
+///
+/// The import runs an interactive login shell, and `shell_env::capture` puts no limit of
+/// its own on how long that takes: an rc file that waits on input, a network call or a
+/// slow plugin never returns, and the wait would then be permanent. Answering with the
+/// `PATH` the process was launched with is the same answer this server gave before it
+/// waited at all, which is wrong but not silent — a send that never returns would leave
+/// the message box looking dead.
+const SHELL_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Waits for that import, so that a command this server runs is looked up on the `PATH`
+/// the user's login shell defines. Returns immediately once it has happened — the signal
+/// is shared, so only the requests arriving during startup wait at all — and also when no
+/// signal was registered, which is what a test that never registers one wants.
+async fn shell_environment_ready(cx: &AsyncApp) {
+    let ready = cx.update(|cx| {
+        cx.try_global::<ShellEnvironmentReady>()
+            .map(|global| global.0.clone())
+    });
+    let Some(ready) = ready else {
+        return;
+    };
+
+    let timer = cx.background_executor().timer(SHELL_ENVIRONMENT_TIMEOUT);
+    select_biased! {
+        _ = ready.fuse() => {}
+        _ = timer.fuse() => {
+            log::warn!(
+                "the login shell's environment has not been captured after {SHELL_ENVIRONMENT_TIMEOUT:?}; \
+                 running the command with the environment this server was launched with"
+            );
+        }
     }
 }

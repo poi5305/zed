@@ -1574,6 +1574,162 @@ mod tests {
         );
     }
 
+    /// One consumer that has stopped reading must not silence the whole connection.
+    ///
+    /// Every response on a connection is handed to its requester by one loop, and that
+    /// loop waits for each hand-off to be taken before it reads the next envelope. A
+    /// requester whose future is still alive but is no longer being polled never takes
+    /// it, so the loop stops there — and every later response, for every other panel and
+    /// every other store on that connection, is never delivered. That is one stalled
+    /// reader turning into a connection that answers nothing, with no error anywhere.
+    #[gpui::test]
+    async fn a_response_no_one_is_polling_does_not_stop_the_rest_of_the_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _drain_outgoing = cx.executor().spawn({
+            let sent = sent.clone();
+            async move {
+                while let Some(envelope) = outgoing_rx.next().await {
+                    sent.lock().push(envelope);
+                }
+            }
+        });
+
+        // Issued and then left alone: the future is alive, holds its half of the
+        // hand-off, and is never polled again. This is a consumer awaiting something
+        // else, not one that has gone away — a dropped one is already handled.
+        let stalled =
+            client.request_dynamic(proto::Test { id: 1 }.into_envelope(0, None, None), "Test", true);
+        let _stalled = Box::pin(stalled);
+
+        let answered =
+            client.request_dynamic(proto::Test { id: 2 }.into_envelope(0, None, None), "Test", true);
+
+        cx.run_until_parked();
+        let request_ids: Vec<u32> = sent
+            .lock()
+            .iter()
+            .filter(|envelope| {
+                matches!(envelope.payload, Some(proto::envelope::Payload::Test(_)))
+            })
+            .map(|envelope| envelope.id)
+            .collect();
+        assert_eq!(
+            request_ids.len(),
+            2,
+            "both requests must have been sent before either is answered; got {request_ids:?}"
+        );
+
+        // The host answers both, the stalled one first, which is the order that puts the
+        // stalled hand-off in front of the one that is being waited on.
+        incoming_tx
+            .unbounded_send(
+                proto::Test { id: 11 }.into_envelope(500, Some(request_ids[0]), None),
+            )
+            .unwrap();
+        incoming_tx
+            .unbounded_send(
+                proto::Test { id: 12 }.into_envelope(501, Some(request_ids[1]), None),
+            )
+            .unwrap();
+
+        let answer = answered
+            .with_timeout(Duration::from_secs(30), &cx.executor())
+            .await;
+        let answer = match answer {
+            Ok(answer) => answer.expect("the second request was answered by the host"),
+            Err(_) => panic!(
+                "the second request was answered by the host and still never arrived: it was \
+                 waited on for 30s while the response before it sat in a hand-off nobody took"
+            ),
+        };
+        assert_eq!(
+            proto::Test::from_envelope(answer).expect("a Test response"),
+            proto::Test { id: 12 },
+            "each requester must get its own response"
+        );
+    }
+
+    /// What taking the hand-off wait away could let through: a response going to the
+    /// wrong requester, or one being dropped, when a consumer is slow rather than stuck.
+    #[gpui::test]
+    async fn a_slow_consumer_still_gets_its_own_response(cx: &mut TestAppContext) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _drain_outgoing = cx.executor().spawn({
+            let sent = sent.clone();
+            async move {
+                while let Some(envelope) = outgoing_rx.next().await {
+                    sent.lock().push(envelope);
+                }
+            }
+        });
+
+        let first =
+            client.request_dynamic(proto::Test { id: 1 }.into_envelope(0, None, None), "Test", true);
+        let second =
+            client.request_dynamic(proto::Test { id: 2 }.into_envelope(0, None, None), "Test", true);
+
+        cx.run_until_parked();
+        let request_ids: Vec<u32> = sent
+            .lock()
+            .iter()
+            .filter(|envelope| {
+                matches!(envelope.payload, Some(proto::envelope::Payload::Test(_)))
+            })
+            .map(|envelope| envelope.id)
+            .collect();
+        assert_eq!(request_ids.len(), 2, "both requests are in flight");
+
+        incoming_tx
+            .unbounded_send(
+                proto::Test { id: 21 }.into_envelope(500, Some(request_ids[0]), None),
+            )
+            .unwrap();
+        incoming_tx
+            .unbounded_send(
+                proto::Test { id: 22 }.into_envelope(501, Some(request_ids[1]), None),
+            )
+            .unwrap();
+
+        // Read out of order and after a delay: the responses were already delivered, so
+        // which one each requester gets cannot depend on when it looks.
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+
+        let second = second
+            .with_timeout(Duration::from_secs(30), &cx.executor())
+            .await
+            .expect("the second response arrived")
+            .expect("the second request succeeded");
+        let first = first
+            .with_timeout(Duration::from_secs(30), &cx.executor())
+            .await
+            .expect("the first response arrived")
+            .expect("the first request succeeded");
+
+        assert_eq!(
+            (
+                proto::Test::from_envelope(first).expect("a Test response"),
+                proto::Test::from_envelope(second).expect("a Test response"),
+            ),
+            (proto::Test { id: 21 }, proto::Test { id: 22 }),
+            "each request must be answered with the response the host sent for it"
+        );
+    }
+
     #[test]
     fn test_ssh_host_ignores_nickname() {
         let options = RemoteConnectionOptions::Ssh(SshConnectionOptions {
@@ -1700,6 +1856,10 @@ impl<T: Send + Clone + 'static> Signal<T> {
     }
 }
 
+/// How long the read loop holds a streamed response back for a reader that is not
+/// keeping up, before it goes on delivering to everyone else.
+const STREAM_CONSUMER_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct ChannelClient {
     next_message_id: AtomicU32,
     outgoing_tx: Mutex<mpsc::UnboundedSender<Envelope>>,
@@ -1811,9 +1971,22 @@ impl ChannelClient {
                     }
                     let sender = this.response_channels.lock().remove(&request_id);
                     if let Some(sender) = sender {
-                        let (tx, rx) = oneshot::channel();
+                        // Handed over without waiting for it to be taken. The loop that
+                        // runs this is the only one delivering responses on the
+                        // connection, so anything it waits for is something every later
+                        // response waits for too: a requester whose future is alive but
+                        // not currently being polled — one task awaiting several requests
+                        // the far end answered out of order is enough — would never take
+                        // the hand-off, and the connection would answer nothing again,
+                        // for any panel, with no error raised anywhere.
+                        //
+                        // Nothing is lost by not waiting. The channel is a one-shot, so
+                        // it holds one response and the in-flight requests already bound
+                        // how many there can be; and the requester drops the barrier
+                        // before it looks at the response, so the wait never ordered any
+                        // work either.
+                        let (tx, _barrier) = oneshot::channel();
                         sender.send((incoming, tx)).ok();
-                        rx.await.ok();
                     } else {
                         let terminal_stream_response = matches!(
                             &incoming.payload,
@@ -1834,7 +2007,24 @@ impl ChannelClient {
                                 this.stream_response_channels.lock().remove(&request_id);
                                 continue;
                             }
-                            rx.await.ok();
+                            // A stream's channel is unbounded and one request may answer
+                            // with many envelopes, so unlike a one-shot response this
+                            // wait is the only thing holding a fast sender to the speed
+                            // of its reader. It is bounded all the same: a reader that
+                            // has stopped reading must cost memory rather than cost every
+                            // other request on the connection its answer.
+                            if rx
+                                .with_timeout(STREAM_CONSUMER_TIMEOUT, &this.executor)
+                                .await
+                                .is_err()
+                            {
+                                log::warn!(
+                                    "{}: a streamed response has not been read for {:?}; \
+                                     delivering the rest without waiting for its reader",
+                                    this.name,
+                                    STREAM_CONSUMER_TIMEOUT
+                                );
+                            }
                         }
                     }
                 } else if let Some(envelope) =

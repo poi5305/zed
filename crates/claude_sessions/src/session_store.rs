@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use gpui::{Context, SharedString, Task};
+use gpui::{Context, FutureExt as _, SharedString, Task};
 use util::ResultExt as _;
 
 use crate::{
@@ -38,6 +38,15 @@ const PANE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// anyway rather than something the user is expected to see.
 const NO_PANE_TARGET: &str = "This session is not running inside tmux, so Zed cannot type into it.";
 
+/// How long one registry scan may be in flight before the poll stops waiting on it.
+///
+/// A scan that is neither answered nor refused is the one failure the store had no
+/// answer for: `error` stays empty, `sessions` stays empty, and every view built on it
+/// draws its own initial state as though it were the host's answer. The bound turns that
+/// into a refusal, which the store already reports and the next turn of the poll retries.
+/// Generous enough that a host merely slow to walk its registry still gets to answer.
+pub(crate) const REGISTRY_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// What put the message in [`ClaudeSessionStore::error`]. A poll that succeeds clears the
 /// error a previous poll left behind, and that must not also wipe the report of a send
 /// the user has just watched fail: the polls run every second, so a send failure with no
@@ -45,6 +54,11 @@ const NO_PANE_TARGET: &str = "This session is not running inside tmux, so Zed ca
 #[derive(PartialEq, Eq)]
 enum ErrorSource {
     Poll,
+    /// Kept apart from [`ErrorSource::Poll`] because the two polls run at the same
+    /// interval: a registry scan that succeeds clears the source it shares, so a
+    /// transcript that fails on every read was reported and wiped within the second,
+    /// leaving a conversation that is empty for no stated reason.
+    Transcript,
     Send,
 }
 
@@ -222,6 +236,35 @@ impl ClaudeSessionStore {
         self.selected_process_id
     }
 
+    /// Tells the store about a session a caller has already been told about, so that a
+    /// view opened onto one can read it before its own first scan has landed — or
+    /// without one ever landing.
+    ///
+    /// The seed is what the caller last saw rather than a second source of truth: the
+    /// next scan that does land rebuilds `sessions` and `transcript_paths` from itself
+    /// and the seed is gone with everything else the scan did not list. Must be called
+    /// before [`Self::select`], which is what turns a process id into the conversation
+    /// being followed.
+    pub fn seed_session(
+        &mut self,
+        session: RegisteredSession,
+        transcript_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(transcript_path) = transcript_path {
+            self.transcript_paths
+                .insert(session.process_id, transcript_path);
+        }
+        if !self
+            .sessions
+            .iter()
+            .any(|listed| listed.process_id == session.process_id)
+        {
+            self.sessions.push(session);
+        }
+        cx.notify();
+    }
+
     pub fn select(&mut self, process_id: u32, cx: &mut Context<Self>) {
         if self.selected_process_id == Some(process_id) {
             return;
@@ -308,8 +351,16 @@ impl ClaudeSessionStore {
     pub fn transcript_path(&self) -> Option<&Path> {
         match &self.transcript_target {
             TranscriptTarget::Main => {
+                // The scan's answer first, and the file this store has actually been
+                // reading when the scan has not named one. Without the fallback a view
+                // whose scan has not landed draws "no transcript yet" over a
+                // conversation it has already read, which is the same answer an agent's
+                // conversation has always given from the reads themselves.
                 let process_id = self.selected_process_id?;
-                self.transcript_paths.get(&process_id).map(PathBuf::as_path)
+                self.transcript_paths
+                    .get(&process_id)
+                    .map(PathBuf::as_path)
+                    .or(self.main_conversation.path.as_deref())
             }
             // The scan reports the session's transcript, never an agent's, so the only
             // answer for an agent is the file its own reads have resolved.
@@ -427,6 +478,18 @@ impl ClaudeSessionStore {
         Some(self.selected_session()?.working_directory.clone())
     }
 
+    /// What a view opened onto the selected session needs in order to read it before a
+    /// scan of its own has landed: the session as this store last saw it, and the file
+    /// the scan found for it.
+    ///
+    /// Handed over rather than looked up again because the caller opening the view is
+    /// the one holding the answer; see [`Self::seed_session`].
+    pub fn session_seed(&self) -> Option<(RegisteredSession, Option<PathBuf>)> {
+        let session = self.selected_session()?.clone();
+        let transcript_path = self.transcript_paths.get(&session.process_id).cloned();
+        Some((session, transcript_path))
+    }
+
     fn selected_session(&self) -> Option<&RegisteredSession> {
         let process_id = self.selected_process_id?;
         self.sessions
@@ -445,7 +508,22 @@ impl ClaudeSessionStore {
 
         cx.spawn(async move |this, cx| {
             loop {
-                let scan = source.list_sessions(project_root.clone()).await;
+                // Bounded, because a scan that is neither answered nor refused is the
+                // one outcome nothing downstream can tell from an empty machine: the
+                // list stays empty, the selection has no session id to follow, and the
+                // conversation draws "no transcript yet" for a session that has written
+                // one. Turning it into a refusal reports it and lets the next turn of
+                // this loop ask again.
+                let scan = match source
+                    .list_sessions(project_root.clone())
+                    .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+                    .await
+                {
+                    Ok(scan) => scan,
+                    Err(_) => Err(anyhow!(
+                        "the machine these sessions run on has not answered in {REGISTRY_SCAN_TIMEOUT:?}"
+                    )),
+                };
 
                 // The only exit: the store has been dropped, so nothing is left to update.
                 if this
@@ -865,7 +943,7 @@ impl ClaudeSessionStore {
             Err(error) => {
                 // Only the transcript is affected; the session list stays as it is.
                 self.error = Some((
-                    ErrorSource::Poll,
+                    ErrorSource::Transcript,
                     format!("Reading transcript: {error:#}").into(),
                 ));
                 cx.notify();
@@ -887,6 +965,10 @@ impl ClaudeSessionStore {
         }
 
         let path_changed = conversation.path != progress.path;
+
+        // Cleared by a read that is actually absorbed rather than by any read that
+        // succeeds, so that a stale one cannot report the transcript as readable again.
+        let cleared_error = self.take_error_from(ErrorSource::Transcript);
 
         if progress.restarted {
             // Counted before the transcript is borrowed: the counter is shared by both
@@ -919,7 +1001,7 @@ impl ClaudeSessionStore {
         conversation.offset = progress.offset;
         conversation.pending = progress.pending;
 
-        if absorbed_any || progress.restarted || path_changed {
+        if absorbed_any || progress.restarted || path_changed || cleared_error {
             cx.notify();
         }
     }

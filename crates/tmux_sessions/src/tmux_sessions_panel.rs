@@ -1,10 +1,11 @@
 use collections::HashSet;
 use gpui::{
-    AnyElement, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render, Task,
-    WeakEntity,
+    AnyElement, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, FutureExt as _,
+    Render, Task, WeakEntity,
 };
 use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
+use std::time::Duration;
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{Disclosure, ListItem, ListItemSpacing, Tooltip, prelude::*};
@@ -27,6 +28,21 @@ const TMUX_MISSING_LOCAL: &str = "No tmux binary was found on this machine.";
 const NO_SESSIONS_REMOTE: &str = "No tmux sessions are running on the remote host.";
 
 const NO_SESSIONS_LOCAL: &str = "No tmux sessions are running on this machine.";
+
+const ASKING_REMOTE: &str = "Asking the remote host for its tmux sessions…";
+
+const ASKING_LOCAL: &str = "Looking for tmux sessions on this machine…";
+
+const UNANSWERED_REMOTE: &str = "The remote host did not answer. Refresh to ask again.";
+
+const UNANSWERED_LOCAL: &str = "The listing failed. Refresh to try again.";
+
+/// How long a listing waits for the host before it stops calling itself unanswered.
+///
+/// The panel asks once and has no poll of its own, so a request that is never answered
+/// is not merely slow: it is the panel's final state. Generous enough that a host merely
+/// busy enough to take a while still gets to answer, and the refresh button re-asks.
+const TMUX_LISTING_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct TmuxSessionsPanel {
     workspace: WeakEntity<Workspace>,
@@ -98,9 +114,15 @@ impl TmuxSessionsPanel {
                     project_id: rpc::proto::REMOTE_SERVER_PROJECT_ID,
                 });
                 cx.spawn(async move |this, cx| {
-                    let listing = response
+                    let listing = match response
+                        .with_timeout(TMUX_LISTING_TIMEOUT, cx.background_executor())
                         .await
-                        .map(|response| (response.tmux_available, response.sessions));
+                    {
+                        Ok(response) => {
+                            response.map(|response| (response.tmux_available, response.sessions))
+                        }
+                        Err(_) => Err(unanswered_within(TMUX_LISTING_TIMEOUT)),
+                    };
                     this.update(cx, |this, cx| this.apply_listing(listing, cx))
                         .log_err();
                 })
@@ -110,12 +132,18 @@ impl TmuxSessionsPanel {
                 // draws the window.
                 let listing = cx.background_spawn(list_tmux_sessions());
                 cx.spawn(async move |this, cx| {
-                    let listing = listing.await.map(|listing| {
-                        (
-                            listing.tmux_available,
-                            listing.sessions.into_iter().map(proto_session).collect(),
-                        )
-                    });
+                    let listing = match listing
+                        .with_timeout(TMUX_LISTING_TIMEOUT, cx.background_executor())
+                        .await
+                    {
+                        Ok(listing) => listing.map(|listing| {
+                            (
+                                listing.tmux_available,
+                                listing.sessions.into_iter().map(proto_session).collect(),
+                            )
+                        }),
+                        Err(_) => Err(unanswered_within(TMUX_LISTING_TIMEOUT)),
+                    };
                     this.update(cx, |this, cx| this.apply_listing(listing, cx))
                         .log_err();
                 })
@@ -194,11 +222,22 @@ impl TmuxSessionsPanel {
             ..Default::default()
         };
 
-        terminal_panel
-            .update(cx, |terminal_panel, cx| {
-                terminal_panel.spawn_task(&spawn, window, cx)
-            })
-            .detach_and_log_err(cx);
+        // Reported into the panel rather than only logged: a failure to attach leaves no
+        // terminal behind, so a log line is the only trace of it and reads to the user as
+        // a click that did nothing at all.
+        let spawned = terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_panel.spawn_task(&spawn, window, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = spawned.await {
+                this.update(cx, |this, cx| {
+                    this.error = Some(format!("Attaching to the session: {error:#}").into());
+                    cx.notify();
+                })
+                .log_err();
+            }
+        })
+        .detach();
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -342,6 +381,24 @@ impl TmuxSessionsPanel {
     /// machine was asked is part of that reason, so the message names it.
     fn empty_message(&self) -> Option<&'static str> {
         let remote = self.remote_client.is_some();
+        if !self.sessions.is_empty() {
+            return None;
+        }
+        // Asked and not yet answered, which is not the same as having been told there is
+        // nothing. The panel asks once, so a request that is never answered would
+        // otherwise leave every field at the value an empty host produces and the panel
+        // stating, permanently and with nothing to retract it, something it was never
+        // told.
+        if self.loading {
+            return Some(if remote { ASKING_REMOTE } else { ASKING_LOCAL });
+        }
+        if self.error.is_some() {
+            return Some(if remote {
+                UNANSWERED_REMOTE
+            } else {
+                UNANSWERED_LOCAL
+            });
+        }
         if !self.tmux_available {
             return Some(if remote {
                 TMUX_MISSING_REMOTE
@@ -349,14 +406,11 @@ impl TmuxSessionsPanel {
                 TMUX_MISSING_LOCAL
             });
         }
-        if self.sessions.is_empty() {
-            return Some(if remote {
-                NO_SESSIONS_REMOTE
-            } else {
-                NO_SESSIONS_LOCAL
-            });
-        }
-        None
+        Some(if remote {
+            NO_SESSIONS_REMOTE
+        } else {
+            NO_SESSIONS_LOCAL
+        })
     }
 }
 
@@ -459,6 +513,12 @@ impl Panel for TmuxSessionsPanel {
     }
 }
 
+/// What a listing that was never answered is reported as. The panel has no poll of its
+/// own, so this is the state it is left in until the user refreshes.
+fn unanswered_within(timeout: Duration) -> anyhow::Error {
+    anyhow::anyhow!("no answer within {timeout:?}")
+}
+
 /// The panel holds the proto shape for both listing paths, so that the rendering
 /// reads one type no matter which machine the sessions came from.
 fn proto_session(session: remote::tmux_sessions::TmuxSession) -> proto::TmuxSession {
@@ -475,5 +535,233 @@ fn proto_session(session: remote::tmux_sessions::TmuxSession) -> proto::TmuxSess
                 active: window.active,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use rpc::{ProtoClient, ProtoMessageHandlerSet, proto::EnvelopedMessage};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Longer than any bound a listing may put on its own request, so that a panel that
+    /// is still waiting after this has stopped waiting for a reason rather than because
+    /// the test did not wait long enough.
+    const LONG_ENOUGH_FOR_ANY_ANSWER: Duration = Duration::from_secs(120);
+
+    /// A remote host that never answers, which is what this panel is being asked to
+    /// survive: a request that is neither answered nor refused leaves every consumer
+    /// holding its own initial state, and the question is what the panel says then.
+    struct SilentHost {
+        answer: parking_lot::Mutex<Option<proto::ListTmuxSessionsResponse>>,
+        /// How long the answer, if there is one, takes to arrive.
+        delay: Duration,
+        executor: gpui::BackgroundExecutor,
+        handlers: parking_lot::Mutex<ProtoMessageHandlerSet>,
+    }
+
+    impl SilentHost {
+        fn never_answering(executor: gpui::BackgroundExecutor) -> Arc<Self> {
+            Arc::new(Self {
+                answer: parking_lot::Mutex::new(None),
+                delay: Duration::ZERO,
+                executor,
+                handlers: parking_lot::Mutex::default(),
+            })
+        }
+
+        fn answering_after(
+            delay: Duration,
+            answer: proto::ListTmuxSessionsResponse,
+            executor: gpui::BackgroundExecutor,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                answer: parking_lot::Mutex::new(Some(answer)),
+                delay,
+                executor,
+                handlers: parking_lot::Mutex::default(),
+            })
+        }
+    }
+
+    impl ProtoClient for SilentHost {
+        fn request(
+            &self,
+            _envelope: rpc::proto::Envelope,
+            _request_type: &'static str,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = anyhow::Result<rpc::proto::Envelope>> + Send + 'static>,
+        > {
+            let answer = self.answer.lock().clone();
+            let delay = self.delay;
+            let executor = self.executor.clone();
+            Box::pin(async move {
+                let Some(answer) = answer else {
+                    std::future::pending::<()>().await;
+                    unreachable!("a host that never answers never returns");
+                };
+                executor.timer(delay).await;
+                Ok(answer.into_envelope(0, None, None))
+            })
+        }
+
+        fn send(
+            &self,
+            _envelope: rpc::proto::Envelope,
+            _message_type: &'static str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn send_response(
+            &self,
+            _envelope: rpc::proto::Envelope,
+            _message_type: &'static str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn message_handler_set(&self) -> &parking_lot::Mutex<ProtoMessageHandlerSet> {
+            &self.handlers
+        }
+
+        fn is_via_collab(&self) -> bool {
+            false
+        }
+
+        fn has_wsl_interop(&self) -> bool {
+            false
+        }
+    }
+
+    fn panel_for(client: AnyProtoClient, cx: &mut TestAppContext) -> Entity<TmuxSessionsPanel> {
+        cx.new(|cx| TmuxSessionsPanel {
+            workspace: WeakEntity::new_invalid(),
+            focus_handle: cx.focus_handle(),
+            position: DockPosition::Left,
+            remote_client: Some(client),
+            sessions: Vec::new(),
+            tmux_available: true,
+            expanded_sessions: HashSet::default(),
+            loading: false,
+            error: None,
+            _refresh: Task::ready(()),
+        })
+    }
+
+    fn one_session() -> proto::ListTmuxSessionsResponse {
+        proto::ListTmuxSessionsResponse {
+            tmux_available: true,
+            sessions: vec![proto::TmuxSession {
+                name: "zed".to_string(),
+                attached: true,
+                window_count: 2,
+                windows: Vec::new(),
+            }],
+        }
+    }
+
+    /// A host that has not answered has not said it has no sessions.
+    ///
+    /// The panel asks once, in its constructor, and every field it draws from starts at
+    /// the value an empty host would produce. A request that is never answered therefore
+    /// leaves it drawing "no tmux sessions are running on the remote host" over a host
+    /// that is running several — an answer the user has no way to tell from a real one,
+    /// and one nothing ever retracts.
+    #[gpui::test]
+    async fn a_host_that_has_not_answered_is_not_reported_as_having_no_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        let client = AnyProtoClient::new(SilentHost::never_answering(cx.executor()));
+        let panel = panel_for(client, cx);
+
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        cx.executor().advance_clock(LONG_ENOUGH_FOR_ANY_ANSWER);
+        cx.run_until_parked();
+
+        let message = panel.read_with(cx, |panel, _| panel.empty_message());
+        assert_ne!(
+            message,
+            Some(NO_SESSIONS_REMOTE),
+            "a host that has not answered must not be reported as having no sessions; \
+             expected anything but {NO_SESSIONS_REMOTE:?}, got {message:?}"
+        );
+        assert_ne!(
+            message, None,
+            "a panel with nothing to draw must say why; expected a message, got {message:?}"
+        );
+    }
+
+    /// The bound above must not swallow the real answer.
+    ///
+    /// A host that answers "no sessions" is a normal state with its own message, and a
+    /// panel that has been told that must say it rather than go on saying it is waiting.
+    #[gpui::test]
+    async fn a_host_that_answers_with_no_sessions_is_reported_as_having_none(
+        cx: &mut TestAppContext,
+    ) {
+        let client = AnyProtoClient::new(SilentHost::answering_after(
+            Duration::ZERO,
+            proto::ListTmuxSessionsResponse {
+                tmux_available: true,
+                sessions: Vec::new(),
+            },
+            cx.executor(),
+        ));
+        let panel = panel_for(client, cx);
+
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        cx.run_until_parked();
+
+        let message = panel.read_with(cx, |panel, _| panel.empty_message());
+        assert_eq!(
+            message,
+            Some(NO_SESSIONS_REMOTE),
+            "a host that answered with an empty listing has said it has no sessions; \
+             expected {NO_SESSIONS_REMOTE:?}, got {message:?}"
+        );
+    }
+
+    /// What a bound on the request could wrongly kill: a host that is merely slow.
+    ///
+    /// The answer is the same answer whether it took a millisecond or most of the bound,
+    /// so a listing that arrives before the bound has to be drawn rather than discarded.
+    #[gpui::test]
+    async fn a_slow_host_that_does_answer_is_still_listed(cx: &mut TestAppContext) {
+        let nearly_the_bound = TMUX_LISTING_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        let client = AnyProtoClient::new(SilentHost::answering_after(
+            nearly_the_bound,
+            one_session(),
+            cx.executor(),
+        ));
+        let panel = panel_for(client, cx);
+
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        cx.executor().advance_clock(nearly_the_bound + Duration::from_millis(1));
+        cx.run_until_parked();
+
+        let (message, names) = panel.read_with(cx, |panel, _| {
+            (
+                panel.empty_message(),
+                panel
+                    .sessions
+                    .iter()
+                    .map(|session| session.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            names,
+            vec!["zed".to_string()],
+            "a host that answered just inside the bound must still be listed; \
+             expected [\"zed\"], got {names:?}"
+        );
+        assert_eq!(
+            message, None,
+            "a panel with sessions to draw has no empty message; expected None, got {message:?}"
+        );
     }
 }

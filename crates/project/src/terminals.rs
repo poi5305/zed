@@ -1,6 +1,6 @@
 use anyhow::Result;
 use collections::HashMap;
-use gpui::{App, AppContext as _, Context, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Task, WeakEntity};
 
 use futures::{FutureExt, future::Shared};
 use itertools::Itertools as _;
@@ -109,6 +109,7 @@ impl Project {
         // Prepare a task for resolving the environment
         let env_task =
             self.resolve_directory_environment(&shell, path.clone(), remote_client.clone(), cx);
+        let environment_executor = cx.background_executor().clone();
 
         // Scope the toolchain lookup to the worktree the terminal is being
         // spawned in. Previously this iterated the active editor's worktree
@@ -132,7 +133,7 @@ impl Project {
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
-            let mut env = env_task.await.unwrap_or_default();
+            let mut env = directory_environment(env_task, &environment_executor).await;
             env.extend(settings.env);
 
             let activation_script = maybe!(async {
@@ -370,11 +371,12 @@ impl Project {
         // Prepare a task for resolving the environment
         let env_task =
             self.resolve_directory_environment(&env_shell, path.clone(), remote_client.clone(), cx);
+        let environment_executor = cx.background_executor().clone();
 
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
-            let mut env = env_task.await.unwrap_or_default();
+            let mut env = directory_environment(env_task, &environment_executor).await;
             env.extend(settings.env);
 
             let activation_script = maybe!(async {
@@ -537,9 +539,10 @@ impl Project {
             remote_client.clone(),
             cx,
         );
+        let environment_executor = cx.background_executor().clone();
 
         cx.spawn(async move |project, cx| {
-            let mut env = env_task.await.unwrap_or_default();
+            let mut env = directory_environment(env_task, &environment_executor).await;
             env.extend(settings.env);
 
             project.update(cx, move |_, cx| {
@@ -708,10 +711,134 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
     }
 }
 
+/// How long a terminal waits for its directory environment before opening without it.
+///
+/// The environment is worth waiting for — it is where the user's `PATH` comes from — but
+/// it is not worth the terminal: on a remote project it is a request to the host, and
+/// both ends keep the in-flight task under a key, so a single unanswered one is a
+/// terminal that never opens again for that directory and never says why.
+///
+/// Wide enough to clear every legitimate wait behind it rather than merely the usual
+/// one: on a remote host the answer is behind that server's own wait for its login
+/// shell's environment, and then behind a login shell run in the directory. Cutting a
+/// real answer off would leave the terminal running on the `PATH` this process was
+/// launched with, which is a subtler wrong than a terminal that is late.
+const DIRECTORY_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a terminal waits for its directory environment, and what it settles for.
+///
+/// Pulled out of the three spawns that share it so that the wait has one shape and one
+/// bound rather than three.
+async fn directory_environment(
+    env_task: Shared<Task<Option<HashMap<String, String>>>>,
+    executor: &gpui::BackgroundExecutor,
+) -> HashMap<String, String> {
+    match env_task
+        .with_timeout(DIRECTORY_ENVIRONMENT_TIMEOUT, executor)
+        .await
+    {
+        Ok(environment) => environment.unwrap_or_default(),
+        Err(_) => {
+            // Opened with what is known rather than not opened at all. The task this
+            // gave up on is memoized by whoever built it, so waiting on it again would
+            // wait on the same one: without this, one directory whose environment was
+            // never answered is one directory that can never be opened a terminal in
+            // again, and nothing says so.
+            log::warn!(
+                "the directory environment has not arrived in {DIRECTORY_ENVIRONMENT_TIMEOUT:?}; \
+                 opening the terminal with the environment this process was launched with"
+            );
+            HashMap::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    use gpui::TestAppContext;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    /// Longer than any bound the wait may put on itself.
+    const LONG_ENOUGH_FOR_ANY_ENVIRONMENT: Duration = Duration::from_secs(600);
+
+    /// Opening a terminal must not be hostage to the environment request.
+    ///
+    /// On a remote project the environment is a request to the host, and both ends
+    /// memoize the task while it is still in flight: one that is never answered is
+    /// therefore not a slow terminal but a terminal that never opens, for that directory,
+    /// for the rest of the session — and with nothing to show for it, because there is no
+    /// error, only a future that stays pending.
+    #[gpui::test]
+    async fn a_terminal_stops_waiting_for_an_environment_that_never_arrives(
+        cx: &mut TestAppContext,
+    ) {
+        let executor = cx.executor();
+        let never_answered: Shared<Task<Option<HashMap<String, String>>>> = executor
+            .spawn(async { std::future::pending::<Option<HashMap<String, String>>>().await })
+            .shared();
+
+        let settled = StdArc::new(AtomicBool::new(false));
+        let waiting = executor.spawn({
+            let settled = settled.clone();
+            let executor = executor.clone();
+            async move {
+                let env = directory_environment(never_answered, &executor).await;
+                settled.store(true, SeqCst);
+                env
+            }
+        });
+
+        executor.advance_clock(LONG_ENOUGH_FOR_ANY_ENVIRONMENT);
+        cx.run_until_parked();
+
+        assert!(
+            settled.load(SeqCst),
+            "a terminal must open without the environment rather than wait for it forever;              expected the wait to be over after {LONG_ENOUGH_FOR_ANY_ENVIRONMENT:?}, it was              still pending"
+        );
+        drop(waiting);
+    }
+
+    /// What the bound above could wrongly kill: an environment that is merely slow.
+    ///
+    /// The environment is what makes the terminal usable — `PATH` above all — so one that
+    /// arrives inside the bound has to be used rather than dropped for a bare default.
+    #[gpui::test]
+    async fn a_slow_environment_that_does_arrive_is_still_used(cx: &mut TestAppContext) {
+        let executor = cx.executor();
+        let nearly_the_bound = DIRECTORY_ENVIRONMENT_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        let slow: Shared<Task<Option<HashMap<String, String>>>> = executor
+            .spawn({
+                let executor = executor.clone();
+                async move {
+                    executor.timer(nearly_the_bound).await;
+                    Some(HashMap::from_iter([(
+                        "PATH".to_string(),
+                        "/opt/homebrew/bin".to_string(),
+                    )]))
+                }
+            })
+            .shared();
+
+        let resolved = executor.spawn({
+            let executor = executor.clone();
+            async move { directory_environment(slow, &executor).await }
+        });
+
+        executor.advance_clock(nearly_the_bound + Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let env = resolved.await;
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/homebrew/bin"),
+            "an environment that arrived inside the bound must be the one the terminal \
+             runs with; expected the host's PATH, got {env:?}"
+        );
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
