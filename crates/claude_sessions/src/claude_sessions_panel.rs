@@ -1231,7 +1231,7 @@ impl ClaudeSessionsPanel {
         let Some(panel) = workspace.panel::<Self>(cx) else {
             return;
         };
-        let (fs, source, project_root, process_id, target) = {
+        let (fs, source, project_root, process_id, seed, target) = {
             let panel = panel.read(cx);
             let store = panel.store.read(cx);
             (
@@ -1239,6 +1239,9 @@ impl ClaudeSessionsPanel {
                 panel.source.clone(),
                 panel.project_root.clone(),
                 store.selected(),
+                // What this store already knows about the session being opened, so that
+                // the tab is not blocked on a scan of its own to learn it again.
+                store.session_seed(),
                 // What the reader is looking at, not just which session it belongs to: a
                 // tab opened from an agent's conversation is opened to read that agent.
                 store.transcript_target().clone(),
@@ -1250,6 +1253,7 @@ impl ClaudeSessionsPanel {
             source,
             project_root,
             process_id,
+            seed,
             target,
             window,
             cx,
@@ -1283,6 +1287,7 @@ impl ClaudeSessionsPanel {
         let fs = self.fs.clone();
         let source = self.source.clone();
         let project_root = self.project_root.clone();
+        let seed = self.store.read(cx).session_seed();
         window.defer(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
                 Self::reveal_session_in_pane(
@@ -1291,6 +1296,7 @@ impl ClaudeSessionsPanel {
                     source,
                     project_root,
                     process_id,
+                    seed,
                     target,
                     window,
                     cx,
@@ -1328,6 +1334,7 @@ impl ClaudeSessionsPanel {
         source: Arc<dyn SessionSource>,
         project_root: Option<PathBuf>,
         process_id: Option<u32>,
+        seed: Option<(RegisteredSession, Option<PathBuf>)>,
         target: TranscriptTarget,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -1351,6 +1358,13 @@ impl ClaudeSessionsPanel {
         let item = cx.new(|cx| {
             let store = cx.new(|cx| {
                 let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
+                // Before selecting, which is what turns a process id into the
+                // conversation being followed: a tab handed only a process id has nothing
+                // to follow until a scan of its own lands, and draws "no transcript yet"
+                // over the conversation it was opened to read until one does.
+                if let Some((session, transcript_path)) = seed {
+                    store.seed_session(session, transcript_path, cx);
+                }
                 if let Some(process_id) = process_id {
                     store.select(process_id, cx);
                 }
@@ -3491,6 +3505,23 @@ impl ClaudeSessionsPanel {
 
     /// The one control the conversation needs of its own: whether the session's tool
     /// calls and thinking are part of what is read.
+    /// What the store last failed at, or nothing when it has not failed. Drawn by both
+    /// halves: the list shows it under the sessions, a tab above the conversation.
+    fn render_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let error = self.store.read(cx).error().cloned()?;
+        Some(
+            div()
+                .px_2()
+                .pb_1()
+                .child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let showing = self.show_tool_calls;
 
@@ -5172,6 +5203,12 @@ impl Render for ClaudeSessionsPanel {
                 if self.in_pane {
                     this.bg(conversation_background(cx))
                         .child(self.render_conversation_toolbar(cx))
+                        // A tab reads its own store, so a scan or a read that keeps
+                        // failing there is the reason its conversation is empty. Drawn
+                        // only under the list until now, which is the other half: a tab
+                        // showed "no transcript yet" for a store that was reporting a
+                        // failure on every poll.
+                        .children(self.render_error(cx))
                         .children(self.render_agent_chips(cx))
                         .child(self.render_transcript_section(window, cx))
                         .children(self.render_live_message(window, cx))
@@ -7836,6 +7873,7 @@ mod tests {
     use crate::SubagentMeta;
     use crate::session_registry::{SessionSummary, TailProgress, TailState};
     use crate::session_source::SessionListing;
+    use crate::session_store::REGISTRY_SCAN_TIMEOUT;
     use crate::transcript::parse_record;
 
     fn record(json: &str) -> TranscriptRecord {
@@ -11833,6 +11871,25 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         }
     }
 
+    /// The one session every scripted scan reports, as a scan reports it.
+    fn scripted_registered_session() -> RegisteredSession {
+        RegisteredSession {
+            process_id: SCRIPTED_PROCESS_ID,
+            session_id: SCRIPTED_SESSION_ID.to_string(),
+            working_directory: PathBuf::from("/scripted-project"),
+            process_start: "Thu Sep 10 02:27:23 2026".to_string(),
+            version: "2.1.267".to_string(),
+            kind: "interactive".to_string(),
+            name: Some("scripted".to_string()),
+            status: None,
+            updated_at: None,
+            // No pane to type into: nothing in these tests sends, and this is what makes
+            // a send impossible rather than merely unused.
+            tmux_target: None,
+            bridge_session_id: None,
+        }
+    }
+
     impl SessionSource for ScriptedSource {
         fn list_sessions(
             &self,
@@ -11840,21 +11897,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         ) -> Task<anyhow::Result<SessionListing>> {
             Task::ready(Ok(SessionListing {
                 sessions: vec![SessionSummary {
-                    session: RegisteredSession {
-                        process_id: SCRIPTED_PROCESS_ID,
-                        session_id: SCRIPTED_SESSION_ID.to_string(),
-                        working_directory: PathBuf::from("/scripted-project"),
-                        process_start: "Thu Sep 10 02:27:23 2026".to_string(),
-                        version: "2.1.267".to_string(),
-                        kind: "interactive".to_string(),
-                        name: Some("scripted".to_string()),
-                        status: None,
-                        updated_at: None,
-                        // No pane to type into: nothing in these tests sends, and this
-                        // is what makes a send impossible rather than merely unused.
-                        tmux_target: None,
-                        bridge_session_id: None,
-                    },
+                    session: scripted_registered_session(),
                     transcript_path: Some(self.home_directory.join("session.jsonl")),
                     // Read from the end of a real transcript, which these tests write by
                     // hand and never through that reader.
@@ -12107,6 +12150,65 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 })
             })
             .expect("building the panel in the test window")
+    }
+
+    /// A tab opened for a session reads that session's conversation.
+    ///
+    /// The store is built the way [`ClaudeSessionsPanel::reveal_session_in_pane`] builds
+    /// it — constructed and selected in the same closure, before any scan has been
+    /// applied — which is the opposite order from every other test here and is the order
+    /// the conversation a reader actually opens is read in.
+    #[gpui::test]
+    async fn a_tab_selected_before_its_first_scan_still_finds_the_transcript(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let session_lines = [chained_line(
+            USER_RECORD_TYPE,
+            "u1",
+            None,
+            false,
+            serde_json::json!("hello"),
+        )];
+        let source: Arc<dyn SessionSource> = Arc::new(ScriptedSource::new(&session_lines, &[]));
+        let store = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(source.clone(), None, cx);
+                store.select(SCRIPTED_PROCESS_ID, cx);
+                store
+            })
+        });
+
+        cx.run_until_parked();
+        // Both polls sleep between turns, so a scan only lands once the clock has moved.
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let (listed, selected, transcript_path) = store.read_with(cx, |store, _| {
+            (
+                store.sessions().len(),
+                store.selected(),
+                store.transcript_path().map(Path::to_path_buf),
+            )
+        });
+
+        assert_eq!(
+            listed, 1,
+            "the scan must reach a store that was selected before it; expected 1 listed session, got {listed}"
+        );
+        assert_eq!(
+            selected,
+            Some(SCRIPTED_PROCESS_ID),
+            "the selection made before the scan must survive it; expected Some({SCRIPTED_PROCESS_ID}), got {selected:?}"
+        );
+        assert!(
+            transcript_path.is_some(),
+            "without a transcript path the tab draws {WAITING_FOR_TRANSCRIPT:?} forever; expected Some(path), got None"
+        );
     }
 
     #[gpui::test]
@@ -12793,4 +12895,353 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
+    /// A host that answers nothing, which is the shape of the failure being guarded
+    /// against: an unanswered request is not an error, so nothing downstream is ever
+    /// told that the answer it is drawing was never given.
+    ///
+    /// Delegates every other method to a [`ScriptedSource`], so that a store built on it
+    /// differs from a working one in exactly one way.
+    struct UnansweredListing {
+        scripted: ScriptedSource,
+        listing: ListingBehaviour,
+        executor: gpui::BackgroundExecutor,
+    }
+
+    enum ListingBehaviour {
+        /// The request is sent and never answered, and never refused either.
+        NeverAnswered,
+        /// The host refuses, which is the case the store already has a path for.
+        Refused,
+        /// The host answers, after taking `0` of its allowance.
+        AnsweredAfter(Duration),
+    }
+
+    impl UnansweredListing {
+        fn new(listing: ListingBehaviour, executor: gpui::BackgroundExecutor) -> Self {
+            Self {
+                scripted: ScriptedSource::new(&[], &[]),
+                listing,
+                executor,
+            }
+        }
+    }
+
+    impl SessionSource for UnansweredListing {
+        fn list_sessions(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<SessionListing>> {
+            match self.listing {
+                ListingBehaviour::NeverAnswered => self
+                    .executor
+                    .spawn(async move { std::future::pending::<anyhow::Result<SessionListing>>().await }),
+                ListingBehaviour::Refused => {
+                    Task::ready(Err(anyhow::anyhow!("the host refused to list its sessions")))
+                }
+                ListingBehaviour::AnsweredAfter(delay) => {
+                    let listed = self.scripted.list_sessions(project_root);
+                    let executor = self.executor.clone();
+                    self.executor.spawn(async move {
+                        executor.timer(delay).await;
+                        listed.await
+                    })
+                }
+            }
+        }
+
+        fn tail_transcript(
+            &self,
+            session_id: String,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.scripted.tail_transcript(session_id, state)
+        }
+
+        fn list_subagents(&self, session_id: String) -> Task<anyhow::Result<Vec<SubagentSummary>>> {
+            self.scripted.list_subagents(session_id)
+        }
+
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<anyhow::Result<HashMap<String, Vec<SubagentSummary>>>> {
+            self.scripted.list_subagents_for_sessions(session_ids)
+        }
+
+        fn pending_question(
+            &self,
+            session_id: String,
+        ) -> Task<anyhow::Result<crate::session_source::QuestionState>> {
+            self.scripted.pending_question(session_id)
+        }
+
+        fn install_question_hook(&self) -> Task<anyhow::Result<Option<PathBuf>>> {
+            self.scripted.install_question_hook()
+        }
+
+        fn list_slash_commands(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<Vec<SlashCommand>>> {
+            self.scripted.list_slash_commands(project_root)
+        }
+
+        fn list_session_files(
+            &self,
+            directory: PathBuf,
+            query: String,
+        ) -> Task<anyhow::Result<Vec<String>>> {
+            self.scripted.list_session_files(directory, query)
+        }
+
+        fn write_session_file(
+            &self,
+            name: String,
+            contents: Vec<u8>,
+        ) -> Task<anyhow::Result<String>> {
+            self.scripted.write_session_file(name, contents)
+        }
+
+        fn tail_subagent(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.scripted
+                .tail_subagent(session_id, agent_id, workflow_run_id, state)
+        }
+
+        fn read_file(
+            &self,
+            path: PathBuf,
+            max_bytes: u64,
+        ) -> Task<anyhow::Result<crate::session_source::FileContents>> {
+            self.scripted.read_file(path, max_bytes)
+        }
+
+        fn send_input(
+            &self,
+            pane_target: String,
+            input: crate::session_source::SessionInput,
+        ) -> Task<anyhow::Result<()>> {
+            self.scripted.send_input(pane_target, input)
+        }
+
+        fn capture_pane(&self, pane_target: String) -> Task<anyhow::Result<String>> {
+            self.scripted.capture_pane(pane_target)
+        }
+    }
+
+    fn store_on(
+        listing: ListingBehaviour,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<ClaudeSessionStore> {
+        let source: Arc<dyn SessionSource> =
+            Arc::new(UnansweredListing::new(listing, cx.executor()));
+        cx.update(|cx| {
+            cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(source, None, cx);
+                store.select(SCRIPTED_PROCESS_ID, cx);
+                store
+            })
+        })
+    }
+
+    /// Longer than any bound a poll may put on its own request.
+    const LONG_ENOUGH_FOR_ANY_ANSWER: Duration = Duration::from_secs(300);
+
+    /// A scan that is never answered has to be told apart from a scan that answered with
+    /// nothing.
+    ///
+    /// The store's only channel to the reader is [`ClaudeSessionStore::error`], and an
+    /// unanswered request leaves it empty: the conversation then draws
+    /// `WAITING_FOR_TRANSCRIPT` — a sentence about the session having written no
+    /// transcript — over a session that has written a large one, and says nothing about
+    /// the host it never heard from.
+    #[gpui::test]
+    async fn a_scan_that_is_never_answered_is_reported_rather_than_drawn_as_no_transcript(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = store_on(ListingBehaviour::NeverAnswered, cx);
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(LONG_ENOUGH_FOR_ANY_ANSWER);
+        cx.run_until_parked();
+
+        let (listed, selected, transcript_path, error) = store.read_with(cx, |store, _| {
+            (
+                store.sessions().len(),
+                store.selected(),
+                store.transcript_path().map(Path::to_path_buf),
+                store.error().cloned(),
+            )
+        });
+
+        assert_eq!(
+            (listed, selected),
+            (0, Some(SCRIPTED_PROCESS_ID)),
+            "the state the reported symptom is drawn from: nothing listed, still selected; \
+             expected (0, Some({SCRIPTED_PROCESS_ID})), got ({listed}, {selected:?})"
+        );
+        assert_eq!(
+            transcript_path, None,
+            "there is no transcript to name without a listing; expected None, got {transcript_path:?}"
+        );
+        assert!(
+            error.is_some(),
+            "a store that has heard nothing back must say so rather than leave the \
+             conversation drawing {WAITING_FOR_TRANSCRIPT:?}; expected Some(message), got {error:?}"
+        );
+    }
+
+    /// The case the store already has a path for, kept beside the one above so that the
+    /// difference between them is a fact of the suite rather than a belief.
+    #[gpui::test]
+    async fn a_scan_the_host_refuses_is_already_reported(cx: &mut gpui::TestAppContext) {
+        let store = store_on(ListingBehaviour::Refused, cx);
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let error = store.read_with(cx, |store, _| store.error().cloned());
+        assert!(
+            error.is_some(),
+            "a refusal is reported today; expected Some(message), got {error:?}"
+        );
+    }
+
+    /// What a bound on the scan could wrongly kill: a host that is merely slow.
+    ///
+    /// A listing that arrives inside the bound is the same listing, and a store that
+    /// discarded it would be trading a silent wrong answer for a loud one.
+    #[gpui::test]
+    async fn a_slow_scan_that_does_arrive_is_still_applied(cx: &mut gpui::TestAppContext) {
+        let nearly_the_bound = REGISTRY_SCAN_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        let store = store_on(ListingBehaviour::AnsweredAfter(nearly_the_bound), cx);
+
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(nearly_the_bound + Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let (listed, error) = store.read_with(cx, |store, _| {
+            (store.sessions().len(), store.error().cloned())
+        });
+        assert_eq!(
+            listed, 1,
+            "a listing that arrived inside the bound must be applied; expected 1, got {listed}"
+        );
+        assert_eq!(
+            error, None,
+            "a listing that arrived must leave nothing to report; expected None, got {error:?}"
+        );
+    }
+
+    /// A tab is opened for a session the dock has already listed, and it must read that
+    /// session's conversation whether or not its own scan ever lands.
+    ///
+    /// The dock holds the whole [`RegisteredSession`] — its `sessionId`, and the file the
+    /// scan found — at the moment the tab is opened, and hands over a process id and
+    /// nothing else. Everything the tab draws is reached through its own `sessions`, so
+    /// one unanswered request leaves it with no session id to follow, no read to issue
+    /// and no name to put in its tab.
+    #[gpui::test]
+    async fn a_tab_reads_the_session_it_was_opened_for_without_a_scan_of_its_own(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source: Arc<dyn SessionSource> = Arc::new(UnansweredListing::new(
+            ListingBehaviour::NeverAnswered,
+            cx.executor(),
+        ));
+        let transcript_path = PathBuf::from("/scripted-home/session.jsonl");
+        let store = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(source, None, cx);
+                store.seed_session(
+                    scripted_registered_session(),
+                    Some(transcript_path.clone()),
+                    cx,
+                );
+                store.select(SCRIPTED_PROCESS_ID, cx);
+                store
+            })
+        });
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let (listed, selected, found) = store.read_with(cx, |store, _| {
+            (
+                store.sessions().len(),
+                store.selected(),
+                store.transcript_path().map(Path::to_path_buf),
+            )
+        });
+        assert_eq!(
+            (listed, selected),
+            (1, Some(SCRIPTED_PROCESS_ID)),
+            "the session the tab was opened for is known to it from the start; \
+             expected (1, Some({SCRIPTED_PROCESS_ID})), got ({listed}, {selected:?})"
+        );
+        assert_eq!(
+            found,
+            Some(transcript_path.clone()),
+            "a tab handed the file the dock had already found must read it; \
+             expected {transcript_path:?}, got {found:?}"
+        );
+    }
+
+    /// The seed is what the dock last saw, not the truth forever: a scan that does land
+    /// and does not list the session has to win over it, or a tab would go on naming a
+    /// session that has exited.
+    #[gpui::test]
+    async fn a_seeded_session_gives_way_to_a_scan_that_does_not_list_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source: Arc<dyn SessionSource> = Arc::new(UnansweredListing::new(
+            ListingBehaviour::AnsweredAfter(Duration::ZERO),
+            cx.executor(),
+        ));
+        let store = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(source, None, cx);
+                let mut departed = scripted_registered_session();
+                departed.process_id = SCRIPTED_PROCESS_ID + 1;
+                departed.session_id = "a-session-that-has-exited".to_string();
+                store.seed_session(departed, Some(PathBuf::from("/gone.jsonl")), cx);
+                store.select(SCRIPTED_PROCESS_ID + 1, cx);
+                store
+            })
+        });
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let (process_ids, selected) = store.read_with(cx, |store, _| {
+            (
+                store
+                    .sessions()
+                    .iter()
+                    .map(|session| session.process_id)
+                    .collect::<Vec<_>>(),
+                store.selected(),
+            )
+        });
+        assert_eq!(
+            process_ids,
+            vec![SCRIPTED_PROCESS_ID],
+            "a scan that landed replaces the seed entirely; expected [{SCRIPTED_PROCESS_ID}], \
+             got {process_ids:?}"
+        );
+        assert_eq!(
+            selected, None,
+            "a session the scan no longer lists is no longer selected; expected None, \
+             got {selected:?}"
+        );
+    }
 }
