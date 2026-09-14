@@ -900,7 +900,7 @@ impl ForwardPortsPanel {
             SharedString::from(format!("forward-ports-{connection_index}-{forward_index}"));
         let (local_end, remote_end) = port_forward_endpoints(forward);
 
-        ListItem::new(element_id.clone())
+        ListItem::new(element_id)
             .spacing(ListItemSpacing::Sparse)
             .child(
                 h_flex()

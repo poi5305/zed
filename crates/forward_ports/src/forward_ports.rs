@@ -725,7 +725,7 @@ mod tests {
                 &[carried_by_ssh],
                 &HashSet::from_iter([disconnected_by_hand])
             ),
-            vec![running.clone()],
+            vec![running],
             "one is already bound by the ssh process and one the reader closed"
         );
 
