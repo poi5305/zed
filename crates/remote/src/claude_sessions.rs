@@ -233,7 +233,14 @@ pub fn start_time_in_proc_stat(stat: &str) -> Option<String> {
         .map(|start_time| start_time.to_string())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Also the wasm path, deliberately.
+///
+/// `util::command` on wasm wraps `smol::process`, which the web build patches to a shim
+/// that runs the command on the server over the `Process::*` RPC -- so this asks the
+/// machine the sessions actually live on, which is what docs/web-zed-plan.md §6.4 requires
+/// of liveness detection. `-o pid=,lstart=` is supported by both procps and BSD `ps`, so it
+/// does not matter which the server runs.
+#[cfg(any(all(unix, not(target_os = "linux")), target_family = "wasm"))]
 pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> {
     let mut start_times = HashMap::default();
     if process_ids.is_empty() {
@@ -275,7 +282,12 @@ pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> 
 
 /// Windows has no equivalent of the registration files this reads, so there is nothing to
 /// check liveness against and every session is reported as gone.
-#[cfg(not(unix))]
+///
+/// wasm is excluded because its situation is the opposite: the registrations do exist, read
+/// from the server's `~/.claude/sessions` over the Fs RPC. Returning an empty map there
+/// would report every live session as `ProcessGone` and show the user an empty panel --
+/// a fabricated success, and the exact defect docs/web-zed-plan.md §10 predicted.
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 pub async fn process_start_times(_process_ids: Vec<u32>) -> HashMap<u32, String> {
     HashMap::default()
 }
@@ -1825,10 +1837,7 @@ pub async fn list_subagents_for_sessions(
                 // `subagents` path cannot be listed must not hide every other session
                 // this walk already found, or has yet to find.
                 read_subagents_for_session(&session_entry.path(), subagents).log_err();
-                resolve_task_agents(
-                    &session_transcript_path(&session_entry.path()),
-                    subagents,
-                );
+                resolve_task_agents(&session_transcript_path(&session_entry.path()), subagents);
             }
         }
     }
@@ -1953,9 +1962,7 @@ fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversati
             {
                 continue;
             }
-            if let Some(tool_use_id) = block
-                .get("tool_use_id")
-                .and_then(serde_json::Value::as_str)
+            if let Some(tool_use_id) = block.get("tool_use_id").and_then(serde_json::Value::as_str)
             {
                 conversation.answered_calls.insert(tool_use_id.to_string());
             }
@@ -2023,11 +2030,7 @@ fn read_subagents_for_session(
                 let Some(workflow_run_id) = single_path_component(&run_directory_name) else {
                     continue;
                 };
-                read_subagents_in(
-                    &directory_entry.path(),
-                    Some(workflow_run_id),
-                    subagents,
-                )?;
+                read_subagents_in(&directory_entry.path(), Some(workflow_run_id), subagents)?;
             }
         }
         // Most sessions run no workflows at all, so a missing directory is the common
@@ -3915,7 +3918,8 @@ mod tests {
              no length at which guessing is safe"
         );
 
-        let single_line = send_text_arguments("zed-claude-1-0", "%12", needs_bracketed_paste("one line"));
+        let single_line =
+            send_text_arguments("zed-claude-1-0", "%12", needs_bracketed_paste("one line"));
         assert_eq!(
             single_line,
             vec![
@@ -5564,7 +5568,10 @@ mod tests {
             .join("projects")
             .join("-a-project")
             .join(format!("{session_id}.jsonl"));
-        write_file(transcript_path.clone(), "{\"type\":\"user\",\"uuid\":\"m1\"}\n");
+        write_file(
+            transcript_path.clone(),
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
 
         let scan = || -> Result<Option<bool>> {
             let subagents_by_session = smol::block_on(list_subagents_for_sessions(
@@ -5637,10 +5644,8 @@ mod tests {
             empty_session_id.to_string(),
             missing_session_id.to_string(),
         ];
-        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ))?;
+        let subagents_by_session =
+            smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids))?;
 
         assert_eq!(subagents_by_session.len(), session_ids.len());
         let plain_subagents = subagents_by_session
@@ -5654,7 +5659,10 @@ mod tests {
             .get(workflow_session_id)
             .context("the workflow session has a result entry")?;
         assert_eq!(workflow_subagents.len(), 1);
-        assert_eq!(workflow_subagents[0].workflow_run_id.as_deref(), Some(REAL_WORKFLOW_RUN_ID));
+        assert_eq!(
+            workflow_subagents[0].workflow_run_id.as_deref(),
+            Some(REAL_WORKFLOW_RUN_ID)
+        );
         assert_eq!(workflow_subagents[0].transcript_path, workflow_transcript);
         assert_eq!(workflow_subagents[0].workflow_agent_finished, Some(true));
 
@@ -5702,21 +5710,21 @@ mod tests {
         std::fs::create_dir_all(&blocked_session_directory)?;
         // Not a directory: `read_dir` fails with something other than NotFound, which is
         // the class of error the scan used to return for the whole map.
-        std::fs::write(blocked_session_directory.join("subagents"), "not a directory")?;
+        std::fs::write(
+            blocked_session_directory.join("subagents"),
+            "not a directory",
+        )?;
 
         let session_ids = vec![
             readable_session_id.to_string(),
             blocked_session_id.to_string(),
         ];
-        let result = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ));
+        let result = smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids));
         let subagents_by_session = match result {
             Ok(subagents_by_session) => subagents_by_session,
-            Err(error) => panic!(
-                "expected Ok so the readable session is still listed, got Err({error:#})"
-            ),
+            Err(error) => {
+                panic!("expected Ok so the readable session is still listed, got Err({error:#})")
+            }
         };
 
         let readable_agent_ids: Vec<&str> = subagents_by_session
@@ -5737,9 +5745,7 @@ mod tests {
         );
 
         assert_eq!(
-            subagents_by_session
-                .get(blocked_session_id)
-                .map(Vec::len),
+            subagents_by_session.get(blocked_session_id).map(Vec::len),
             Some(0),
             "the blocked session stays a key mapping to no agents, got {:?}",
             subagents_by_session.get(blocked_session_id)
@@ -5770,15 +5776,13 @@ mod tests {
                 .map(|session_id| (*session_id).to_string()),
         );
 
-        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ))
-        .unwrap_or_else(|error| {
-            panic!(
-                "a mix of a real session id and rejected ids must be Ok, got Err({error:#})"
-            )
-        });
+        let subagents_by_session =
+            smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a mix of a real session id and rejected ids must be Ok, got Err({error:#})"
+                    )
+                });
 
         assert_eq!(
             subagents_by_session.len(),
@@ -6148,7 +6152,11 @@ mod tests {
         let home_directory = temporary_directory("subagent-journal-order");
         let session_id = "parallel-session";
         let workflow_run_id = "wf_145c9932-8c7";
-        let started_in_order = ["a9f5821990bd75881", "ae82337df519e5f65", "a687e098981ffb2e2"];
+        let started_in_order = [
+            "a9f5821990bd75881",
+            "ae82337df519e5f65",
+            "a687e098981ffb2e2",
+        ];
 
         for (agent_id, phase) in started_in_order
             .iter()
@@ -6176,10 +6184,7 @@ mod tests {
             .join("workflows")
             .join(workflow_run_id);
         let mut journal = String::from("{\"type\":\"launched\"}\n");
-        for agent_id in started_in_order
-            .iter()
-            .chain(["ae7502cee18bbe2b4"].iter())
-        {
+        for agent_id in started_in_order.iter().chain(["ae7502cee18bbe2b4"].iter()) {
             journal.push_str(&format!(
                 "{{\"type\":\"started\",\"agentId\":\"{agent_id}\",\"phase\":\"Fan out\"}}\n"
             ));
@@ -6576,5 +6581,4 @@ mod pane_key_tests {
             );
         }
     }
-
 }

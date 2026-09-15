@@ -23,6 +23,12 @@ language.workspace = true
 # tree-sitter-json and tree-sitter-rust -- but enabling all eighteen hits two
 # per-grammar problems that are not about the toolchain.
 languages.workspace = true
+
+# Phase 6's panels. `forward_ports` is deliberately absent: docs/web-zed-plan.md §6.5
+# rules that it has no meaning in a browser, which has no "this machine" to bind a port on.
+project_manager.workspace = true
+tmux_sessions.workspace = true
+claude_sessions.workspace = true
 lsp.workspace = true
 async-trait.workspace = true
 editor.workspace = true
