@@ -49,7 +49,7 @@ use std::{
         Arc, LazyLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use std::{cmp, pin::Pin};
 use telemetry::Telemetry;
@@ -58,6 +58,7 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 use url::Url;
 use util::{ConnectionResult, ResultExt};
+use web_time::Instant;
 
 pub use llm_token::*;
 pub use rpc::*;

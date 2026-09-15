@@ -16,10 +16,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 use task::Shell;
 use util::get_default_system_shell_preferring_bash;
+use web_time::Instant;
 
 /// Request to run a terminal command inside an OS-level sandbox.
 ///
