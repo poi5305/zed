@@ -2384,6 +2384,7 @@ pub(crate) fn search_symbols(
             .to_owned();
         // Note if you make changes to this filtering below, also change `project_symbols::ProjectSymbolsDelegate::filter`
         const MAX_MATCHES: usize = 100;
+        #[cfg(not(target_family = "wasm"))]
         let mut visible_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &visible_match_candidates,
             &query,
@@ -2393,6 +2394,16 @@ pub(crate) fn search_symbols(
             &cancellation_flag,
             cx.background_executor().clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut visible_matches = fuzzy::match_strings_blocking(
+            &visible_match_candidates,
+            &query,
+            false,
+            true,
+            MAX_MATCHES,
+            &cancellation_flag,
+            cx.background_executor().clone(),);
+        #[cfg(not(target_family = "wasm"))]
         let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &external_match_candidates,
             &query,
@@ -2402,6 +2413,15 @@ pub(crate) fn search_symbols(
             &cancellation_flag,
             cx.background_executor().clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut external_matches = fuzzy::match_strings_blocking(
+            &external_match_candidates,
+            &query,
+            false,
+            true,
+            MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
+            &cancellation_flag,
+            cx.background_executor().clone(),);
         let sort_key_for_match = |mat: &StringMatch| {
             let symbol = &symbols[mat.candidate_id];
             (Reverse(OrderedFloat(mat.score)), symbol.label.filter_text())
