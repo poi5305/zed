@@ -23,7 +23,11 @@ serde_json.workspace = true
 serde_json_lenient.workspace = true
 serde_path_to_error.workspace = true
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# No longer native-only. tree-sitter's C compiles and links for wasm32 against its own
+# vendored libc headers (docs/web-zed-plan.md §4.4), so the real structural-edit
+# implementation runs in the browser instead of the panicking stubs it used to get.
+# The `wasm` feature here is tree-sitter's own and does not pull wasmtime in this fork,
+# which is §4's decision (b).
 tree-sitter = { workspace = true, features = ["wasm"], optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 
