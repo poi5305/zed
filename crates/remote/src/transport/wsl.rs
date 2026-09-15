@@ -20,8 +20,8 @@ use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
 };
+use web_time::Instant;
 
 use util::{
     command::Stdio,

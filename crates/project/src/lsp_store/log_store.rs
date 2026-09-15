@@ -1,8 +1,9 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Weak},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 use collections::HashMap;
 use futures::{StreamExt, channel::mpsc};

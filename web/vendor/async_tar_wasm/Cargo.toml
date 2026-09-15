@@ -1,0 +1,19 @@
+[package]
+name = "async-tar"
+version = "0.6.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "WASM-compatible wrapper around async-tar"
+publish = false
+
+# Native: re-export git bd3ad6f. Same shape as smol_wasm (real crate only
+# under not(wasm)). Cannot be a git dep of
+# https://github.com/zed-industries/async-tar: that URL is patched onto
+# this wrapper (cycle). crates.io 0.6.1 is the pax.rs regression §4
+# forbids. This path crate is that git tree; Cargo.toml differs by package
+# name and a tokio-stream pin to the root lock's 0.1.17.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async_tar_real = { package = "async-tar-real", path = "git_bd3ad6f" }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures-core = "0.3"

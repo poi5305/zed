@@ -131,30 +131,55 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
 }
 
 static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
+#[cfg(not(target_family = "wasm"))]
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
+#[cfg(target_family = "wasm")]
+std::thread_local! {
+    static PARSERS: std::cell::RefCell<Vec<Parser>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[ztracing::instrument(skip_all)]
 pub fn with_parser<F, R>(func: F) -> R
 where
     F: FnOnce(&mut Parser) -> R,
 {
-    let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
-        let mut parser = Parser::new();
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
-        parser
-    });
-    // Tree-sitter auto-resets the parser at the end of a successful parse,
-    // but the cancellation paths (progress callback returning `Break`,
-    // cancelled balancing) leave outstanding state on the parser. The next
-    // call to `parse_with_options` would then *resume* that cancelled parse
-    // instead of starting fresh.
-    parser.reset();
-    parser.set_included_ranges(&[]).unwrap();
-    let result = func(&mut parser);
-    PARSERS.lock().push(parser);
-    result
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
+            let mut parser = Parser::new();
+            parser
+                .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+                .unwrap();
+            parser
+        });
+        // Tree-sitter auto-resets the parser at the end of a successful parse,
+        // but the cancellation paths (progress callback returning `Break`,
+        // cancelled balancing) leave outstanding state on the parser. The next
+        // call to `parse_with_options` would then *resume* that cancelled parse
+        // instead of starting fresh.
+        parser.reset();
+        parser.set_included_ranges(&[]).unwrap();
+        let result = func(&mut parser);
+        PARSERS.lock().push(parser);
+        result
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        PARSERS.with(|parsers| {
+            let mut parser = parsers.borrow_mut().pop().unwrap_or_else(|| {
+                let mut parser = Parser::new();
+                parser
+                    .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+                    .unwrap();
+                parser
+            });
+            parser.reset();
+            parser.set_included_ranges(&[]).unwrap();
+            let result = func(&mut parser);
+            parsers.borrow_mut().push(parser);
+            result
+        })
+    }
 }
 
 pub fn with_query_cursor<F, R>(func: F) -> R
@@ -964,7 +989,19 @@ impl Language {
         Self {
             id,
             config,
-            grammar: ts_language.map(|ts_language| Arc::new(Grammar::new(ts_language))),
+            grammar: ts_language.map(|ts_language| {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Arc::new(Grammar::new(ts_language))
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = ts_language;
+                    panic!(
+                        "Language::new cannot wrap a tree_sitter::Language on wasm; use Grammar::new(ParseableLanguage::from_resolver(...)) on the parsing thread"
+                    );
+                }
+            }),
             context_provider: None,
             toolchain: None,
             manifest_name: None,
@@ -1382,8 +1419,13 @@ impl Debug for Language {
 
 pub(crate) fn parse_text(grammar: &Grammar, text: &Rope, old_tree: Option<Tree>) -> Tree {
     with_parser(|parser| {
+        #[cfg(not(target_family = "wasm"))]
         parser
             .set_language(&grammar.ts_language)
+            .expect("incompatible grammar");
+        #[cfg(target_family = "wasm")]
+        parser
+            .set_language(&grammar.parseable_language().expect("incompatible grammar"))
             .expect("incompatible grammar");
         let mut chunks = text.chunks_in_range(0..text.len());
         parser

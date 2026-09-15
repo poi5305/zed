@@ -40,6 +40,8 @@ use lsp::LanguageServerId;
 use parking_lot::Mutex;
 use settings::{SettingsStore, WorktreeId};
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     any::Any,
     cell::Cell,
@@ -54,7 +56,7 @@ use std::{
     path::PathBuf,
     rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::TreeMap;
@@ -70,6 +72,8 @@ use theme::{ActiveTheme as _, SyntaxTheme};
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
 use util::{RangeExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use {tree_sitter_python, tree_sitter_rust, tree_sitter_typescript};
@@ -1367,7 +1371,7 @@ impl Buffer {
         let old_snapshot = self.text.snapshot().clone();
         let mut branch_buffer = self.text.branch();
         let mut syntax_snapshot = self.syntax_map.lock().snapshot();
-        cx.background_spawn(async move {
+        let future = async move {
             if !edits.is_empty() {
                 if let Some(language) = language.clone() {
                     syntax_snapshot.reparse(&old_snapshot, registry.clone(), language);
@@ -1386,7 +1390,15 @@ impl Buffer {
                 applied_edits_snapshot: branch_buffer.into_snapshot(),
                 syntax_snapshot,
             }
-        })
+        };
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.background_spawn(future)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            cx.foreground_executor().spawn(future)
+        }
     }
 
     /// Applies all of the changes in this buffer that intersect any of the
@@ -1949,14 +1961,16 @@ impl Buffer {
             }
         }
 
-        let parse_task = cx.background_spawn({
-            let language = language.clone();
-            let language_registry = language_registry.clone();
-            async move {
-                syntax_snapshot.reparse(&text, language_registry, language);
-                syntax_snapshot
-            }
-        });
+        let language_for_parse = language.clone();
+        let language_registry_for_parse = language_registry.clone();
+        let parse_future = async move {
+            syntax_snapshot.reparse(&text, language_registry_for_parse, language_for_parse);
+            syntax_snapshot
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let parse_task = cx.background_spawn(parse_future);
+        #[cfg(target_family = "wasm")]
+        let parse_task = cx.foreground_executor().spawn(parse_future);
 
         self.reparse = Some(cx.spawn(async move |this, cx| {
             let new_syntax_map = parse_task.await;
@@ -2073,6 +2087,7 @@ impl Buffer {
                 }));
                 return;
             };
+            #[cfg(not(target_family = "wasm"))]
             match cx
                 .foreground_executor()
                 .block_with_timeout(block_budget, indent_sizes)
@@ -2087,6 +2102,17 @@ impl Buffer {
                         .ok();
                     }));
                 }
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = block_budget;
+                self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
+                    let indent_sizes = indent_sizes.await;
+                    this.update(cx, |this, cx| {
+                        this.apply_autoindents(indent_sizes, cx);
+                    })
+                    .ok();
+                }));
             }
         } else {
             self.autoindent_requests.clear();
@@ -3523,7 +3549,7 @@ impl Buffer {
         let language = self.language().cloned();
         let registry = self.language_registry();
         let new_text = self.text.snapshot_with_edits(edits);
-        cx.background_spawn(async move {
+        let future = async move {
             if let Some(language) = language.clone() {
                 syntax.reparse(&text, registry.clone(), language);
             }
@@ -3541,7 +3567,15 @@ impl Buffer {
                 text: new_text,
                 snapshot,
             }
-        })
+        };
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.background_spawn(future)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            cx.foreground_executor().spawn(future)
+        }
     }
 
     pub fn fast_forward(&mut self, edited: EditedBufferSnapshot, cx: &mut Context<Self>) {

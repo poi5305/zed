@@ -1,13 +1,19 @@
 use gpui::{Context, Task};
-use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock};
 use std::{path::PathBuf, sync::Arc};
+
+#[cfg(not(target_family = "wasm"))]
+use parking_lot::{MappedRwLockReadGuard, RwLockReadGuard};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
+#[cfg(not(target_family = "wasm"))]
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::{Event, Terminal};
+#[cfg(not(target_family = "wasm"))]
+use crate::Event;
+use crate::Terminal;
 
 #[derive(Clone, Copy)]
 pub struct ProcessIdGetter {
@@ -23,12 +29,25 @@ impl ProcessIdGetter {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn fallback_pid(&self) -> Pid {
         Pid::from_u32(self.fallback_pid)
     }
+
+    #[cfg(target_family = "wasm")]
+    pub fn fallback_pid(&self) -> u32 {
+        self.fallback_pid
+    }
 }
 
-#[cfg(unix)]
+#[cfg(target_family = "wasm")]
+impl ProcessIdGetter {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+}
+
+#[cfg(all(unix, not(target_family = "wasm")))]
 impl ProcessIdGetter {
     fn pid(&self) -> Option<Pid> {
         // Negative pid means error.
@@ -73,6 +92,7 @@ pub(crate) struct ProcessInfo {
 }
 
 /// Fetches Zed-relevant Pseudo-Terminal (PTY) process information
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct PtyProcessInfo {
     system: RwLock<System>,
     refresh_kind: ProcessRefreshKind,
@@ -82,6 +102,7 @@ pub(crate) struct PtyProcessInfo {
     task: Mutex<Option<Task<()>>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PtyProcessInfo {
     pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
         // Task enumeration is on by default and would retain a `Process` entry
@@ -239,6 +260,48 @@ impl PtyProcessInfo {
     }
 
     pub(crate) fn pid(&self) -> Option<Pid> {
+        self.pid_getter.pid()
+    }
+}
+
+/// WASM stub: there is no local child process to inspect.
+#[cfg(target_family = "wasm")]
+pub(crate) struct PtyProcessInfo {
+    pid_getter: ProcessIdGetter,
+    pub(crate) current: RwLock<Option<ProcessInfo>>,
+    task: Mutex<Option<Task<()>>>,
+}
+
+#[cfg(target_family = "wasm")]
+impl PtyProcessInfo {
+    pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
+        PtyProcessInfo {
+            pid_getter,
+            current: RwLock::new(None),
+            task: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn pid_getter(&self) -> &ProcessIdGetter {
+        &self.pid_getter
+    }
+
+    pub(crate) fn kill_current_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn kill_child_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn terminate_child_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, _cx: &mut Context<'_, Terminal>) {
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
         self.pid_getter.pid()
     }
 }

@@ -2,12 +2,14 @@
 pub mod test;
 
 mod llm_token;
+#[cfg(not(target_family = "wasm"))]
 mod proxy;
 pub mod telemetry;
 pub mod user;
 pub mod zed_urls;
 
 use anyhow::{Context as _, Result, anyhow};
+#[cfg(not(target_family = "wasm"))]
 use async_tungstenite::tungstenite::{
     client::IntoClientRequest,
     error::Error as WebsocketError,
@@ -30,6 +32,7 @@ use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
+#[cfg(not(target_family = "wasm"))]
 use proxy::{connect_proxy_stream, excluded_from_proxy};
 use rand::prelude::*;
 use release_channel::{AppVersion, ReleaseChannel};
@@ -51,6 +54,7 @@ use std::{
 use std::{cmp, pin::Pin};
 use telemetry::Telemetry;
 use thiserror::Error;
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::TcpStream;
 use url::Url;
 use util::{ConnectionResult, ResultExt};
@@ -249,14 +253,17 @@ pub enum EstablishConnectionError {
     Unauthorized,
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+    #[cfg(not(target_family = "wasm"))]
     #[error("{0}")]
     InvalidHeaderValue(#[from] async_tungstenite::tungstenite::http::header::InvalidHeaderValue),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[cfg(not(target_family = "wasm"))]
     #[error("{0}")]
     Websocket(#[from] async_tungstenite::tungstenite::http::Error),
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<WebsocketError> for EstablishConnectionError {
     fn from(error: WebsocketError) -> Self {
         if let WebsocketError::Http(response) = &error {
@@ -356,10 +363,45 @@ pub struct ClientCredentialsProvider {
     provider: Arc<dyn CredentialsProvider>,
 }
 
+#[cfg(target_family = "wasm")]
+struct WasmCredentialsProvider;
+
+#[cfg(target_family = "wasm")]
+impl credentials_provider::CredentialsProvider for WasmCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        _url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        _url: &'a str,
+        _username: &'a str,
+        _password: &'a [u8],
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move { anyhow::bail!("OS keychain is not available in the browser") })
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        _url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move { anyhow::bail!("OS keychain is not available in the browser") })
+    }
+}
+
 impl ClientCredentialsProvider {
     pub fn new(cx: &App) -> Self {
         Self {
+            #[cfg(not(target_family = "wasm"))]
             provider: zed_credentials_provider::global(cx),
+            #[cfg(target_family = "wasm")]
+            provider: Arc::new(WasmCredentialsProvider),
         }
     }
 
@@ -980,6 +1022,7 @@ impl Client {
     ///
     /// The connection is re-established with exponential backoff if it drops or fails to
     /// establish.
+    #[cfg(not(target_family = "wasm"))]
     fn connect_to_cloud(self: &Arc<Self>, cx: &AsyncApp) {
         let this = self.clone();
         let task = cx.spawn(async move |cx| {
@@ -1012,6 +1055,7 @@ impl Client {
 
     /// Runs a single attempt of the cloud websocket connection, returning once the connection
     /// closes (cleanly or otherwise) or fails to establish.
+    #[cfg(not(target_family = "wasm"))]
     async fn run_cloud_connection(self: &Arc<Self>, cx: &mut AsyncApp) -> Result<()> {
         let connect_task = cx.update({
             let cloud_client = self.cloud_client.clone();
@@ -1062,6 +1106,7 @@ impl Client {
 
         let credentials = self.sign_in(try_provider, cx).await?;
 
+        #[cfg(not(target_family = "wasm"))]
         self.connect_to_cloud(cx);
 
         cx.update(move |cx| {
@@ -1181,7 +1226,10 @@ impl Client {
             let executor = executor.clone();
             move |duration| executor.timer(duration)
         });
+        #[cfg(not(target_family = "wasm"))]
         let handle_io = executor.spawn(handle_io);
+        #[cfg(target_family = "wasm")]
+        let handle_io = cx.spawn(async move |_cx| handle_io.await);
 
         let peer_id = async {
             log::debug!("waiting for server hello");
@@ -1228,6 +1276,7 @@ impl Client {
                 while let Some(message) = incoming.next().await {
                     this.handle_message(message, cx);
                     // Don't starve the main thread when receiving lots of messages at once.
+                    #[cfg(not(target_family = "wasm"))]
                     smol::future::yield_now().await;
                 }
             }
@@ -1277,7 +1326,19 @@ impl Client {
             return callback(credentials, cx);
         }
 
-        self.establish_websocket_connection(credentials, cx)
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.establish_websocket_connection(credentials, cx)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = credentials;
+            cx.spawn(async move |_cx| {
+                Err(EstablishConnectionError::other(anyhow!(
+                    "collab websocket is not available on wasm until rpc::wasm_conn lands"
+                )))
+            })
+        }
     }
 
     fn rpc_url(
@@ -1323,6 +1384,7 @@ impl Client {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn establish_websocket_connection(
         self: &Arc<Self>,
         credentials: &Credentials,
@@ -1427,6 +1489,7 @@ impl Client {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn authenticate_with_browser(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
         let http = self.http.clone();
         let this = self.clone();
@@ -1558,6 +1621,14 @@ impl Client {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn authenticate_with_browser(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
+        cx.spawn(async move |_cx| {
+            anyhow::bail!("authenticate_with_browser is not supported on WASM")
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     async fn authenticate_as_admin(
         self: &Arc<Self>,
         http: Arc<HttpClientWithUrl>,

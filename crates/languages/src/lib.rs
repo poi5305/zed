@@ -2,6 +2,7 @@ use futures::FutureExt as _;
 use gpui::{App, SharedString, UpdateGlobal};
 use node_runtime::NodeRuntime;
 use project::Fs;
+#[cfg(not(target_family = "wasm"))]
 use python::PyprojectTomlManifestProvider;
 use rust::CargoManifestProvider;
 use settings::{SemanticTokenRules, SettingsStore};
@@ -11,10 +12,9 @@ use util::ResultExt;
 
 pub use language::*;
 
-use crate::{
-    json::JsonTaskProvider,
-    python::{BasedPyrightLspAdapter, RuffLspAdapter},
-};
+use crate::json::JsonTaskProvider;
+#[cfg(not(target_family = "wasm"))]
+use crate::python::{BasedPyrightLspAdapter, RuffLspAdapter};
 
 mod bash;
 mod c;
@@ -24,6 +24,7 @@ mod eslint;
 mod go;
 mod json;
 mod package_json;
+#[cfg(not(target_family = "wasm"))]
 mod python;
 mod rust;
 mod tailwind;
@@ -68,12 +69,19 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     let json_context_provider = Arc::new(JsonTaskProvider);
     let json_lsp_adapter = Arc::new(json::JsonLspAdapter::new(languages.clone(), node.clone()));
     let node_version_lsp_adapter = Arc::new(json::NodeVersionAdapter);
+    #[cfg(not(target_family = "wasm"))]
     let py_lsp_adapter = Arc::new(python::PyLspAdapter::new());
+    #[cfg(not(target_family = "wasm"))]
     let ty_lsp_adapter = Arc::new(python::TyLspAdapter::new(fs.clone()));
+    #[cfg(not(target_family = "wasm"))]
     let python_context_provider = Arc::new(python::PythonContextProvider);
+    #[cfg(not(target_family = "wasm"))]
     let python_lsp_adapter = Arc::new(python::PyrightLspAdapter::new(node.clone()));
+    #[cfg(not(target_family = "wasm"))]
     let basedpyright_lsp_adapter = Arc::new(BasedPyrightLspAdapter::new(node.clone()));
+    #[cfg(not(target_family = "wasm"))]
     let ruff_lsp_adapter = Arc::new(RuffLspAdapter::new(fs.clone()));
+    #[cfg(not(target_family = "wasm"))]
     let python_toolchain_provider = Arc::new(python::PythonToolchainProvider::new(fs.clone()));
     let rust_context_provider = Arc::new(rust::RustContextProvider);
     let rust_lsp_adapter = Arc::new(rust::RustLspAdapter);
@@ -156,6 +164,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![],
             ..Default::default()
         },
+        #[cfg(not(target_family = "wasm"))]
         LanguageInfo {
             name: "python",
             adapters: vec![
@@ -319,10 +328,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         anyhow::Ok(())
     })
     .detach();
+    #[cfg(not(target_family = "wasm"))]
     let manifest_providers: [Arc<dyn ManifestProvider>; 2] = [
         Arc::from(CargoManifestProvider),
         Arc::from(PyprojectTomlManifestProvider),
     ];
+    #[cfg(target_family = "wasm")]
+    let manifest_providers: [Arc<dyn ManifestProvider>; 1] = [Arc::from(CargoManifestProvider)];
     for provider in manifest_providers {
         project::ManifestProvidersStore::global(cx).register(provider);
     }

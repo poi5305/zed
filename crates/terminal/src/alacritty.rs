@@ -8,7 +8,6 @@ mod hyperlinks;
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
-    event_loop::{EventLoop, Msg, Notifier},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
@@ -21,12 +20,16 @@ use alacritty_terminal::{
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
         search::{Match, RegexIter, RegexSearch},
     },
-    tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
         NamedPrivateMode, PrivateMode,
     },
+};
+#[cfg(not(target_family = "wasm"))]
+use alacritty_terminal::{
+    event_loop::{EventLoop, Msg, Notifier},
+    tty,
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
@@ -35,18 +38,22 @@ use vte::ansi::Handler;
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
+#[cfg(not(target_family = "wasm"))]
+use crate::pty_info::ProcessIdGetter;
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, GridLinesChange, HoveredWord, Hyperlink,
     HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
-    pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) type AlacrittyPty = tty::Pty;
+#[cfg(target_family = "wasm")]
+pub(super) type AlacrittyPty = ();
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
 pub(super) type AlacrittyTermLock = FairMutex<AlacrittyTerm>;
@@ -62,7 +69,7 @@ pub(super) struct AlacrittySearch {
     search: RegexSearch,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_family = "wasm")))]
 impl From<&AlacrittyPty> for ProcessIdGetter {
     fn from(pty: &AlacrittyPty) -> Self {
         Self::new(pty.file().as_raw_fd(), pty.child().id())
@@ -82,10 +89,12 @@ impl From<&AlacrittyPty> for ProcessIdGetter {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) struct PtySender {
     notifier: Notifier,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PtySender {
     pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
         self.notifier.notify(input);
@@ -105,6 +114,24 @@ impl PtySender {
         if let Err(error) = self.notifier.0.send(Msg::Shutdown) {
             log::debug!("failed to shut down alacritty pty loop: {error}");
         }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(super) struct PtySender;
+
+#[cfg(target_family = "wasm")]
+impl PtySender {
+    pub(super) fn notify(&self, _input: impl Into<Cow<'static, [u8]>>) {
+        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
+    }
+
+    pub(super) fn resize(&self, _bounds: TerminalBounds) {
+        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
+    }
+
+    pub(super) fn shutdown(&self) {
+        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
     }
 }
 
@@ -153,11 +180,12 @@ pub(super) fn apply_config(term: &AlacrittyTermLock, config: &AlacrittyTermConfi
     term.lock().set_options(config.clone());
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 pub(super) fn current_child_signal_mask() -> io::Result<tty::SignalMask> {
     tty::SignalMask::current()
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn pty_options(
     shell: Option<(String, Vec<String>)>,
     working_directory: Option<PathBuf>,
@@ -177,6 +205,7 @@ pub(super) fn pty_options(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn open_pty(
     options: &tty::Options,
     bounds: TerminalBounds,
@@ -200,6 +229,7 @@ pub(super) fn new_term(
     Arc::new(FairMutex::new(term))
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn spawn_event_loop(
     term: Arc<AlacrittyTermLock>,
     events_tx: UnboundedSender<PtyEvent>,
