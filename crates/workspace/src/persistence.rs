@@ -27,12 +27,18 @@ use project::{
     trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
 };
 
+#[cfg(target_family = "wasm")]
+use async_recursion::async_recursion;
 use language::{LanguageName, Toolchain, ToolchainScope};
 use remote::{
     DockerConnectionOptions, RemoteConnectionIdentity, RemoteConnectionOptions,
     SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_family = "wasm")]
+use serde_json::{Value, json};
+#[cfg(target_family = "wasm")]
+use sqlez::remote_sql;
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
@@ -1077,15 +1083,70 @@ impl Domain for WorkspaceDb {
 
 db::static_connection!(WorkspaceDb, []);
 
+#[cfg(target_family = "wasm")]
+struct SqlBatch {
+    queries: Vec<Value>,
+}
+
+#[cfg(target_family = "wasm")]
+impl SqlBatch {
+    fn new() -> Self {
+        Self {
+            queries: Vec::new(),
+        }
+    }
+
+    fn push_bound<B: Bind>(&mut self, sql: &str, bindings: B) -> Result<usize> {
+        let index = self.queries.len();
+        self.queries.push(remote_sql::bound_query(sql, bindings)?);
+        Ok(index)
+    }
+
+    fn push_params(&mut self, sql: &str, params: Vec<Value>) -> usize {
+        let index = self.queries.len();
+        self.queries.push(json!({
+            "sql": sql,
+            "params": params,
+        }));
+        index
+    }
+
+    async fn commit(self) -> Result<()> {
+        let result = remote_sql::batch(self.queries).await?;
+        match result.get("ok") {
+            Some(Value::Bool(true)) => Ok(()),
+            _ => bail!("Sql::batch did not commit layout save: {result}"),
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn batch_parent_param(parent_query: Option<usize>) -> Value {
+    match parent_query {
+        Some(query) => remote_sql::batch_last_rowid(query),
+        None => Value::Null,
+    }
+}
+
 impl WorkspaceDb {
     /// Returns a serialized workspace for the given worktree_roots. If the passed array
     /// is empty, the most recent workspace is returned instead. If no workspace for the
     /// passed roots is stored, returns none.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn workspace_for_roots<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
     ) -> Option<SerializedWorkspace> {
         self.workspace_for_roots_internal(worktree_roots, None)
+    }
+
+    /// SQL errors are `Err`, not `None`, so a failed read cannot look like a new workspace.
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn workspace_for_roots<P: AsRef<Path>>(
+        &self,
+        worktree_roots: &[P],
+    ) -> Result<Option<SerializedWorkspace>> {
+        self.workspace_for_roots_remote(worktree_roots).await
     }
 
     pub(crate) fn remote_workspace_for_roots<P: AsRef<Path>>(
@@ -1494,6 +1555,7 @@ impl WorkspaceDb {
         ret
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
@@ -1687,6 +1749,460 @@ impl WorkspaceDb {
             .log_err();
         })
         .await;
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) -> Result<()> {
+        let _ = self;
+        let paths = workspace.paths.serialize();
+        let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
+        log::debug!("Saving workspace at location: {:?}", workspace.location);
+        if !matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+            bail!(
+                "web workspace persistence only supports SerializedWorkspaceLocation::Local; got {:?}",
+                workspace.location
+            );
+        }
+
+        let mut batch = SqlBatch::new();
+        batch
+            .push_bound(
+                sql!(DELETE FROM pane_groups WHERE workspace_id = ?1),
+                workspace.id,
+            )
+            .context("Clearing old pane groups")?;
+        batch
+            .push_bound(
+                sql!(DELETE FROM panes WHERE workspace_id = ?1),
+                workspace.id,
+            )
+            .context("Clearing old panes")?;
+
+        // Bookmarks, breakpoints, user_toolchains, and recent_navigation_history
+        // are omitted: breakpoint/toolchain inserts continue on error inside the
+        // native savepoint, which a single Sql::batch cannot express without
+        // rolling back the layout; they are also out of this round's layout scope.
+
+        if !paths.paths.is_empty() {
+            batch
+                .push_bound(
+                    sql!(
+                        DELETE
+                        FROM workspaces
+                        WHERE
+                            workspace_id != ?1 AND
+                            paths IS ?2 AND
+                            remote_connection_id IS ?3
+                    ),
+                    (workspace.id, paths.paths.clone(), None::<u64>),
+                )
+                .context("clearing out old locations")?;
+        }
+
+        let query = sql!(
+            INSERT INTO workspaces(
+                workspace_id,
+                paths,
+                paths_order,
+                identity_paths,
+                identity_paths_order,
+                remote_connection_id,
+                left_dock_visible,
+                left_dock_active_panel,
+                left_dock_zoom,
+                right_dock_visible,
+                right_dock_active_panel,
+                right_dock_zoom,
+                bottom_dock_visible,
+                bottom_dock_active_panel,
+                bottom_dock_zoom,
+                session_id,
+                window_id,
+                timestamp
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+            ON CONFLICT DO
+            UPDATE SET
+                paths = ?2,
+                paths_order = ?3,
+                identity_paths = ?4,
+                identity_paths_order = ?5,
+                remote_connection_id = ?6,
+                left_dock_visible = ?7,
+                left_dock_active_panel = ?8,
+                left_dock_zoom = ?9,
+                right_dock_visible = ?10,
+                right_dock_active_panel = ?11,
+                right_dock_zoom = ?12,
+                bottom_dock_visible = ?13,
+                bottom_dock_active_panel = ?14,
+                bottom_dock_zoom = ?15,
+                session_id = ?16,
+                window_id = ?17,
+                timestamp = CURRENT_TIMESTAMP
+        );
+        let args = (
+            workspace.id,
+            paths.paths.clone(),
+            paths.order.clone(),
+            identity_paths.as_ref().map(|paths| paths.paths.clone()),
+            identity_paths.as_ref().map(|paths| paths.order.clone()),
+            None::<u64>,
+            workspace.docks,
+            workspace.session_id,
+            workspace.window_id,
+        );
+        batch
+            .push_bound(query, args)
+            .context("Updating workspace")?;
+
+        Self::save_pane_group_remote(&mut batch, workspace.id, &workspace.center_group, None)
+            .context("save pane group in save workspace")?;
+
+        batch.commit().await
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn save_pane_group_remote(
+        batch: &mut SqlBatch,
+        workspace_id: WorkspaceId,
+        pane_group: &SerializedPaneGroup,
+        parent: Option<(usize, usize)>,
+    ) -> Result<()> {
+        if parent.is_none() {
+            log::debug!("Saving a pane group for workspace {workspace_id:?}");
+        }
+        match pane_group {
+            SerializedPaneGroup::Group {
+                axis,
+                children,
+                flexes,
+            } => {
+                let (parent_query, position) = parent.unzip();
+                let flex_string = flexes
+                    .as_ref()
+                    .map(|flexes| serde_json::json!(flexes).to_string());
+
+                let mut params = remote_sql::bind_params(workspace_id)?;
+                params.push(batch_parent_param(parent_query));
+                params.extend(remote_sql::bind_params((position, *axis, flex_string))?);
+                let group_query = batch.push_params(
+                    sql!(
+                        INSERT INTO pane_groups(
+                            workspace_id,
+                            parent_group_id,
+                            position,
+                            axis,
+                            flexes
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        RETURNING group_id
+                    ),
+                    params,
+                );
+
+                for (position, group) in children.iter().enumerate() {
+                    Self::save_pane_group_remote(
+                        batch,
+                        workspace_id,
+                        group,
+                        Some((group_query, position)),
+                    )?;
+                }
+
+                Ok(())
+            }
+            SerializedPaneGroup::Pane(pane) => {
+                Self::save_pane_remote(batch, workspace_id, pane, parent)?;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn save_pane_remote(
+        batch: &mut SqlBatch,
+        workspace_id: WorkspaceId,
+        pane: &SerializedPane,
+        parent: Option<(usize, usize)>,
+    ) -> Result<usize> {
+        let pane_query = batch
+            .push_bound(
+                sql!(
+                    INSERT INTO panes(workspace_id, active, pinned_count)
+                    VALUES (?, ?, ?)
+                    RETURNING pane_id
+                ),
+                (workspace_id, pane.active, pane.pinned_count),
+            )
+            .context("Could not retrieve inserted pane_id")?;
+
+        let (parent_query, order) = parent.unzip();
+        let mut params = vec![
+            remote_sql::batch_last_rowid(pane_query),
+            batch_parent_param(parent_query),
+        ];
+        params.extend(remote_sql::bind_params(order)?);
+        batch.push_params(
+            sql!(
+                INSERT INTO center_panes(pane_id, parent_group_id, position)
+                VALUES (?, ?, ?)
+            ),
+            params,
+        );
+
+        Self::save_items_remote(batch, workspace_id, pane_query, &pane.children)
+            .context("Saving items")?;
+
+        Ok(pane_query)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn save_items_remote(
+        batch: &mut SqlBatch,
+        workspace_id: WorkspaceId,
+        pane_query: usize,
+        items: &[SerializedItem],
+    ) -> Result<()> {
+        let insert_sql = sql!(
+            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active, preview) VALUES (?, ?, ?, ?, ?, ?, ?)
+        );
+        for (position, item) in items.iter().enumerate() {
+            let mut params = remote_sql::bind_params(workspace_id)?;
+            params.push(remote_sql::batch_last_rowid(pane_query));
+            params.extend(remote_sql::bind_params((position, item))?);
+            batch.push_params(insert_sql, params);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_family = "wasm")]
+    async fn workspace_for_roots_remote<P: AsRef<Path>>(
+        &self,
+        worktree_roots: &[P],
+    ) -> Result<Option<SerializedWorkspace>> {
+        let root_paths = PathList::new(worktree_roots);
+
+        if root_paths.is_empty() {
+            return Ok(None);
+        }
+
+        let row = remote_sql::select_row_bound::<
+            _,
+            (
+                WorkspaceId,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<SerializedWindowBounds>,
+                Option<Uuid>,
+                Option<bool>,
+                DockStructure,
+                Option<u64>,
+            ),
+        >(
+            sql! {
+                SELECT
+                    workspace_id,
+                    paths,
+                    paths_order,
+                    identity_paths,
+                    identity_paths_order,
+                    window_state,
+                    window_x,
+                    window_y,
+                    window_width,
+                    window_height,
+                    display,
+                    centered_layout,
+                    left_dock_visible,
+                    left_dock_active_panel,
+                    left_dock_zoom,
+                    right_dock_visible,
+                    right_dock_active_panel,
+                    right_dock_zoom,
+                    bottom_dock_visible,
+                    bottom_dock_active_panel,
+                    bottom_dock_zoom,
+                    window_id
+                FROM workspaces
+                WHERE
+                    paths IS ? AND
+                    remote_connection_id IS ?
+                LIMIT 1
+            },
+            (root_paths.serialize().paths, None::<i32>),
+        )
+        .await
+        .context("Loading workspace for roots")?;
+
+        let Some((
+            workspace_id,
+            paths,
+            paths_order,
+            identity_paths,
+            identity_paths_order,
+            window_bounds,
+            display,
+            centered_layout,
+            docks,
+            window_id,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let paths = PathList::deserialize(&SerializedPathList {
+            paths,
+            order: paths_order,
+        });
+        let identity_paths = identity_paths.map(|paths| {
+            PathList::deserialize(&SerializedPathList {
+                paths,
+                order: identity_paths_order.unwrap_or_default(),
+            })
+        });
+
+        Ok(Some(SerializedWorkspace {
+            id: workspace_id,
+            location: SerializedWorkspaceLocation::Local,
+            paths,
+            identity_paths,
+            center_group: self
+                .get_center_pane_group_remote(workspace_id)
+                .await
+                .context("Getting center group")?,
+            window_bounds,
+            centered_layout: centered_layout.unwrap_or(false),
+            display,
+            docks,
+            session_id: None,
+            bookmarks: BTreeMap::default(),
+            breakpoints: BTreeMap::default(),
+            window_id,
+            user_toolchains: BTreeMap::default(),
+            recent_navigation_history: Vec::new(),
+        }))
+    }
+
+    #[cfg(target_family = "wasm")]
+    async fn get_center_pane_group_remote(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<SerializedPaneGroup> {
+        Ok(self
+            .get_pane_group_remote(workspace_id, None)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                SerializedPaneGroup::Pane(SerializedPane {
+                    active: true,
+                    children: vec![],
+                    pinned_count: 0,
+                })
+            }))
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[async_recursion(?Send)]
+    async fn get_pane_group_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        group_id: Option<GroupId>,
+    ) -> Result<Vec<SerializedPaneGroup>> {
+        type GroupKey = (Option<GroupId>, WorkspaceId);
+        type GroupOrPane = (
+            Option<GroupId>,
+            Option<SerializedAxis>,
+            Option<PaneId>,
+            Option<bool>,
+            Option<usize>,
+            Option<String>,
+        );
+        let rows = remote_sql::select_bound::<GroupKey, GroupOrPane>(
+            sql!(
+                SELECT group_id, axis, pane_id, active, pinned_count, flexes
+                    FROM (SELECT
+                            group_id,
+                            axis,
+                            NULL as pane_id,
+                            NULL as active,
+                            NULL as pinned_count,
+                            position,
+                            parent_group_id,
+                            workspace_id,
+                            flexes
+                          FROM pane_groups
+                        UNION
+                          SELECT
+                            NULL,
+                            NULL,
+                            center_panes.pane_id,
+                            panes.active as active,
+                            pinned_count,
+                            position,
+                            parent_group_id,
+                            panes.workspace_id as workspace_id,
+                            NULL
+                          FROM center_panes
+                          JOIN panes ON center_panes.pane_id = panes.pane_id)
+                    WHERE parent_group_id IS ? AND workspace_id = ?
+                    ORDER BY position
+            ),
+            (group_id, workspace_id),
+        )
+        .await?;
+
+        let mut pane_groups = Vec::new();
+        for (group_id, axis, pane_id, active, pinned_count, flexes) in rows {
+            let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
+            let pane_group = if let Some((group_id, axis)) = group_id.zip(axis) {
+                let flexes = flexes
+                    .map(|flexes: String| serde_json::from_str::<Vec<f32>>(&flexes))
+                    .transpose()?;
+
+                SerializedPaneGroup::Group {
+                    axis,
+                    children: self
+                        .get_pane_group_remote(workspace_id, Some(group_id))
+                        .await?,
+                    flexes,
+                }
+            } else if let Some((pane_id, active, pinned_count)) = maybe_pane {
+                SerializedPaneGroup::Pane(SerializedPane::new(
+                    self.get_items_remote(pane_id).await?,
+                    active,
+                    pinned_count,
+                ))
+            } else {
+                bail!("Pane Group Child was neither a pane group or a pane");
+            };
+
+            let keep = match &pane_group {
+                SerializedPaneGroup::Group { children, .. } => !children.is_empty(),
+                SerializedPaneGroup::Pane(pane) => !pane.children.is_empty(),
+            };
+            if keep {
+                pane_groups.push(pane_group);
+            }
+        }
+        Ok(pane_groups)
+    }
+
+    #[cfg(target_family = "wasm")]
+    async fn get_items_remote(&self, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
+        let _ = self;
+        remote_sql::select_bound(
+            sql!(
+                SELECT kind, item_id, active, preview FROM items
+                WHERE pane_id = ?
+                    ORDER BY position
+            ),
+            pane_id,
+        )
+        .await
     }
 
     pub(crate) async fn get_or_create_remote_connection(
@@ -2595,6 +3111,22 @@ impl WorkspaceDb {
         use db::sqlez::statement::Statement;
         use itertools::Itertools as _;
 
+        // Refuse before destroying anything. `clear_trusted_worktrees` is an async
+        // `query!` and so reaches the server's database over the SQL RPC, while the
+        // re-insert below goes through `self.write`, which needs a synchronous
+        // connection wasm does not have. Running the clear first would wipe the trust
+        // table and then fail to restore it -- losing state rather than failing to
+        // change it, which is the worse of the two.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = &trusted_worktrees;
+            anyhow::bail!(
+                "trusted worktrees cannot be saved from the browser yet: the insert needs a \
+                 synchronous connection. Nothing was cleared."
+            );
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.clear_trusted_worktrees()
             .await
             .context("clearing previous trust state")?;
