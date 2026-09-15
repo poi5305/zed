@@ -38,6 +38,10 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+base64.workspace = true
+smol.workspace = true
+
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

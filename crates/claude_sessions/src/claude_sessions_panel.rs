@@ -54,6 +54,10 @@ use workspace::{
     item::SerializableItem,
 };
 
+#[cfg(target_family = "wasm")]
+use crate::session_source::WebSource;
+#[cfg(not(target_family = "wasm"))]
+use crate::session_source::{LocalSource, RemoteSource};
 use crate::{
     COMPACT_AFTER_PINGS, CacheTtl, ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings,
     EndedReason, EndedSession, HookInstallOutcome, KeepAliveConfig, KeepAliveState,
@@ -67,7 +71,7 @@ use crate::{
         TranscriptSpend, attachment_is_readable, tmux_session_name, window_target,
         workflow_run_id_in_tool_result,
     },
-    session_source::{FileContents, LocalSource, RemoteSource, SessionSource},
+    session_source::{FileContents, SessionSource},
     status as keep_alive_status,
     terminal_anchors::{self, Anchoring, Glyphs, ScreenRow},
     transcript::{AutoModeFlags, Spend},
@@ -2854,13 +2858,24 @@ impl ClaudeSessionsPanel {
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
         // The sessions worth showing are the ones on the machine the project is
         // opened from: on a remote project they are read over that project's
-        // connection, and the panel is otherwise the same on both.
-        let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
-            Some(remote_client) => Arc::new(RemoteSource::new(
-                remote_client.read(cx).proto_client(),
-                cx.background_executor().clone(),
-            )),
-            None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+        // connection, and the panel is otherwise the same on both. In the browser
+        // there is no local filesystem, so every method is one JSON-RPC to the
+        // server, which calls the same functions LocalSource calls directly.
+        let source: Arc<dyn SessionSource> = {
+            #[cfg(target_family = "wasm")]
+            {
+                Arc::new(WebSource::new(cx.background_executor().clone()))
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                match project.read(cx).remote_client() {
+                    Some(remote_client) => Arc::new(RemoteSource::new(
+                        remote_client.read(cx).proto_client(),
+                        cx.background_executor().clone(),
+                    )),
+                    None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+                }
+            }
         };
         (source, project_root)
     }
