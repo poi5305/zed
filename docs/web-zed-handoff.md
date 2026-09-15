@@ -10,61 +10,39 @@ commit messages and `docs/web-zed-plan.md` do not already say.
 
 ## 1. Status
 
+The plan defines eight phases -- 0, 0b, 1, 2, 3, 4, 5, 6. Sections 7 to 11 of the document
+are sections, not phases.
+
 | Phase | State |
 | --- | --- |
-| 0 · 0b | ✅ measurement complete (`phase0-rebase-cost.md`, `phase0b-wasm-report.md`) |
-| 1 | ✅ second workspace + review round 1 |
-| 2 | ✅ seven vendored forks + review round 2 |
-| 3 | ✅ 48 manifests + 72 `.rs` + review rounds 3 and 4 |
-| 4a · 4b · 4c | ⚠️ **recorded as done, and is not.** `build.sh`, the three web crates and `zed_web_server` exist, but `zed_web_workspace` was written against **nine APIs that were never implemented** (see §5.7 of the plan). Nothing caught it because the crate had never compiled |
-| **5** | **in progress** — `cd web && cargo check --workspace --target wasm32-unknown-unknown` is down to `settings_ui` and `keymap_editor`. Everything else in the graph type-checks, including `language`, `languages`, `edit_prediction_ui` and `sidebar` |
-| 6 | `Home::` RPC done (server + the wasm seeding API); the four panels not started |
+| 0 · 0b | ✅ measurement complete |
+| 1 · 2 · 3 | ✅ |
+| 4 | ✅ **now genuinely** — it was recorded as done while `zed_web_workspace` referred to twelve things that did not exist; see §1b |
+| **5 · first light** | ✅ **`./web/build.sh` exits 0 and writes a 72 MB module to `web/dist/static/`** |
+| **6** | `Home::` RPC done; three panels registered and routed; `forward_ports` dispositioned by §6.5. Two §6.4 items remain, both listed in §5 below |
 
-**Desktop is unaffected and that is asserted, not assumed.** Root `Cargo.lock` has gained
-lines and deleted none across the whole port; the nine crates §9 pins keep their exact
-sources; `cargo check` of every touched crate passes natively.
+Desktop is unaffected and asserted, not assumed: both lock files have gained lines and deleted
+none, every touched crate passes `cargo check` natively, and `cargo fmt --all -- --check` is
+clean apart from two files that predate this work.
 
-## 2. How to resume Phase 5
+## 1b. Phase 4 was recorded as complete and was not
 
-The loop is mechanical and each iteration is one crate:
+An entry-point crate is the last thing a workspace check reaches, because nothing depends on
+it. Every error in front of it hides every error inside it, so `zed_web_workspace` could be
+written, reviewed and signed off while referring to an API surface that was only ever planned.
+Twelve defects of that one shape were found and fixed once it finally compiled:
 
-```
-CARGO_BUILD_JOBS=2 ./web/build.sh > /tmp/b.log 2>&1
-grep -oE "could not compile [^ ]+" /tmp/b.log | sort -u     # what to fix
-grep -E "^error" -A6 /tmp/b.log | head -40                  # why
-```
+| | |
+| --- | --- |
+| `extensions_ui::init_remote_store` | called once, defined nowhere |
+| `web_extensions.rs` | 512 lines, never declared as a module, never compiled |
+| nine APIs | `sqlez::remote_sql`, `db::prepare_web_database`, `assets::install_web_assets`, `terminal::set_remote_client`, two `settings` keymap paths, `Session::for_web`, `Workspace::initial_state_loaded`, `PlatformTitleBar::set_left_padding` |
+| `smol_wasm/src/rpc.rs` | a stand-in whose own header said Phase 4 would replace it. Its `call` returned "not wired yet", so **every `Fs::*` and `Process::*` call in the browser failed** |
+| `ActivityIndicator::new` | called with four arguments; it has taken three since before this port |
+| `SettingsWindow` | missing `Focusable`, `EventEmitter`, `new_modal`, `open_page` |
 
-Then fix, and verify **both** targets before moving on:
-
-```
-export CC_wasm32_unknown_unknown="$PWD/target/wasi-sdk/bin/clang"
-export CFLAGS_wasm32_unknown_unknown="-isystem $PWD/target/wasi-sdk/share/wasi-sysroot/include/wasm32-wasi"
-
-cd web && CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=../target/web-probe \
-    cargo check -p <crate> --target wasm32-unknown-unknown --lib
-CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=target/web-probe cargo check -p <crate> --lib
-```
-
-**Export those two variables first.** `./web/build.sh` sets them itself, so a single-crate
-`cargo check` run by hand is the only place they go missing — and when they do, the 18
-tree-sitter grammars are handed to the host clang, which cannot target wasm32. The failure
-names the grammar, not the missing toolchain, so it reads as a broken crate. It made
-`debugger_ui` look broken once when it was already fine.
-
-### The environment constraint that shapes everything
-
-**Five subagent runs were killed by the OS for memory pressure.** Not one was a quality
-failure — the `language_models` agent had finished all 50 errors before it was killed, and
-the previous session wrongly recorded it as unfinished because it never got to run the
-check. The cause is simply that this workspace's wasm compile peaks above the machine's
-free memory, and any agent must run cargo to verify.
-
-What did not help: lowering `CARGO_BUILD_JOBS` from 4 to 2, restricting agents to single
-crates, forbidding `./web/build.sh` in agent prompts. What worked: doing the remaining
-edits directly and running one small `cargo check` at a time.
-
-**If the next session has more memory headroom, delegation is fine and faster.** If not,
-expect to do it inline.
+**The rule that follows:** a crate nothing depends on needs its own `cargo check` from the day
+it is created, even -- especially -- when it cannot yet link.
 
 ## 2b. Every remaining layer has had one of three shapes
 
@@ -189,44 +167,65 @@ work is one nobody reads, and this one has already caught a real regression once
 
 ## 5. What is left
 
-**Phase 5:** keep running the loop in §2 until `./web/build.sh` produces a `.wasm` in
-`web/dist/static/`. Every layer so far has been one of a handful of shapes: a dependency
-gated in the manifest whose call sites never followed (seen nine times), a `block_on` the
-browser cannot perform, or a `std::time::Instant` the §5.5 sweep missed.
+**Nothing has been opened in a browser yet.** The build produces a module; that it runs is an
+assumption. Serving `web/dist/` and opening a project is the next action, and it will find
+things this session could not.
 
-**Known §6.4 gap, found while porting `recent_projects` and deliberately left for Phase 6:**
-the remote-server *UI* is gone from the wasm build, but a `ssh://` / `wsl://` / `docker://`
-entry already in the recents list still renders and is still clickable, falling through to
-`open_remote_project` (which `disconnected_overlay` also uses). §6.4 says those entries must be
-"hidden or refused"; today they are neither. It is not a compile error, which is exactly why it
-needs to be written down.
+**Phase 6, two remaining §6.4 items.** `project_manager` needs its VS Code import to pick paths
+by the *server's* OS rather than the wasm target's, and `ssh://`/`wsl://`/`docker://` entries
+hidden. `tmux_sessions` needs what §6.4 already says costs more than the code did: its quoting
+and `;` handling tried against a real tmux.
 
-**An inconsistency worth ruling on before `claude_sessions` ships.** `Home::dirs` refuses
-when `ZED_WEB_RESTRICT_PATHS` puts the home directory outside the workspace — that was a
-deliberate choice, so `~` expansion fails loudly rather than silently pointing somewhere the
-client cannot read. But the `ClaudeSessions::` RPCs read `~/.claude` directly, without going
-through `FsRpc`, exactly as the SSH `headless_project` does. So in a restricted deployment
-one path refuses and the other does not. Either the restriction is about what the *client* may
-address (in which case the current split is right and should be documented) or about what the
-deployment will read at all (in which case these RPCs need the same check). It was escalated
-rather than decided, which is correct — but it does need deciding.
+**Also outstanding, all recorded where they were found:**
 
-**Phase 6:** not started. Note §6.5's finding before planning it — `forward_ports` has no
-meaning in a browser, and §6.2's count stands: `crates/remote/src/claude_sessions.rs` has
-113 `std::fs` sites.
-
-**Also outstanding:** `cargo fmt --all -- --check` fails on five files that were already
-dirty before this work began (`claude_sessions_panel.rs`, `session_store.rs`,
-`remote/claude_sessions.rs`, `remote_server/server.rs`, `tmux_sessions_panel.rs`). Not
-caused by the port, not fixed by it, and a CI gate.
+- **Syntax highlighting is one grammar, not eighteen.** `load-grammars` is off, and no longer
+  for an architectural reason: the C now compiles against tree-sitter's own vendored headers
+  (§4.4). What blocks the other seventeen is `tree-sitter-bash` 0.25.1 and `tree-sitter-c`
+  0.24.2 hitting `tree-sitter-language`'s deliberate "upgrade tree-sitter to 0.27" `#error`,
+  and some scanners calling libc without including it. Both are version bumps.
+- **`ZED_WEB_RESTRICT_PATHS` is inconsistent.** `Home::dirs` refuses when home falls outside the
+  workspace; the `ClaudeSessions::` RPCs read `~/.claude` regardless, as the SSH server does.
+  Which is right depends on what the restriction is meant to bound. Escalated, not decided.
+- **Four `self.write` closures still fail on wasm**: `get_or_create_remote_connection` (dead
+  code on web), `toolchains` (degraded to empty, logged), `set_toolchain`, and
+  `save_trusted_worktrees` — which now refuses *before* clearing, because clearing reaches the
+  server and succeeds while the re-insert cannot.
+- **`zed_web_server` now links `remote`**, and through it `gpui`. It builds on macOS; whether
+  the Linux/Docker image still builds and how much that adds is unmeasured.
+- **`check-workspace-isolation.sh`'s M1/M2 over-report.** `phase3a_base` is a fixed commit, so
+  the diff has grown to cover Phases 4-6. Exclude `web/vendor/` from both. M1's finding about
+  `zed_web_workspace` declaring unused dependencies was real and is now partly resolved.
+- **`cargo fmt` is dirty on two pre-existing files** (`remote_server/server.rs`,
+  `tmux_sessions_panel.rs`), traceable to `bc35645130`. A CI gate.
 
 ## 6. A method note
 
-Four times this session a conclusion was drawn from a process's state rather than its
-output, and three of those were caught before they reached the user. The fourth reached a
-commit message. The shape is always the same: a pipeline's exit code belongs to its last
-command, a killed agent has not necessarily failed, and a gate that has never been red has
-not been shown to work.
+**Read the output, not the status.** This has now failed eight times across the port, always
+the same way: a number that looked relevant was taken as the answer.
 
-**Read the output, not the status.** Every significant finding in this port came from
-doing that.
+| What was read | What it meant |
+| --- | --- |
+| a pipeline's exit code | the exit code of `tail`, not of `cargo` |
+| `grep -c '^error'` returning 0 | cargo had *panicked* before compiling anything |
+| `df` showing 336 GiB free | the wrong volume; `target/` is on another mount that was 100% full |
+| `exit=101, errors=1` | "that package is not in this graph", not "it fails to compile" |
+| a check printing `0 errors` | the script exited before running cargo, three times running |
+| an `undefined symbol` at link time | `cargo check` never links, so the C had never been compiled |
+
+The last one is the general case: **a green `cargo check` understates what the link step
+needs**, which the plan said in advance and which three separate link failures then proved.
+
+Two habits that worked, and are cheap:
+
+1. **Make the success marker explicit, and look for it.** The check script prints `GUARD OK` as
+   its last line. Three runs lacked it and still printed `0 errors`; the absence was the signal,
+   and it was there to be seen before the false claim reached a commit message.
+2. **Ask a delegated agent what the parts it *did not* touch now do.** That question surfaced
+   `save_trusted_worktrees` wiping a user's trust state on the web — a data-loss path nobody
+   had asked about, in a function nobody had asked it to change.
+
+And one that keeps recurring in the code itself: **the same fact written in two places will
+drift, and nothing will notice.** A hard-coded wasm-bindgen version against the lock; a
+manifest gate against its `use`; a build script's feature branch against the feature it was
+renamed from; a check script's CFLAGS against `build.sh`'s. Every one of those cost a debugging
+session. Derive the second copy, or delete it.
