@@ -3,6 +3,8 @@ use std::{cmp::Reverse, sync::Arc};
 use agent_settings::AgentSettings;
 use collections::{HashMap, HashSet, IndexMap};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+#[cfg(target_family = "wasm")]
+use fuzzy::match_strings_blocking;
 use gpui::{
     Action, AnyElement, App, BackgroundExecutor, DismissEvent, FocusHandle, ForegroundExecutor,
     Subscription, Task,
@@ -333,6 +335,7 @@ impl ModelMatcher {
     }
 
     pub fn fuzzy_search(&self, query: &str) -> Vec<ModelInfo> {
+        #[cfg(not(target_family = "wasm"))]
         let mut matches = self.fg_executor.block_on(match_strings(
             &self.candidates,
             query,
@@ -342,6 +345,16 @@ impl ModelMatcher {
             &Default::default(),
             self.bg_executor.clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut matches = match_strings_blocking(
+            &self.candidates,
+            query,
+            false,
+            true,
+            100,
+            &Default::default(),
+            self.bg_executor.clone(),
+        );
 
         let sorting_key = |mat: &StringMatch| {
             let candidate = &self.candidates[mat.candidate_id];

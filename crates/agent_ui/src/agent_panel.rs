@@ -68,6 +68,7 @@ use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -1525,7 +1526,11 @@ impl AgentPanel {
             )
         });
 
-        // Subscribe to extension events to sync agent servers when extensions change
+        // Subscribe to extension events to sync agent servers when extensions change.
+        // `extension_host` needs host process support and is native-only, so on the web
+        // there is no store to subscribe to -- extensions are not installable there at
+        // all, which is why `None` is the accurate answer rather than a degraded one.
+        #[cfg(not(target_family = "wasm"))]
         let extension_subscription = ExtensionStore::try_global(cx).map(|store| {
             cx.subscribe(&store, |this, _source, event, cx| match event {
                 extension_host::Event::ExtensionUninstalled(id) => {
@@ -1534,6 +1539,8 @@ impl AgentPanel {
                 _ => {}
             })
         });
+        #[cfg(target_family = "wasm")]
+        let extension_subscription: Option<gpui::Subscription> = None;
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
         let _project_subscription =

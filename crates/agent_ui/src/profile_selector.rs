@@ -6,6 +6,8 @@ use agent_settings::{
 };
 use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+#[cfg(target_family = "wasm")]
+use fuzzy::match_strings_blocking;
 use gpui::{
     Action, AnyElement, AnyView, App, BackgroundExecutor, Context, DismissEvent, Empty, Entity,
     FocusHandle, Focusable, ForegroundExecutor, SharedString, Subscription, Task, Window,
@@ -461,15 +463,30 @@ impl ProfilePickerDelegate {
 
         let cancel_flag = AtomicBool::new(false);
 
-        self.foreground.block_on(match_strings(
-            self.string_candidates.as_ref(),
-            query,
-            false,
-            true,
-            100,
-            &cancel_flag,
-            self.background.clone(),
-        ))
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.foreground.block_on(match_strings(
+                self.string_candidates.as_ref(),
+                query,
+                false,
+                true,
+                100,
+                &cancel_flag,
+                self.background.clone(),
+            ))
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            match_strings_blocking(
+                self.string_candidates.as_ref(),
+                query,
+                false,
+                true,
+                100,
+                &cancel_flag,
+                self.background.clone(),
+            )
+        }
     }
 }
 
