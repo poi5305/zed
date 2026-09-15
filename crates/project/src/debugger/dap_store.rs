@@ -971,7 +971,8 @@ impl DapAdapterDelegate {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl dap::adapters::DapDelegate for DapAdapterDelegate {
     fn worktree_id(&self) -> WorktreeId {
         self.worktree.id()

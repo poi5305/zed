@@ -1,4 +1,6 @@
 use anyhow::Result;
+#[cfg(target_family = "wasm")]
+use anyhow::anyhow;
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Task, WeakEntity};
 
@@ -571,9 +573,19 @@ impl Project {
                         Ok(command)
                     }
                 }
-                .map(|mut process| {
+                .and_then(|mut process| {
                     util::set_pre_exec_to_start_new_session(&mut process);
-                    smol::process::Command::from(process)
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        Ok(smol::process::Command::from(process))
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let _ = process;
+                        Err(anyhow!(
+                            "exec_in_shell cannot spawn a local process in the browser"
+                        ))
+                    }
                 })
             })?
         })

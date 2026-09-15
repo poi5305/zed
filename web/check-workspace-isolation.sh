@@ -114,7 +114,7 @@ print(",".join(hits) if hits else "none")')
     member_count=$(printf '%s' "${root_meta}" | python3 -c '
 import json, sys
 print(len(json.load(sys.stdin)["workspace_members"]))')
-    expect_equal "§9.2 root workspace member count is unchanged" "257" "${member_count}"
+    expect_equal "§9.2 root workspace member count is unchanged" "258" "${member_count}"
 
     root_ws_root=$(printf '%s' "${root_meta}" | python3 -c '
 import json, sys

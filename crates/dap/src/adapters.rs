@@ -36,8 +36,21 @@ pub enum DapStatus {
     Failed { error: String },
 }
 
-#[async_trait]
-pub trait DapDelegate: Send + Sync + 'static {
+#[cfg(not(target_family = "wasm"))]
+mod dap_delegate_bounds {
+    pub trait Bounds: Send + Sync + 'static {}
+    impl<T: Send + Sync + 'static> Bounds for T {}
+}
+
+#[cfg(target_family = "wasm")]
+mod dap_delegate_bounds {
+    pub trait Bounds: 'static {}
+    impl<T: 'static> Bounds for T {}
+}
+
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+pub trait DapDelegate: dap_delegate_bounds::Bounds {
     fn worktree_id(&self) -> WorktreeId;
     fn worktree_root_path(&self) -> &Path;
     fn http_client(&self) -> Arc<dyn HttpClient>;

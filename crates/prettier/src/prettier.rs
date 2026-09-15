@@ -334,7 +334,20 @@ impl Prettier {
                 let configuration = lsp::DidChangeConfigurationParams {
                     settings: Default::default(),
                 };
-                executor.spawn(server.initialize(params, configuration.into(), request_timeout, cx))
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    executor.spawn(server.initialize(
+                        params,
+                        configuration.into(),
+                        request_timeout,
+                        cx,
+                    ))
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = &executor;
+                    server.initialize(params, configuration.into(), request_timeout, cx)
+                }
             })
             .await
             .context("prettier server initialization")?;
