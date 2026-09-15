@@ -167,9 +167,27 @@ work is one nobody reads, and this one has already caught a real regression once
 
 ## 5. What is left
 
-**Nothing has been opened in a browser yet.** The build produces a module; that it runs is an
-assumption. Serving `web/dist/` and opening a project is the next action, and it will find
-things this session could not.
+**It has now been opened in a browser, and that is where the work continues.** Serve
+`web/dist/` with `web/dist/bin/zed-web-server <project> web/dist/static --port <n>`, sign in
+with the token the server logs, and read the console. Two things came out of doing it once:
+
+- **Fixed:** `GlobalKeyValueStore::global()` panicked during startup and took the window with
+  it. The panic was this port's own and named its own alternative — and nothing had ever done
+  what it asked, because nothing had ever executed it. It no longer needs to block: the wasm
+  open path returns without awaiting, so it is polled once by hand.
+- **Next:** `RefCell already borrowed` in `gpui/src/app/async_context.rs` (lines 39, 65, 167,
+  262) still fires on load. It survives the fix above, so it is a separate re-entrancy problem
+  rather than that panic's wake, and it is the thing standing between this build and a drawn
+  window.
+
+**The three verification layers are not substitutes for each other**, and this port has now
+paid for learning that in order:
+
+| Layer | What it caught that the one above could not |
+| --- | --- |
+| `cargo check`, both targets | types, features, cfg coverage |
+| the link step (`build.sh`) | tree-sitter's C never compiled; a build script's feature branch out of step with its own manifest; C and Rust disagreeing on target features |
+| **loading it in a browser** | a startup panic none of the above could see |
 
 **Phase 6's code is done, including the verification §6.4 gated it on.** The tmux quoting and
 `;` handling were tried against tmux 3.6b, reproducing the exact argv `send_text_arguments`
