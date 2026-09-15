@@ -3,6 +3,7 @@ pub mod query;
 
 // Re-export
 pub use anyhow;
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 pub use gpui;
 use gpui::{App, AppContext, Global};
@@ -18,6 +19,7 @@ use release_channel::ReleaseChannel;
 use sqlez::domain::Migrator;
 use sqlez::thread_safe_connection::ThreadSafeConnection;
 use sqlez_macros::sql;
+#[cfg(not(target_family = "wasm"))]
 use std::fs::create_dir_all;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -61,9 +63,24 @@ impl AppDatabase {
     /// Opens the production database and runs all inventory-registered
     /// migrations in dependency order.
     pub fn new() -> Self {
-        let db_dir = database_dir();
-        let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
-        Self(connection)
+        #[cfg(target_family = "wasm")]
+        panic!(
+            "AppDatabase::new() cannot block the wasm main thread; use AppDatabase::open_in_memory"
+        );
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let db_dir = database_dir();
+            let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
+            Self(connection)
+        }
+    }
+
+    /// Opens a named in-memory database and runs all domain migrations.
+    ///
+    /// Used by the wasm web workspace, which cannot call `block_on`. Pair with
+    /// `locking_queue` so `build` can complete without parking the main thread.
+    pub async fn open_in_memory(name: &str) -> Self {
+        Self(open_in_memory_db::<AppMigrator>(name).await)
     }
 
     /// Creates a new in-memory database with a unique name and runs all
@@ -182,6 +199,7 @@ pub async fn open_db<M: Migrator + 'static>(
     let db_path = db_path(db_dir, scope);
 
     let connection = maybe!(async {
+        #[cfg(not(target_family = "wasm"))]
         if let Some(parent) = db_path.parent() {
             create_dir_all(parent)
                 .context("Could not create db directory")
@@ -212,16 +230,40 @@ async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnectio
         .log_err()
 }
 
-async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
+async fn open_fallback_db<M: Migrator + 'static>() -> ThreadSafeConnection {
     log::warn!("Opening fallback in-memory database");
-    ThreadSafeConnection::builder::<M>(FALLBACK_DB_NAME, false)
+    #[cfg(not(target_family = "wasm"))]
+    {
+        ThreadSafeConnection::builder::<M>(FALLBACK_DB_NAME, false)
+            .with_db_initialization_query(DB_INITIALIZE_QUERY)
+            .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
+            .build()
+            .await
+            .expect(
+                "Fallback in memory database failed. Likely initialization queries or migrations have fundamental errors",
+            )
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        open_in_memory_db::<M>(FALLBACK_DB_NAME).await
+    }
+}
+
+async fn open_in_memory_db<M: Migrator + 'static>(name: &str) -> ThreadSafeConnection {
+    use sqlez::thread_safe_connection::locking_queue;
+
+    match ThreadSafeConnection::builder::<M>(name, false)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
         .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
+        .with_write_queue_constructor(locking_queue())
         .build()
         .await
-        .expect(
-            "Fallback in memory database failed. Likely initialization queries or migrations have fundamental errors",
-        )
+    {
+        Ok(conn) => conn,
+        Err(err) => {
+            panic!("in-memory AppDatabase failed to initialize: {err:#}")
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

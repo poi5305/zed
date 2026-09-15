@@ -69,7 +69,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sum_tree::{Bias, Dimensions, Edit, KeyedItem, SeekTarget, SumTree, Summary, TreeMap, TreeSet};
 use text::{LineEnding, Rope};
@@ -78,6 +78,7 @@ use util::{
     paths::{PathMatcher, PathStyle, SanitizedPath, home_dir},
     rel_path::RelPath,
 };
+use web_time::Instant;
 pub use worktree_settings::WorktreeSettings;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);

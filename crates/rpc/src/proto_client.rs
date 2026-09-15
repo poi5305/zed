@@ -18,8 +18,9 @@ use std::{
         Arc, OnceLock,
         atomic::{self, AtomicU64},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct AnyProtoClient(Arc<State>);

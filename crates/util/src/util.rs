@@ -1,19 +1,12 @@
 #[cfg(test)]
 extern crate self as util;
 
-#[cfg(not(target_family = "wasm"))]
 pub mod archive;
-#[cfg(not(target_family = "wasm"))]
 pub mod command;
-#[cfg(not(target_family = "wasm"))]
 pub mod fs;
-#[cfg(not(target_family = "wasm"))]
 pub mod process;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
 
 pub mod disambiguate;
@@ -49,7 +42,6 @@ pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 
-#[cfg(not(target_family = "wasm"))]
 pub use self::shell::{
     get_default_system_shell, get_default_system_shell_preferring_bash, get_system_shell,
 };
@@ -321,6 +313,12 @@ pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<S
     zed_path
         .try_shell_safe(shell_kind)
         .context("Failed to shell-escape Zed executable path.")
+}
+
+/// Returns a shell escaped path for the current zed executable.
+#[cfg(target_family = "wasm")]
+pub fn get_shell_safe_zed_path(_shell_kind: shell::ShellKind) -> anyhow::Result<String> {
+    anyhow::bail!("zed executable path is not available in the browser")
 }
 
 /// Returns a path for the zed cli executable, this function

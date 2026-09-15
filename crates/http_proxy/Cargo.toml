@@ -21,6 +21,7 @@ path = "src/http_proxy.rs"
 nixos-integration-tests = []
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 futures.workspace = true

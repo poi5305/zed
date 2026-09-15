@@ -1,0 +1,27 @@
+[package]
+name = "smol"
+version = "2.0.2"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "WASM-compatible wrapper around smol"
+publish = false
+
+# Native: re-export the real crate. Git source (not crates.io) so a later
+# [patch.crates-io] smol = { path = ... } cannot recurse into this dependency.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smol_real = { package = "smol", git = "https://github.com/smol-rs/smol", rev = "a1e642196803fc5dff56f1e04e867bfc024966bd" }  # peeled v2.0.2; tags are mutable
+
+# Wasm: the pieces that do not pull async-io / async-process / polling / errno.
+[target.'cfg(target_family = "wasm")'.dependencies]
+anyhow = "1.0.86"
+async-channel = "2.0.0"
+async-executor = "1.5.0"
+async-lock = "3.0.0"
+base64 = "0.22"
+flate2 = "1"
+futures = "0.3"
+futures-lite = "2.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1.1.2", features = ["v4", "js"] }
+wasm-bindgen-futures = "0.4"

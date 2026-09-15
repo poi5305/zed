@@ -1242,7 +1242,7 @@ impl Markdown {
         let language_registry = self.language_registry.clone();
         let fallback = self.fallback_code_block_language.clone();
 
-        let parsed = cx.background_spawn(async move {
+        let parse_future = async move {
             if should_parse_links_only {
                 return (
                     ParsedMarkdown {
@@ -1352,7 +1352,11 @@ impl Markdown {
                 },
                 images_by_source_offset,
             )
-        });
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let parsed = cx.background_spawn(parse_future);
+        #[cfg(target_family = "wasm")]
+        let parsed = cx.foreground_executor().spawn(parse_future);
 
         cx.spawn(async move |this, cx| {
             let (parsed, images_by_source_offset) = parsed.await;

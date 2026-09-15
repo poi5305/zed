@@ -1,0 +1,174 @@
+[workspace]
+resolver = "2"
+members = [
+    "vendor/agent_client_protocol_patch",
+    "vendor/url_wasm",
+    "vendor/smol_wasm",
+    "vendor/wasm_thread_patch",
+    "vendor/alacritty_terminal",
+    "vendor/tree_sitter_wasm",
+    "vendor/async_tar_wasm",
+    "crates/wasm_rpc",
+    "crates/wasm_remote",
+    "crates/zed_web_workspace",
+]
+
+[workspace.package]
+publish = false
+edition = "2024"
+
+[workspace.dependencies]
+# First-party root members (81). Paths are relative to this file (web/Cargo.toml),
+# so crates/<name> in the root table becomes ../crates/<name> here.
+activity_indicator = { path = "../crates/activity_indicator" }
+agent_settings = { path = "../crates/agent_settings" }
+agent_ui = { path = "../crates/agent_ui" }
+assets = { path = "../crates/assets" }
+breadcrumbs = { path = "../crates/breadcrumbs" }
+client = { path = "../crates/client" }
+clock = { path = "../crates/clock" }
+collections = { path = "../crates/collections", version = "0.1.0" }
+command_palette = { path = "../crates/command_palette" }
+dap = { path = "../crates/dap" }
+dap_adapters = { path = "../crates/dap_adapters" }
+db = { path = "../crates/db" }
+debugger_ui = { path = "../crates/debugger_ui" }
+diagnostics = { path = "../crates/diagnostics" }
+edit_prediction = { path = "../crates/edit_prediction" }
+edit_prediction_ui = { path = "../crates/edit_prediction_ui" }
+editor = { path = "../crates/editor" }
+encoding_selector = { path = "../crates/encoding_selector" }
+extensions_ui = { path = "../crates/extensions_ui" }
+feature_flags = { path = "../crates/feature_flags" }
+file_finder = { path = "../crates/file_finder" }
+fs = { path = "../crates/fs" }
+git = { path = "../crates/git" }
+git_ui = { path = "../crates/git_ui" }
+go_to_line = { path = "../crates/go_to_line" }
+gpui = { path = "../crates/gpui", default-features = false }
+gpui_platform = { path = "../crates/gpui_platform", default-features = false }
+gpui_web = { path = "../crates/gpui_web" }
+http_client = { path = "../crates/http_client" }
+image_viewer = { path = "../crates/image_viewer" }
+keymap_editor = { path = "../crates/keymap_editor" }
+language = { path = "../crates/language" }
+language_model = { path = "../crates/language_model" }
+language_models = { path = "../crates/language_models" }
+language_selector = { path = "../crates/language_selector" }
+language_tools = { path = "../crates/language_tools" }
+languages = { path = "../crates/languages", default-features = false }
+line_ending_selector = { path = "../crates/line_ending_selector" }
+lsp = { path = "../crates/lsp" }
+markdown_preview = { path = "../crates/markdown_preview" }
+menu = { path = "../crates/menu" }
+multi_buffer = { path = "../crates/multi_buffer" }
+node_runtime = { path = "../crates/node_runtime" }
+open_path_prompt = { path = "../crates/open_path_prompt" }
+outline = { path = "../crates/outline" }
+outline_panel = { path = "../crates/outline_panel" }
+paths = { path = "../crates/paths" }
+platform_title_bar = { path = "../crates/platform_title_bar" }
+project = { path = "../crates/project" }
+project_panel = { path = "../crates/project_panel" }
+project_symbols = { path = "../crates/project_symbols" }
+prompt_store = { path = "../crates/prompt_store" }
+recent_projects = { path = "../crates/recent_projects" }
+release_channel = { path = "../crates/release_channel" }
+rope = { path = "../crates/rope" }
+search = { path = "../crates/search" }
+session = { path = "../crates/session" }
+settings = { path = "../crates/settings" }
+settings_ui = { path = "../crates/settings_ui" }
+sidebar = { path = "../crates/sidebar" }
+snippet_provider = { path = "../crates/snippet_provider" }
+snippets_ui = { path = "../crates/snippets_ui" }
+sqlez = { path = "../crates/sqlez" }
+svg_preview = { path = "../crates/svg_preview" }
+tab_switcher = { path = "../crates/tab_switcher" }
+tabular_data_preview = { path = "../crates/tabular_data_preview"}
+task = { path = "../crates/task" }
+tasks_ui = { path = "../crates/tasks_ui" }
+terminal = { path = "../crates/terminal" }
+terminal_view = { path = "../crates/terminal_view" }
+text = { path = "../crates/text" }
+theme = { path = "../crates/theme" }
+theme_selector = { path = "../crates/theme_selector" }
+theme_settings = { path = "../crates/theme_settings" }
+toolchain_selector = { path = "../crates/toolchain_selector" }
+ui = { path = "../crates/ui" }
+util = { path = "../crates/util" }
+watch = { path = "../crates/watch" }
+which_key = { path = "../crates/which_key" }
+workspace = { path = "../crates/workspace" }
+zed_actions = { path = "../crates/zed_actions" }
+
+# Third-party (14). Values copied verbatim from the root [workspace.dependencies].
+agent-client-protocol = { version = "=2.0.0", features = ["unstable"] }
+anyhow = "1.0.86"
+async-channel = "2.5.0"
+async-trait = "0.1"
+base64 = "0.22"
+futures = "0.3.32"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+smol = "2.0"
+uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
+wasm-bindgen = "0.2.120"
+
+# New web workspace crates (2). Paths relative to this file.
+wasm_rpc = { path = "crates/wasm_rpc" }
+wasm_remote = { path = "crates/wasm_remote" }
+
+# Profiles are honoured only at a workspace root, so moving the wasm build out of
+# the root workspace means this has to be re-declared here rather than inherited.
+# Kept byte-identical to zedweb/zed-web:Cargo.toml's [profile.web-release], which
+# web/build.sh builds with.
+[profile.web-release]
+inherits = "release"
+debug = false
+strip = "symbols"
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+
+[patch.crates-io]
+# Patches do not cross workspaces, so every root patch the wasm graph reaches has
+# to be repeated verbatim. This list is not a guess: it is the intersection of the
+# root [patch.crates-io] keys with the packages reachable from gpui, scheduler,
+# rpc, remote, project and editor under `cargo metadata --filter-platform
+# wasm32-unknown-unknown`. web/check-workspace-isolation.sh recomputes it.
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+
+# The Phase 2 vendored forks. These redirect the same crate names the desktop
+# workspace resolves from crates.io/git, which is the isolation point §3.2 exists
+# for: they are declared here and nowhere else.
+agent-client-protocol = { path = "vendor/agent_client_protocol_patch" }
+url = { path = "vendor/url_wasm" }
+smol = { path = "vendor/smol_wasm" }
+
+# crates/gpui_web:37 and crates/scheduler:41 take wasm_thread from the git URL, so a
+# [patch.crates-io] entry for it would be inert: measured, cargo then resolves the git
+# source and prints "patch was not used". The table below is the one that does the work.
+[patch."https://github.com/zed-industries/wasm_thread"]
+wasm_thread = { path = "vendor/wasm_thread_patch" }
+
+# alacritty_terminal is a git source in the root workspace
+# (git+https://github.com/zed-industries/alacritty?rev=4c129667), so
+# [patch.crates-io] would be inert the same way wasm_thread's was.
+[patch."https://github.com/zed-industries/alacritty"]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+
+# tree-sitter and async-tar are git sources in the root workspace, so
+# [patch.crates-io] would be inert the same way wasm_thread's was.
+[patch."https://github.com/tree-sitter/tree-sitter"]
+tree-sitter = { path = "vendor/tree_sitter_wasm" }
+
+[patch."https://github.com/zed-industries/async-tar"]
+async-tar = { path = "vendor/async_tar_wasm" }

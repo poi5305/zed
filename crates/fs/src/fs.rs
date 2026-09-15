@@ -1,23 +1,32 @@
+#[cfg(not(target_family = "wasm"))]
 pub mod fs_watcher;
+#[cfg(not(target_family = "wasm"))]
 mod git_clone_progress;
 
 use parking_lot::Mutex;
-use slotmap::{KeyData, SlotMap};
+use slotmap::KeyData;
+#[cfg(not(target_family = "wasm"))]
+use slotmap::SlotMap;
 use std::ffi::OsString;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Instant;
-use util::maybe;
+use web_time::Instant;
 
 use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
 use futures::stream::iter;
 use gpui::App;
+#[cfg(not(target_family = "wasm"))]
 use gpui::BackgroundExecutor;
 use gpui::Global;
 use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(not(target_family = "wasm"))]
 use util::command::{Stdio, new_command};
+#[cfg(not(target_family = "wasm"))]
+use util::maybe;
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
@@ -30,23 +39,30 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
 
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
-use git::repository::{GitRepository, RealGitRepository};
+use git::repository::GitRepository;
+#[cfg(not(target_family = "wasm"))]
+use git::repository::RealGitRepository;
 #[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use smol::io::AsyncWriteExt;
+#[cfg(not(target_family = "wasm"))]
+use std::io::Write;
 #[cfg(feature = "test-support")]
 use std::path::Component;
 use std::{
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use text::LineEnding;
 
@@ -104,6 +120,7 @@ pub trait Fs: Send + Sync {
         path: &Path,
         content: Pin<&mut (dyn AsyncRead + Send)>,
     ) -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn extract_tar_file(
         &self,
         path: &Path,
@@ -215,6 +232,7 @@ struct TrashedEntry {
     pub original_parent: PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::TrashItem> for TrashedEntry {
     fn from(item: trash::TrashItem) -> Self {
         Self {
@@ -225,6 +243,7 @@ impl From<trash::TrashItem> for TrashedEntry {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl TrashedEntry {
     fn into_trash_item(self) -> trash::TrashItem {
         trash::TrashItem {
@@ -253,6 +272,7 @@ pub enum TrashRestoreError {
     Unknown { description: String },
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::Error> for TrashRestoreError {
     fn from(err: trash::Error) -> Self {
         match err {
@@ -442,6 +462,7 @@ impl TrashId {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealFs {
     this: std::sync::Weak<Self>,
     bundled_git_binary_path: Option<PathBuf>,
@@ -458,6 +479,7 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf>;
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl FileHandle for std::fs::File {
     #[cfg(target_os = "macos")]
     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
@@ -550,8 +572,10 @@ impl FileHandle for std::fs::File {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealWatcher {}
 
+#[cfg(not(target_family = "wasm"))]
 impl RealFs {
     pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
@@ -714,7 +738,7 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<PathBuf>>> {
     let entries =
         std::fs::read_dir(&path).with_context(|| format!("failed to open directory {path:?}"))?;
@@ -725,6 +749,7 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -1411,7 +1436,10 @@ impl Fs for RealFs {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(any(target_os = "linux", target_os = "freebsd"))
+))]
 impl Watcher for RealWatcher {
     fn add(&self, _: &Path) -> Result<()> {
         Ok(())
@@ -3004,6 +3032,7 @@ impl Fs for FakeFs {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn extract_tar_file(
         &self,
         path: &Path,

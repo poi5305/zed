@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 path = "src/codestral.rs"
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 edit_prediction_types.workspace = true
 edit_prediction.workspace = true

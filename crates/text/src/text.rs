@@ -24,6 +24,8 @@ use regex::Regex;
 pub use rope::*;
 pub use selection::*;
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering, Reverse},
@@ -34,7 +36,7 @@ use std::{
     ops::{self, Deref, Range, Sub},
     str,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 pub use subscription::*;
 pub use sum_tree::Bias;
@@ -44,6 +46,9 @@ use util::debug_panic;
 
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
+
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 static LINE_SEPARATORS_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\r\n|\r").expect("Failed to create LINE_SEPARATORS_REGEX"));
