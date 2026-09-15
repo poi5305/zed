@@ -1499,14 +1499,11 @@ mod tests {
                         {
                             CopilotServer::Running(server) => {
                                 let shutdown_future = server.lsp.shutdown();
-                                Some(spawn_copilot_work!(
-                                    cx,
-                                    async move {
-                                        if let Some(fut) = shutdown_future {
-                                            fut.await;
-                                        }
+                                Some(spawn_copilot_work!(cx, async move {
+                                    if let Some(fut) = shutdown_future {
+                                        fut.await;
                                     }
-                                ))
+                                }))
                             }
                             _ => None,
                         };

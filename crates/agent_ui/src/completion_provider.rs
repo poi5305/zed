@@ -2402,7 +2402,8 @@ pub(crate) fn search_symbols(
             true,
             MAX_MATCHES,
             &cancellation_flag,
-            cx.background_executor().clone(),);
+            cx.background_executor().clone(),
+        );
         #[cfg(not(target_family = "wasm"))]
         let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &external_match_candidates,
@@ -2421,7 +2422,8 @@ pub(crate) fn search_symbols(
             true,
             MAX_MATCHES - visible_matches.len().min(MAX_MATCHES),
             &cancellation_flag,
-            cx.background_executor().clone(),);
+            cx.background_executor().clone(),
+        );
         let sort_key_for_match = |mat: &StringMatch| {
             let symbol = &symbols[mat.candidate_id];
             (Reverse(OrderedFloat(mat.score)), symbol.label.filter_text())

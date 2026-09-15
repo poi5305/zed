@@ -690,7 +690,7 @@ impl LspInstaller for TypeScriptLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         _: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Option<LanguageServerBinary>> + use<> {
         let node = self.node.clone();
         let typescript_version = version.typescript_version.clone();
         let server_version = version.server_version.clone();
@@ -737,7 +737,7 @@ impl LspInstaller for TypeScriptLspAdapter {
         latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         _: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let node = self.node.clone();
 
         async move {
