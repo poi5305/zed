@@ -197,6 +197,24 @@ impl ProjectManagerPanel {
                 if paths.is_empty() {
                     return;
                 }
+                // Refused rather than hidden, which docs/web-zed-plan.md §6.4 allows either
+                // of. Hiding makes a project the user knows they have vanish from a list
+                // without saying why; refusing names the reason. A browser cannot open an
+                // SSH, WSL or docker connection of its own -- its "remote" is already the
+                // machine this workspace runs on.
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = (options, paths, new_window);
+                    self.report_error(
+                        anyhow::anyhow!(
+                            "ssh://, wsl:// and docker:// projects cannot be opened from the \
+                             browser: this window is already connected to the machine they \
+                             would be opened from"
+                        ),
+                        cx,
+                    );
+                }
+                #[cfg(not(target_family = "wasm"))]
                 self.open_remote(options, paths, new_window, window, cx);
             }
         }

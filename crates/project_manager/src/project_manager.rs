@@ -221,14 +221,41 @@ const VSCODE_FLAVORS: [&str; 5] = ["Code", "Code - Insiders", "Cursor", "VSCodiu
 /// Where the VS Code "Project Manager" extension keeps its projects, newest flavor first.
 ///
 /// Every path is returned whether or not it exists; the caller reads the ones that do.
+/// The operating system whose VS Code layout should be read.
+///
+/// `cfg!` answers for the machine this was compiled for. On the web that is
+/// wasm32-unknown-unknown, whose `target_os` is `unknown`, so every `cfg!` below would
+/// fall through to the Linux layout while the files live on whatever the server runs.
+/// The server reports its own `std::env::consts::OS` over `Home::dirs`, and the web
+/// entry point seeds it here before anything reads it.
+#[cfg(target_family = "wasm")]
+static SERVER_OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(target_family = "wasm")]
+pub fn set_server_os(os: impl Into<String>) {
+    let _ = SERVER_OS.set(os.into());
+}
+
+fn host_os() -> &'static str {
+    #[cfg(target_family = "wasm")]
+    {
+        SERVER_OS.get().map(String::as_str).unwrap_or("linux")
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::env::consts::OS
+    }
+}
+
 pub fn vscode_project_files() -> Vec<PathBuf> {
     let home = paths::home_dir();
+    let host_os = host_os();
     VSCODE_FLAVORS
         .iter()
         .map(|flavor| {
-            let application = if cfg!(target_os = "macos") {
+            let application = if host_os == "macos" {
                 home.join("Library/Application Support").join(flavor)
-            } else if cfg!(target_os = "windows") {
+            } else if host_os == "windows" {
                 std::env::var("APPDATA")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| home.join("AppData/Roaming"))
