@@ -1,8 +1,11 @@
+#[cfg(not(target_family = "wasm"))]
 mod dev_container_suggest;
 pub mod disconnected_overlay;
 mod remote_connections;
+#[cfg(not(target_family = "wasm"))]
 mod remote_servers;
 pub mod sidebar_recent_projects;
+#[cfg(not(target_family = "wasm"))]
 mod ssh_config;
 
 use std::{
@@ -34,10 +37,12 @@ use picker::{
 };
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
+#[cfg(not(target_family = "wasm"))]
 pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
+#[cfg(not(target_family = "wasm"))]
 use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
@@ -49,7 +54,9 @@ use workspace::{
     SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
+use zed_actions::OpenRecent;
+#[cfg(not(target_family = "wasm"))]
+use zed_actions::{OpenDevContainer, OpenRemote};
 
 actions!(
     recent_projects,
@@ -483,6 +490,7 @@ pub fn init(cx: &mut App) {
             }
         }
     });
+    #[cfg(not(target_family = "wasm"))]
     cx.on_action(|open_remote: &OpenRemote, cx| {
         let from_existing_connection = open_remote.from_existing_connection;
         let create_new_window = open_remote
@@ -503,6 +511,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(DisconnectedOverlay::register).detach();
 
+    #[cfg(not(target_family = "wasm"))]
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
             if !workspace.project().read(cx).is_local() {
@@ -540,6 +549,7 @@ pub fn init(cx: &mut App) {
     });
 
     // Subscribe to worktree additions to suggest opening the project in a dev container
+    #[cfg(not(target_family = "wasm"))]
     cx.observe_new(
         |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             let Some(window) = window else {
@@ -1723,36 +1733,40 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 }
                             })
                     })
-                    .child(
-                        ButtonLike::new("open_remote_folder")
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_1()
-                                    .justify_between()
-                                    .child(Label::new("Open Remote Folder"))
-                                    .child(KeyBinding::for_action(
-                                        &OpenRemote {
-                                            from_existing_connection: false,
-                                            create_new_window: Some(self.create_new_window),
-                                        },
-                                        cx,
-                                    )),
-                            )
-                            .on_click({
-                                let create_new_window = self.create_new_window;
-                                move |_, window, cx| {
-                                    window.dispatch_action(
-                                        OpenRemote {
-                                            from_existing_connection: false,
-                                            create_new_window: Some(create_new_window),
-                                        }
-                                        .boxed_clone(),
-                                        cx,
-                                    )
-                                }
-                            }),
-                    )
+                    .map(|this| {
+                        #[cfg(not(target_family = "wasm"))]
+                        let this = this.child(
+                            ButtonLike::new("open_remote_folder")
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1()
+                                        .justify_between()
+                                        .child(Label::new("Open Remote Folder"))
+                                        .child(KeyBinding::for_action(
+                                            &OpenRemote {
+                                                from_existing_connection: false,
+                                                create_new_window: Some(self.create_new_window),
+                                            },
+                                            cx,
+                                        )),
+                                )
+                                .on_click({
+                                    let create_new_window = self.create_new_window;
+                                    move |_, window, cx| {
+                                        window.dispatch_action(
+                                            OpenRemote {
+                                                from_existing_connection: false,
+                                                create_new_window: Some(create_new_window),
+                                            }
+                                            .boxed_clone(),
+                                            cx,
+                                        )
+                                    }
+                                }),
+                        );
+                        this
+                    })
                     .into_any(),
             );
         }
@@ -1949,7 +1963,8 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     let workspace_handle = workspace_handle.clone();
                                     let open_action = open_action.clone();
                                     move |menu, _, _| {
-                                        menu.context(focus_handle)
+                                        let menu = menu
+                                            .context(focus_handle)
                                             .when(show_add_to_workspace, |menu| {
                                                 menu.action(
                                                     "Add Folder to this Project",
@@ -1971,15 +1986,17 @@ impl PickerDelegate for RecentProjectsDelegate {
                                                         );
                                                     }
                                                 },
-                                            )
-                                            .action(
-                                                "Open Remote Folder",
-                                                OpenRemote {
-                                                    from_existing_connection: false,
-                                                    create_new_window: Some(create_new_window),
-                                                }
-                                                .boxed_clone(),
-                                            )
+                                            );
+                                        #[cfg(not(target_family = "wasm"))]
+                                        let menu = menu.action(
+                                            "Open Remote Folder",
+                                            OpenRemote {
+                                                from_existing_connection: false,
+                                                create_new_window: Some(create_new_window),
+                                            }
+                                            .boxed_clone(),
+                                        );
+                                        menu
                                     }
                                 }))
                             }

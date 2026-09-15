@@ -1,18 +1,25 @@
+// `audio` needs livekit and `extension_host` needs wasmtime, both native-only.
+// These pages must be omitted from the wasm settings list, not present-but-broken.
+#[cfg(not(target_family = "wasm"))]
 mod audio_input_output_setup;
+#[cfg(not(target_family = "wasm"))]
 mod audio_test_window;
 mod edit_prediction_provider_setup;
 mod external_agents_page;
 mod feature_flags;
 mod llm_providers_page;
+#[cfg(not(target_family = "wasm"))]
 mod mcp_servers_page;
 mod sandbox_settings;
 mod skill_creator;
 mod skills_setup;
 mod tool_permissions_setup;
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use audio_input_output_setup::{
     render_input_audio_device_dropdown, render_output_audio_device_dropdown,
 };
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use audio_test_window::open_audio_test_window;
 pub(crate) use edit_prediction_provider_setup::render_edit_prediction_setup_page;
 pub(crate) use external_agents_page::{
@@ -22,6 +29,7 @@ pub(crate) use feature_flags::render_feature_flags_page;
 pub(crate) use llm_providers_page::{
     LlmProviderForm, render_add_llm_provider_popover, render_llm_providers_page,
 };
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use mcp_servers_page::{
     McpServerForm, render_add_server_popover, render_mcp_servers_page,
 };

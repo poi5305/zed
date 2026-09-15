@@ -206,6 +206,7 @@ impl ColumnFilterDelegate {
         }
 
         let cancel_flag = AtomicBool::new(false);
+        #[cfg(not(target_family = "wasm"))]
         let mut matches: Vec<StringMatch> = self.foreground.block_on(match_strings(
             self.string_candidates.as_ref(),
             query,
@@ -215,6 +216,16 @@ impl ColumnFilterDelegate {
             &cancel_flag,
             self.background.clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut matches: Vec<StringMatch> = fuzzy::match_strings_blocking(
+            self.string_candidates.as_ref(),
+            query,
+            false,
+            true,
+            usize::MAX,
+            &cancel_flag,
+            self.background.clone(),
+        );
         matches.sort_by_key(|m| m.candidate_id);
         matches
             .into_iter()

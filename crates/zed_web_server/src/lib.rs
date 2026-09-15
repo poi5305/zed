@@ -6,6 +6,7 @@ mod extension_rpc;
 mod fs_rpc;
 mod git_rpc;
 mod highlight_rpc;
+mod home_rpc;
 mod process_rpc;
 mod rpc;
 mod sql_rpc;
