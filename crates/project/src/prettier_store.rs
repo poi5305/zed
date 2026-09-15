@@ -507,7 +507,7 @@ impl PrettierStore {
             .global_lsp_settings
             .get_request_timeout();
 
-        cx.background_spawn(async move {
+        crate::spawn_project_work!(cx, async move {
             let _: Vec<()> = future::join_all(prettiers_to_reload.into_iter().map(|(worktree_id, prettier_path, prettier_instance)| {
                 async move {
                     let Some(instance) = prettier_instance.prettier else {

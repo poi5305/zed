@@ -476,7 +476,7 @@ impl LspStore {
             let request_timeout = ProjectSettings::get_global(cx)
                 .global_lsp_settings
                 .get_request_timeout();
-            cx.background_spawn(async move {
+            crate::spawn_project_work!(cx, async move {
                 server
                     .request::<DocumentLinkResolve>(lsp_link, request_timeout)
                     .await

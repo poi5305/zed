@@ -310,7 +310,7 @@ impl LspStore {
             let request_timeout = ProjectSettings::get_global(cx)
                 .global_lsp_settings
                 .get_request_timeout();
-            cx.background_spawn(async move {
+            crate::spawn_project_work!(cx, async move {
                 let resolve_task = lang_server.request::<lsp::request::ColorPresentationRequest>(
                     lsp::ColorPresentationParams {
                         text_document: make_text_document_identifier(&path)?,

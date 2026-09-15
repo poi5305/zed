@@ -77,7 +77,20 @@ pub fn workspace_folder_for_uri(uri: Uri) -> WorkspaceFolder {
     WorkspaceFolder { uri, name }
 }
 
+#[cfg(not(target_family = "wasm"))]
 type NotificationHandler = Box<dyn Send + FnMut(Option<RequestId>, Value, &mut AsyncApp)>;
+#[cfg(target_family = "wasm")]
+type NotificationHandler = Box<dyn FnMut(Option<RequestId>, Value, &mut AsyncApp)>;
+
+#[cfg(not(target_family = "wasm"))]
+trait LspHandlerSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> LspHandlerSend for T {}
+
+#[cfg(target_family = "wasm")]
+trait LspHandlerSend {}
+#[cfg(target_family = "wasm")]
+impl<T> LspHandlerSend for T {}
 type PendingRespondTasks = Arc<Mutex<HashMap<RequestId, Task<()>>>>;
 type ResponseHandler = Box<dyn Send + FnOnce(Result<String, ResponseError>) -> Task<()>>;
 type IoHandler = Box<dyn Send + FnMut(IoKind, &str)>;
@@ -1182,7 +1195,7 @@ impl LanguageServer {
         timeout: Duration,
         cx: &App,
     ) -> Task<Result<Arc<Self>>> {
-        cx.background_spawn(async move {
+        let future = async move {
             let response = self
                 .request::<request::Initialize>(params, timeout)
                 .await
@@ -1203,7 +1216,15 @@ impl LanguageServer {
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
             Ok(Arc::new(self))
-        })
+        };
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.background_spawn(future)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            cx.foreground_executor().spawn(future)
+        }
     }
 
     /// Sends a shutdown request to the language server process and prepares the [`LanguageServer`] to be dropped.
@@ -1269,6 +1290,7 @@ impl LanguageServer {
     ///
     /// [LSP Specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#notificationMessage)
     #[must_use]
+    #[cfg(not(target_family = "wasm"))]
     pub fn on_notification<T, F>(&self, f: F) -> Subscription
     where
         T: notification::Notification,
@@ -1277,15 +1299,38 @@ impl LanguageServer {
         self.on_custom_notification(T::METHOD, f)
     }
 
+    #[must_use]
+    #[cfg(target_family = "wasm")]
+    pub fn on_notification<T, F>(&self, f: F) -> Subscription
+    where
+        T: notification::Notification,
+        F: 'static + FnMut(T::Params, &mut AsyncApp),
+    {
+        self.on_custom_notification(T::METHOD, f)
+    }
+
     /// Register a handler to handle incoming LSP requests.
     ///
     /// [LSP Specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#requestMessage)
     #[must_use]
+    #[cfg(not(target_family = "wasm"))]
     pub fn on_request<T, F, Fut>(&self, f: F) -> Subscription
     where
         T: request::Request,
         T::Params: 'static + Send,
         F: 'static + FnMut(T::Params, &mut AsyncApp) -> Fut + Send,
+        Fut: 'static + Future<Output = Result<T::Result>>,
+    {
+        self.on_custom_request(T::METHOD, f)
+    }
+
+    #[must_use]
+    #[cfg(target_family = "wasm")]
+    pub fn on_request<T, F, Fut>(&self, f: F) -> Subscription
+    where
+        T: request::Request,
+        T::Params: 'static + Send,
+        F: 'static + FnMut(T::Params, &mut AsyncApp) -> Fut,
         Fut: 'static + Future<Output = Result<T::Result>>,
     {
         self.on_custom_request(T::METHOD, f)
@@ -1323,7 +1368,7 @@ impl LanguageServer {
     #[must_use]
     fn on_custom_notification<Params, F>(&self, method: &'static str, mut f: F) -> Subscription
     where
-        F: 'static + FnMut(Params, &mut AsyncApp) + Send,
+        F: 'static + FnMut(Params, &mut AsyncApp) + LspHandlerSend,
         Params: DeserializeOwned + 'static,
     {
         let prev_handler = self.notification_handlers.lock().insert(
@@ -1347,7 +1392,7 @@ impl LanguageServer {
     #[must_use]
     fn on_custom_request<Params, Res, Fut, F>(&self, method: &'static str, mut f: F) -> Subscription
     where
-        F: 'static + FnMut(Params, &mut AsyncApp) -> Fut + Send,
+        F: 'static + FnMut(Params, &mut AsyncApp) -> Fut + LspHandlerSend,
         Fut: 'static + Future<Output = Result<Res>>,
         Params: DeserializeOwned + Send + 'static,
         Res: Serialize,

@@ -508,10 +508,23 @@ impl CachedLspAdapter {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+mod lsp_adapter_delegate_bounds {
+    pub trait Bounds: Send + Sync {}
+    impl<T: Send + Sync> Bounds for T {}
+}
+
+#[cfg(target_family = "wasm")]
+mod lsp_adapter_delegate_bounds {
+    pub trait Bounds {}
+    impl<T> Bounds for T {}
+}
+
 /// [`LspAdapterDelegate`] allows [`LspAdapter]` implementations to interface with the application
 // e.g. to display a notification or fetch data from the web.
-#[async_trait]
-pub trait LspAdapterDelegate: Send + Sync {
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+pub trait LspAdapterDelegate: lsp_adapter_delegate_bounds::Bounds {
     fn show_notification(&self, message: &str, cx: &mut App);
     fn http_client(&self) -> Arc<dyn HttpClient>;
     fn worktree_id(&self) -> WorktreeId;
