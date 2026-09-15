@@ -30,7 +30,21 @@ stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.97.1}"
 # every `cd web && cargo` to nightly (F4). rustup run beats the repo pin via
 # RUSTUP_TOOLCHAIN without --install.
 nightly_toolchain="${RUST_NIGHTLY_TOOLCHAIN:-nightly}"
-wasm_bindgen_version="${WASM_BINDGEN_VERSION:-0.2.127}"
+# The CLI and the `wasm-bindgen` crate must be the same version -- wasm-bindgen refuses
+# to process a module built against a different bindgen schema -- so read the requirement
+# from the lock rather than repeating it here. A hard-coded number is one more place for
+# the two to disagree, and they did: this said 0.2.127 while both locks pinned 0.2.120.
+wasm_bindgen_version="${WASM_BINDGEN_VERSION:-}"
+if [[ -z "${wasm_bindgen_version}" ]]; then
+    wasm_bindgen_version=$(
+        awk '/^name = "wasm-bindgen"$/ { found = 1; next }
+             found && /^version = / { gsub(/[">]|version = /, ""); print; exit }' \
+            "${repo_dir}/web/Cargo.lock"
+    )
+fi
+if [[ -z "${wasm_bindgen_version}" ]]; then
+    die "error: could not read the wasm-bindgen version from web/Cargo.lock."
+fi
 cargo_bin="${CARGO:-cargo}"
 download_wasi_sdk="${repo_dir}/script/download-wasi-sdk"
 
@@ -220,7 +234,12 @@ install -m 0755 \
     require_unset_rustflags
     export CARGO_TARGET_DIR="${wasm_target}"
     export CC_wasm32_unknown_unknown="${wasi_sdk}/bin/clang"
-    export CFLAGS_wasm32_unknown_unknown="-isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasi"
+    # The C target features must match web/.cargo/config.toml's `-C target-feature`.
+    # Rust asks the linker for --shared-memory, and rust-lld refuses it if any object in
+    # the link was built without atomics and bulk-memory:
+    #   "--shared-memory is disallowed by <obj> because it was not compiled with
+    #    'atomics' or 'bulk-memory' features"
+    export CFLAGS_wasm32_unknown_unknown="-isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasi -matomics -mbulk-memory -mmutable-globals"
     rustup run "${nightly_toolchain}" "${cargo_bin}" build \
         -p zed_web_workspace \
         --target wasm32-unknown-unknown \

@@ -13,19 +13,35 @@ fn main() {
     )
     .unwrap();
 
-    // On WASM we rely on stub Rust bindings and do not compile the C library.
-    if target.starts_with("wasm32") {
-        return;
-    }
+    // The Rust bindings are not stubs -- they call `ts_*` for real -- so skipping the C
+    // build here produced a workspace that type-checks and then fails at link time with
+    // `undefined symbol: ts_tree_cursor_*`. tree-sitter ships its own wasm stdlib
+    // (`src/wasm-stdlib/`, and the `imports.txt` copied above) precisely so the core can
+    // be compiled without a libc, which is what `configure_wasm_build` below sets up.
 
     let mut config = cc::Build::new();
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WASM");
+    // This fork's `wasm` feature is `["std"]` -- it does not pull `wasmtime-c-api`, which
+    // docs/web-zed-plan.md §4 keeps out of the graph on purpose. `TREE_SITTER_FEATURE_WASM`
+    // compiles the wasm *store* into the C core and needs wasmtime's headers, so it is
+    // driven by whether those headers were actually published rather than by the feature
+    // flag, which no longer implies them.
     if env::var("CARGO_FEATURE_WASM").is_ok() {
-        config
-            .define("TREE_SITTER_FEATURE_WASM", "")
-            .define("static_assert(...)", "")
-            .include(env::var("DEP_WASMTIME_C_API_INCLUDE").unwrap());
+        match env::var("DEP_WASMTIME_C_API_INCLUDE") {
+            Ok(include) => {
+                config
+                    .define("TREE_SITTER_FEATURE_WASM", "")
+                    .define("static_assert(...)", "")
+                    .include(include);
+            }
+            Err(_) => {
+                println!(
+                    "cargo:warning=tree-sitter: building without the wasm store; \
+                     wasmtime-c-api is not in this graph"
+                );
+            }
+        }
     }
 
     let manifest_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
