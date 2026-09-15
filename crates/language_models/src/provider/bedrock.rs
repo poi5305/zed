@@ -53,13 +53,10 @@ use open_ai::responses::{ResponseOutputItem, StreamEvent as OpenAiResponseStream
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use settings::{
-    BedrockAvailableModel as AvailableModel, BedrockMantleAvailableModel as MantleAvailableModel,
-    Settings, SettingsStore,
-};
+use settings::{Settings, SettingsStore};
 use std::sync::LazyLock;
 use std::time::SystemTime;
-use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
+use strum::IntoEnumIterator;
 use ui::{ButtonLink, ConfiguredApiCard, Divider, List, ListBulletItem, prelude::*};
 use ui_input::InputField;
 use util::ResultExt;
@@ -79,14 +76,9 @@ actions!(bedrock, [Tab, TabPrev]);
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("amazon-bedrock");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Amazon Bedrock");
-pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &[
-    "host",
-    "x-amz-date",
-    "x-amz-security-token",
-    "x-amz-content-sha256",
-    "amz-sdk-invocation-id",
-    "amz-sdk-request",
-];
+pub use crate::provider::bedrock_settings::{
+    AmazonBedrockSettings, BedrockAuthMethod, RESERVED_HEADER_NAMES,
+};
 
 /// Credentials stored in the keychain for static authentication.
 /// Region is handled separately since it's orthogonal to auth method.
@@ -132,45 +124,6 @@ impl BedrockCredentials {
             })
         } else {
             None
-        }
-    }
-}
-
-#[derive(Default, Clone, Debug, PartialEq)]
-pub struct AmazonBedrockSettings {
-    pub available_models: Vec<AvailableModel>,
-    pub mantle_available_models: Vec<MantleAvailableModel>,
-    pub custom_headers: CustomHeaders,
-    pub region: Option<String>,
-    pub endpoint: Option<String>,
-    pub profile_name: Option<String>,
-    pub role_arn: Option<String>,
-    pub authentication_method: Option<BedrockAuthMethod>,
-    pub allow_global: Option<bool>,
-    pub guardrail_identifier: Option<String>,
-    pub guardrail_version: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, EnumIter, IntoStaticStr, JsonSchema)]
-pub enum BedrockAuthMethod {
-    #[serde(rename = "named_profile")]
-    NamedProfile,
-    #[serde(rename = "sso")]
-    SingleSignOn,
-    #[serde(rename = "api_key")]
-    ApiKey,
-    /// IMDSv2, PodIdentity, env vars, etc.
-    #[serde(rename = "default")]
-    Automatic,
-}
-
-impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
-    fn from(value: settings::BedrockAuthMethodContent) -> Self {
-        match value {
-            settings::BedrockAuthMethodContent::SingleSignOn => BedrockAuthMethod::SingleSignOn,
-            settings::BedrockAuthMethodContent::Automatic => BedrockAuthMethod::Automatic,
-            settings::BedrockAuthMethodContent::NamedProfile => BedrockAuthMethod::NamedProfile,
-            settings::BedrockAuthMethodContent::ApiKey => BedrockAuthMethod::ApiKey,
         }
     }
 }

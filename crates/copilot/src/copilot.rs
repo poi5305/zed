@@ -54,6 +54,23 @@ actions!(
     ]
 );
 
+/// On wasm, `LanguageServer` holds `NotificationHandler` closures that are not
+/// `Send`. Native still uses the background executor; wasm uses the foreground
+/// executor so the future does not need `Send` (same shape as `spawn_project_work!`
+/// in `project` and `buffer.rs` parse tasks).
+macro_rules! spawn_copilot_work {
+    ($cx:expr, $future:expr) => {{
+        #[cfg(not(target_family = "wasm"))]
+        {
+            $cx.background_spawn($future)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            $cx.foreground_executor().spawn($future)
+        }
+    }};
+}
+
 enum CopilotServer {
     Disabled,
     Starting { task: Shared<Task<()>> },
@@ -171,31 +188,30 @@ impl RegisteredBuffer {
                     .ok()??;
                 let new_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot()).ok()?;
 
-                let content_changes = cx
-                    .background_spawn({
-                        let new_snapshot = new_snapshot.clone();
-                        async move {
-                            new_snapshot
-                                .edits_since::<Dimensions<PointUtf16, usize>>(&old_version)
-                                .map(|edit| {
-                                    let edit_start = edit.new.start.0;
-                                    let edit_end = edit_start + (edit.old.end.0 - edit.old.start.0);
-                                    let new_text = new_snapshot
-                                        .text_for_range(edit.new.start.1..edit.new.end.1)
-                                        .collect();
-                                    lsp::TextDocumentContentChangeEvent {
-                                        range: Some(lsp::Range::new(
-                                            point_to_lsp(edit_start),
-                                            point_to_lsp(edit_end),
-                                        )),
-                                        range_length: None,
-                                        text: new_text,
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    })
-                    .await;
+                let content_changes = spawn_copilot_work!(cx, {
+                    let new_snapshot = new_snapshot.clone();
+                    async move {
+                        new_snapshot
+                            .edits_since::<Dimensions<PointUtf16, usize>>(&old_version)
+                            .map(|edit| {
+                                let edit_start = edit.new.start.0;
+                                let edit_end = edit_start + (edit.old.end.0 - edit.old.start.0);
+                                let new_text = new_snapshot
+                                    .text_for_range(edit.new.start.1..edit.new.end.1)
+                                    .collect();
+                                lsp::TextDocumentContentChangeEvent {
+                                    range: Some(lsp::Range::new(
+                                        point_to_lsp(edit_start),
+                                        point_to_lsp(edit_end),
+                                    )),
+                                    range_length: None,
+                                    text: new_text,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .await;
 
                 copilot
                     .update(cx, |copilot, _| {
@@ -391,7 +407,7 @@ impl Copilot {
                     let shutdown = match mem::replace(&mut this.server, CopilotServer::Disabled) {
                         CopilotServer::Running(server) => {
                             let shutdown_future = server.lsp.shutdown();
-                            Some(cx.background_spawn(async move {
+                            Some(spawn_copilot_work!(cx, async move {
                                 if let Some(fut) = shutdown_future {
                                     fut.await;
                                 }
@@ -807,7 +823,7 @@ impl Copilot {
                 }
             };
 
-            cx.background_spawn(task.map_err(|err| anyhow!("{err:?}")))
+            spawn_copilot_work!(cx, task.map_err(|err| anyhow!("{err:?}")))
         } else {
             // If we're downloading, wait until download is finished
             // If we're in a stuck state, display to the user
@@ -824,7 +840,7 @@ impl Copilot {
                     .get_request_timeout();
 
                 let server = server.clone();
-                cx.background_spawn(async move {
+                spawn_copilot_work!(cx, async move {
                     server
                         .request::<request::SignOut>(request::SignOutParams {}, request_timeout)
                         .await
@@ -833,7 +849,7 @@ impl Copilot {
                     anyhow::Ok(())
                 })
             }
-            CopilotServer::Disabled => cx.background_spawn(async { anyhow::Ok(()) }),
+            CopilotServer::Disabled => spawn_copilot_work!(cx, async { anyhow::Ok(()) }),
             _ => Task::ready(Err(anyhow!("copilot hasn't started yet"))),
         }
     }
@@ -1045,7 +1061,7 @@ impl Copilot {
             .enable_next_edit_suggestions
             .unwrap_or(true);
 
-        cx.background_spawn(async move {
+        spawn_copilot_work!(cx, async move {
             let (version, snapshot) = pending_snapshot.await?;
             let lsp_position = point_to_lsp(position);
 
@@ -1195,7 +1211,7 @@ impl Copilot {
                 },
                 request_timeout,
             );
-            cx.background_spawn(async move {
+            spawn_copilot_work!(cx, async move {
                 request
                     .await
                     .into_response()
@@ -1483,11 +1499,14 @@ mod tests {
                         {
                             CopilotServer::Running(server) => {
                                 let shutdown_future = server.lsp.shutdown();
-                                Some(cx.background_spawn(async move {
-                                    if let Some(fut) = shutdown_future {
-                                        fut.await;
+                                Some(spawn_copilot_work!(
+                                    cx,
+                                    async move {
+                                        if let Some(fut) = shutdown_future {
+                                            fut.await;
+                                        }
                                     }
-                                }))
+                                ))
                             }
                             _ => None,
                         };
