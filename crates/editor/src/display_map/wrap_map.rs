@@ -7,19 +7,22 @@ use super::{
 };
 
 use collections::HashMap;
+#[cfg(target_family = "wasm")]
+use futures::FutureExt as _;
 use futures_lite::future::yield_now;
 use gpui::{
     App, AppContext as _, Context, Entity, Font, FontId, LineWrapper, Pixels, Task, TextSystem,
 };
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 use std::{
     cmp,
     collections::VecDeque,
     mem,
     ops::Range,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
@@ -286,17 +289,24 @@ impl WrapMap {
             }];
 
             if total_rows < WRAP_YIELD_ROW_INTERVAL {
-                let edits = gpui::block_on(new_snapshot.update(
-                    tab_snapshot,
-                    &tab_edits,
-                    wrap_width,
-                    &mut line_wrapper,
-                    &mut fragment_builder,
-                ));
-                self.snapshot = new_snapshot;
-                self.edits_since_sync = self.edits_since_sync.compose(&edits);
-            } else {
-                let task = cx.background_spawn(async move {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let edits = gpui::block_on(new_snapshot.update(
+                        tab_snapshot,
+                        &tab_edits,
+                        wrap_width,
+                        &mut line_wrapper,
+                        &mut fragment_builder,
+                    ));
+                    self.snapshot = new_snapshot;
+                    self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                }
+                // `update` only `yield_now`s every WRAP_YIELD_ROW_INTERVAL rows, and this
+                // branch is a single full-range edit of fewer rows, so the first poll is
+                // Ready. `now_or_never` dropping a Pending future would lose wraps; panic
+                // rather than paint the isomorphic (unwrapped) snapshot.
+                #[cfg(target_family = "wasm")]
+                {
                     let edits = new_snapshot
                         .update(
                             tab_snapshot,
@@ -305,34 +315,87 @@ impl WrapMap {
                             &mut line_wrapper,
                             &mut fragment_builder,
                         )
-                        .await;
-                    (new_snapshot, edits)
-                });
-
-                match cx
-                    .foreground_executor()
-                    .block_with_timeout(Duration::from_millis(5), task)
+                        .now_or_never()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "WrapMap::rewrap of {total_rows} rows suspended; cannot block the wasm main thread"
+                            )
+                        });
+                    self.snapshot = new_snapshot;
+                    self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                }
+            } else {
+                #[cfg(not(target_family = "wasm"))]
                 {
-                    Ok((snapshot, edits)) => {
-                        self.snapshot = snapshot;
-                        self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                    let task = cx.background_spawn(async move {
+                        let edits = new_snapshot
+                            .update(
+                                tab_snapshot,
+                                &tab_edits,
+                                wrap_width,
+                                &mut line_wrapper,
+                                &mut fragment_builder,
+                            )
+                            .await;
+                        (new_snapshot, edits)
+                    });
+
+                    match cx
+                        .foreground_executor()
+                        .block_with_timeout(Duration::from_millis(5), task)
+                    {
+                        Ok((snapshot, edits)) => {
+                            self.snapshot = snapshot;
+                            self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                        }
+                        Err(wrap_task) => {
+                            self.background_task = Some(cx.spawn(async move |this, cx| {
+                                let (snapshot, edits) = wrap_task.await;
+                                this.update(cx, |this, cx| {
+                                    this.snapshot = snapshot;
+                                    this.edits_since_sync = this
+                                        .edits_since_sync
+                                        .compose(mem::take(&mut this.interpolated_edits).invert())
+                                        .compose(&edits);
+                                    this.background_task = None;
+                                    this.flush_edits(cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                        }
                     }
-                    Err(wrap_task) => {
-                        self.background_task = Some(cx.spawn(async move |this, cx| {
-                            let (snapshot, edits) = wrap_task.await;
-                            this.update(cx, |this, cx| {
-                                this.snapshot = snapshot;
-                                this.edits_since_sync = this
-                                    .edits_since_sync
-                                    .compose(mem::take(&mut this.interpolated_edits).invert())
-                                    .compose(&edits);
-                                this.background_task = None;
-                                this.flush_edits(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                    }
+                }
+                // Same completion as native's timeout `Err` arm: wraps are computed, not
+                // dropped. We cannot `block_with_timeout` on the browser main thread.
+                #[cfg(target_family = "wasm")]
+                {
+                    let wrap_task = cx.foreground_executor().spawn(async move {
+                        let edits = new_snapshot
+                            .update(
+                                tab_snapshot,
+                                &tab_edits,
+                                wrap_width,
+                                &mut line_wrapper,
+                                &mut fragment_builder,
+                            )
+                            .await;
+                        (new_snapshot, edits)
+                    });
+                    self.background_task = Some(cx.spawn(async move |this, cx| {
+                        let (snapshot, edits) = wrap_task.await;
+                        this.update(cx, |this, cx| {
+                            this.snapshot = snapshot;
+                            this.edits_since_sync = this
+                                .edits_since_sync
+                                .compose(mem::take(&mut this.interpolated_edits).invert())
+                                .compose(&edits);
+                            this.background_task = None;
+                            this.flush_edits(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
                 }
             }
         } else {
@@ -388,6 +451,7 @@ impl WrapMap {
                 .flat_map(|(_, tab_edits)| tab_edits.iter())
                 .map(|edit| (edit.new.end.row().saturating_sub(edit.new.start.row()) + 1) as usize)
                 .sum::<usize>();
+            #[cfg(not(target_family = "wasm"))]
             if update_passes + total_new_rows < WRAP_YIELD_ROW_INTERVAL {
                 let mut wrap_edits = Patch::default();
                 for (tab_snapshot, tab_edits) in pending_edits {
@@ -445,6 +509,43 @@ impl WrapMap {
                         }));
                     }
                 }
+            }
+            // Multiple `tab_edits` yield between row-edits even when the row
+            // count is small, so `now_or_never` can drop in-flight wraps. Take
+            // native's timeout `Err` path instead: interpolate now, apply wraps later.
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = (update_passes, total_new_rows);
+                let wrap_task = cx.foreground_executor().spawn(async move {
+                    let mut edits = Patch::default();
+                    for (tab_snapshot, tab_edits) in pending_edits {
+                        let wrap_edits = snapshot
+                            .update(
+                                tab_snapshot,
+                                &tab_edits,
+                                wrap_width,
+                                &mut line_wrapper,
+                                &mut fragment_builder,
+                            )
+                            .await;
+                        edits = edits.compose(&wrap_edits);
+                    }
+                    (snapshot, edits)
+                });
+                self.background_task = Some(cx.spawn(async move |this, cx| {
+                    let (snapshot, edits) = wrap_task.await;
+                    this.update(cx, |this, cx| {
+                        this.snapshot = snapshot;
+                        this.edits_since_sync = this
+                            .edits_since_sync
+                            .compose(mem::take(&mut this.interpolated_edits).invert())
+                            .compose(&edits);
+                        this.background_task = None;
+                        this.flush_edits(cx);
+                        cx.notify();
+                    })
+                    .ok();
+                }));
             }
         }
 

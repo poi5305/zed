@@ -242,6 +242,10 @@ impl PromptStore {
     #[cfg(target_family = "wasm")]
     pub fn new(_db_path: PathBuf, cx: &App) -> Task<Result<Self>> {
         cx.background_spawn(async move {
+            log::warn!(
+                "prompt library persistence (heed/LMDB) is not available in the browser; \
+                 built-in prompts are loaded, user-saved prompts are not"
+            );
             Ok(PromptStore {
                 metadata_cache: RwLock::new(MetadataCache::with_builtins()),
                 bodies: RwLock::new(HashMap::default()),
@@ -351,7 +355,9 @@ impl PromptStore {
                         if let Some(built_in) = id.as_built_in() {
                             built_in.default_content().into()
                         } else {
-                            anyhow::bail!("prompt not found")
+                            anyhow::bail!(
+                                "prompt library persistence (heed/LMDB) is not available in the browser"
+                            )
                         }
                     }
                 };
