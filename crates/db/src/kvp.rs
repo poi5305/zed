@@ -250,16 +250,45 @@ static GLOBAL_KEY_VALUE_STORE: std::sync::LazyLock<GlobalKeyValueStore> =
         )))
     });
 
+/// The wasm store, built without blocking.
+///
+/// Opening a database on wasm does not touch a local one: `ThreadSafeConnection::build`
+/// returns immediately there, because the schema lives on the server and
+/// `db::prepare_web_database` applies it through `Sql::migrate`. So the future completes
+/// on its first poll and `now_or_never` is sound here for the same reason it is in
+/// `fuzzy::match_strings_blocking` -- the wasm path cannot suspend.
+///
+/// Before this, `global()` panicked on wasm telling the caller to build a store from
+/// `AppDatabase` instead. Nothing did, and the panic fired during startup, taking the
+/// window with it -- the first thing a browser actually running this build hit.
+#[cfg(target_family = "wasm")]
+static GLOBAL_KEY_VALUE_STORE: std::sync::LazyLock<GlobalKeyValueStore> =
+    std::sync::LazyLock::new(|| {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        // Polled by hand rather than with `futures`, which this crate does not depend on,
+        // and in the same shape `fuzzy::match_strings_blocking` uses for the same reason.
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut future = std::pin::pin!(crate::open_in_memory_db::<GlobalKeyValueStore>(
+            crate::FALLBACK_DB_NAME
+        ));
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(connection) => GlobalKeyValueStore(connection),
+            Poll::Pending => {
+                unreachable!("the wasm open path returns without awaiting and cannot suspend")
+            }
+        }
+    });
+
 impl GlobalKeyValueStore {
     pub fn global() -> &'static Self {
-        #[cfg(target_family = "wasm")]
-        panic!(
-            "GlobalKeyValueStore::global() cannot block the wasm main thread; construct a store from AppDatabase after open_in_memory"
-        );
-        #[cfg(not(target_family = "wasm"))]
-        {
-            &GLOBAL_KEY_VALUE_STORE
-        }
+        &GLOBAL_KEY_VALUE_STORE
     }
 
     query! {
