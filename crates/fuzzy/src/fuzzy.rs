@@ -8,3 +8,5 @@ pub use paths::{
     PathMatch, PathMatchCandidate, PathMatchCandidateSet, match_fixed_path_set, match_path_sets,
 };
 pub use strings::{StringMatch, StringMatchCandidate, match_strings};
+#[cfg(target_family = "wasm")]
+pub use strings::match_strings_blocking;

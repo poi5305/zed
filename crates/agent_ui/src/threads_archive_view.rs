@@ -1353,6 +1353,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
+        #[cfg(not(target_family = "wasm"))]
         let mut sibling_matches = gpui::block_on(fuzzy::match_strings(
             &sibling_candidates,
             query,
@@ -1362,6 +1363,15 @@ impl PickerDelegate for ProjectPickerDelegate {
             &Default::default(),
             cx.background_executor().clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut sibling_matches = fuzzy::match_strings_blocking(
+            &sibling_candidates,
+            query,
+            smart_case,
+            true,
+            100,
+            &Default::default(),
+            cx.background_executor().clone(),);
 
         sibling_matches.sort_unstable_by(|a, b| {
             b.score
@@ -1389,6 +1399,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
+        #[cfg(not(target_family = "wasm"))]
         let mut recent_matches = gpui::block_on(fuzzy::match_strings(
             &recent_candidates,
             query,
@@ -1398,6 +1409,15 @@ impl PickerDelegate for ProjectPickerDelegate {
             &Default::default(),
             cx.background_executor().clone(),
         ));
+        #[cfg(target_family = "wasm")]
+        let mut recent_matches = fuzzy::match_strings_blocking(
+            &recent_candidates,
+            query,
+            smart_case,
+            true,
+            100,
+            &Default::default(),
+            cx.background_executor().clone(),);
 
         recent_matches.sort_unstable_by(|a, b| {
             b.score
