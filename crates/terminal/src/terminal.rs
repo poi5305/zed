@@ -36,6 +36,8 @@ use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(target_family = "wasm")]
+use std::sync::OnceLock;
 use std::{
     borrow::Cow,
     cmp::{self, min},
@@ -94,6 +96,35 @@ impl HeadlessTerminal {
     pub fn is_enabled(cx: &App) -> bool {
         cx.try_global::<Self>().is_some_and(|headless| headless.0)
     }
+}
+
+#[cfg(target_family = "wasm")]
+static REMOTE_CLIENT: OnceLock<smol::RpcClient> = OnceLock::new();
+
+/// Store the browser RPC client so wasm terminal paths can spawn on the host.
+///
+/// Same shape as `smol::set_remote_client` / `wasm_remote::set_remote_client`.
+#[cfg(target_family = "wasm")]
+pub fn set_remote_client(client: smol::RpcClient) {
+    if REMOTE_CLIENT.set(client).is_err() {
+        log::warn!("terminal remote client already installed");
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn remote_client() -> Option<smol::RpcClient> {
+    REMOTE_CLIENT.get().cloned()
+}
+
+/// Shared RPC client for wasm terminal shims, matching `smol`'s `remote_rpc_client`.
+#[cfg(target_family = "wasm")]
+pub fn remote_rpc_client() -> std::io::Result<smol::RpcClient> {
+    remote_client().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "terminal remote RPC client not initialized",
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug)]

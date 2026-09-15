@@ -153,6 +153,10 @@ pub fn default_keymap() -> Cow<'static, str> {
     asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
 }
 
+pub fn default_keymap_path() -> &'static str {
+    DEFAULT_KEYMAP_PATH
+}
+
 pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
 
 pub fn vim_keymap() -> Cow<'static, str> {
@@ -169,6 +173,10 @@ pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides-mac
 
 #[cfg(not(target_os = "macos"))]
 pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides.json";
+
+pub fn specific_overrides_keymap_path() -> &'static str {
+    SPECIFIC_OVERRIDES_KEYMAP_PATH
+}
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
     asset_str::<SettingsAssets>("settings/initial_user_settings.json")

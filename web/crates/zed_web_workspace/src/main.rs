@@ -511,8 +511,9 @@ impl language::LspInstaller for HostLspAdapter {
         _: (),
         _: std::path::PathBuf,
         _: &Arc<dyn language::LspAdapterDelegate>,
-    ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>> + Send + use<>
-    {
+    ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>>
+    + language::MaybeSend
+    + use<> {
         let program = self.program;
         async move { anyhow::bail!("{program} must be installed on the server PATH") }
     }
@@ -598,7 +599,8 @@ impl language::LspInstaller for WebPyrightLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &std::path::PathBuf,
         delegate: &Arc<dyn language::LspAdapterDelegate>,
-    ) -> impl std::future::Future<Output = Option<lsp::LanguageServerBinary>> + Send + use<> {
+    ) -> impl std::future::Future<Output = Option<lsp::LanguageServerBinary>> + language::MaybeSend + use<>
+    {
         let node = self.node.clone();
         let version = version.clone();
         let container_dir = container_dir.clone();
@@ -627,8 +629,9 @@ impl language::LspInstaller for WebPyrightLspAdapter {
         _: Self::BinaryVersion,
         container_dir: std::path::PathBuf,
         delegate: &Arc<dyn language::LspAdapterDelegate>,
-    ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>> + Send + use<>
-    {
+    ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>>
+    + language::MaybeSend
+    + use<> {
         let node = self.node.clone();
         let delegate = delegate.clone();
         async move {

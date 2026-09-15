@@ -7,6 +7,9 @@ pub mod connection_wasm;
 #[cfg(target_family = "wasm")]
 pub use connection_wasm as connection;
 
+#[cfg(target_family = "wasm")]
+pub mod remote_sql;
+
 pub mod domain;
 
 #[cfg(not(target_family = "wasm"))]
