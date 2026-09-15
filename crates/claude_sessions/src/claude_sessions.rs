@@ -26,6 +26,8 @@ pub use session_registry::{RegisteredSession, SubagentMeta, SubagentSummary};
 pub use session_source::{
     FileContents, LocalSource, RemoteSource, SessionInput, SessionListing, SessionSource,
 };
+#[cfg(target_family = "wasm")]
+pub use session_source::{WebSource, set_remote_client};
 pub use session_store::{ClaudeSessionStore, TranscriptTarget};
 pub use transcript::{CompactMetadata, Transcript, TranscriptRecord};
 pub use usage::{ModelRates, Usage, rates_for_model};

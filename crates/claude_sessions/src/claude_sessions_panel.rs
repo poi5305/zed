@@ -29,8 +29,7 @@ use gpui::{
     DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image,
     ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
     Pixels, Rems, Render, ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, img,
-    list,
-    pulsating_between, relative,
+    list, pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
@@ -51,13 +50,17 @@ use workspace::{
 
 use zed_actions::editor::{MoveDown, MoveUp};
 
+#[cfg(target_family = "wasm")]
+use crate::session_source::WebSource;
+#[cfg(not(target_family = "wasm"))]
+use crate::session_source::{LocalSource, RemoteSource};
 use crate::{
     ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, NextMessage, OpenInEditor,
     PasteIntoMessage, PreviousMessage, RegisteredSession, SendMessage, SubagentSummary,
     ToggleFocus, TranscriptRecord, TranscriptTarget, Usage, rates_for_model,
     session_registry::{Digit, PaneKey, Question, SlashCommand, SlashCommandScope},
     session_registry::{tmux_session_name, workflow_run_id_in_tool_result},
-    session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
+    session_source::{FileContents, SessionInput, SessionSource},
     transcript::Spend,
 };
 
@@ -344,7 +347,11 @@ fn answer_cost(
 ) -> Option<SharedString> {
     let spend = store.transcript().spend();
     let rates = rates_for_model(spend.model.as_deref()?)?;
-    Some(SharedString::from(answer_summary(usage, rates, answered_at)))
+    Some(SharedString::from(answer_summary(
+        usage,
+        rates,
+        answered_at,
+    )))
 }
 
 /// The line drawn under an answer when the reader has asked what it cost.
@@ -354,11 +361,7 @@ fn answer_cost(
 /// cache read at a tenth of it — so one combined "in" figure says nothing about where an
 /// answer's money went. Each is left out when it is zero, which keeps the line short on
 /// the answers that only read from the cache.
-fn answer_summary(
-    usage: Usage,
-    rates: ModelRates,
-    answered_at: Option<&SharedString>,
-) -> String {
+fn answer_summary(usage: Usage, rates: ModelRates, answered_at: Option<&SharedString>) -> String {
     // First, because it is what the rest of the line is dated by: the cache write below
     // says how long what this answer wrote lives, and that is only an expiry once there
     // is a time to count it from.
@@ -1232,13 +1235,24 @@ impl ClaudeSessionsPanel {
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
             // The sessions worth showing are the ones on the machine the project is
             // opened from: on a remote project they are read over that project's
-            // connection, and the panel is otherwise the same on both.
-            let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
-                Some(remote_client) => Arc::new(RemoteSource::new(
-                    remote_client.read(cx).proto_client(),
-                    cx.background_executor().clone(),
-                )),
-                None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+            // connection, and the panel is otherwise the same on both. In the browser
+            // there is no local filesystem, so every method is one JSON-RPC to the
+            // server, which calls the same functions LocalSource calls directly.
+            let source: Arc<dyn SessionSource> = {
+                #[cfg(target_family = "wasm")]
+                {
+                    Arc::new(WebSource::new(cx.background_executor().clone()))
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    match project.read(cx).remote_client() {
+                        Some(remote_client) => Arc::new(RemoteSource::new(
+                            remote_client.read(cx).proto_client(),
+                            cx.background_executor().clone(),
+                        )),
+                        None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+                    }
+                }
             };
             let store =
                 cx.new(|cx| ClaudeSessionStore::new(source.clone(), project_root.clone(), cx));
@@ -2776,19 +2790,17 @@ impl ClaudeSessionsPanel {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| match row {
-                SessionAgentRow::WorkflowRun { label, note } => {
-                    ListItem::new(SharedString::from(format!(
-                        "claude-session-run-{process_id}-{index}"
-                    )))
-                    .spacing(ListItemSpacing::Sparse)
-                    .indent_level(1)
-                    .start_slot(
-                        Icon::new(IconName::ListTree)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(agent_row_body(label, Some(note), Color::Default))
-                }
+                SessionAgentRow::WorkflowRun { label, note } => ListItem::new(SharedString::from(
+                    format!("claude-session-run-{process_id}-{index}"),
+                ))
+                .spacing(ListItemSpacing::Sparse)
+                .indent_level(1)
+                .start_slot(
+                    Icon::new(IconName::ListTree)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(agent_row_body(label, Some(note), Color::Default)),
                 SessionAgentRow::Agent {
                     label,
                     note,
@@ -2808,19 +2820,17 @@ impl ClaudeSessionsPanel {
                     this.reveal_in_pane(Some(process_id), target.clone(), window, cx)
                 }))
                 .child(agent_row_body(label, note, Color::Muted)),
-                SessionAgentRow::Shell { label, note } => {
-                    ListItem::new(SharedString::from(format!(
-                        "claude-session-shell-{process_id}-{index}"
-                    )))
-                    .spacing(ListItemSpacing::Sparse)
-                    .indent_level(1)
-                    .start_slot(
-                        Icon::new(IconName::Terminal)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(agent_row_body(label, Some(note), Color::Muted))
-                }
+                SessionAgentRow::Shell { label, note } => ListItem::new(SharedString::from(
+                    format!("claude-session-shell-{process_id}-{index}"),
+                ))
+                .spacing(ListItemSpacing::Sparse)
+                .indent_level(1)
+                .start_slot(
+                    Icon::new(IconName::Terminal)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(agent_row_body(label, Some(note), Color::Muted)),
             })
             .collect()
     }
@@ -2902,9 +2912,9 @@ impl ClaudeSessionsPanel {
                     SharedString::from(format!("claude-session-agents-{index}")),
                     shown,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_session_agents(process_id, cx)
-                }))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.toggle_session_agents(process_id, cx)),
+                )
             }))
             .child(indicator);
 
@@ -3288,8 +3298,7 @@ impl ClaudeSessionsPanel {
                         .overflow_y_scroll()
                         .track_scroll(&self.live_message_scroll)
                         .child(
-                            Label::new(SharedString::from(live.to_string()))
-                                .size(LabelSize::Small),
+                            Label::new(SharedString::from(live.to_string())).size(LabelSize::Small),
                         )
                         .custom_scrollbars(
                             Scrollbars::new(ScrollAxes::Vertical)
@@ -5299,8 +5308,7 @@ impl Render for ClaudeSessionsPanel {
                                 .flatten(),
                         )
                         .children(
-                            (!reading_an_agent)
-                                .then(|| self.render_input(cx).into_any_element()),
+                            (!reading_an_agent).then(|| self.render_input(cx).into_any_element()),
                         )
                 } else {
                     this.child(self.render_session_section(cx))
@@ -6290,7 +6298,11 @@ fn group_cards_by_phase(
     for mut card in cards {
         // An `Agent` call spawns the one agent its card already accounts for, so its
         // cards are never grouped and keep whatever their own card says.
-        let phase = if is_workflow_call { card.phase.take() } else { None };
+        let phase = if is_workflow_call {
+            card.phase.take()
+        } else {
+            None
+        };
         // Matched against every group rather than only the one last opened: a phase that
         // ran several agents at once has as many cards, and a later phase's card can sit
         // between two of them, which merging only neighbours would draw as the same phase
@@ -6514,9 +6526,11 @@ fn agent_row_body(
                 .color(label_color)
                 .single_line(),
         )
-        .children(
-            note.map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Hidden)),
-        )
+        .children(note.map(|note| {
+            Label::new(note)
+                .size(LabelSize::XSmall)
+                .color(Color::Hidden)
+        }))
 }
 
 /// What a session list row says beside an agent's name, or `None` when it can say
@@ -12252,10 +12266,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             let mut subagents_by_session = HashMap::default();
             for session_id in session_ids {
                 let listed = self.list_subagents(session_id.clone());
-                subagents_by_session.insert(
-                    session_id,
-                    smol::block_on(listed).unwrap_or_default(),
-                );
+                subagents_by_session.insert(session_id, smol::block_on(listed).unwrap_or_default());
             }
             Task::ready(Ok(subagents_by_session))
         }
@@ -12902,7 +12913,6 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
-
     /// A run can spawn any number of agents, so the list has to say which run each agent
     /// came from rather than laying them out beside the session's own agents.
     #[test]
@@ -13462,13 +13472,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let shells = shells_of(&lines);
         let got: Vec<(&str, &str, bool)> = shells
             .iter()
-            .map(|shell| {
-                (
-                    shell.task_id.as_ref(),
-                    shell.label.as_ref(),
-                    shell.finished,
-                )
-            })
+            .map(|shell| (shell.task_id.as_ref(), shell.label.as_ref(), shell.finished))
             .collect();
 
         assert_eq!(
@@ -13497,9 +13501,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                  </task-notification>\n\nwhy did this fail?",
             ),
         ];
-        let got = shells_of(&lines)
-            .first()
-            .map(|shell| shell.finished);
+        let got = shells_of(&lines).first().map(|shell| shell.finished);
 
         assert_eq!(
             got,
@@ -13630,14 +13632,16 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let groups = group_cards_by_phase(vec![only], false);
 
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, None, "no heading is drawn for a call with no run");
+        assert_eq!(
+            groups[0].0, None,
+            "no heading is drawn for a call with no run"
+        );
         assert_eq!(
             groups[0].1[0].phase,
             Some(SharedString::from("Wait A")),
             "and the card keeps whatever it said"
         );
     }
-
 
     /// Captured from a real `parallel()` run: `Fan out` spawned three agents and `Collect`
     /// one, and sorted by agent id the `Collect` agent lands between two of the `Fan out`
@@ -13706,12 +13710,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             project_root: Option<PathBuf>,
         ) -> Task<anyhow::Result<SessionListing>> {
             match self.listing {
-                ListingBehaviour::NeverAnswered => self
-                    .executor
-                    .spawn(async move { std::future::pending::<anyhow::Result<SessionListing>>().await }),
-                ListingBehaviour::Refused => {
-                    Task::ready(Err(anyhow::anyhow!("the host refused to list its sessions")))
-                }
+                ListingBehaviour::NeverAnswered => self.executor.spawn(async move {
+                    std::future::pending::<anyhow::Result<SessionListing>>().await
+                }),
+                ListingBehaviour::Refused => Task::ready(Err(anyhow::anyhow!(
+                    "the host refused to list its sessions"
+                ))),
                 ListingBehaviour::AnsweredAfter(delay) => {
                     let listed = self.scripted.list_sessions(project_root);
                     let executor = self.executor.clone();

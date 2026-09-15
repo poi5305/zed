@@ -1234,6 +1234,7 @@ fn init_app_state(
     });
     smol::set_remote_client(remote_client.clone());
     terminal::set_remote_client(remote_client.clone());
+    claude_sessions::set_remote_client(remote_client.clone());
     web_agent_panel::set_remote_client(remote_client.clone());
     // Server-side SQLite for workspace/KVP persistence.
     sqlez::remote_sql::set_sql_endpoint(format!("{server_origin}/sql"));

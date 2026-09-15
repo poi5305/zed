@@ -26,6 +26,9 @@ agent_ui = { path = "../crates/agent_ui" }
 assets = { path = "../crates/assets" }
 breadcrumbs = { path = "../crates/breadcrumbs" }
 client = { path = "../crates/client" }
+claude_sessions = { path = "../crates/claude_sessions" }
+project_manager = { path = "../crates/project_manager" }
+tmux_sessions = { path = "../crates/tmux_sessions" }
 clock = { path = "../crates/clock" }
 collections = { path = "../crates/collections", version = "0.1.0" }
 command_palette = { path = "../crates/command_palette" }

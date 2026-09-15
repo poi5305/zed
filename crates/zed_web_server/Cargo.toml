@@ -23,6 +23,8 @@ clap = { workspace = true, features = ["env"] }
 futures.workspace = true
 hex.workspace = true
 paths.workspace = true
+remote.workspace = true
+smol.workspace = true
 portable-pty.workspace = true
 rand.workspace = true
 reqwest.workspace = true

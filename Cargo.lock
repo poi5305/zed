@@ -3094,6 +3094,7 @@ name = "claude_sessions"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "collections",
  "editor",
@@ -23329,10 +23330,12 @@ dependencies = [
  "paths",
  "portable-pty",
  "rand 0.9.4",
+ "remote",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "smol",
  "tar",
  "tempfile",
  "tokio",

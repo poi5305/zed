@@ -1020,9 +1020,8 @@ mod tests {
     use crate::{
         session_registry::{
             HEARTBEAT_CUTOFF_MILLIS, SessionSummary, find_transcript, list_subagents,
-            list_subagents_for_sessions,
-            normalize_whitespace, now_millis, read_registrations, read_subagent_transcript_tail,
-            read_transcript_tail, visible_sessions,
+            list_subagents_for_sessions, normalize_whitespace, now_millis, read_registrations,
+            read_subagent_transcript_tail, read_transcript_tail, visible_sessions,
         },
         session_source::{FileContents, read_file_prefix},
     };
@@ -2310,7 +2309,11 @@ mod tests {
         cx.run_until_parked();
 
         store.read_with(cx, |store, _| {
-            assert_eq!(store.selected(), None, "the session is gone from the registry");
+            assert_eq!(
+                store.selected(),
+                None,
+                "the session is gone from the registry"
+            );
             assert_eq!(
                 store.transcript_target(),
                 &reading_the_flat_agent(),

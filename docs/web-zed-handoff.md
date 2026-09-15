@@ -201,6 +201,16 @@ entry already in the recents list still renders and is still clickable, falling 
 "hidden or refused"; today they are neither. It is not a compile error, which is exactly why it
 needs to be written down.
 
+**An inconsistency worth ruling on before `claude_sessions` ships.** `Home::dirs` refuses
+when `ZED_WEB_RESTRICT_PATHS` puts the home directory outside the workspace — that was a
+deliberate choice, so `~` expansion fails loudly rather than silently pointing somewhere the
+client cannot read. But the `ClaudeSessions::` RPCs read `~/.claude` directly, without going
+through `FsRpc`, exactly as the SSH `headless_project` does. So in a restricted deployment
+one path refuses and the other does not. Either the restriction is about what the *client* may
+address (in which case the current split is right and should be documented) or about what the
+deployment will read at all (in which case these RPCs need the same check). It was escalated
+rather than decided, which is correct — but it does need deciding.
+
 **Phase 6:** not started. Note §6.5's finding before planning it — `forward_ports` has no
 meaning in a browser, and §6.2's count stands: `crates/remote/src/claude_sessions.rs` has
 113 `std::fs` sites.
