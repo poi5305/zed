@@ -69,11 +69,18 @@ workspace.workspace = true
 zed_actions.workspace = true
 zed_credentials_provider.workspace = true
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-audio.workspace = true
+# Measured for wasm32 rather than assumed: these three build, so their settings
+# pages stay in the browser. Phase 3a gated all five together, before
+# `edit_prediction` was ported and before the WASI SDK existed.
 codestral.workspace = true
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
+
+# `audio` needs livekit and `extension_host` needs wasmtime -- the one package
+# docs/web-zed-plan.md §4 keeps out of the wasm graph on purpose. These two are
+# native-only for real, and the pages that use them are cfg'd out to match.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+audio.workspace = true
 extension_host.workspace = true
 
 [dev-dependencies]

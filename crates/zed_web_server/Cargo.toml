@@ -22,6 +22,7 @@ base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 futures.workspace = true
 hex.workspace = true
+paths.workspace = true
 portable-pty.workspace = true
 rand.workspace = true
 reqwest.workspace = true

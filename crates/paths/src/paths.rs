@@ -118,6 +118,24 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
     })
 }
 
+#[cfg(target_family = "wasm")]
+pub fn set_config_dir(path: PathBuf) {
+    if CONFIG_DIR.set(path).is_err() {
+        panic!(
+            "set_config_dir called after config_dir was already initialized; config_dir caches its first result forever, so this seed cannot replace it and the web client would keep using a path that is not the server's config directory"
+        );
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn set_data_dir(path: PathBuf) {
+    if CURRENT_DATA_DIR.set(path).is_err() {
+        panic!(
+            "set_data_dir called after data_dir was already initialized; data_dir caches its first result forever, so this seed cannot replace it and the web client would keep using a path that is not the server's data directory"
+        );
+    }
+}
+
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {

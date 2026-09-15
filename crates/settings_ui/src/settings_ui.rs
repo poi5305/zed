@@ -57,9 +57,10 @@ use crate::components::{
     SettingsSectionHeader, font_picker, icon_theme_picker, render_ollama_model_picker,
     text_field_a11y_state, theme_picker,
 };
+use crate::pages::{CustomAgentForm, LlmProviderForm};
+#[cfg(not(target_family = "wasm"))]
 use crate::pages::{
-    CustomAgentForm, LlmProviderForm, McpServerForm, render_input_audio_device_dropdown,
-    render_output_audio_device_dropdown,
+    McpServerForm, render_input_audio_device_dropdown, render_output_audio_device_dropdown,
 };
 
 const NAVBAR_CONTAINER_TAB_INDEX: isize = 0;
@@ -523,7 +524,10 @@ pub fn init(cx: &mut App) {
 }
 
 fn init_renderers(cx: &mut App) {
-    cx.default_global::<SettingFieldRenderer>()
+    // Bound rather than chained through, because the two audio renderers below are
+    // native-only and an attribute cannot sit on a link of a method chain.
+    let renderers = cx
+        .default_global::<SettingFieldRenderer>()
         .add_renderer::<UnimplementedSettingField>(
             |settings_window, item, _, settings_file, _, sub_field, _, cx| {
                 render_settings_item(
@@ -672,12 +676,14 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::OllamaModelName>(render_ollama_model_picker)
         .add_basic_renderer::<settings::SemanticTokens>(render_dropdown)
         .add_basic_renderer::<settings::DocumentFoldingRanges>(render_dropdown)
-        .add_basic_renderer::<settings::DocumentSymbols>(render_dropdown)
+        .add_basic_renderer::<settings::DocumentSymbols>(render_dropdown);
+
+    #[cfg(not(target_family = "wasm"))]
+    let renderers = renderers
         .add_basic_renderer::<settings::AudioInputDeviceName>(render_input_audio_device_dropdown)
-        .add_basic_renderer::<settings::AudioOutputDeviceName>(render_output_audio_device_dropdown)
-        .add_basic_renderer::<settings::TerminalBell>(render_dropdown)
-        // please semicolon stay on next line
-        ;
+        .add_basic_renderer::<settings::AudioOutputDeviceName>(render_output_audio_device_dropdown);
+
+    renderers.add_basic_renderer::<settings::TerminalBell>(render_dropdown);
 }
 
 #[derive(Clone, Copy)]
@@ -997,10 +1003,12 @@ pub struct SettingsWindow {
     /// where `focus_visible` styling would otherwise be suppressed).
     pub(crate) llm_provider_add_focus_handle: FocusHandle,
     /// State for the active "add/edit custom MCP server" form sub-page, if open.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) mcp_server_form: Option<McpServerForm>,
     /// Stable focus handle for the MCP "Add Server" button, so it can show a
     /// focus ring when the page auto-focuses it on open (which happens via mouse,
     /// where `focus_visible` styling would otherwise be suppressed).
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) mcp_add_server_focus_handle: FocusHandle,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
     pub(crate) custom_agent_form: Option<CustomAgentForm>,
@@ -2026,7 +2034,9 @@ impl SettingsWindow {
             last_copied_skill_directory_path: None,
             llm_provider_form: None,
             llm_provider_add_focus_handle: cx.focus_handle(),
+            #[cfg(not(target_family = "wasm"))]
             mcp_server_form: None,
+            #[cfg(not(target_family = "wasm"))]
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
@@ -3779,6 +3789,7 @@ impl SettingsWindow {
             let is_llm_providers_page = current_sub_page.link.json_path == Some("llm_providers")
                 && current_sub_page.link.title.as_ref() == "LLM Providers";
             let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
+            #[cfg(not(target_family = "wasm"))]
             let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
 
             page_header = h_flex()
@@ -3838,8 +3849,17 @@ impl SettingsWindow {
                         .when(is_external_agents_page, |this| {
                             this.child(pages::render_add_agent_popover(self, window, cx))
                         })
-                        .when(is_mcp_servers_page, |this| {
-                            this.child(pages::render_add_server_popover(self, window, cx))
+                        .map(|this| {
+                            #[cfg(not(target_family = "wasm"))]
+                            {
+                                this.when(is_mcp_servers_page, |this| {
+                                    this.child(pages::render_add_server_popover(self, window, cx))
+                                })
+                            }
+                            #[cfg(target_family = "wasm")]
+                            {
+                                this
+                            }
                         }),
                 )
                 .into_any_element();
@@ -5368,7 +5388,9 @@ pub mod test {
                 last_copied_skill_directory_path: None,
                 llm_provider_form: None,
                 llm_provider_add_focus_handle: cx.focus_handle(),
+                #[cfg(not(target_family = "wasm"))]
                 mcp_server_form: None,
+                #[cfg(not(target_family = "wasm"))]
                 mcp_add_server_focus_handle: cx.focus_handle(),
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
@@ -5507,7 +5529,9 @@ pub mod test {
             last_copied_skill_directory_path: None,
             llm_provider_form: None,
             llm_provider_add_focus_handle: cx.focus_handle(),
+            #[cfg(not(target_family = "wasm"))]
             mcp_server_form: None,
+            #[cfg(not(target_family = "wasm"))]
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),

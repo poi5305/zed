@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{LazyLock, OnceLock},
 };
 
 use path::rel_path::RelPath;
@@ -19,9 +19,10 @@ use path::rel_path::RelPathBuf;
 
 pub use path::PathStyle;
 
+static HOME_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 /// Returns the path to the user's home directory.
 pub fn home_dir() -> &'static PathBuf {
-    static HOME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME_DIR.get_or_init(|| {
         if cfg!(any(test, feature = "test-support")) {
             if cfg!(target_os = "macos") {
@@ -32,11 +33,8 @@ pub fn home_dir() -> &'static PathBuf {
                 PathBuf::from("/home/zed")
             }
         } else {
-            // `/workspace` is a placeholder, not the server's real home.
-            // Phase 6's `Home::` RPC will replace it with the actual home and
-            // config directories. Until then, anything that expands `~` —
-            // `claude_sessions` (`~/.claude`) and `project_manager`
-            // (`~/.config/zed/projects.json`) — is wrong on the web build
+            // `/workspace` is only the unseeded wasm fallback. The web client
+            // must call `set_home_dir` with `Home::dirs` before any read
             // (see docs/web-zed-plan.md §6.3).
             #[cfg(target_family = "wasm")]
             {
@@ -48,6 +46,15 @@ pub fn home_dir() -> &'static PathBuf {
             }
         }
     })
+}
+
+#[cfg(target_family = "wasm")]
+pub fn set_home_dir(path: PathBuf) {
+    if HOME_DIR.set(path).is_err() {
+        panic!(
+            "set_home_dir called after home_dir was already initialized; home_dir caches its first result forever, so this seed cannot replace it and every ~ expansion would keep the wrong path"
+        );
+    }
 }
 
 pub trait PathExt {
