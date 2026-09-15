@@ -577,15 +577,28 @@ impl PickerDelegate for CommandPaletteDelegate {
             return true;
         };
 
-        match cx
+        // Returning `false` means "not finalized yet, ask again"; the caller already
+        // handles it, which is what makes the wasm arm equivalent rather than degraded.
+        // Native waits up to `duration` for the matches; the browser's main thread cannot
+        // block at all, so it takes them only if they are already there.
+        #[cfg(not(target_family = "wasm"))]
+        let received = cx
             .foreground_executor()
             .block_with_timeout(duration, rx.clone().recv())
-        {
-            Ok(Some((commands, matches, interceptor_result))) => {
+            .ok()
+            .flatten();
+        #[cfg(target_family = "wasm")]
+        let received = {
+            let _ = duration;
+            rx.clone().try_recv().ok()
+        };
+
+        match received {
+            Some((commands, matches, interceptor_result)) => {
                 self.matches_updated(query, commands, matches, interceptor_result, cx);
                 true
             }
-            _ => {
+            None => {
                 self.updating_matches = Some((task, rx));
                 false
             }
