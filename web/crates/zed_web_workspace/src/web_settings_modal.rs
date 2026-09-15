@@ -106,7 +106,6 @@ pub fn open_settings_popup(
             // (uses `update_window`, which doesn't hold a `Workspace` lease).
             let settings = cx.new_window_entity(|window, cx| {
                 let mut settings = SettingsWindow::new_modal(original_window, window, cx);
-                settings.set_context_server_store(context_server_store);
                 if let Some(page) = page.as_deref() {
                     settings.open_page(page, window, cx);
                 }
