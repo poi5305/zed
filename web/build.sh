@@ -234,12 +234,30 @@ install -m 0755 \
     require_unset_rustflags
     export CARGO_TARGET_DIR="${wasm_target}"
     export CC_wasm32_unknown_unknown="${wasi_sdk}/bin/clang"
-    # The C target features must match web/.cargo/config.toml's `-C target-feature`.
+    # Headers: tree-sitter's own, not the WASI sysroot's. The sysroot's <wasi/api.h>
+    # refuses any target that is not WASI proper, and wasm32-unknown-unknown is not, so
+    # every grammar's C failed against it. tree-sitter vendors the libc subset its
+    # parsers need for exactly this target -- see its src/wasm-stdlib/README.md, "the
+    # same vendored libc sources ... are linked directly into the application" -- and
+    # publishes the headers from its `language` crate. WASI clang stays as the compiler.
+    #
+    # Target features: these must match web/.cargo/config.toml's `-C target-feature`.
     # Rust asks the linker for --shared-memory, and rust-lld refuses it if any object in
     # the link was built without atomics and bulk-memory:
     #   "--shared-memory is disallowed by <obj> because it was not compiled with
     #    'atomics' or 'bulk-memory' features"
-    export CFLAGS_wasm32_unknown_unknown="-isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasi -matomics -mbulk-memory -mmutable-globals"
+    tree_sitter_wasm_headers=$(
+        "${cargo_bin}" metadata --format-version 1 --filter-platform wasm32-unknown-unknown 2>/dev/null |
+            grep -o '"manifest_path":"[^"]*tree-sitter[^"]*/crates/language/Cargo.toml"' |
+            head -1 |
+            sed 's/.*:"//; s/"$//; s|/Cargo.toml$|/wasm/include|'
+    )
+    if [[ -z "${tree_sitter_wasm_headers}" || ! -d "${tree_sitter_wasm_headers}" ]]; then
+        die "error: could not locate tree-sitter's wasm headers via cargo metadata." \
+            "They come from the \`tree-sitter-language\` crate's wasm/include directory," \
+            "and every tree-sitter grammar's C build needs them on wasm32-unknown-unknown."
+    fi
+    export CFLAGS_wasm32_unknown_unknown="-isystem ${tree_sitter_wasm_headers} -matomics -mbulk-memory -mmutable-globals"
     rustup run "${nightly_toolchain}" "${cargo_bin}" build \
         -p zed_web_workspace \
         --target wasm32-unknown-unknown \

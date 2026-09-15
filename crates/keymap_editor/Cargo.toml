@@ -47,7 +47,6 @@ zed_actions.workspace = true
 # sysroot's <wasi/api.h> refuses any target that is not WASI proper. The keymap
 # editor's syntax highlighting is therefore native-only, and its two use sites are
 # cfg'd to match.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
 tree-sitter-json.workspace = true
 tree-sitter-rust.workspace = true
 
