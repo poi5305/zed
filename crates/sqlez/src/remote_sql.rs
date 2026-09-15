@@ -17,6 +17,21 @@ pub trait AsyncSqlClient: Send + Sync {
     fn call(&self, method: &str, params: Value) -> BoxFuture<'static, Result<Value>>;
 }
 
+/// Any closure of the right shape is a client.
+///
+/// Without this, the only place the impl could live is the crate owning the client
+/// type, which would make the transport depend on this crate and close the cycle
+/// `util -> smol -> wasm_rpc -> sqlez -> util`. A closure lets the wiring sit in the
+/// entry point, which legitimately depends on both.
+impl<F> AsyncSqlClient for F
+where
+    F: Fn(&str, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync,
+{
+    fn call(&self, method: &str, params: Value) -> BoxFuture<'static, Result<Value>> {
+        self(method, params)
+    }
+}
+
 static SQL_ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SQL_RPC_ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static ASYNC_CLIENT: OnceLock<Mutex<Option<Arc<dyn AsyncSqlClient>>>> = OnceLock::new();

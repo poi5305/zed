@@ -1230,7 +1230,14 @@ fn init_app_state(
     // Server-side SQLite for workspace/KVP persistence.
     sqlez::remote_sql::set_sql_endpoint(format!("{server_origin}/sql"));
     sqlez::remote_sql::set_sql_rpc_endpoint(rpc_url.clone());
-    sqlez::remote_sql::set_async_sql_client(remote_client.clone());
+    sqlez::remote_sql::set_async_sql_client({
+        let client = remote_client.clone();
+        move |method: &str, params: serde_json::Value| {
+            let client = client.clone();
+            let method = method.to_string();
+            futures::FutureExt::boxed(async move { client.call(&method, &params).await })
+        }
+    });
 
     let remote_fs = Arc::new(RemoteFs::new(
         remote_client.clone(),
@@ -1645,12 +1652,8 @@ fn install_workspace_chrome(cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
-        let activity_indicator = activity_indicator::ActivityIndicator::new(
-            workspace,
-            workspace.project().read(cx).languages().clone(),
-            window,
-            cx,
-        );
+        let activity_indicator =
+            activity_indicator::ActivityIndicator::new(workspace, window, cx);
         let edit_prediction_menu_handle = ui::PopoverMenuHandle::default();
         let edit_prediction_button = cx.new(|cx| {
             edit_prediction_ui::EditPredictionButton::new(
@@ -2145,7 +2148,14 @@ pub fn main() {
             wasm_remote::RemoteClient::connect(&rpc_url).expect("WebSocket connect failed");
         sqlez::remote_sql::set_sql_endpoint(format!("{server_origin}/sql"));
         sqlez::remote_sql::set_sql_rpc_endpoint(rpc_url);
-        sqlez::remote_sql::set_async_sql_client(remote_client.clone());
+        sqlez::remote_sql::set_async_sql_client({
+        let client = remote_client.clone();
+        move |method: &str, params: serde_json::Value| {
+            let client = client.clone();
+            let method = method.to_string();
+            futures::FutureExt::boxed(async move { client.call(&method, &params).await })
+        }
+    });
         let initialization = futures::try_join!(load_web_assets(), db::prepare_web_database());
         if let Err(error) = initialization {
             web_sys::console::error_1(

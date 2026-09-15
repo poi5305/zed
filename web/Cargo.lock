@@ -12784,6 +12784,7 @@ dependencies = [
  "smol 2.0.2 (git+https://github.com/smol-rs/smol?rev=a1e642196803fc5dff56f1e04e867bfc024966bd)",
  "uuid",
  "wasm-bindgen-futures",
+ "wasm_rpc",
 ]
 
 [[package]]
@@ -12909,6 +12910,7 @@ name = "sqlez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "collections",
  "futures",
  "indoc",
@@ -12916,6 +12918,8 @@ dependencies = [
  "log",
  "parking_lot",
  "pollster 0.4.0",
+ "serde",
+ "serde_json",
  "sqlformat",
  "thread_local",
  "util",
@@ -13653,6 +13657,7 @@ dependencies = [
  "schemars 1.0.4",
  "serde",
  "settings",
+ "smol 2.0.2",
  "sysinfo",
  "task",
  "theme",
@@ -13662,7 +13667,6 @@ dependencies = [
  "urlencoding",
  "util",
  "vte",
- "wasm_remote",
  "web-time",
  "windows 0.62.2",
 ]
