@@ -45,28 +45,36 @@ pub struct SyntaxSnapshot {
 // To avoid blocking the main thread, we offload the drop operation to a background thread.
 impl Drop for SyntaxSnapshot {
     fn drop(&mut self) {
-        static DROP_TX: LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
-            LazyLock::new(|| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("SyntaxSnapshot::drop".into())
-                    .spawn(move || while let Ok(_) = rx.recv() {})
-                    .expect("failed to spawn drop thread");
-                tx
-            });
-        // This does allocate a new Arc, but it's cheap and avoids blocking the main thread without needing to use an `Option` or `MaybeUninit`.
-        let _ = DROP_TX.send(std::mem::replace(
-            &mut self.layers,
-            SumTree::from_summary(SyntaxLayerSummary {
-                min_depth: Default::default(),
-                max_depth: Default::default(),
-                // Deliberately bogus anchors, doesn't matter in this context
-                range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_language: Default::default(),
-                contains_unknown_injections: Default::default(),
-            }),
-        ));
+        // The offload is an optimisation, and wasm has nowhere to offload to:
+        // `std::thread::spawn` is `Unsupported` there, so the `expect` below fired the
+        // moment tree-sitter became reachable in the browser. Dropping inline costs the
+        // main thread the deallocation it was trying to avoid; not dropping at all would
+        // leak every syntax tree the session ever built.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static DROP_TX: LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
+                LazyLock::new(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::Builder::new()
+                        .name("SyntaxSnapshot::drop".into())
+                        .spawn(move || while let Ok(_) = rx.recv() {})
+                        .expect("failed to spawn drop thread");
+                    tx
+                });
+            // This does allocate a new Arc, but it's cheap and avoids blocking the main thread without needing to use an `Option` or `MaybeUninit`.
+            let _ = DROP_TX.send(std::mem::replace(
+                &mut self.layers,
+                SumTree::from_summary(SyntaxLayerSummary {
+                    min_depth: Default::default(),
+                    max_depth: Default::default(),
+                    // Deliberately bogus anchors, doesn't matter in this context
+                    range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_language: Default::default(),
+                    contains_unknown_injections: Default::default(),
+                }),
+            ));
+        }
     }
 }
 
