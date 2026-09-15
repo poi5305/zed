@@ -173,15 +173,29 @@ impl SharedThread {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        const COMPRESSION_LEVEL: i32 = 3;
         let json = serde_json::to_vec(self)?;
-        let compressed = zstd::encode_all(json.as_slice(), COMPRESSION_LEVEL)?;
-        Ok(compressed)
+        #[cfg(not(target_family = "wasm"))]
+        {
+            const COMPRESSION_LEVEL: i32 = 3;
+            let compressed = zstd::encode_all(json.as_slice(), COMPRESSION_LEVEL)?;
+            Ok(compressed)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Ok(json)
+        }
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let decompressed = zstd::decode_all(data)?;
-        Ok(serde_json::from_slice(&decompressed)?)
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let decompressed = zstd::decode_all(data)?;
+            Ok(serde_json::from_slice(&decompressed)?)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Ok(serde_json::from_slice(data)?)
+        }
     }
 }
 
@@ -500,6 +514,7 @@ impl ThreadsDatabase {
         thread: DbThread,
         folder_paths: &PathList,
     ) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
         const COMPRESSION_LEVEL: i32 = 3;
 
         #[derive(Serialize)]
@@ -532,9 +547,13 @@ impl ThreadsDatabase {
 
         let connection = connection.lock();
 
-        let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
-        let data_type = DataType::Zstd;
-        let data = compressed;
+        #[cfg(not(target_family = "wasm"))]
+        let (data_type, data) = {
+            let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
+            (DataType::Zstd, compressed)
+        };
+        #[cfg(target_family = "wasm")]
+        let (data_type, data) = (DataType::Json, json_data.into_bytes());
 
         // Use the thread's updated_at as created_at for new threads.
         // This ensures the creation time reflects when the thread was conceptually
@@ -657,8 +676,16 @@ impl ThreadsDatabase {
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
         let json_data = match data_type {
             DataType::Zstd => {
-                let decompressed = zstd::decode_all(&data[..])?;
-                String::from_utf8(decompressed)?
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let decompressed = zstd::decode_all(&data[..])?;
+                    String::from_utf8(decompressed)?
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    let _ = data;
+                    anyhow::bail!("zstd-compressed thread data cannot be decoded on wasm")
+                }
             }
             DataType::Json => String::from_utf8(data)?,
         };

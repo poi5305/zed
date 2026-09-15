@@ -64,10 +64,11 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
+use web_time::Instant;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
@@ -1517,14 +1518,23 @@ impl Thread {
             return Ok(temp_dir.clone());
         }
 
-        let temp_dir = tempfile::Builder::new()
-            .prefix("zed-agent-terminal-")
-            .tempdir()
-            .context("failed to create sandboxed terminal temp directory")?;
-        let temp_dir = temp_dir.keep();
-        self.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
-        cx.notify();
-        Ok(temp_dir)
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = cx;
+            anyhow::bail!("sandboxed terminal temp directories are not available in the browser");
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("zed-agent-terminal-")
+                .tempdir()
+                .context("failed to create sandboxed terminal temp directory")?;
+            let temp_dir = temp_dir.keep();
+            self.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
+            cx.notify();
+            Ok(temp_dir)
+        }
     }
 
     pub fn replay(
