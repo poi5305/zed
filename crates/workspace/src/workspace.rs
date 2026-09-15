@@ -1653,6 +1653,10 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    /// False until [`Self::load_workspace`] finishes, or until `open_items`
+    /// determines there is no serialized workspace to restore. Starts false so
+    /// observers waiting on initial restore do not treat construction as loaded.
+    initial_state_loaded: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2155,6 +2159,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            initial_state_loaded: false,
         }
     }
 
@@ -2907,6 +2912,10 @@ impl Workspace {
 
     pub fn is_restoring(&self) -> bool {
         self.restoring_workspace
+    }
+
+    pub fn initial_state_loaded(&self) -> bool {
+        self.initial_state_loaded
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7934,6 +7943,7 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
+                workspace.initial_state_loaded = true;
                 cx.notify();
             })?;
 
@@ -9296,6 +9306,12 @@ fn open_items(
             for _ in 0..project_paths_to_open.len() {
                 opened_items.push(None);
             }
+            workspace.update(cx, |workspace, cx| {
+                workspace.initial_state_loaded = true;
+                if cfg!(target_family = "wasm") {
+                    cx.notify();
+                }
+            })?;
         }
         assert!(opened_items.len() == project_paths_to_open.len());
 

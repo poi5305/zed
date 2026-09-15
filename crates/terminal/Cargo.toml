@@ -50,6 +50,12 @@ web-time.workspace = true
 libc.workspace = true
 sysinfo.workspace = true
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The web workspace patches `smol` to `web/vendor/smol_wasm`, which re-exports the
+# browser RPC client. Depending on it keeps this root crate free of any path into
+# `web/`, which §9's isolation check forbids.
+smol.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 

@@ -25,3 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1.1.2", features = ["v4", "js"] }
 wasm-bindgen-futures = "0.4"
+# Phase 2 shipped `src/rpc.rs` as a stand-in because this crate did not exist yet.
+# It does now, and until it was wired every `Fs::*` and `Process::*` call in the
+# browser returned "smol wasm RPC is not wired yet".
+wasm_rpc = { path = "../../crates/wasm_rpc" }

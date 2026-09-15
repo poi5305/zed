@@ -552,6 +552,71 @@ Two process lessons, both cheap to state and expensive to relearn:
    the right trade: a gate that over-reports costs a reworded comment, while teaching it to skip
    comments risks teaching it to skip a real occurrence inside a string. Reword the comment.
 
+### 5.7 Phase 4 is not done, and the compiler could not say so until now [verified]
+
+With every other crate in the graph compiling, `cargo check --workspace --target
+wasm32-unknown-unknown` finally reaches `zed_web_workspace` and reports 25 errors. Nine of
+them are calls to things that **do not exist anywhere in the tree** — verified by searching for
+each definition, not inferred from the error text:
+
+| Missing | Shape |
+| --- | --- |
+| `sqlez::remote_sql::{set_sql_endpoint, set_sql_rpc_endpoint, set_async_sql_client}` | an entire module: workspace/KVP persistence routed to the server's SQLite |
+| `db::prepare_web_database` | its async initialisation, awaited in `try_join!` at startup |
+| `assets::install_web_assets` | installs fetched assets into the embed store |
+| `terminal::set_remote_client` | the terminal remoting hook §6.4.1 depends on |
+| `settings::default_keymap_path`, `settings::specific_overrides_keymap_path` | keymap path accessors |
+| `Session::for_web` | a session that is not backed by a local sqlite file |
+| `Workspace::initial_state_loaded` | |
+| `PlatformTitleBar::set_left_padding` | |
+
+Two more of the same kind were found and fixed while getting here:
+`extensions_ui::init_remote_store` was called once and defined nowhere, and
+`web_extensions.rs` — 512 lines, documented as the web extensions UI over the `Extensions::*`
+RPC — was never declared as a module, so it had never been compiled at all.
+
+**The lesson is structural, not clerical.** An entry-point crate that nothing else depends on
+is the last thing a workspace check reaches, so every error in front of it hides every error
+inside it. Phase 4 could be written, reviewed and recorded as complete while referring to an
+API surface that was only ever planned. A crate in that position needs its own `cargo check`
+from the day it is created, even when — especially when — it cannot yet link.
+
+#### Ruling — SQL goes over RPC, the workspace layout does not go over SQL
+
+This section was written twice before it was right, and both wrong versions failed the same
+way: **the thing being measured was one level above the thing that does the work.** Recording
+that is more useful than recording the answer.
+
+- *First draft:* "`sqlez` is synchronous and the transport is async, so this is an
+  architectural fork needing workers and `Atomics.wait`." **Wrong.** `db`'s `query!` macro
+  wraps `sqlez`, and its dominant form generates `async fn` bodies. Callers already await.
+- *Second draft:* "therefore the layout persists over `Sql::` RPC." **Also wrong.**
+  `save_workspace` — the function that writes the pane and tab layout — does not use
+  `query!` at all. It is a hand-written `self.write(|conn| conn.with_savepoint(…))`
+  transaction with branching and recursive pane-group inserts inside the closure, so there is
+  no static SQL to forward.
+
+Measured, on `crates/workspace/src/persistence.rs`: **5 hand-written `self.write` closures**
+(`save_workspace`, `get_or_create_remote_connection`, `toolchains`, `set_toolchain`,
+`save_trusted_worktrees`), **1 `with_savepoint`**, and **18 direct `conn.select`/`conn.exec`
+reads**. The layout is written by the first of those and read by several of the last.
+
+The ruling, in two parts:
+
+| Path | Where it runs |
+| --- | --- |
+| `query!`'s **async** arms | over `Sql::query`/`Sql::batch` to the server's real SQLite. Every caller already awaits, so none change. Covers KVP and most workspace queries |
+| `query!`'s **sync** arms | fail honestly on wasm. They carry debugger breakpoints and worktree trust, not layout |
+| **the workspace layout itself** | a `Workspace::` RPC, **not** the SQL layer |
+
+The last row is the part worth arguing for. `zed_web_server` already serves
+`Workspace::ui_state`, `Workspace::activate`, `Workspace::set_sidebar_open` and
+`Workspace::set_project_groups`, so workspace state is already half server-side; layout joins
+what is there. More importantly, `save_workspace`'s transaction then runs **unchanged**, on a
+machine that has a synchronous connection, instead of being re-expressed as a batch and
+trusted to still be equivalent. Nothing in the browser blocks, nothing needs
+`SharedArrayBuffer`, and the layout follows the user to another machine.
+
 ## 6. The four local features
 
 ### 6.1 The governing fact [verified]

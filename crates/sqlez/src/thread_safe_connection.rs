@@ -1,20 +1,25 @@
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 use collections::HashMap;
 use futures::{Future, FutureExt, channel::oneshot};
 use parking_lot::{Mutex, RwLock};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 use std::{
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, LazyLock},
     thread,
-    time::Duration,
 };
 use thread_local::ThreadLocal;
 
 use crate::{connection::Connection, domain::Migrator, util::UnboundedSyncSender};
 
+#[cfg(not(target_family = "wasm"))]
 const MIGRATION_RETRIES: usize = 10;
+#[cfg(not(target_family = "wasm"))]
 const CONNECTION_INITIALIZE_RETRIES: usize = 50;
+#[cfg(not(target_family = "wasm"))]
 const CONNECTION_INITIALIZE_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 type QueuedWrite = Box<dyn 'static + Send + FnOnce()>;
@@ -80,49 +85,61 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
         self.connection
             .initialize_queues(self.write_queue_constructor);
 
-        let db_initialize_query = self.db_initialize_query;
+        #[cfg(target_family = "wasm")]
+        {
+            // Schema lives on the server (`Sql::migrate` via `db::prepare_web_database`).
+            let _ = self.db_initialize_query;
+            Ok(self.connection)
+        }
 
-        self.connection
-            .write(move |connection| {
-                if let Some(db_initialize_query) = db_initialize_query {
-                    connection.exec(db_initialize_query).with_context(|| {
-                        format!(
-                            "Db initialize query failed to execute: {}",
-                            db_initialize_query
-                        )
-                    })?()?;
-                }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let db_initialize_query = self.db_initialize_query;
 
-                // Retry failed migrations in case they were run in parallel from different
-                // processes. This gives a best attempt at migrating before bailing
-                let mut migration_result =
-                    anyhow::Result::<()>::Err(anyhow::anyhow!("Migration never run"));
-
-                let foreign_keys_enabled: bool =
-                    connection.select_row::<i32>("PRAGMA foreign_keys")?()
-                        .unwrap_or(None)
-                        .map(|enabled| enabled != 0)
-                        .unwrap_or(false);
-
-                connection.exec("PRAGMA foreign_keys = OFF;")?()?;
-
-                for _ in 0..MIGRATION_RETRIES {
-                    migration_result = connection
-                        .with_savepoint("thread_safe_multi_migration", || M::migrate(connection));
-
-                    if migration_result.is_ok() {
-                        break;
+            self.connection
+                .write(move |connection| {
+                    if let Some(db_initialize_query) = db_initialize_query {
+                        connection.exec(db_initialize_query).with_context(|| {
+                            format!(
+                                "Db initialize query failed to execute: {}",
+                                db_initialize_query
+                            )
+                        })?()?;
                     }
-                }
 
-                if foreign_keys_enabled {
-                    connection.exec("PRAGMA foreign_keys = ON;")?()?;
-                }
-                migration_result
-            })
-            .await?;
+                    // Retry failed migrations in case they were run in parallel from different
+                    // processes. This gives a best attempt at migrating before bailing
+                    let mut migration_result =
+                        anyhow::Result::<()>::Err(anyhow::anyhow!("Migration never run"));
 
-        Ok(self.connection)
+                    let foreign_keys_enabled: bool =
+                        connection.select_row::<i32>("PRAGMA foreign_keys")?()
+                            .unwrap_or(None)
+                            .map(|enabled| enabled != 0)
+                            .unwrap_or(false);
+
+                    connection.exec("PRAGMA foreign_keys = OFF;")?()?;
+
+                    for _ in 0..MIGRATION_RETRIES {
+                        migration_result = connection
+                            .with_savepoint("thread_safe_multi_migration", || {
+                                M::migrate(connection)
+                            });
+
+                        if migration_result.is_ok() {
+                            break;
+                        }
+                    }
+
+                    if foreign_keys_enabled {
+                        connection.exec("PRAGMA foreign_keys = ON;")?()?;
+                    }
+                    migration_result
+                })
+                .await?;
+
+            Ok(self.connection)
+        }
     }
 }
 
@@ -200,6 +217,10 @@ impl ThreadSafeConnection {
             Self::open_shared_memory(uri)
         };
 
+        #[cfg(target_family = "wasm")]
+        let _ = connection_initialize_query;
+
+        #[cfg(not(target_family = "wasm"))]
         if let Some(initialize_query) = connection_initialize_query {
             let mut last_error = None;
             let initialized = (0..CONNECTION_INITIALIZE_RETRIES).any(|attempt| {
@@ -243,6 +264,7 @@ impl ThreadSafeConnection {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn is_schema_lock_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
     message.contains("database schema is locked") || message.contains("database is locked")

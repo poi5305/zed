@@ -16,7 +16,7 @@ commit messages and `docs/web-zed-plan.md` do not already say.
 | 1 | ✅ second workspace + review round 1 |
 | 2 | ✅ seven vendored forks + review round 2 |
 | 3 | ✅ 48 manifests + 72 `.rs` + review rounds 3 and 4 |
-| 4a · 4b · 4c | ✅ `build.sh`, three web crates, `zed_web_server` |
+| 4a · 4b · 4c | ⚠️ **recorded as done, and is not.** `build.sh`, the three web crates and `zed_web_server` exist, but `zed_web_workspace` was written against **nine APIs that were never implemented** (see §5.7 of the plan). Nothing caught it because the crate had never compiled |
 | **5** | **in progress** — `cd web && cargo check --workspace --target wasm32-unknown-unknown` is down to `settings_ui` and `keymap_editor`. Everything else in the graph type-checks, including `language`, `languages`, `edit_prediction_ui` and `sidebar` |
 | 6 | `Home::` RPC done (server + the wasm seeding API); the four panels not started |
 

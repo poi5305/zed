@@ -527,3 +527,17 @@ impl RpcClient {
         receiver
     }
 }
+
+#[cfg(target_family = "wasm")]
+impl sqlez::remote_sql::AsyncSqlClient for RpcClient {
+    fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<serde_json::Value>> {
+        use futures::FutureExt;
+        let this = self.clone();
+        let method = method.to_string();
+        async move { this.call(&method, &params).await }.boxed()
+    }
+}

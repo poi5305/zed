@@ -17275,6 +17275,7 @@ name = "sqlez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "collections",
  "futures 0.3.32",
  "indoc",
@@ -17282,6 +17283,8 @@ dependencies = [
  "log",
  "parking_lot",
  "pollster 0.4.0",
+ "serde",
+ "serde_json",
  "sqlformat",
  "thread_local",
  "util",
@@ -18374,6 +18377,7 @@ dependencies = [
  "schemars 1.0.4",
  "serde",
  "settings",
+ "smol",
  "sysinfo 0.39.6",
  "task",
  "theme",

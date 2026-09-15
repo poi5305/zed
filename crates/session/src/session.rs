@@ -46,6 +46,16 @@ impl Session {
         }
     }
 
+    /// Browser session: no local sqlite, so there is no previous session to restore.
+    #[cfg(target_family = "wasm")]
+    pub fn for_web() -> Self {
+        Self {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            old_session_id: None,
+            old_window_ids: None,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_with_old_session(old_session_id: String) -> Self {
         Self {

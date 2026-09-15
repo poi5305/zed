@@ -13662,6 +13662,7 @@ dependencies = [
  "urlencoding",
  "util",
  "vte",
+ "wasm_remote",
  "web-time",
  "windows 0.62.2",
 ]
