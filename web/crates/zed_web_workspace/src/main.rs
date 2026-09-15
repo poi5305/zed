@@ -121,6 +121,14 @@ extern "C" {
 }
 
 #[cfg(target_family = "wasm")]
+#[derive(serde::Deserialize)]
+struct WebHomeDirs {
+    home: String,
+    config: String,
+    data: String,
+}
+
+#[cfg(target_family = "wasm")]
 #[derive(Clone, Default, serde::Deserialize)]
 struct WebWorkspaceUiState {
     sidebar_open: bool,
@@ -1652,8 +1660,7 @@ fn install_workspace_chrome(cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
-        let activity_indicator =
-            activity_indicator::ActivityIndicator::new(workspace, window, cx);
+        let activity_indicator = activity_indicator::ActivityIndicator::new(workspace, window, cx);
         let edit_prediction_menu_handle = ui::PopoverMenuHandle::default();
         let edit_prediction_button = cx.new(|cx| {
             edit_prediction_ui::EditPredictionButton::new(
@@ -2149,13 +2156,41 @@ pub fn main() {
         sqlez::remote_sql::set_sql_endpoint(format!("{server_origin}/sql"));
         sqlez::remote_sql::set_sql_rpc_endpoint(rpc_url);
         sqlez::remote_sql::set_async_sql_client({
-        let client = remote_client.clone();
-        move |method: &str, params: serde_json::Value| {
-            let client = client.clone();
-            let method = method.to_string();
-            futures::FutureExt::boxed(async move { client.call(&method, &params).await })
+            let client = remote_client.clone();
+            move |method: &str, params: serde_json::Value| {
+                let client = client.clone();
+                let method = method.to_string();
+                futures::FutureExt::boxed(async move { client.call(&method, &params).await })
+            }
+        });
+        // `home_dir`, `config_dir` and `data_dir` cache their first result forever, so the
+        // server's real directories have to arrive before anything expands a `~`. Seeding
+        // here, ahead of the database and asset work, is the last point where that holds.
+        //
+        // A failure is not fatal. `Home::dirs` refuses rather than guessing when
+        // ZED_WEB_RESTRICT_PATHS puts those directories outside the workspace, and the
+        // editor still opens -- `~` expansion is simply wrong there, which is why this
+        // says so rather than failing quietly.
+        match remote_client
+            .call::<_, WebHomeDirs>("Home::dirs", &serde_json::json!({}))
+            .await
+        {
+            Ok(dirs) => {
+                util::paths::set_home_dir(std::path::PathBuf::from(dirs.home));
+                paths::set_config_dir(std::path::PathBuf::from(dirs.config));
+                paths::set_data_dir(std::path::PathBuf::from(dirs.data));
+            }
+            Err(error) => {
+                web_sys::console::warn_1(
+                    &format!(
+                        "zed_web_workspace: Home::dirs failed ({error:#}); \
+                         ~ expansion will use the /workspace placeholder and be wrong"
+                    )
+                    .into(),
+                );
+            }
         }
-    });
+
         let initialization = futures::try_join!(load_web_assets(), db::prepare_web_database());
         if let Err(error) = initialization {
             web_sys::console::error_1(
