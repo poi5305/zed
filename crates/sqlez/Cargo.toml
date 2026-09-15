@@ -23,3 +23,8 @@ uuid.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libsqlite3-sys.workspace = true
 sqlformat.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true

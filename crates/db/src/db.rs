@@ -334,6 +334,75 @@ where
         .detach()
 }
 
+/// Runs inventory-registered domain migrations against the server SQLite via `Sql::migrate`.
+///
+/// Must be awaited before `AppDatabase::open_in_memory` on wasm: that constructor only
+/// creates a local handle, because there is no in-process sqlite.
+#[cfg(target_family = "wasm")]
+pub async fn prepare_web_database() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let registrations: Vec<&DomainMigration> = inventory::iter::<DomainMigration>().collect();
+    let sorted = topological_sort(&registrations);
+    for reg in sorted {
+        migrate_web_domain(reg)
+            .await
+            .with_context(|| format!("Failed to prepare web database (domain '{}')", reg.name))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+async fn migrate_web_domain(reg: &DomainMigration) -> anyhow::Result<()> {
+    use anyhow::bail;
+    use sqlez::remote_sql::{self, MigrateResult};
+
+    match remote_sql::migrate(reg.name, reg.migrations, &[]).await? {
+        MigrateResult::Applied { applied } => {
+            log::info!(
+                "web database domain '{}' migrated (applied {applied} step(s))",
+                reg.name
+            );
+            Ok(())
+        }
+        MigrateResult::Drift { changes } => {
+            let mut allowed = Vec::new();
+            for change in &changes {
+                if (reg.should_allow_migration_change)(
+                    change.index,
+                    &change.stored,
+                    &change.proposed,
+                ) {
+                    allowed.push(change.index as u64);
+                } else {
+                    bail!(
+                        "Migration changed for {} at step {}\n\nStored migration:\n{}\n\nProposed migration:\n{}",
+                        reg.name,
+                        change.index,
+                        change.stored,
+                        change.proposed
+                    );
+                }
+            }
+            match remote_sql::migrate(reg.name, reg.migrations, &allowed).await? {
+                MigrateResult::Applied { applied } => {
+                    log::info!(
+                        "web database domain '{}' migrated after allowed drift (applied {applied} step(s))",
+                        reg.name
+                    );
+                    Ok(())
+                }
+                MigrateResult::Drift { changes } => {
+                    bail!(
+                        "Migration drift remains for domain '{}' after allowed changes: {changes:?}",
+                        reg.name
+                    )
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;
