@@ -189,6 +189,40 @@ const AGENT_ID_CHIP_CHARACTERS: usize = 6;
 /// the list carries it and none of it tells two runs apart.
 const WORKFLOW_RUN_ID_PREFIX: &str = "wf_";
 
+/// The field Claude Code writes beside a `Bash` result when the command was left running
+/// in the background. Its presence is what tells a backgrounded call from an ordinary one,
+/// and its value is the id every later notification names that shell by.
+const BACKGROUND_TASK_ID_FIELD: &str = "backgroundTaskId";
+
+/// What a backgrounded call's own result says before naming the file the command's output
+/// is being written to.
+const BACKGROUND_OUTPUT_PREFIX: &str = "Output is being written to: ";
+
+/// The notification Claude Code queues into the conversation when a background command
+/// ends, and the element of it naming which one ended. This is the only record that a
+/// shell is over: the command writes to a file rather than into the conversation.
+const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
+const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
+const TASK_NOTIFICATION_ID_OPEN: &str = "<task-id>";
+const TASK_NOTIFICATION_ID_CLOSE: &str = "</task-id>";
+
+/// The sentence Claude Code writes immediately after the output path. The path is cut
+/// here rather than at the first `. `, because a `. ` can be part of the path itself.
+const BACKGROUND_OUTPUT_FOLLOWING_SENTENCE: &str = ". You will be notified";
+
+/// How much of a command a background shell's label carries when the call recorded no
+/// description of what it was for.
+const SHELL_LABEL_CHARACTERS: usize = 40;
+
+/// How much of a command a background shell's tooltip carries. A backgrounded command is
+/// often a whole script written inline, and a tooltip the height of the window says less
+/// than one that fits on screen.
+const SHELL_TOOLTIP_COMMAND_CHARACTERS: usize = 240;
+
+/// What a background shell's row says beside its name. Only the ones still running are
+/// drawn, so this is the one thing such a row can say.
+const SHELL_RUNNING_NOTE: &str = "Running";
+
 const MAIN_CONVERSATION_CHIP: &str = "Main";
 const AGENT_READ_ONLY_NOTE: &str =
     "This is an agent's conversation, and can only be read. Switch to Main to reply.";
@@ -2567,18 +2601,22 @@ impl ClaudeSessionsPanel {
         let agent_rows: Vec<Vec<SessionAgentRow>> = {
             let store = self.store.read(cx);
             let open_target = store.transcript_target().clone();
-            let main_path = store.main_transcript().active_path();
+            let main_transcript = store.main_transcript();
+            let main_path = main_transcript.active_path();
+            // Only the followed session's conversation is read, and a background shell is
+            // recorded nowhere else, so every other session's row list has none — which
+            // is the same way `main_path` is withheld from them below.
+            let shells = background_shells(&main_transcript.full_path());
             sessions
                 .iter()
                 .map(|session| {
+                    let is_selected = selected_process_id == Some(session.process_id);
                     let main_path: &[&TranscriptRecord] =
-                        if selected_process_id == Some(session.process_id) {
-                            &main_path
-                        } else {
-                            &[]
-                        };
+                        if is_selected { &main_path } else { &[] };
+                    let shells: &[BackgroundShell] = if is_selected { &shells } else { &[] };
                     session_agent_rows(
                         store.subagents_of(&session.session_id),
+                        shells,
                         main_path,
                         &open_target,
                     )
@@ -2770,6 +2808,19 @@ impl ClaudeSessionsPanel {
                     this.reveal_in_pane(Some(process_id), target.clone(), window, cx)
                 }))
                 .child(agent_row_body(label, note, Color::Muted)),
+                SessionAgentRow::Shell { label, note } => {
+                    ListItem::new(SharedString::from(format!(
+                        "claude-session-shell-{process_id}-{index}"
+                    )))
+                    .spacing(ListItemSpacing::Sparse)
+                    .indent_level(1)
+                    .start_slot(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(agent_row_body(label, Some(note), Color::Muted))
+                }
             })
             .collect()
     }
@@ -2928,14 +2979,15 @@ impl ClaudeSessionsPanel {
     fn render_agent_chips(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Read out whole before any listener is built: the store's borrow and the
         // `cx.listener` calls below cannot be held at the same time.
-        let (subagents, target, states) = {
+        let (subagents, target, states, shells) = {
             let store = self.store.read(cx);
             store.selected()?;
             let target = store.transcript_target().clone();
             // The states come off the session's own conversation, which is followed
             // whichever one is on screen, so a chip stays truthful while its own agent's
             // records are the ones being drawn.
-            let main_path = store.main_transcript().active_path();
+            let main_transcript = store.main_transcript();
+            let main_path = main_transcript.active_path();
             let subagents: Vec<SubagentSummary> = store
                 .subagents()
                 .iter()
@@ -2946,10 +2998,14 @@ impl ClaudeSessionsPanel {
                 .iter()
                 .map(|summary| agent_state(summary, &main_path))
                 .collect();
-            (subagents, target, states)
+            let shells: Vec<BackgroundShell> = background_shells(&main_transcript.full_path())
+                .into_iter()
+                .filter(|shell| !shell.finished)
+                .collect();
+            (subagents, target, states, shells)
         };
 
-        if subagents.is_empty() && target == TranscriptTarget::Main {
+        if subagents.is_empty() && shells.is_empty() && target == TranscriptTarget::Main {
             return None;
         }
 
@@ -2969,7 +3025,7 @@ impl ClaudeSessionsPanel {
                 None,
                 target == TranscriptTarget::Main,
                 false,
-                TranscriptTarget::Main,
+                Some(TranscriptTarget::Main),
                 cx,
             ));
 
@@ -2986,7 +3042,22 @@ impl ClaudeSessionsPanel {
                 Some(agent_chip_tooltip(summary)),
                 is_selected,
                 is_running,
-                chip_target,
+                Some(chip_target),
+                cx,
+            ));
+        }
+
+        // Last in the row, after everything that opens a conversation: a shell chip is a
+        // label rather than a tab, and one sitting among the tabs would read as a tab that
+        // refuses to open. It pulses because only the shells still running are drawn.
+        for (index, shell) in shells.iter().enumerate() {
+            row = row.child(self.render_agent_chip(
+                &format!("shell-{index}"),
+                shell.label.clone(),
+                Some(background_shell_tooltip(shell)),
+                false,
+                true,
+                None,
                 cx,
             ));
         }
@@ -2998,6 +3069,10 @@ impl ClaudeSessionsPanel {
     /// retargeting this one: a run of several agents is watched beside the conversation
     /// that started it, and a tab that swapped what it was showing under the reader would
     /// make watching two of them impossible.
+    ///
+    /// `None` as the target is a chip that names something with no conversation to open —
+    /// a background shell, whose output goes to a file. It is drawn as the others are so
+    /// that the row reads as one list of what the session is running.
     fn render_agent_chip(
         &self,
         id: &str,
@@ -3005,7 +3080,7 @@ impl ClaudeSessionsPanel {
         tooltip: Option<SharedString>,
         is_selected: bool,
         is_running: bool,
-        target: TranscriptTarget,
+        target: Option<TranscriptTarget>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let button = Button::new(
@@ -3023,9 +3098,11 @@ impl ClaudeSessionsPanel {
         .when_some(tooltip, |this, tooltip| {
             this.tooltip(Tooltip::text(tooltip))
         })
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_agent_in_pane(target.clone(), window, cx)
-        }));
+        .when_some(target, |this, target| {
+            this.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_agent_in_pane(target.clone(), window, cx)
+            }))
+        });
 
         if !is_running {
             return button.into_any_element();
@@ -6260,6 +6337,12 @@ enum SessionAgentRow {
         indent_level: usize,
         target: TranscriptTarget,
     },
+    /// A command the session left running in the background. Its output goes to a file
+    /// rather than into a conversation, so the row says what is running and opens nothing.
+    Shell {
+        label: SharedString,
+        note: SharedString,
+    },
 }
 
 /// The agent list of one session: the agents it spawned itself, then each workflow run it
@@ -6277,6 +6360,7 @@ enum SessionAgentRow {
 /// what `main_path` and `open_target` are for.
 fn session_agent_rows(
     subagents: &[SubagentSummary],
+    shells: &[BackgroundShell],
     main_path: &[&TranscriptRecord],
     open_target: &TranscriptTarget,
 ) -> Vec<SessionAgentRow> {
@@ -6348,6 +6432,15 @@ fn session_agent_rows(
                 },
             });
         }
+    }
+
+    // Below the agents rather than among them: a shell is not a conversation, and a row
+    // that opens nothing sitting between rows that do would read as one that failed to.
+    for shell in shells.iter().filter(|shell| !shell.finished) {
+        rows.push(SessionAgentRow::Shell {
+            label: shell.label.clone(),
+            note: SharedString::from(SHELL_RUNNING_NOTE),
+        });
     }
 
     rows
@@ -6593,6 +6686,213 @@ fn subagents_of_call<'summaries>(
         .iter()
         .filter(|summary| summary.workflow_run_id.as_deref() == Some(workflow_run_id.as_str()))
         .collect()
+}
+
+/// One command the session left running with `Bash(run_in_background)`.
+///
+/// A background shell writes to a file rather than into the conversation, and the only
+/// thing the conversation says about it after it starts is the notification that ends it.
+/// So a reader watching the panel has no way of telling that one is running at all, which
+/// is what listing them puts back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BackgroundShell {
+    task_id: SharedString,
+    /// What the call said it was for, failing that the head of the command it ran.
+    label: SharedString,
+    /// The whole command, which is the tooltip's to show; the label is only its head.
+    command: Option<SharedString>,
+    /// Where the output is being written, as the call's own result announced it.
+    output_path: Option<SharedString>,
+    /// Whether a notification has since said this shell ended, however it ended. What the
+    /// panel offers is the ones still running, and a shell that failed is not one of them.
+    finished: bool,
+}
+
+/// Every background shell the conversation records, in the order they were started.
+///
+/// Read down the whole conversation rather than the path the model can still see, for the
+/// reason [`call_is_answered`] gives: compaction severs that chain, and a shell started
+/// before one is still running after it — dropping it from the list would be the panel
+/// claiming a running command had stopped.
+fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<BackgroundShell> {
+    // The `Bash` inputs seen so far, keyed by call id. A call is written before the result
+    // announcing the shell it started, so one forward pass pairs the two.
+    let mut bash_calls: HashMap<&'records str, (Option<&'records str>, Option<&'records str>)> =
+        HashMap::default();
+    let mut shells: Vec<BackgroundShell> = Vec::new();
+
+    for record in path.iter().copied() {
+        let content = record
+            .raw
+            .get("message")
+            .and_then(|message| message.get("content"));
+
+        if let Some(blocks) = content.and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some(TOOL_USE_BLOCK_TYPE)
+                    || block.get("name").and_then(Value::as_str) != Some(BASH_TOOL_NAME)
+                {
+                    continue;
+                }
+                let Some(tool_use_id) = block.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let argument = |key: &str| {
+                    block
+                        .get("input")
+                        .and_then(|input| input.get(key))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                };
+                bash_calls.insert(tool_use_id, (argument("description"), argument("command")));
+            }
+        }
+
+        if let Some(task_id) = record
+            .raw
+            .get("toolUseResult")
+            .and_then(|result| result.get(BACKGROUND_TASK_ID_FIELD))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|task_id| !task_id.is_empty())
+        {
+            // A record can answer several calls at once; the backgrounded `Bash` is the
+            // result whose id we have already seen as a `Bash` tool_use, failing that the
+            // result whose text is the launch announcement. Taking `.first()` would name
+            // the shell after whichever other call happened to be answered in the same
+            // record.
+            let results = tool_result_texts(record);
+            let chosen = results
+                .iter()
+                .find(|(tool_use_id, _)| bash_calls.contains_key(tool_use_id))
+                .or_else(|| {
+                    results
+                        .iter()
+                        .find(|(_, announcement)| background_output_path(announcement).is_some())
+                })
+                .or_else(|| results.first());
+            let (description, command) = chosen
+                .and_then(|(tool_use_id, _)| bash_calls.get(tool_use_id))
+                .copied()
+                .unwrap_or((None, None));
+            shells.push(BackgroundShell {
+                task_id: SharedString::from(task_id.to_string()),
+                label: background_shell_label(task_id, description, command),
+                command: command.map(|command| SharedString::from(command.to_string())),
+                output_path: chosen
+                    .and_then(|(_, announcement)| background_output_path(announcement))
+                    .map(SharedString::from),
+                finished: false,
+            });
+        }
+
+        // The notification arrives as words rather than as a tool result, in one of two
+        // shapes: the message it is delivered as when the session was between turns, and
+        // the attachment it is folded into when it arrived mid-turn and was absorbed into
+        // the turn already running. Both are read, because which of them a shell gets is
+        // decided by what the session happened to be doing when its command ended — so
+        // reading only the first leaves most shells pulsing for the rest of the session.
+        //
+        // Both are tested as strings, which costs nothing: a record whose content is
+        // blocks is never one of these, and joining every block's text to find out would
+        // walk whole tool outputs on every draw.
+        let notification = content
+            .and_then(Value::as_str)
+            .or_else(|| {
+                record
+                    .raw
+                    .get("attachment")
+                    .and_then(|attachment| attachment.get("prompt"))
+                    .and_then(Value::as_str)
+            })
+            .and_then(task_notification_id);
+        if let Some(task_id) = notification {
+            // Applied now rather than collected and replayed over every shell at the end:
+            // a later launch can reuse the same id, and a set of every id ever notified
+            // would mark that new shell finished the moment it started.
+            for shell in &mut shells {
+                if shell.task_id.as_ref() == task_id {
+                    shell.finished = true;
+                }
+            }
+        }
+    }
+
+    shells
+}
+
+/// The shell or agent a queued task notification is about, or `None` for text that is not
+/// one. Matched only when the wrapper is the whole message, so that a reader quoting the
+/// words back — including at the front of a question — is not read as a shell ending.
+fn task_notification_id(text: &str) -> Option<&str> {
+    let text = text.trim();
+    if !text.starts_with(TASK_NOTIFICATION_OPEN) {
+        return None;
+    }
+    let (inside, rest) = text.split_once(TASK_NOTIFICATION_CLOSE)?;
+    // Words after the wrapper are the reader asking about it, not the CLI reporting it.
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let (_, rest) = inside.split_once(TASK_NOTIFICATION_ID_OPEN)?;
+    let (task_id, _) = rest.split_once(TASK_NOTIFICATION_ID_CLOSE)?;
+    let task_id = task_id.trim();
+    (!task_id.is_empty()).then_some(task_id)
+}
+
+/// The file a backgrounded call's own result says its output is being written to.
+fn background_output_path(announcement: &str) -> Option<String> {
+    let (_, rest) = announcement.split_once(BACKGROUND_OUTPUT_PREFIX)?;
+    let path = match rest.split_once(BACKGROUND_OUTPUT_FOLLOWING_SENTENCE) {
+        Some((path, _)) => path,
+        None => match rest.split_once(". ") {
+            Some((path, _)) => path,
+            None => rest.trim_end().trim_end_matches('.'),
+        },
+    };
+    let path = path.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// What a background shell is called in the list: what the call said it was for, failing
+/// that the head of the command it ran, failing that the id the notifications name it by.
+fn background_shell_label(
+    task_id: &str,
+    description: Option<&str>,
+    command: Option<&str>,
+) -> SharedString {
+    if let Some(description) = description {
+        return SharedString::from(description.to_string());
+    }
+
+    // A command is often a whole pipeline written over several lines, of which the first
+    // is what says which call it is.
+    if let Some(first_line) = command
+        .and_then(|command| command.lines().next())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        return SharedString::from(truncate_and_trailoff(first_line, SHELL_LABEL_CHARACTERS));
+    }
+
+    SharedString::from(format!("Shell {task_id}"))
+}
+
+/// What a shell's tooltip adds to its label: only what the call actually recorded, because
+/// a line reading `Output: unknown` says less than no line.
+fn background_shell_tooltip(shell: &BackgroundShell) -> SharedString {
+    let mut lines = vec![format!("Background shell {}", shell.task_id)];
+    if let Some(command) = shell.command.as_deref() {
+        lines.push(truncate_and_trailoff(
+            command,
+            SHELL_TOOLTIP_COMMAND_CHARACTERS,
+        ));
+    }
+    if let Some(output_path) = shell.output_path.as_deref() {
+        lines.push(format!("Output: {output_path}"));
+    }
+    SharedString::from(lines.join("\n"))
 }
 
 /// The run id the `Workflow` call's own result announces.
@@ -10106,7 +10406,7 @@ mod tests {
         agent.task_agent_finished = Some(true);
 
         assert_eq!(
-            session_agent_rows(&[agent], &[], &READING_NOTHING),
+            session_agent_rows(&[agent], &[], &[], &READING_NOTHING),
             Vec::new()
         );
     }
@@ -12620,7 +12920,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         second_of_run.meta.workflow_phase = Some("Wait B".to_string());
         second_of_run.workflow_agent_finished = Some(false);
 
-        let rows = session_agent_rows(&[plain, first_of_run, second_of_run], &[], &READING_NOTHING);
+        let rows = session_agent_rows(
+            &[plain, first_of_run, second_of_run],
+            &[],
+            &[],
+            &READING_NOTHING,
+        );
 
         assert_eq!(
             rows,
@@ -12676,7 +12981,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let mut second = subagent("a2", Some("wf_2"), None);
         second.workflow_agent_finished = Some(false);
 
-        let rows = session_agent_rows(&[first, second], &[], &READING_NOTHING);
+        let rows = session_agent_rows(&[first, second], &[], &[], &READING_NOTHING);
 
         assert_eq!(
             headings_of(&rows),
@@ -12695,7 +13000,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 SessionAgentRow::WorkflowRun { label, note } => {
                     Some((label.as_ref(), note.as_ref()))
                 }
-                SessionAgentRow::Agent { .. } => None,
+                SessionAgentRow::Agent { .. } | SessionAgentRow::Shell { .. } => None,
             })
             .collect()
     }
@@ -12704,7 +13009,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         rows.iter()
             .filter_map(|row| match row {
                 SessionAgentRow::Agent { label, .. } => Some(label.as_ref()),
-                SessionAgentRow::WorkflowRun { .. } => None,
+                SessionAgentRow::WorkflowRun { .. } | SessionAgentRow::Shell { .. } => None,
             })
             .collect()
     }
@@ -12721,7 +13026,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         working.meta.description = Some("stage-B".to_string());
         working.workflow_agent_finished = Some(false);
 
-        let rows = session_agent_rows(&[returned, working], &[], &READING_NOTHING);
+        let rows = session_agent_rows(&[returned, working], &[], &[], &READING_NOTHING);
 
         assert_eq!(labels_of(&rows), vec!["stage-B"]);
         assert_eq!(
@@ -12739,7 +13044,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         only.workflow_agent_finished = Some(true);
 
         assert_eq!(
-            session_agent_rows(&[only], &[], &READING_NOTHING),
+            session_agent_rows(&[only], &[], &[], &READING_NOTHING),
             Vec::new()
         );
     }
@@ -12756,7 +13061,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             agent_id: "a1".to_string(),
             workflow_run_id: Some("wf_1".to_string()),
         };
-        let rows = session_agent_rows(&[returned], &[], &reading_it);
+        let rows = session_agent_rows(&[returned], &[], &[], &reading_it);
 
         assert_eq!(labels_of(&rows), vec!["stage-A"]);
     }
@@ -12770,7 +13075,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         agent.meta.description = Some("look at the file".to_string());
 
         assert_eq!(
-            labels_of(&session_agent_rows(&[agent], &[], &READING_NOTHING)),
+            labels_of(&session_agent_rows(&[agent], &[], &[], &READING_NOTHING)),
             vec!["look at the file"],
         );
     }
@@ -12787,6 +13092,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let rows = session_agent_rows(
             &[first_of_first, only_of_second, second_of_first],
             &[],
+            &[],
             &READING_NOTHING,
         );
 
@@ -12800,6 +13106,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     }
                     TranscriptTarget::Main => "main".to_string(),
                 },
+                SessionAgentRow::Shell { label, .. } => format!("shell:{label}"),
             })
             .collect();
         assert_eq!(
@@ -12813,6 +13120,473 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             ],
             "both of wf_1's agents sit under its heading even though a2 was between them \
              in the input; got {outline:?}"
+        );
+    }
+
+    /// The result Claude Code writes for a `Bash` call it left running in the background,
+    /// verbatim in shape: the announcement the reader is shown, and the `backgroundTaskId`
+    /// beside it that names the shell.
+    fn background_launch_line(
+        uuid: &str,
+        tool_use_id: &str,
+        task_id: &str,
+        output_path: &str,
+    ) -> String {
+        serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": format!(
+                    "Command running in background with ID: {task_id}. Output is being \
+                     written to: {output_path}. You will be notified when it completes. \
+                     To check interim output, use Read on that file path.",
+                ),
+            }] },
+            "toolUseResult": { "stdout": "", "backgroundTaskId": task_id },
+        })
+        .to_string()
+    }
+
+    /// The notification Claude Code queues into the conversation when a background command
+    /// ends, which is the only record that it did.
+    fn task_notification_line(uuid: &str, task_id: &str, status: &str) -> String {
+        user_message_line(
+            uuid,
+            &format!(
+                "<task-notification>\n<task-id>{task_id}</task-id>\n<status>{status}</status>\n\
+                 </task-notification>",
+            ),
+        )
+    }
+
+    /// The same notification as [`task_notification_line`], in the shape Claude Code
+    /// writes when it arrived while a turn was running and was absorbed into that turn
+    /// rather than delivered as a message of its own. Most shells end this way: the
+    /// session is usually working when the command it backgrounded finishes.
+    fn absorbed_task_notification_line(uuid: &str, parent_uuid: &str, task_id: &str) -> String {
+        serde_json::json!({
+            "type": "attachment",
+            "uuid": uuid,
+            "parentUuid": parent_uuid,
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "task-notification",
+                "prompt": format!(
+                    "<task-notification>\n<task-id>{task_id}</task-id>\n\
+                     <status>completed</status>\n</task-notification>",
+                ),
+            },
+        })
+        .to_string()
+    }
+
+    fn shells_of(json_lines: &[String]) -> Vec<BackgroundShell> {
+        let records: Vec<TranscriptRecord> = json_lines
+            .iter()
+            .map(|line| record(line.as_str()))
+            .collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        background_shells(&path)
+    }
+
+    /// A backgrounded command writes to a file and says nothing more in the conversation,
+    /// so without this the panel shows a session that looks idle while it is running work.
+    #[test]
+    fn a_backgrounded_bash_call_is_listed_as_the_shell_it_started() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({
+                    "command": "pnpm test",
+                    "description": "Run the suite",
+                    "run_in_background": true,
+                }),
+            ),
+            background_launch_line("m2", "toolu_01", "b7q64rk1n", "/tmp/tasks/b7q64rk1n.output"),
+        ];
+
+        assert_eq!(
+            shells_of(&lines),
+            vec![BackgroundShell {
+                task_id: SharedString::from("b7q64rk1n"),
+                label: SharedString::from("Run the suite"),
+                command: Some(SharedString::from("pnpm test")),
+                output_path: Some(SharedString::from("/tmp/tasks/b7q64rk1n.output")),
+                finished: false,
+            }],
+            "the call says what the shell is for and where its output goes; all of that \
+             has to survive into the row"
+        );
+    }
+
+    /// The panel offers what is still running, exactly as it does for agents: a session
+    /// that has backgrounded twenty commands would otherwise bury the one still going.
+    #[test]
+    fn a_shell_the_notification_has_ended_is_not_offered() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "sleep 1", "description": "Wait" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            tool_use_line(
+                "m3",
+                "toolu_02",
+                "Bash",
+                serde_json::json!({ "command": "sleep 2", "description": "Wait longer" }),
+            ),
+            background_launch_line("m4", "toolu_02", "b2", "/tmp/tasks/b2.output"),
+            task_notification_line("m5", "b1", "completed"),
+        ];
+        let shells = shells_of(&lines);
+
+        assert_eq!(
+            shells
+                .iter()
+                .map(|shell| (shell.task_id.as_ref(), shell.finished))
+                .collect::<Vec<_>>(),
+            vec![("b1", true), ("b2", false)],
+            "the notification ends the shell it names and no other"
+        );
+        assert_eq!(
+            session_agent_rows(&[], &shells, &[], &READING_NOTHING),
+            vec![SessionAgentRow::Shell {
+                label: SharedString::from("Wait longer"),
+                note: SharedString::from("Running"),
+            }],
+            "only the shell still running is drawn"
+        );
+    }
+
+    /// A shell that failed or was killed is over as much as one that succeeded, and a row
+    /// that went on pulsing for it would be the panel claiming work was still happening.
+    #[test]
+    fn a_shell_that_ended_badly_is_over_too() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "x" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            task_notification_line("m3", "b1", "failed"),
+        ];
+
+        assert!(
+            shells_of(&lines)
+                .first()
+                .is_some_and(|shell| shell.finished),
+            "whichever way it ended, it is not running"
+        );
+    }
+
+    /// Taken from a real session: of the twelve shells it backgrounded, eleven ended with
+    /// the session mid-turn and so were recorded only this way. Reading the delivered
+    /// message alone left every one of them pulsing as though it were still running.
+    #[test]
+    fn a_notification_absorbed_into_a_running_turn_ends_its_shell_too() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "pnpm test" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            absorbed_task_notification_line("m3", "m2", "b1"),
+        ];
+
+        assert!(
+            shells_of(&lines)
+                .first()
+                .is_some_and(|shell| shell.finished),
+            "the shell ended; the shape the notification was written in does not change \
+             whether it did"
+        );
+    }
+
+    /// Words a reader typed are not a record of anything ending, however closely they
+    /// quote one.
+    #[test]
+    fn a_reader_quoting_a_notification_does_not_end_a_shell() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "x" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            user_message_line(
+                "m3",
+                "did you see <task-notification><task-id>b1</task-id></task-notification> go by?",
+            ),
+        ];
+
+        assert!(
+            shells_of(&lines)
+                .first()
+                .is_some_and(|shell| !shell.finished),
+            "a notification is a message of its own, not a phrase inside one"
+        );
+    }
+
+    /// A `Bash` call that was waited on has no shell behind it: its answer is in the
+    /// conversation already.
+    #[test]
+    fn an_ordinary_bash_call_starts_no_shell() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "ls" }),
+            ),
+            tool_result_line_with_content("m2", "toolu_01", "README.md"),
+        ];
+
+        assert_eq!(shells_of(&lines), Vec::new());
+    }
+
+    /// Claude Code does not always record a description, and a row reading `Shell b7q6…`
+    /// tells a reader nothing about what their machine is busy with.
+    #[test]
+    fn a_shell_with_no_description_is_named_by_the_head_of_its_command() {
+        let command = "cd /very/long/path/somewhere && pnpm run build --filter app\nrm -rf dist";
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": command }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+        ];
+
+        let label = shells_of(&lines)
+            .first()
+            .map(|shell| shell.label.to_string())
+            .unwrap_or_default();
+        assert!(
+            label.starts_with("cd /very/long/path/somewhere"),
+            "the head of the first line is what names the call; got {label:?}"
+        );
+        assert!(
+            !label.contains("rm -rf dist"),
+            "a label is one line of a row, not the whole script; got {label:?}"
+        );
+        assert!(
+            label.chars().count() <= SHELL_LABEL_CHARACTERS + 1,
+            "a label wider than the dock pushes the note off the row; got {label:?}"
+        );
+    }
+
+    /// Nothing in the conversation pairs the announcement with the call when the call
+    /// itself has been compacted away, and a shell dropped for that reason is a running
+    /// command the reader is never told about.
+    #[test]
+    fn a_shell_whose_call_is_gone_is_still_listed() {
+        let lines = [background_launch_line(
+            "m1",
+            "toolu_01",
+            "b1",
+            "/tmp/tasks/b1.output",
+        )];
+
+        assert_eq!(
+            shells_of(&lines),
+            vec![BackgroundShell {
+                task_id: SharedString::from("b1"),
+                label: SharedString::from("Shell b1"),
+                command: None,
+                output_path: Some(SharedString::from("/tmp/tasks/b1.output")),
+                finished: false,
+            }],
+            "the announcement alone is enough to say a shell is running"
+        );
+    }
+
+    /// The shells go below every row that opens something, so that a row which opens
+    /// nothing is not mistaken for one that failed to.
+    #[test]
+    fn shells_are_listed_below_the_agents_of_the_same_session() {
+        let mut agent = subagent("a0", None, Some("toolu_01"));
+        agent.meta.description = Some("read the file".to_string());
+        let shell = BackgroundShell {
+            task_id: SharedString::from("b1"),
+            label: SharedString::from("Watch the log"),
+            command: None,
+            output_path: None,
+            finished: false,
+        };
+
+        let rows = session_agent_rows(&[agent], &[shell], &[], &READING_NOTHING);
+
+        assert_eq!(
+            rows.last(),
+            Some(&SessionAgentRow::Shell {
+                label: SharedString::from("Watch the log"),
+                note: SharedString::from("Running"),
+            }),
+        );
+        assert_eq!(rows.len(), 2, "the agent keeps its own row; got {rows:?}");
+    }
+
+    /// A task id names a shell, not a slot that stays dead after the first one ended.
+    #[test]
+    fn a_shell_started_after_its_ids_notification_is_still_running() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "first", "description": "First" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            task_notification_line("m3", "b1", "completed"),
+            tool_use_line(
+                "m4",
+                "toolu_02",
+                "Bash",
+                serde_json::json!({ "command": "second", "description": "Second" }),
+            ),
+            background_launch_line("m5", "toolu_02", "b1", "/tmp/tasks/b1-again.output"),
+        ];
+        let shells = shells_of(&lines);
+        let got: Vec<(&str, &str, bool)> = shells
+            .iter()
+            .map(|shell| {
+                (
+                    shell.task_id.as_ref(),
+                    shell.label.as_ref(),
+                    shell.finished,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![("b1", "First", true), ("b1", "Second", false)],
+            "the notification ends the shell that was already running, not one started \
+             after it"
+        );
+    }
+
+    /// Pasting a notification and then asking about it is still the reader's words,
+    /// however completely they quoted it at the start of the message.
+    #[test]
+    fn a_reader_pasting_a_notification_then_asking_does_not_end_a_shell() {
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "x" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            user_message_line(
+                "m3",
+                "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n\
+                 </task-notification>\n\nwhy did this fail?",
+            ),
+        ];
+        let got = shells_of(&lines)
+            .first()
+            .map(|shell| shell.finished);
+
+        assert_eq!(
+            got,
+            Some(false),
+            "the extra question is the reader's, so the shell is still running"
+        );
+    }
+
+    /// A record can answer more than one call, and the backgrounded `Bash` is not
+    /// always the first of them.
+    #[test]
+    fn a_backgrounded_bash_result_behind_another_tool_result_still_names_the_shell() {
+        let announcement = "Command running in background with ID: b1. Output is being \
+             written to: /tmp/tasks/b1.output. You will be notified when it completes. \
+             To check interim output, use Read on that file path.";
+        let lines = [
+            tool_use_line(
+                "m0",
+                "toolu_read",
+                "Read",
+                serde_json::json!({ "file_path": "a.rs" }),
+            ),
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({
+                    "command": "pnpm test",
+                    "description": "Run the suite",
+                }),
+            ),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "m2",
+                "message": { "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": "fn main() {}",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": announcement,
+                    },
+                ] },
+                "toolUseResult": { "stdout": "", "backgroundTaskId": "b1" },
+            })
+            .to_string(),
+        ];
+
+        assert_eq!(
+            shells_of(&lines),
+            vec![BackgroundShell {
+                task_id: SharedString::from("b1"),
+                label: SharedString::from("Run the suite"),
+                command: Some(SharedString::from("pnpm test")),
+                output_path: Some(SharedString::from("/tmp/tasks/b1.output")),
+                finished: false,
+            }],
+            "the backgrounded call is the one whose result announced the shell, not \
+             whichever tool_result happens to sit first"
+        );
+    }
+
+    /// The path is taken as a string up to the sentence that follows it, not cut at the
+    /// first `. `.
+    #[test]
+    fn a_shell_output_path_that_contains_dot_space_is_kept_whole() {
+        let output_path = "/tmp/my. tasks/b1.output";
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "x" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", output_path),
+        ];
+        let got = shells_of(&lines)
+            .first()
+            .and_then(|shell| shell.output_path.as_deref().map(str::to_string));
+
+        assert_eq!(
+            got.as_deref(),
+            Some(output_path),
+            "a `. ` inside the path is still the path, not the end of it"
         );
     }
 
