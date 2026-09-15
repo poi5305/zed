@@ -12,6 +12,7 @@ workspace = true
 path = "src/edit_prediction_context.rs"
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 clock.workspace = true
 collections.workspace = true

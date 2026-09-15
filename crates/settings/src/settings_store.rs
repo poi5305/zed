@@ -356,30 +356,37 @@ impl SettingsStore {
         cx: &mut App,
         settings_changed: impl 'static + Fn(SettingsFile, SettingsParseResult, &mut App),
     ) {
-        let (mut user_settings_file_rx, user_settings_watcher) = crate::watch_config_file(
+        let (user_settings_file_rx, user_settings_watcher) = crate::watch_config_file(
             cx.background_executor(),
             fs.clone(),
             paths::settings_file().clone(),
         );
-        let (mut global_settings_file_rx, global_settings_watcher) = crate::watch_config_file(
+        let (global_settings_file_rx, global_settings_watcher) = crate::watch_config_file(
             cx.background_executor(),
             fs,
             paths::global_settings_file().clone(),
         );
 
-        let global_content = cx
-            .foreground_executor()
-            .block_on(global_settings_file_rx.next())
-            .unwrap();
-        let user_content = cx
-            .foreground_executor()
-            .block_on(user_settings_file_rx.next())
-            .unwrap();
+        #[cfg(not(target_family = "wasm"))]
+        let (mut user_settings_file_rx, mut global_settings_file_rx) =
+            (user_settings_file_rx, global_settings_file_rx);
 
-        let result = self.set_user_settings(&user_content, cx);
-        settings_changed(SettingsFile::User, result, cx);
-        let result = self.set_global_settings(&global_content, cx);
-        settings_changed(SettingsFile::Global, result, cx);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let global_content = cx
+                .foreground_executor()
+                .block_on(global_settings_file_rx.next())
+                .unwrap();
+            let user_content = cx
+                .foreground_executor()
+                .block_on(user_settings_file_rx.next())
+                .unwrap();
+
+            let result = self.set_user_settings(&user_content, cx);
+            settings_changed(SettingsFile::User, result, cx);
+            let result = self.set_global_settings(&global_content, cx);
+            settings_changed(SettingsFile::Global, result, cx);
+        }
 
         self._settings_files_watcher = Some(cx.spawn(async move |cx| {
             let _user_settings_watcher = user_settings_watcher;
@@ -798,24 +805,32 @@ impl SettingsStore {
         user_settings_content: &str,
         file: SettingsFile,
     ) -> (Option<SettingsContentType>, SettingsParseResult) {
+        #[cfg_attr(target_family = "wasm", allow(unused_mut))]
         let mut migration_status = MigrationStatus::NotNeeded;
         let (settings, parse_status) = if user_settings_content.is_empty() {
             SettingsContentType::parse_json("{}")
         } else {
-            let migration_res = migrator::migrate_settings(user_settings_content);
-            migration_status = match &migration_res {
-                Ok(Some(_)) => MigrationStatus::Succeeded,
-                Ok(None) => MigrationStatus::NotNeeded,
-                Err(err) => MigrationStatus::Failed {
-                    error: err.to_string(),
-                },
-            };
-            let content = match &migration_res {
-                Ok(Some(content)) => content,
-                Ok(None) => user_settings_content,
-                Err(_) => user_settings_content,
-            };
-            SettingsContentType::parse_json(content)
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let migration_res = migrator::migrate_settings(user_settings_content);
+                migration_status = match &migration_res {
+                    Ok(Some(_)) => MigrationStatus::Succeeded,
+                    Ok(None) => MigrationStatus::NotNeeded,
+                    Err(err) => MigrationStatus::Failed {
+                        error: err.to_string(),
+                    },
+                };
+                let content = match &migration_res {
+                    Ok(Some(content)) => content,
+                    Ok(None) => user_settings_content,
+                    Err(_) => user_settings_content,
+                };
+                SettingsContentType::parse_json(content)
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                SettingsContentType::parse_json(user_settings_content)
+            }
         };
 
         let result = SettingsParseResult {

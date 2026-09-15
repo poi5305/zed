@@ -67,7 +67,8 @@ use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use thiserror::Error;
 use util::{ResultExt as _, rel_path::RelPath};

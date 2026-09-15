@@ -240,6 +240,7 @@ impl std::ops::Deref for GlobalKeyValueStore {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 static GLOBAL_KEY_VALUE_STORE: std::sync::LazyLock<GlobalKeyValueStore> =
     std::sync::LazyLock::new(|| {
         let db_dir = crate::database_dir();
@@ -251,7 +252,14 @@ static GLOBAL_KEY_VALUE_STORE: std::sync::LazyLock<GlobalKeyValueStore> =
 
 impl GlobalKeyValueStore {
     pub fn global() -> &'static Self {
-        &GLOBAL_KEY_VALUE_STORE
+        #[cfg(target_family = "wasm")]
+        panic!(
+            "GlobalKeyValueStore::global() cannot block the wasm main thread; construct a store from AppDatabase after open_in_memory"
+        );
+        #[cfg(not(target_family = "wasm"))]
+        {
+            &GLOBAL_KEY_VALUE_STORE
+        }
     }
 
     query! {

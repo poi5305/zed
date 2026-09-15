@@ -37,9 +37,10 @@ use std::{
         atomic::{AtomicI32, Ordering::SeqCst},
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ConnectionResult, redact};
+use web_time::Instant;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const CONTENT_LEN_HEADER: &str = "Content-Length: ";
@@ -89,11 +90,24 @@ pub enum IoKind {
     StdErr,
 }
 
+#[cfg(target_family = "wasm")]
+fn serialize_arguments<S>(arguments: &Vec<OsString>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let strings: Vec<String> = arguments
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    strings.serialize(serializer)
+}
+
 /// Represents a launchable language server. This can either be a standalone binary or the path
 /// to a runtime with arguments to instruct it to launch the actual language server file.
 #[derive(Clone, Serialize)]
 pub struct LanguageServerBinary {
     pub path: PathBuf,
+    #[cfg_attr(target_family = "wasm", serde(serialize_with = "serialize_arguments"))]
     pub arguments: Vec<OsString>,
     pub env: Option<HashMap<String, String>>,
 }
@@ -1680,7 +1694,10 @@ impl LanguageServer {
             .unwrap()
         }));
 
+        #[cfg(not(target_family = "wasm"))]
         outbound_tx.send_blocking(serializer)?;
+        #[cfg(target_family = "wasm")]
+        outbound_tx.try_send(serializer)?;
         Ok(())
     }
 

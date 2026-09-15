@@ -34,13 +34,17 @@ use project::{
     },
 };
 use smallvec::{SmallVec, smallvec};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     cell::Cell,
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 use zed_actions::{
     buffer_search,
     search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},

@@ -109,6 +109,93 @@ pub fn oauth_callback_page(title: &str, message: &str, is_error: bool) -> String
     )
 }
 
+use anyhow::{Result, anyhow};
+
+/// Parsed OAuth callback parameters from the authorization server redirect.
+pub struct OAuthCallbackParams {
+    pub code: String,
+    pub state: String,
+}
+
+/// Configuration for the loopback OAuth callback server.
+///
+/// OAuth servers compare `redirect_uri` against a per-client allow-list using
+/// exact string matching (RFC 6749 §3.1.2), so the `host`, `preferred_port`,
+/// and `path` here must match what's registered for the OAuth client_id.
+#[derive(Clone, Copy)]
+pub struct OAuthCallbackServerConfig {
+    /// Host portion of the redirect URI (typically `127.0.0.1` or `localhost`).
+    pub host: &'static str,
+    /// Preferred port. Use `0` for an OS-assigned ephemeral port.
+    pub preferred_port: u16,
+    /// Optional fallback port if `preferred_port` is unavailable. Only used
+    /// when `preferred_port` is non-zero.
+    pub fallback_port: Option<u16>,
+    /// Callback path on the redirect URI (e.g. `/callback`, `/auth/callback`).
+    pub path: &'static str,
+}
+
+impl Default for OAuthCallbackServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1",
+            preferred_port: 0,
+            fallback_port: None,
+            path: "/callback",
+        }
+    }
+}
+
+impl OAuthCallbackParams {
+    /// Parse the query string from a callback URL like
+    /// `http://127.0.0.1:<port>/callback?code=...&state=...`.
+    pub fn parse_query(query: &str) -> Result<Self> {
+        let mut code: Option<String> = None;
+        let mut state: Option<String> = None;
+        let mut error: Option<String> = None;
+        let mut error_description: Option<String> = None;
+
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "code" => {
+                    if !value.is_empty() {
+                        code = Some(value.into_owned());
+                    }
+                }
+                "state" => {
+                    if !value.is_empty() {
+                        state = Some(value.into_owned());
+                    }
+                }
+                "error" => {
+                    if !value.is_empty() {
+                        error = Some(value.into_owned());
+                    }
+                }
+                "error_description" => {
+                    if !value.is_empty() {
+                        error_description = Some(value.into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(error_code) = error {
+            anyhow::bail!(
+                "OAuth authorization failed: {} ({})",
+                error_code,
+                error_description.as_deref().unwrap_or("no description")
+            );
+        }
+
+        let code = code.ok_or_else(|| anyhow!("missing 'code' parameter in OAuth callback"))?;
+        let state = state.ok_or_else(|| anyhow!("missing 'state' parameter in OAuth callback"))?;
+
+        Ok(Self { code, state })
+    }
+}
+
 fn html_escape(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -127,96 +214,11 @@ fn html_escape(input: &str) -> String {
 #[cfg(not(target_family = "wasm"))]
 mod server {
     use super::oauth_callback_page;
+    use super::{OAuthCallbackParams, OAuthCallbackServerConfig};
     use anyhow::{Context as _, Result, anyhow};
     use std::str::FromStr;
     use std::time::Duration;
     use url::Url;
-
-    /// Parsed OAuth callback parameters from the authorization server redirect.
-    pub struct OAuthCallbackParams {
-        pub code: String,
-        pub state: String,
-    }
-
-    /// Configuration for the loopback OAuth callback server.
-    ///
-    /// OAuth servers compare `redirect_uri` against a per-client allow-list using
-    /// exact string matching (RFC 6749 §3.1.2), so the `host`, `preferred_port`,
-    /// and `path` here must match what's registered for the OAuth client_id.
-    #[derive(Clone, Copy)]
-    pub struct OAuthCallbackServerConfig {
-        /// Host portion of the redirect URI (typically `127.0.0.1` or `localhost`).
-        pub host: &'static str,
-        /// Preferred port. Use `0` for an OS-assigned ephemeral port.
-        pub preferred_port: u16,
-        /// Optional fallback port if `preferred_port` is unavailable. Only used
-        /// when `preferred_port` is non-zero.
-        pub fallback_port: Option<u16>,
-        /// Callback path on the redirect URI (e.g. `/callback`, `/auth/callback`).
-        pub path: &'static str,
-    }
-
-    impl Default for OAuthCallbackServerConfig {
-        fn default() -> Self {
-            Self {
-                host: "127.0.0.1",
-                preferred_port: 0,
-                fallback_port: None,
-                path: "/callback",
-            }
-        }
-    }
-
-    impl OAuthCallbackParams {
-        /// Parse the query string from a callback URL like
-        /// `http://127.0.0.1:<port>/callback?code=...&state=...`.
-        pub fn parse_query(query: &str) -> Result<Self> {
-            let mut code: Option<String> = None;
-            let mut state: Option<String> = None;
-            let mut error: Option<String> = None;
-            let mut error_description: Option<String> = None;
-
-            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                match key.as_ref() {
-                    "code" => {
-                        if !value.is_empty() {
-                            code = Some(value.into_owned());
-                        }
-                    }
-                    "state" => {
-                        if !value.is_empty() {
-                            state = Some(value.into_owned());
-                        }
-                    }
-                    "error" => {
-                        if !value.is_empty() {
-                            error = Some(value.into_owned());
-                        }
-                    }
-                    "error_description" => {
-                        if !value.is_empty() {
-                            error_description = Some(value.into_owned());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if let Some(error_code) = error {
-                anyhow::bail!(
-                    "OAuth authorization failed: {} ({})",
-                    error_code,
-                    error_description.as_deref().unwrap_or("no description")
-                );
-            }
-
-            let code = code.ok_or_else(|| anyhow!("missing 'code' parameter in OAuth callback"))?;
-            let state =
-                state.ok_or_else(|| anyhow!("missing 'state' parameter in OAuth callback"))?;
-
-            Ok(Self { code, state })
-        }
-    }
 
     /// How long to wait for the browser to complete the OAuth flow before giving
     /// up and releasing the loopback port.
@@ -257,13 +259,13 @@ mod server {
         let (tx, rx) = futures::channel::oneshot::channel();
 
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
+            let deadline = web_time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
 
             loop {
                 if tx.is_canceled() {
                     return;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(web_time::Instant::now());
                 if remaining.is_zero() {
                     return;
                 }
@@ -487,7 +489,22 @@ mod server {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub use server::{
-    OAuthCallbackParams, OAuthCallbackServerConfig, start_oauth_callback_server,
-    start_oauth_callback_server_with_config,
-};
+pub use server::{start_oauth_callback_server, start_oauth_callback_server_with_config};
+
+#[cfg(target_family = "wasm")]
+pub fn start_oauth_callback_server() -> Result<(
+    String,
+    futures::channel::oneshot::Receiver<Result<OAuthCallbackParams>>,
+)> {
+    anyhow::bail!("OAuth callback server cannot bind a loopback TCP port in the browser")
+}
+
+#[cfg(target_family = "wasm")]
+pub fn start_oauth_callback_server_with_config(
+    _config: OAuthCallbackServerConfig,
+) -> Result<(
+    String,
+    futures::channel::oneshot::Receiver<Result<OAuthCallbackParams>>,
+)> {
+    anyhow::bail!("OAuth callback server cannot bind a loopback TCP port in the browser")
+}

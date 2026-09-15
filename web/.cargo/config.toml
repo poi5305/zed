@@ -1,0 +1,31 @@
+# Cargo discovers this file by walking up from the CURRENT WORKING DIRECTORY, not
+# from the workspace root. `cargo build --manifest-path web/Cargo.toml --target
+# wasm32-unknown-unknown` run from the repo root therefore reads none of these
+# flags and silently applies the desktop root's `[build] rustflags` instead
+# (`-C symbol-mangling-version=v0 --cfg tokio_unstable`), producing a wasm binary
+# with no atomics and no shared memory. Every wasm build must run with `web/` as
+# its working directory.
+#
+# `-C target-feature=+atomics` also needs a std rebuilt with atomics, which means
+# `-Z build-std=std,panic_abort` on a nightly toolchain. `web/` currently resolves
+# to the repo's stable rust-toolchain.toml, so that cannot happen here; the build
+# entrypoint has to select nightly explicitly, as zedweb/zed-web:web/build.sh:53
+# does with `rustup run nightly`. The same script exports CC_wasm32_unknown_unknown
+# and CFLAGS_wasm32_unknown_unknown pointing at a downloaded wasi-sdk, which C-
+# building dependencies need and which is likewise not expressible here.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--initial-memory=134217728",
+    "-C", "link-arg=--max-memory=4294967296",
+    "-C", "link-arg=--export=__heap_base",
+    "-C", "link-arg=--export=__stack_pointer",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__wasm_call_ctors",
+]

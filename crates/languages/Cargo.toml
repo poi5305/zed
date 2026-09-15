@@ -38,13 +38,6 @@ log.workspace = true
 lsp.workspace = true
 node_runtime.workspace = true
 parking_lot.workspace = true
-pet-conda.workspace = true
-pet-core.workspace = true
-pet-fs.workspace = true
-pet-poetry.workspace = true
-pet-reporter.workspace = true
-pet-virtualenv.workspace = true
-pet.workspace = true
 project.workspace = true
 regex.workspace = true
 rope.workspace = true
@@ -63,6 +56,15 @@ tree-sitter = { workspace = true, optional = true , features = ["wasm"] }
 tree-sitter-gitcommit = { workspace = true, optional = true }
 url.workspace = true
 util.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+pet-conda.workspace = true
+pet-core.workspace = true
+pet-fs.workspace = true
+pet-poetry.workspace = true
+pet-reporter.workspace = true
+pet-virtualenv.workspace = true
+pet.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

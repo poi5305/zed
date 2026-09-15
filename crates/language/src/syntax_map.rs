@@ -14,7 +14,7 @@ use std::{
     fmt, iter,
     ops::{ControlFlow, Deref, DerefMut, Range},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use streaming_iterator::StreamingIterator;
 use sum_tree::{Bias, Dimensions, SeekTarget, SumTree};
@@ -23,6 +23,7 @@ use tree_sitter::{
     Node, Query, QueryCapture, QueryCaptures, QueryCursor, QueryMatch, QueryMatches,
     QueryPredicateArg,
 };
+use web_time::Instant;
 
 pub const MAX_BYTES_TO_QUERY: usize = 16 * 1024;
 
@@ -1567,7 +1568,10 @@ fn parse_text(
 
         let mut chunks = text.chunks_in_range(start_byte..text.len());
         parser.set_included_ranges(ranges)?;
+        #[cfg(not(target_family = "wasm"))]
         parser.set_language(&grammar.ts_language)?;
+        #[cfg(target_family = "wasm")]
+        parser.set_language(&grammar.parseable_language()?)?;
         parser
             .parse_with_options(
                 &mut move |offset, _| {

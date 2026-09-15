@@ -1,17 +1,19 @@
 use anyhow::Result;
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 #[cfg(feature = "editing")]
 use serde_json::Value;
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+use std::ops::Range;
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use std::{ops::Range, sync::LazyLock};
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use tree_sitter::{Query, StreamingIterator as _};
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use util::RangeExt;
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn update_value_in_json_text<'a>(
     text: &mut String,
     key_path: &mut Vec<&'a str>,
@@ -72,7 +74,7 @@ pub fn update_value_in_json_text<'a>(
 }
 
 /// * `replace_key` - When an exact key match according to `key_path` is found, replace the key with `replace_key` if `Some`.
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn replace_value_in_json_text<T: AsRef<str>>(
     text: &str,
     key_path: &[T],
@@ -284,7 +286,7 @@ pub fn replace_value_in_json_text<T: AsRef<str>>(
     }
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn construct_json_value(
     key_path: &[impl AsRef<str>],
     new_value: Option<&serde_json::Value>,
@@ -301,12 +303,12 @@ fn construct_json_value(
     return new_value;
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn parse_index_key(index_key: &str) -> Option<usize> {
     index_key.strip_prefix('#')?.parse().ok()
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn handle_possible_array_value(
     key_node: &tree_sitter::Node,
     value_node: &tree_sitter::Node,
@@ -374,14 +376,14 @@ fn handle_possible_array_value(
     return Some((replace_range, replace_value));
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_DOCUMENT_KIND: &str = "document";
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_ARRAY_KIND: &str = "array";
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_COMMENT_KIND: &str = "comment";
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn replace_top_level_array_value_in_json_text(
     text: &str,
     key_path: &[impl AsRef<str>],
@@ -504,7 +506,7 @@ pub fn replace_top_level_array_value_in_json_text(
     }
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn append_top_level_array_value_in_json_text(
     text: &str,
     new_value: &Value,
@@ -629,7 +631,7 @@ pub fn append_top_level_array_value_in_json_text(
 
 /// Infers the indentation size used in JSON text by analyzing the tree structure.
 /// Returns the detected indent size, or a default of 2 if no indentation is found.
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn infer_json_indent_size(text: &str) -> usize {
     const MAX_INDENT_SIZE: usize = 64;
 
@@ -722,7 +724,7 @@ pub fn infer_json_indent_size(text: &str) -> usize {
     if max_count == 0 { 2 } else { max_indent }
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn to_pretty_json(
     value: &impl Serialize,
     indent_size: usize,
@@ -755,6 +757,59 @@ pub fn parse_json_with_comments<T: DeserializeOwned>(content: &str) -> Result<T>
     let value = serde_path_to_error::deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
+}
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+const JSON_STRUCTURAL_EDITS_UNAVAILABLE: &str =
+    "JSON structural edits require tree-sitter, which is not available on wasm";
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+pub fn update_value_in_json_text<'a>(
+    _text: &mut String,
+    _key_path: &mut Vec<&'a str>,
+    _tab_size: usize,
+    _old_value: &'a Value,
+    _new_value: &'a Value,
+    _edits: &mut Vec<(Range<usize>, String)>,
+) {
+    panic!("{JSON_STRUCTURAL_EDITS_UNAVAILABLE}")
+}
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+pub fn replace_value_in_json_text<T: AsRef<str>>(
+    _text: &str,
+    _key_path: &[T],
+    _tab_size: usize,
+    _new_value: Option<&Value>,
+    _replace_key: Option<&str>,
+) -> (Range<usize>, String) {
+    panic!("{JSON_STRUCTURAL_EDITS_UNAVAILABLE}")
+}
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+pub fn replace_top_level_array_value_in_json_text(
+    _text: &str,
+    _key_path: &[impl AsRef<str>],
+    _new_value: Option<&Value>,
+    _replace_key: Option<&str>,
+    _array_index: usize,
+    _tab_size: usize,
+) -> (Range<usize>, String) {
+    panic!("{JSON_STRUCTURAL_EDITS_UNAVAILABLE}")
+}
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+pub fn append_top_level_array_value_in_json_text(
+    _text: &str,
+    _new_value: &Value,
+    _tab_size: usize,
+) -> (Range<usize>, String) {
+    panic!("{JSON_STRUCTURAL_EDITS_UNAVAILABLE}")
+}
+
+#[cfg(all(feature = "editing", target_family = "wasm"))]
+pub fn infer_json_indent_size(_text: &str) -> usize {
+    panic!("{JSON_STRUCTURAL_EDITS_UNAVAILABLE}")
 }
 
 #[cfg(test)]

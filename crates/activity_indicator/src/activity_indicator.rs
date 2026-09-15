@@ -14,15 +14,10 @@ use project::{
     git_store::{GitStoreEvent, Repository},
 };
 use smallvec::SmallVec;
-use std::{
-    cmp::Reverse,
-    collections::HashSet,
-    fmt::Write,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{cmp::Reverse, collections::HashSet, fmt::Write, sync::Arc, time::Duration};
 use ui::{ContextMenu, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::truncate_and_trailoff;
+use web_time::Instant;
 use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
 const GIT_OPERATION_DELAY: Duration = Duration::from_millis(0);

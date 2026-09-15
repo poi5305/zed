@@ -119,6 +119,8 @@ use serde_json::Value;
 use settings::{Settings, SettingsLocation, SettingsStore};
 use sha2::{Digest, Sha256};
 use snippet::Snippet;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -136,11 +138,13 @@ use std::{
         Arc,
         atomic::{self, AtomicUsize},
     },
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::Dimensions;
 use text::{Anchor, BufferId, LineEnding, OffsetRangeExt, ToPoint as _};
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use util::{
     ConnectionResult, ResultExt as _, debug_panic, defer, maybe, merge_json_value_into,

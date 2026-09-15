@@ -15,6 +15,9 @@ doctest = false
 [dependencies]
 smol.workspace = true
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 async-io = "2.4"
 windows.workspace = true

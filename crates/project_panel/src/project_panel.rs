@@ -55,7 +55,7 @@ use std::{
     ops::{Neg, Range},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -70,6 +70,7 @@ use util::{
     paths::{PathExt, PathStyle, compare_paths},
     rel_path::{RelPath, RelPathBuf},
 };
+use web_time::Instant;
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
     SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,

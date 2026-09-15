@@ -20,7 +20,6 @@ use path::rel_path::RelPathBuf;
 pub use path::PathStyle;
 
 /// Returns the path to the user's home directory.
-#[cfg(not(target_family = "wasm"))]
 pub fn home_dir() -> &'static PathBuf {
     static HOME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME_DIR.get_or_init(|| {
@@ -33,7 +32,20 @@ pub fn home_dir() -> &'static PathBuf {
                 PathBuf::from("/home/zed")
             }
         } else {
-            dirs::home_dir().expect("failed to determine home directory")
+            // `/workspace` is a placeholder, not the server's real home.
+            // Phase 6's `Home::` RPC will replace it with the actual home and
+            // config directories. Until then, anything that expands `~` —
+            // `claude_sessions` (`~/.claude`) and `project_manager`
+            // (`~/.config/zed/projects.json`) — is wrong on the web build
+            // (see docs/web-zed-plan.md §6.3).
+            #[cfg(target_family = "wasm")]
+            {
+                PathBuf::from("/workspace")
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                dirs::home_dir().expect("failed to determine home directory")
+            }
         }
     })
 }
@@ -94,7 +106,6 @@ pub trait PathExt {
     fn multiple_extensions(&self) -> Option<String>;
 
     /// Try to make a shell-safe representation of the path.
-    #[cfg(not(target_family = "wasm"))]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String>;
 }
 
@@ -178,7 +189,6 @@ impl<T: AsRef<Path>> PathExt for T {
         Some(parts.into_iter().join("."))
     }
 
-    #[cfg(not(target_family = "wasm"))]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String> {
         use anyhow::Context;
         let path_str = self

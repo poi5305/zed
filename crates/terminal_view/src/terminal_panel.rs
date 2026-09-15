@@ -333,7 +333,7 @@ impl TerminalPanel {
                 .log_err()
                 .flatten()
         {
-            let started_at = std::time::Instant::now();
+            let started_at = web_time::Instant::now();
             let deserialized = workspace
                 .update_in(cx, |workspace, window, cx| {
                     deserialize_terminal_panel(

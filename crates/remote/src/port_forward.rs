@@ -381,24 +381,32 @@ impl PortForwardStore {
                 return;
             }
 
-            let mut incoming = listener.incoming();
-            while let Some(stream) = incoming.next().await {
-                match stream {
-                    Ok(stream) => {
-                        if this
-                            .update(cx, |this, cx| this.begin_tunnel(&forward, stream, cx))
-                            .is_err()
-                        {
-                            return;
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let mut incoming = listener.incoming();
+                while let Some(stream) = incoming.next().await {
+                    match stream {
+                        Ok(stream) => {
+                            if this
+                                .update(cx, |this, cx| this.begin_tunnel(&forward, stream, cx))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "port forward: failed to accept on {host}:{}: {error}",
+                                forward.local_port
+                            );
                         }
                     }
-                    Err(error) => {
-                        log::error!(
-                            "port forward: failed to accept on {host}:{}: {error}",
-                            forward.local_port
-                        );
-                    }
                 }
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = listener;
+                log::error!("port forward: local TCP accept is not available in the browser");
             }
         })
     }
@@ -413,38 +421,48 @@ impl PortForwardStore {
     ) {
         let tunnel_id = self.next_tunnel_id;
         self.next_tunnel_id += 1;
-        self.open_tunnel(tunnel_id, stream.clone(), Some(forward.clone()), cx);
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (forward, stream, cx, tunnel_id);
+            panic!(
+                "TcpStream cannot be cloned in the browser; local TCP port forwarding is not available"
+            );
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.open_tunnel(tunnel_id, stream.clone(), Some(forward.clone()), cx);
 
-        let request = self.client.request(proto::OpenPortTunnel {
-            project_id: self.project_id,
-            tunnel_id,
-            remote_host: forward
-                .remote_host
-                .clone()
-                .unwrap_or_else(|| DEFAULT_REMOTE_HOST.to_string()),
-            remote_port: forward.remote_port as u32,
-        });
+            let request = self.client.request(proto::OpenPortTunnel {
+                project_id: self.project_id,
+                tunnel_id,
+                remote_host: forward
+                    .remote_host
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REMOTE_HOST.to_string()),
+                remote_port: forward.remote_port as u32,
+            });
 
-        let forward = forward.clone();
-        let open_task = cx.spawn(async move |this, cx| {
-            let result = request.await;
-            this.update(cx, |this, cx| match result {
-                Ok(_) => {
-                    this.start_reading(tunnel_id, stream, cx);
-                    this.set_status(&forward, PortForwardStatus::Active, cx);
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    log::error!("port forward: could not open tunnel: {message}");
-                    this.remove_tunnel(tunnel_id);
-                    this.set_status(&forward, PortForwardStatus::Failed(message.into()), cx);
-                }
-            })
-            .ok();
-        });
+            let forward = forward.clone();
+            let open_task = cx.spawn(async move |this, cx| {
+                let result = request.await;
+                this.update(cx, |this, cx| match result {
+                    Ok(_) => {
+                        this.start_reading(tunnel_id, stream, cx);
+                        this.set_status(&forward, PortForwardStatus::Active, cx);
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        log::error!("port forward: could not open tunnel: {message}");
+                        this.remove_tunnel(tunnel_id);
+                        this.set_status(&forward, PortForwardStatus::Failed(message.into()), cx);
+                    }
+                })
+                .ok();
+            });
 
-        if let Some(tunnel) = self.tunnels.get_mut(&tunnel_id) {
-            tunnel._open_task = Some(open_task);
+            if let Some(tunnel) = self.tunnels.get_mut(&tunnel_id) {
+                tunnel._open_task = Some(open_task);
+            }
         }
     }
 
@@ -642,8 +660,18 @@ impl PortForwardStore {
             .with_context(|| format!("could not connect to {host}:{port}"))?;
 
         this.update(&mut cx, |this, cx| {
-            this.open_tunnel(tunnel_id, stream.clone(), None, cx);
-            this.start_reading(tunnel_id, stream, cx);
+            #[cfg(not(target_family = "wasm"))]
+            {
+                this.open_tunnel(tunnel_id, stream.clone(), None, cx);
+                this.start_reading(tunnel_id, stream, cx);
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = (this, cx, stream, tunnel_id);
+                panic!(
+                    "TcpStream cannot be cloned in the browser; local TCP port forwarding is not available"
+                );
+            }
         });
         Ok(proto::Ack {})
     }

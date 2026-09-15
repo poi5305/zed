@@ -24,8 +24,8 @@ use std::{
         atomic::{self, AtomicU32},
     },
     time::Duration,
-    time::Instant,
 };
+use web_time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct ConnectionId {
@@ -72,12 +72,7 @@ pub struct ConnectionState {
     #[serde(skip)]
     response_channels: Arc<
         Mutex<
-            Option<
-                HashMap<
-                    u32,
-                    oneshot::Sender<(proto::Envelope, std::time::Instant, oneshot::Sender<()>)>,
-                >,
-            >,
+            Option<HashMap<u32, oneshot::Sender<(proto::Envelope, Instant, oneshot::Sender<()>)>>>,
         >,
     >,
     #[allow(clippy::type_complexity)]

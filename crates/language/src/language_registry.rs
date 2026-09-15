@@ -701,104 +701,104 @@ impl LanguageRegistry {
             hash_map::Entry::Vacant(entry) => {
                 let this = self.clone();
 
-                self.executor
-                    .spawn(async move {
-                        let language = async {
-                            let loaded_language = (language_load)().await?;
-                            if let Some(grammar) = loaded_language.config.grammar.clone() {
-                                let grammar = Some(this.get_or_load_grammar(grammar).await?);
+                let future = async move {
+                    let language = async {
+                        let loaded_language = (language_load)().await?;
+                        if let Some(grammar) = loaded_language.config.grammar.clone() {
+                            let grammar = Some(this.get_or_load_grammar(grammar).await?);
 
-                                Language::new_with_id(language_id, loaded_language.config, grammar)
-                                    .with_context_provider(loaded_language.context_provider)
-                                    .with_toolchain_lister(loaded_language.toolchain_provider)
-                                    .with_manifest(loaded_language.manifest_name)
-                                    .with_queries(loaded_language.queries)
-                            } else {
-                                Ok(
-                                    Language::new_with_id(
-                                        language_id,
-                                        loaded_language.config,
-                                        None,
-                                    )
+                            Language::new_with_id(language_id, loaded_language.config, grammar)
+                                .with_context_provider(loaded_language.context_provider)
+                                .with_toolchain_lister(loaded_language.toolchain_provider)
+                                .with_manifest(loaded_language.manifest_name)
+                                .with_queries(loaded_language.queries)
+                        } else {
+                            Ok(
+                                Language::new_with_id(language_id, loaded_language.config, None)
                                     .with_context_provider(loaded_language.context_provider)
                                     .with_manifest(loaded_language.manifest_name)
                                     .with_toolchain_lister(loaded_language.toolchain_provider),
-                                )
-                            }
+                            )
                         }
-                        .await;
+                    }
+                    .await;
 
-                        let language = language.map(Arc::new);
-                        if let Err(error) = &language {
-                            log::error!("failed to load language {language_name}:\n{error:?}");
-                        }
-                        let stale_txs = {
-                            let mut state = this.state.write();
-                            let is_current = state
+                    let language = language.map(Arc::new);
+                    if let Err(error) = &language {
+                        log::error!("failed to load language {language_name}:\n{error:?}");
+                    }
+                    let stale_txs = {
+                        let mut state = this.state.write();
+                        let is_current = state
+                            .available_languages
+                            .get_language(language_id)
+                            .is_some();
+                        if is_current {
+                            if let Ok(language) = &language {
+                                state.add(language.clone());
+                            }
+                            state.mark_language_loaded(language_id);
+                            if let Some(txs) = state.loading_languages.remove(&language_id) {
+                                for tx in txs {
+                                    let _ = tx.send(match &language {
+                                        Ok(language) => Ok(language.clone()),
+                                        Err(error) => Err(anyhow!(
+                                            "failed to load language {language_name}: {error}"
+                                        )),
+                                    });
+                                }
+                            }
+                            None
+                        } else {
+                            let txs = state
+                                .loading_languages
+                                .remove(&language_id)
+                                .unwrap_or_default();
+                            let replacement_id = state
                                 .available_languages
-                                .get_language(language_id)
-                                .is_some();
-                            if is_current {
-                                if let Ok(language) = &language {
-                                    state.add(language.clone());
-                                }
-                                state.mark_language_loaded(language_id);
-                                if let Some(txs) = state.loading_languages.remove(&language_id) {
-                                    for tx in txs {
-                                        let _ = tx.send(match &language {
-                                            Ok(language) => Ok(language.clone()),
-                                            Err(error) => Err(anyhow!(
-                                                "failed to load language {language_name}: {error}"
-                                            )),
-                                        });
+                                .find_by_exact_name(language_name.0.as_ref())
+                                .map(|language| language.id());
+                            Some((txs, replacement_id))
+                        }
+                    };
+                    if let Some((txs, replacement_id)) = stale_txs
+                        && !txs.is_empty()
+                    {
+                        match replacement_id {
+                            Some(replacement_id) => {
+                                let result = match this.load_language(replacement_id).await {
+                                    Ok(result) => result,
+                                    Err(_) => Err(anyhow!(LanguageNotFound)),
+                                };
+                                match result {
+                                    Ok(replacement_language) => {
+                                        for tx in txs {
+                                            let _ = tx.send(Ok(replacement_language.clone()));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let message = format!("{error:#}");
+                                        for tx in txs {
+                                            let _ = tx.send(Err(anyhow!(
+                                                "failed to load language {language_name}: {message}"
+                                            )));
+                                        }
                                     }
                                 }
-                                None
-                            } else {
-                                let txs = state
-                                    .loading_languages
-                                    .remove(&language_id)
-                                    .unwrap_or_default();
-                                let replacement_id = state
-                                    .available_languages
-                                    .find_by_exact_name(language_name.0.as_ref())
-                                    .map(|language| language.id());
-                                Some((txs, replacement_id))
                             }
-                        };
-                        if let Some((txs, replacement_id)) = stale_txs
-                            && !txs.is_empty()
-                        {
-                            match replacement_id {
-                                Some(replacement_id) => {
-                                    let result = match this.load_language(replacement_id).await {
-                                        Ok(result) => result,
-                                        Err(_) => Err(anyhow!(LanguageNotFound)),
-                                    };
-                                    match result {
-                                        Ok(replacement_language) => {
-                                            for tx in txs {
-                                                let _ = tx.send(Ok(replacement_language.clone()));
-                                            }
-                                        }
-                                        Err(error) => {
-                                            let message = format!("{error:#}");
-                                            for tx in txs {
-                                                let _ = tx.send(Err(anyhow!(
-                                                    "failed to load language {language_name}: {message}"
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    for tx in txs {
-                                        let _ = tx.send(Err(anyhow!(LanguageNotFound)));
-                                    }
+                            None => {
+                                for tx in txs {
+                                    let _ = tx.send(Err(anyhow!(LanguageNotFound)));
                                 }
                             }
                         }
-                    })
+                    }
+                };
+                #[cfg(not(target_family = "wasm"))]
+                self.executor.spawn(future).detach();
+                #[cfg(target_family = "wasm")]
+                gpui::ForegroundExecutor::new(self.executor.dispatcher().clone())
+                    .spawn(future)
                     .detach();
 
                 entry.insert(vec![tx]);
@@ -848,36 +848,40 @@ impl LanguageRegistry {
                     let this = self.clone();
                     let wasm_path = wasm_path.clone();
                     *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
-                    self.executor
-                        .spawn(async move {
-                            let grammar_result = maybe!({
-                                let wasm_bytes = std::fs::read(&wasm_path)?;
-                                let grammar_name = wasm_path
-                                    .file_stem()
-                                    .and_then(OsStr::to_str)
-                                    .context("invalid grammar filename")?;
-                                anyhow::Ok(with_parser(|parser| {
-                                    let mut store = parser.take_wasm_store().unwrap();
-                                    let grammar = store.load_language(grammar_name, &wasm_bytes);
-                                    parser.set_wasm_store(store).unwrap();
-                                    grammar
-                                })?)
-                            })
-                            .map_err(Arc::new);
-
-                            let value = match &grammar_result {
-                                Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),
-                                Err(error) => AvailableGrammar::LoadFailed(error.clone()),
-                            };
-
-                            log::trace!("finish loading grammar {name:?}");
-                            let old_value = this.state.write().grammars.insert(name, value);
-                            if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
-                                for tx in txs {
-                                    tx.send(grammar_result.clone()).ok();
-                                }
-                            }
+                    let future = async move {
+                        let grammar_result = maybe!({
+                            let wasm_bytes = std::fs::read(&wasm_path)?;
+                            let grammar_name = wasm_path
+                                .file_stem()
+                                .and_then(OsStr::to_str)
+                                .context("invalid grammar filename")?;
+                            anyhow::Ok(with_parser(|parser| {
+                                let mut store = parser.take_wasm_store().unwrap();
+                                let grammar = store.load_language(grammar_name, &wasm_bytes);
+                                parser.set_wasm_store(store).unwrap();
+                                grammar
+                            })?)
                         })
+                        .map_err(Arc::new);
+
+                        let value = match &grammar_result {
+                            Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),
+                            Err(error) => AvailableGrammar::LoadFailed(error.clone()),
+                        };
+
+                        log::trace!("finish loading grammar {name:?}");
+                        let old_value = this.state.write().grammars.insert(name, value);
+                        if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
+                            for tx in txs {
+                                tx.send(grammar_result.clone()).ok();
+                            }
+                        }
+                    };
+                    #[cfg(not(target_family = "wasm"))]
+                    self.executor.spawn(future).detach();
+                    #[cfg(target_family = "wasm")]
+                    gpui::ForegroundExecutor::new(self.executor.dispatcher().clone())
+                        .spawn(future)
                         .detach();
                 }
             }

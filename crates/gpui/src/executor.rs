@@ -1,13 +1,10 @@
 use crate::{ActivityGuard, App, PlatformDispatcher, PlatformScheduler};
-#[cfg(not(target_family = "wasm"))]
 use futures::channel::mpsc;
 use futures::prelude::*;
 use gpui_util::{TryFutureExt, TryFutureExtBacktrace};
 use scheduler::Instant;
 use scheduler::Scheduler;
-use std::{future::Future, marker::PhantomData, rc::Rc, sync::Arc, time::Duration};
-#[cfg(not(target_family = "wasm"))]
-use std::{mem, pin::Pin};
+use std::{future::Future, marker::PhantomData, mem, pin::Pin, rc::Rc, sync::Arc, time::Duration};
 
 pub use scheduler::{
     DedicatedExecutor, FallibleTask, LocalExecutor as SchedulerLocalExecutor, Priority, Task,
@@ -152,7 +149,6 @@ impl BackgroundExecutor {
     ///
     /// Dropping the returned future cancels its tasks and synchronously waits for their futures to
     /// be destroyed before returning.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn scoped<'scope, F>(&self, scheduler: F)
     where
         F: FnOnce(&mut Scope<'scope>),
@@ -173,7 +169,6 @@ impl BackgroundExecutor {
     ///
     /// Dropping the returned future cancels its tasks and synchronously waits for their futures to
     /// be destroyed before returning.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn scoped_priority<'scope, F>(&self, priority: Priority, scheduler: F)
     where
         F: FnOnce(&mut Scope<'scope>),
@@ -475,7 +470,6 @@ impl ForegroundExecutor {
 }
 
 /// Scope manages a set of tasks that are enqueued and waited on together. See [`BackgroundExecutor::scoped`].
-#[cfg(not(target_family = "wasm"))]
 pub struct Scope<'a> {
     executor: BackgroundExecutor,
     priority: Priority,
@@ -485,7 +479,6 @@ pub struct Scope<'a> {
     lifetime: PhantomData<&'a ()>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl<'a> Scope<'a> {
     fn new(executor: BackgroundExecutor, priority: Priority) -> Self {
         let (tx, rx) = mpsc::channel(1);
@@ -527,7 +520,28 @@ impl<'a> Scope<'a> {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(target_family = "wasm")]
+fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::pin::pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    let mut future = pin!(future);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+    }
+}
+
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
         self.tx.take().unwrap();
@@ -538,10 +552,15 @@ impl Drop for Scope<'_> {
             self.rx.next().await;
         };
         let mut future = std::pin::pin!(future);
+
+        #[cfg(not(target_family = "wasm"))]
         self.executor
             .inner
             .scheduler()
             .block(None, future.as_mut(), None);
+
+        #[cfg(target_family = "wasm")]
+        block_on_ready(future);
     }
 }
 

@@ -66,7 +66,7 @@ pub fn detect_language(
 ) -> Task<Option<Arc<Language>>> {
     let source = extract_sample(&buffer);
     let current_language_name = buffer.language().map(|language| language.name());
-    cx.background_spawn(async move {
+    let future = async move {
         let detection = betlang::detect(source);
         let (mut pending_languages, mut confirmed_languages) = (Vec::new(), Vec::new());
         // As in VS Code, retain only high-confidence candidate groups followed by a clear confidence gap.
@@ -115,7 +115,15 @@ pub fn detect_language(
             .await
             .ok()
             .and_then(|language| language.ok())
-    })
+    };
+    #[cfg(not(target_family = "wasm"))]
+    {
+        cx.background_spawn(future)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        cx.foreground_executor().spawn(future)
+    }
 }
 
 fn extract_sample(buffer: &BufferSnapshot) -> Vec<u8> {

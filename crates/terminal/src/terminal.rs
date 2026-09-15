@@ -4,7 +4,7 @@ mod alacritty;
 mod pty_info;
 pub mod terminal_settings;
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use anyhow::Context as _;
 use anyhow::{Result, bail};
 use futures_lite::future::yield_now;
@@ -47,11 +47,13 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+// wasm: std::time::Instant panics ("time not implemented on this platform")
 use thiserror::Error;
 use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
 pub use vte::ansi::{Color, NamedColor, Rgb};
+use web_time::Instant;
 
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
@@ -59,20 +61,21 @@ use gpui::{
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
-    vi_motion,
+    make_content, new_term, pty_term_config, resize, screen_lines, scroll_display, scroll_to_point,
+    search_matches, selection_text, set_default_cursor_style, set_selection as set_term_selection,
+    shrink_to_used, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection, update_selection_to_vi_cursor,
+    update_vi_cursor_for_scroll, used_lines, vi_goto_point, vi_motion,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::alacritty::{open_pty, pty_options, spawn_event_loop};
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
 
@@ -1099,7 +1102,7 @@ impl TerminalBuilder {
         // allocation / acquiring a controlling terminal fails with `ENOTTY`.
         // When set, run the command as a plain subprocess instead.
         let no_pty = HeadlessTerminal::is_enabled(cx);
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_family = "wasm")))]
         let child_signal_mask = match current_child_signal_mask()
             .context("failed to capture terminal child signal mask")
         {
@@ -1249,53 +1252,69 @@ impl TerminalBuilder {
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
             } else {
-                let alacritty_shell = shell_params.as_ref().map(|params| {
+                #[cfg(target_family = "wasm")]
+                {
+                    bail!(TerminalError {
+                        directory: working_directory,
+                        program: shell_params.as_ref().map(|params| params.program.clone()),
+                        args: shell_params.as_ref().and_then(|params| params.args.clone()),
+                        title_override: terminal_title_override,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "local PTY is not available in the browser until RemotePty RPC lands",
+                        ),
+                    });
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let alacritty_shell = shell_params.as_ref().map(|params| {
+                        (
+                            params.program.clone(),
+                            params.args.clone().unwrap_or_default(),
+                        )
+                    });
+                    let pty_options = pty_options(
+                        alacritty_shell,
+                        working_directory.clone(),
+                        env.clone(),
+                        // We pass in the foreground thread's signal mask to the child process via pty_options,
+                        // so terminal construction can run on a background thread without breaking Ctrl-C and other signals
+                        // otherwise the terminal would inherit the background executor's signal mask which blocks
+                        // some terminal signals
+                        #[cfg(not(windows))]
+                        child_signal_mask,
+                        #[cfg(windows)]
+                        shell_kind.tty_escape_args(),
+                    );
+
+                    //Setup the pty...
+                    let pty = match open_pty(&pty_options, TerminalBounds::default(), window_id) {
+                        Ok(pty) => pty,
+                        Err(error) => {
+                            bail!(TerminalError {
+                                directory: working_directory,
+                                program: shell_params.as_ref().map(|params| params.program.clone()),
+                                args: shell_params.as_ref().and_then(|params| params.args.clone()),
+                                title_override: terminal_title_override,
+                                source: error,
+                            });
+                        }
+                    };
+
+                    let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
+
+                    //And connect them together
+                    let pty_tx =
+                        spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
+
                     (
-                        params.program.clone(),
-                        params.args.clone().unwrap_or_default(),
+                        TerminalType::Pty {
+                            resources: PtyResources::Active(pty_tx),
+                            info: Arc::new(pty_info),
+                        },
+                        None,
                     )
-                });
-                let pty_options = pty_options(
-                    alacritty_shell,
-                    working_directory.clone(),
-                    env.clone(),
-                    // We pass in the foreground thread's signal mask to the child process via pty_options,
-                    // so terminal construction can run on a background thread without breaking Ctrl-C and other signals
-                    // otherwise the terminal would inherit the background executor's signal mask which blocks
-                    // some terminal signals
-                    #[cfg(not(windows))]
-                    child_signal_mask,
-                    #[cfg(windows)]
-                    shell_kind.tty_escape_args(),
-                );
-
-                //Setup the pty...
-                let pty = match open_pty(&pty_options, TerminalBounds::default(), window_id) {
-                    Ok(pty) => pty,
-                    Err(error) => {
-                        bail!(TerminalError {
-                            directory: working_directory,
-                            program: shell_params.as_ref().map(|params| params.program.clone()),
-                            args: shell_params.as_ref().and_then(|params| params.args.clone()),
-                            title_override: terminal_title_override,
-                            source: error,
-                        });
-                    }
-                };
-
-                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
-
-                //And connect them together
-                let pty_tx =
-                    spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
-
-                (
-                    TerminalType::Pty {
-                        resources: PtyResources::Active(pty_tx),
-                        info: Arc::new(pty_info),
-                    },
-                    None,
-                )
+                }
             };
 
             let no_task = task.is_none();
@@ -3076,7 +3095,16 @@ impl Terminal {
             .detach();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn pid(&self) -> Option<sysinfo::Pid> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.pid(),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn pid(&self) -> Option<u32> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),
             TerminalType::DisplayOnly => None,

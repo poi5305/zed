@@ -52,7 +52,6 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 task.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 ui.workspace = true
 terminal.workspace = true
@@ -60,6 +59,10 @@ uuid.workspace = true
 util.workspace = true
 watch.workspace = true
 zed_credentials_provider.workspace = true
+
+# tempfile pulls errno, unsupported on wasm32-unknown-unknown.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tempfile.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
