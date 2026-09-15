@@ -419,6 +419,29 @@ pub struct Terminal {
     _sandbox: Option<SandboxConfigHandle>,
 }
 
+/// Splits an exit status into the two fields ACP reports it as.
+///
+/// `portable_pty` is the natural source of both, but it needs host process support and is
+/// native-only, so wasm reads the code straight off `std` instead. Signals have no meaning
+/// there: the command ran on the server, and its terminal RPC reports the status it saw.
+fn exit_code_and_signal(exit_status: Option<ExitStatus>) -> (Option<u32>, Option<String>) {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let exit_status = exit_status.map(portable_pty::ExitStatus::from);
+        (
+            exit_status.as_ref().map(|status| status.exit_code()),
+            exit_status.and_then(|status| status.signal().map(ToOwned::to_owned)),
+        )
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        (
+            exit_status.and_then(|status| status.code()).map(|code| code as u32),
+            None,
+        )
+    }
+}
+
 pub struct TerminalOutput {
     pub ended_at: Instant,
     pub exit_status: Option<ExitStatus>,
@@ -501,11 +524,11 @@ impl Terminal {
                     })
                     .ok();
 
-                    let exit_status = exit_status.map(portable_pty::ExitStatus::from);
+                    let (exit_code, signal) = exit_code_and_signal(exit_status);
 
                     acp::TerminalExitStatus::new()
-                        .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                        .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)))
+                        .exit_code(exit_code)
+                        .signal(signal)
                 })
                 .shared(),
         }
@@ -539,7 +562,7 @@ impl Terminal {
 
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
         if let Some(output) = self.output.as_ref() {
-            let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
+            let (exit_code, signal) = exit_code_and_signal(output.exit_status);
 
             acp::TerminalOutputResponse::new(
                 output.content.clone(),
@@ -547,8 +570,8 @@ impl Terminal {
             )
             .exit_status(
                 acp::TerminalExitStatus::new()
-                    .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                    .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned))),
+                    .exit_code(exit_code)
+                    .signal(signal),
             )
         } else {
             let (current_content, original_len) = self.truncated_output(cx);

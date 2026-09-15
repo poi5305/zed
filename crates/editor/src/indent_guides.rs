@@ -1,7 +1,11 @@
-use std::{cmp::Ordering, ops::Range, time::Duration};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
+use std::{cmp::Ordering, ops::Range};
 
 use collections::HashSet;
-use gpui::{App, AppContext as _, Context, Task, Window};
+#[cfg(not(target_family = "wasm"))]
+use gpui::AppContext as _;
+use gpui::{App, Context, Task, Window};
 use language::language_settings::LanguageSettings;
 use multi_buffer::{IndentGuide, MultiBufferRow, ToPoint};
 use text::{LineIndent, Point};
@@ -98,26 +102,44 @@ impl Editor {
 
             let snapshot = snapshot.clone();
 
-            let task = cx.background_spawn(resolve_indented_range(snapshot, cursor_row));
-
-            // Try to resolve the indent in a short amount of time, otherwise move it to a background task.
-            match cx
-                .foreground_executor()
-                .block_with_timeout(Duration::from_micros(200), task)
+            #[cfg(not(target_family = "wasm"))]
             {
-                Ok(result) => state.active_indent_range = result,
-                Err(future) => {
-                    state.pending_refresh = Some(cx.spawn_in(window, async move |editor, cx| {
-                        let result = cx.background_spawn(future).await;
-                        editor
-                            .update(cx, |editor, _| {
-                                editor.active_indent_guides_state.active_indent_range = result;
-                                editor.active_indent_guides_state.pending_refresh = None;
-                            })
-                            .log_err();
-                    }));
-                    return None;
+                let task = cx.background_spawn(resolve_indented_range(snapshot, cursor_row));
+
+                // Try to resolve the indent in a short amount of time, otherwise move it to a background task.
+                match cx
+                    .foreground_executor()
+                    .block_with_timeout(Duration::from_micros(200), task)
+                {
+                    Ok(result) => state.active_indent_range = result,
+                    Err(future) => {
+                        state.pending_refresh =
+                            Some(cx.spawn_in(window, async move |editor, cx| {
+                                let result = cx.background_spawn(future).await;
+                                editor
+                                    .update(cx, |editor, _| {
+                                        editor.active_indent_guides_state.active_indent_range =
+                                            result;
+                                        editor.active_indent_guides_state.pending_refresh = None;
+                                    })
+                                    .log_err();
+                            }));
+                        return None;
+                    }
                 }
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                state.pending_refresh = Some(cx.spawn_in(window, async move |editor, cx| {
+                    let result = resolve_indented_range(snapshot, cursor_row).await;
+                    editor
+                        .update(cx, |editor, _| {
+                            editor.active_indent_guides_state.active_indent_range = result;
+                            editor.active_indent_guides_state.pending_refresh = None;
+                        })
+                        .log_err();
+                }));
+                return None;
             }
         }
 
