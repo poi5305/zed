@@ -327,6 +327,62 @@ build, but it means none of `zed-web`'s build wiring transfers verbatim — ever
 unification and `default-features` decision above has to be re-expressed in `web/Cargo.toml`, where
 feature unification works over a *different* crate set. That is the main thing Phase 2 has to prove.
 
+### 4.4 §4.2 re-measured on the built graph, and both halves of it were wrong [verified]
+
+§4.2 ruled that the web build compiles **18 tree-sitter grammar C libraries**, because
+`crates/markdown:51` and `crates/edit_prediction:83` enable `load-grammars`, and concluded from
+that that the WASI SDK is a hard prerequisite. Measured against the graph that now actually
+builds, with `cargo tree -p zed_web_workspace --target wasm32-unknown-unknown`:
+
+```
+tree-sitter        v0.27.0 (web/vendor/tree_sitter_wasm)
+tree-sitter-json   v0.24.8
+tree-sitter-language v0.1.8
+```
+
+**One grammar, not eighteen** — and it arrives through `tasks_ui`, not through `grammars`.
+`grammars`, `languages`, `markdown` and `edit_prediction` all resolve with **no features at
+all** in the wasm graph, so `load-grammars` is off everywhere.
+
+Two corrections follow, and they point in opposite directions:
+
+**The conclusion survives; the reasoning does not.** The WASI SDK is still a hard prerequisite,
+because `tree-sitter-json`'s C still has to build for wasm32 — that is exactly why
+`debugger_ui` (→ `tasks_ui` → `tree-sitter-json`) failed when it was checked without the
+`CC_wasm32_unknown_unknown` export. The count and the causal story were both wrong.
+
+**And the missing 17 cannot simply be switched on.** Turning `load-grammars` on was tried:
+`tree-sitter-rust`'s build script fails for `wasm32-unknown-unknown` even with WASI clang and
+the WASI sysroot on the include path —
+
+```
+wasi-sysroot/include/wasm32-wasi/wasi/api.h:23:2:
+error: <wasi/api.h> is only supported on WASI platforms.
+```
+
+The sysroot's headers guard on `__wasi__`, which `wasm32-unknown-unknown` does not define.
+`tree-sitter-json` happens not to include anything that reaches that header; `tree-sitter-rust`'s
+scanner does.
+
+#### BLOCKER — the web build has no syntax highlighting, and this is why
+
+This is a product-level consequence, not a build detail, so it needs stating plainly: with
+`load-grammars` off, **no tree-sitter grammar is registered in the browser**. A project opens,
+the text is there, and it is unhighlighted — no highlighting, no structural selection, no
+outline. `crates/languages` compiling for wasm (which cost this port its `MaybeSend` work)
+delivers the LSP adapters, not the grammars.
+
+Whether that was a deliberate Phase 3a decision to dodge the C build or an accident nobody
+measured, it was never recorded as a ruling, and "first light" should not be declared without
+saying it out loud. Resolving it needs a real decision:
+
+| Option | Cost |
+| --- | --- |
+| Build the grammars against a sysroot whose headers do not guard on `__wasi__` (or patch the guard) | Unknown until tried on more than `tree-sitter-rust`; the guard is upstream WASI's, not ours |
+| Target `wasm32-wasip1` for the C only, linking it into a `wasm32-unknown-unknown` module | Mixed-target linking; likely fragile |
+| Ship the grammars as separate `.wasm` parsers loaded at runtime, which is what tree-sitter's own `wasm` feature is for | Reintroduces the `wasmtime` question §4 decided against, though possibly via the browser's own WebAssembly API rather than wasmtime |
+| Accept an unhighlighted editor for now | Honest, and cheap, but it should be a stated product decision rather than a silent one |
+
 ## 5. Porting the 273 modified files
 
 ### 5.1 Classification [verified]
@@ -466,6 +522,35 @@ The fix is one import line. The rule is what matters:
 
 `SystemTime` has the same hazard and no `scheduler` equivalent; nothing in our tree uses it on a
 wasm-reachable path yet, and nothing should start.
+
+### 5.6 What the `Instant` gate found once it could run [verified]
+
+`web/check-wasm-time.sh` was written in Phase 3b and believed green through two review
+rounds. It was neither green nor red: it resolved `-p zed_web_workspace` against the **root**
+manifest, and the root sets `exclude = ["web"]`, so every run ended at
+
+```
+error: package ID specification `zed_web_workspace` did not match any packages
+```
+
+It exited non-zero, so it was not silently passing — but nothing had ever consulted it, and
+"needs Phase 4" in the handoff was the wrong diagnosis. Pointed at `web/Cargo.toml` it works,
+and the first real run was red on ten counts:
+
+| Finding | Meaning |
+| --- | --- |
+| `client.rs`, `editor/cursor_animation.rs`, `editor/element.rs`, `acp_thread/terminal.rs`, `edit_prediction_context.rs` | live `Instant::now()` in the wasm graph — compiles, **panics in a browser**, invisible to every native test |
+| `alacritty_terminal` × 3 | stale allowlist entries; the crate moved to `web/vendor/` in Phase 2 |
+| `editor/scroll.rs` × 2 | stale allowlist entries; fixed during the port |
+
+Two process lessons, both cheap to state and expensive to relearn:
+
+1. **A gate that has never been red has not been shown to work.** This one was authored,
+   reviewed twice, and recorded as a standing guard while being incapable of checking anything.
+   Every new gate needs one deliberate red run against a known-bad input before it is trusted.
+2. **The gate matches comments too**, so a note mentioning the forbidden path trips it. That is
+   the right trade: a gate that over-reports costs a reworded comment, while teaching it to skip
+   comments risks teaching it to skip a real occurrence inside a string. Reword the comment.
 
 ## 6. The four local features
 

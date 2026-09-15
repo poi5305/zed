@@ -42,6 +42,12 @@ use notifications::status_toast::StatusToast;
 use project::{
     AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId, repo_identity_path_if_local,
 };
+// `recent_projects` is native-only in this crate's manifest, and has to be: it needs
+// `extension_host`, which pulls `wasmtime` -- the one package docs/web-zed-plan.md §4
+// keeps out of the wasm graph on purpose. The popover is therefore absent on the web
+// until Phase 6's `project_manager` decides what a recent project means to a browser
+// (§10, open question 8).
+#[cfg(not(target_family = "wasm"))]
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
@@ -801,6 +807,7 @@ pub struct Sidebar {
     draft_kinds: HashMap<ThreadId, DraftKind>,
     view: SidebarView,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
+    #[cfg(not(target_family = "wasm"))]
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
@@ -939,6 +946,7 @@ impl Sidebar {
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
+            #[cfg(not(target_family = "wasm"))]
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
             project_header_new_thread_menu_handles: HashMap::new(),
@@ -6674,6 +6682,7 @@ impl Sidebar {
             .child(self.filter_editor.clone())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn render_recent_projects_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let multi_workspace = self.multi_workspace.upgrade();
 
@@ -6718,6 +6727,12 @@ impl Sidebar {
                 y: px(-2.0),
             })
             .anchor(gpui::Anchor::BottomRight)
+    }
+
+    /// The web build has no recent-projects popover; see the note on the import above.
+    #[cfg(target_family = "wasm")]
+    fn render_recent_projects_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
 
     fn new_thread_in_group(
@@ -7911,9 +7926,18 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::on_previous_project))
             .on_action(cx.listener(Self::on_next_thread))
             .on_action(cx.listener(Self::on_previous_thread))
-            .on_action(cx.listener(|this, _: &OpenRecent, window, cx| {
-                this.recent_projects_popover_handle.toggle(window, cx);
-            }))
+            .map(|el| {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    el.on_action(cx.listener(|this, _: &OpenRecent, window, cx| {
+                        this.recent_projects_popover_handle.toggle(window, cx);
+                    }))
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    el
+                }
+            })
             .font(ui_font)
             .map(|el| {
                 let on_left = self.side(cx) == SidebarSide::Left;

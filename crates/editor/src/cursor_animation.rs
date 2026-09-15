@@ -7,7 +7,8 @@
 
 use collections::HashMap;
 use gpui::{Bounds, Pixels, Point, point, px};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 const MAX_FRAME_DURATION: Duration = Duration::from_millis(33);
 const SPRING_RESET_EPSILON: f32 = 0.001;
