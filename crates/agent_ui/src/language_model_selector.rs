@@ -2,9 +2,9 @@ use std::{cmp::Reverse, sync::Arc};
 
 use agent_settings::AgentSettings;
 use collections::{HashMap, HashSet, IndexMap};
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 #[cfg(target_family = "wasm")]
 use fuzzy::match_strings_blocking;
+use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, BackgroundExecutor, DismissEvent, FocusHandle, ForegroundExecutor,
     Subscription, Task,

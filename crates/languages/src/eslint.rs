@@ -105,7 +105,7 @@ impl LspInstaller for EsLintLspAdapter {
         version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         let node = self.node.clone();
 

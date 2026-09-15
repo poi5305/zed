@@ -1371,7 +1371,8 @@ impl PickerDelegate for ProjectPickerDelegate {
             true,
             100,
             &Default::default(),
-            cx.background_executor().clone(),);
+            cx.background_executor().clone(),
+        );
 
         sibling_matches.sort_unstable_by(|a, b| {
             b.score
@@ -1417,7 +1418,8 @@ impl PickerDelegate for ProjectPickerDelegate {
             true,
             100,
             &Default::default(),
-            cx.background_executor().clone(),);
+            cx.background_executor().clone(),
+        );
 
         recent_matches.sort_unstable_by(|a, b| {
             b.score

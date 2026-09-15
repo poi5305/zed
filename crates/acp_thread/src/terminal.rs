@@ -436,7 +436,9 @@ fn exit_code_and_signal(exit_status: Option<ExitStatus>) -> (Option<u32>, Option
     #[cfg(target_family = "wasm")]
     {
         (
-            exit_status.and_then(|status| status.code()).map(|code| code as u32),
+            exit_status
+                .and_then(|status| status.code())
+                .map(|code| code as u32),
             None,
         )
     }

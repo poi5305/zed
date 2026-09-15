@@ -37,10 +37,19 @@ grep -E "^error" -A6 /tmp/b.log | head -40                  # why
 Then fix, and verify **both** targets before moving on:
 
 ```
+export CC_wasm32_unknown_unknown="$PWD/target/wasi-sdk/bin/clang"
+export CFLAGS_wasm32_unknown_unknown="-isystem $PWD/target/wasi-sdk/share/wasi-sysroot/include/wasm32-wasi"
+
 cd web && CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=../target/web-probe \
     cargo check -p <crate> --target wasm32-unknown-unknown --lib
 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=target/web-probe cargo check -p <crate> --lib
 ```
+
+**Export those two variables first.** `./web/build.sh` sets them itself, so a single-crate
+`cargo check` run by hand is the only place they go missing — and when they do, the 18
+tree-sitter grammars are handed to the host clang, which cannot target wasm32. The failure
+names the grammar, not the missing toolchain, so it reads as a broken crate. It made
+`debugger_ui` look broken once when it was already fine.
 
 ### The environment constraint that shapes everything
 
@@ -73,6 +82,22 @@ atomics + workers), with nothing in any test suite to notice.
 Instead, the three sites that shipped a `Language` across threads take the foreground
 executor on wasm. `crates/project`'s 14 `Pin<Box<dyn Future + Send>>` errors were the bill
 for that decision — finite, concrete, and paid.
+
+### `MaybeSend` / `MaybeSync` are the bill for that, and they are cheap
+
+The `!Send` ruling above propagates up through everything that holds a `Language`, and the
+bounds it collides with are written in three different places. Each needs its own shape:
+
+| Where the bound is written | How wasm relaxes it |
+| --- | --- |
+| A trait's method signature (`-> impl Send + Future<…>`) | `MaybeSend`, a marker trait: `Send` off wasm via a blanket `impl<T: Send>`, empty on wasm. 28 sites. |
+| A trait's supertrait list (`LspAdapter: Send + Sync`) | `MaybeSend + MaybeSync`, same shape. |
+| A trait **object** (`dyn Fn() -> … + Send + Sync`) | a cfg'd type alias, because only auto traits may follow the principal trait in a trait object — `dyn Fn() + MaybeSend` does not compile. |
+
+Native behaviour is unchanged by construction: `MaybeSend: Send` with a blanket impl for every
+`T: Send` means the native bound is still exactly `Send`. That is what makes these safe to
+add and dangerous to "simplify" — deleting them reads like tidying and silently re-imposes a
+bound wasm cannot satisfy.
 
 ### `fuzzy::match_strings` matches inline on wasm
 
@@ -125,6 +150,20 @@ Run all three before believing anything:
 | `web/check-workspace-isolation.sh` | §9's desktop-isolation invariants, plus the §3.2 rules nothing else enforced. It has already caught a real regression — another agent rewrote `web/Cargo.toml` wholesale half an hour after the assertions landed, dropping `[profile.web-release]` and four `[patch]` entries |
 | `web/check-refusals.sh` | the four §5.3 refusals, bound to behavioural strings rather than line numbers |
 | `web/check-wasm-time.sh` + `wasm-std-instant.allowlist` | §5.5's `Instant` rule; needs `zed_web_workspace` so it cannot run before Phase 4 |
+
+### What the gate reports today, and which half of it is real
+
+`check-workspace-isolation.sh` last recorded **0 failures** at review round 4. It now reports
+four, and they are not one thing:
+
+| Report | Verdict |
+| --- | --- |
+| `V11` × 2 (`cd web && cargo check --workspace` fails) | **expected.** Making that command succeed *is* Phase 5. It goes green when Phase 5 finishes, and not before. |
+| `M1` — `zed_web_workspace` declares `gpui_web`, `wasm_rpc`, `feature_flags`, `edit_prediction`, `instant`, `agent-client-protocol`, none of which its own `src/` ever names | **a real finding, verified by hand.** Either they are load-bearing for a reason no comment records, or they are dead manifest lines that reached `Cargo.lock`. Phase 4's author is the one who knows; resolve it before Phase 6. |
+| `M1`/`M2` — every `web/vendor/*` fork | **a scope defect in the gate.** `phase3a_base` is a fixed commit, so the diff has grown to cover Phases 4 and 5 as they landed. These manifests are upstream's, kept verbatim on purpose, and `M1` cannot see their sources anyway (`tree_sitter_wasm` builds from `binding_rust/`, not `src/`). Exclude `web/vendor/` from M1 and M2. |
+
+Fixing the third is what keeps the second readable. A gate that cries wolf about legitimate
+work is one nobody reads, and this one has already caught a real regression once.
 
 ## 5. What is left
 

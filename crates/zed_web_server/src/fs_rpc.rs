@@ -571,6 +571,7 @@ fn metadata_value(metadata: &fs::Metadata) -> Value {
         "mtime_nanos": metadata.mtime_nsec(),
         "is_symlink": metadata.file_type().is_symlink(),
         "is_dir": metadata.is_dir(),
+        "is_file": metadata.is_file(),
         "len": metadata.len(),
         "is_fifo": metadata.file_type().is_fifo(),
         "is_executable": mode & 0o100 != 0,

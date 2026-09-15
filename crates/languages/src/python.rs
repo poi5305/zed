@@ -504,7 +504,7 @@ impl LspInstaller for TyLspAdapter {
         latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
 
         async move {
@@ -807,7 +807,7 @@ impl LspInstaller for PyrightLspAdapter {
         _latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         let node = self.node.clone();
 
@@ -830,7 +830,7 @@ impl LspInstaller for PyrightLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Option<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         let node = self.node.clone();
         let version = version.clone();
@@ -1984,7 +1984,7 @@ impl LspInstaller for PyLspAdapter {
         _: (),
         _: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
 
         async move {
@@ -2247,7 +2247,7 @@ impl LspInstaller for BasedPyrightLspAdapter {
         _latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         let node = self.node.clone();
 
@@ -2270,7 +2270,7 @@ impl LspInstaller for BasedPyrightLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Option<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         let node = self.node.clone();
         let version = version.clone();
@@ -2589,7 +2589,7 @@ impl LspInstaller for RuffLspAdapter {
         latest_version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
 
         async move {

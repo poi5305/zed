@@ -71,7 +71,7 @@ impl LspInstaller for TailwindCssLspAdapter {
         _latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         _: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let node = self.node.clone();
 
         async move {
@@ -93,7 +93,7 @@ impl LspInstaller for TailwindCssLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         _: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Option<LanguageServerBinary>> + use<> {
         let node = self.node.clone();
         let version = version.clone();
         let container_dir = container_dir.clone();

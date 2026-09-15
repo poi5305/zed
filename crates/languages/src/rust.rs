@@ -1,11 +1,16 @@
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use async_trait::async_trait;
 use collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
 use futures::StreamExt;
 use futures::lock::OwnedMutexGuard;
 use gpui::{App, AppContext, AsyncApp, Entity, SharedString, Task};
-use http_client::github::AssetKind;
-use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
+use http_client::github::GitHubLspBinaryVersion;
+#[cfg(not(target_family = "wasm"))]
+use http_client::github::{AssetKind, latest_github_release};
+#[cfg(not(target_family = "wasm"))]
 use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
 use lsp::{InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions};
@@ -28,6 +33,7 @@ use std::{
 };
 use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
 use util::command::{Stdio, new_command};
+#[cfg(not(target_family = "wasm"))]
 use util::fs::{make_file_executable, remove_matching};
 use util::merge_json_value_into;
 use util::rel_path::RelPath;
@@ -252,6 +258,7 @@ impl RustLspAdapter {
         false
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn build_asset_name() -> String {
         let extension = match Self::GITHUB_ASSET_KIND {
             AssetKind::TarGz => "tar.gz",
@@ -752,7 +759,7 @@ impl LspInstaller for RustLspAdapter {
         cx: &AsyncApp,
     ) -> Option<LanguageServerBinary> {
         let delegate = delegate.clone();
-        cx.background_spawn(async move {
+        let future = async move {
             let env = delegate.shell_env().await;
             if let Some(path) = Self::rustup_rust_analyzer_for_worktree(delegate.as_ref()).await {
                 let result = delegate
@@ -798,10 +805,21 @@ impl LspInstaller for RustLspAdapter {
                 env: Some(env),
                 arguments: vec![],
             })
-        })
-        .await
+        };
+        // Capturing `LspAdapterDelegate` is `!Send` on wasm (`tree_sitter::Language`).
+        // The browser has one thread, so the foreground executor is the equivalent
+        // choice rather than a lesser one.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.background_spawn(future).await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            cx.foreground_executor().spawn(future).await
+        }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn fetch_latest_server_version(
         &self,
         delegate: &Arc<dyn LspAdapterDelegate>,
@@ -828,12 +846,25 @@ impl LspInstaller for RustLspAdapter {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    async fn fetch_latest_server_version(
+        &self,
+        _delegate: &Arc<dyn LspAdapterDelegate>,
+        _pre_release: bool,
+        _: &mut AsyncApp,
+    ) -> Result<GitHubLspBinaryVersion> {
+        anyhow::bail!(
+            "the browser cannot install a native language server; that is done on the server"
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn fetch_server_binary(
         &self,
         version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
 
         async move {
@@ -914,6 +945,20 @@ impl LspInstaller for RustLspAdapter {
                 env: None,
                 arguments: Default::default(),
             })
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn fetch_server_binary(
+        &self,
+        _version: GitHubLspBinaryVersion,
+        _container_dir: PathBuf,
+        _delegate: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl language::MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
+        async move {
+            anyhow::bail!(
+                "the browser cannot install a native language server; that is done on the server"
+            )
         }
     }
 
@@ -1402,6 +1447,7 @@ fn package_name_from_pkgid(pkgid: &str) -> Option<&str> {
     Some(package_name)
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn get_cached_server_binary(container_dir: PathBuf) -> Option<LanguageServerBinary> {
     let binary_result = maybe!(async {
         let mut last = None;
@@ -1444,6 +1490,13 @@ async fn get_cached_server_binary(container_dir: PathBuf) -> Option<LanguageServ
             None
         }
     }
+}
+
+#[cfg(target_family = "wasm")]
+async fn get_cached_server_binary(_container_dir: PathBuf) -> Option<LanguageServerBinary> {
+    // The browser has no cached host rust-analyzer; the caller already treats None as
+    // "try download".
+    None
 }
 
 fn test_fragment(variables: &TaskVariables, path: &Path, stem: &str) -> String {

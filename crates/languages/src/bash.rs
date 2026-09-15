@@ -97,7 +97,7 @@ impl LspInstaller for BashLspAdapter {
         version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<lsp::LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Option<lsp::LanguageServerBinary>> + use<> {
         let node = self.node.clone();
         let version = version.clone();
         let container_dir = container_dir.clone();
@@ -146,7 +146,7 @@ impl LspInstaller for BashLspAdapter {
         _latest_version: Self::BinaryVersion,
         container_dir: std::path::PathBuf,
         delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<lsp::LanguageServerBinary>> + use<> {
+    ) -> impl language::MaybeSend + Future<Output = Result<lsp::LanguageServerBinary>> + use<> {
         let node = self.node.clone();
         let delegate = delegate.clone();
 

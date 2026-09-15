@@ -34,6 +34,18 @@ use theme::Theme;
 
 use util::{maybe, post_inc};
 
+/// Constructs a lazily registered LSP adapter on demand.
+///
+/// `Send + Sync` off wasm, where the registry is shared across threads. On wasm the closure
+/// captures an `Arc<dyn LspAdapter>`, which is neither -- see [`crate::MaybeSend`] -- and the
+/// registry lives on the browser's single thread, so the bounds are dropped rather than forged.
+/// [`crate::MaybeSend`] cannot express this: only auto traits may follow the principal trait in
+/// a trait object, so the split has to be on the alias.
+#[cfg(not(target_family = "wasm"))]
+type AvailableLspAdapter = Arc<dyn Fn() -> Arc<CachedLspAdapter> + 'static + Send + Sync>;
+#[cfg(target_family = "wasm")]
+type AvailableLspAdapter = Arc<dyn Fn() -> Arc<CachedLspAdapter> + 'static>;
+
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
     language_server_download_dir: Option<Arc<Path>>,
@@ -49,8 +61,7 @@ struct LanguageRegistryState {
     grammars: HashMap<Arc<str>, AvailableGrammar>,
     lsp_adapters: HashMap<LanguageName, Vec<Arc<CachedLspAdapter>>>,
     all_lsp_adapters: HashMap<LanguageServerName, Arc<CachedLspAdapter>>,
-    available_lsp_adapters:
-        HashMap<LanguageServerName, Arc<dyn Fn() -> Arc<CachedLspAdapter> + 'static + Send + Sync>>,
+    available_lsp_adapters: HashMap<LanguageServerName, AvailableLspAdapter>,
     loading_languages: HashMap<LanguageId, Vec<oneshot::Sender<Result<Arc<Language>>>>>,
     subscription: (watch::Sender<()>, watch::Receiver<()>),
     theme: Option<Arc<Theme>>,
