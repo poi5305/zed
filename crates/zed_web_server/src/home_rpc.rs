@@ -44,5 +44,9 @@ fn dirs(fs_rpc: &FsRpc) -> Result<Value> {
         "home": home.display().to_string(),
         "config": config.display().to_string(),
         "data": data.display().to_string(),
+        // Anything on the client that picks a path by operating system is choosing for
+        // this machine, not for the browser's target -- which is `unknown` and would
+        // silently land on the Linux layout.
+        "os": std::env::consts::OS,
     }))
 }

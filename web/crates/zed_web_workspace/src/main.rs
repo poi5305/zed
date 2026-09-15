@@ -126,6 +126,8 @@ struct WebHomeDirs {
     home: String,
     config: String,
     data: String,
+    #[serde(default)]
+    os: String,
 }
 
 #[cfg(target_family = "wasm")]
@@ -2207,6 +2209,11 @@ pub fn main() {
                 util::paths::set_home_dir(std::path::PathBuf::from(dirs.home));
                 paths::set_config_dir(std::path::PathBuf::from(dirs.config));
                 paths::set_data_dir(std::path::PathBuf::from(dirs.data));
+                // Anything choosing a path by operating system has to choose for the
+                // server; `cfg!` here would answer for wasm32-unknown-unknown.
+                if !dirs.os.is_empty() {
+                    project_manager::set_server_os(dirs.os);
+                }
             }
             Err(error) => {
                 web_sys::console::warn_1(
