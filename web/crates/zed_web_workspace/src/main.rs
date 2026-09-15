@@ -1998,6 +1998,14 @@ fn load_core_panels(
         // Real desktop AgentPanel: native agent runs in-process over remote Fs +
         // remote SQL; model providers stream over the wasm Fetch HTTP client.
         let agent_panel = AgentPanel::load(workspace_handle.clone(), cx.clone());
+        // This fork's own panels (docs/web-zed-plan.md §6). `forward_ports` is absent by
+        // §6.5's ruling: a browser has no "this machine" for a forwarded port to bind on.
+        let project_manager_panel =
+            project_manager::ProjectManagerPanel::load(workspace_handle.clone(), cx.clone());
+        let tmux_sessions_panel =
+            tmux_sessions::TmuxSessionsPanel::load(workspace_handle.clone(), cx.clone());
+        let claude_sessions_panel =
+            claude_sessions::ClaudeSessionsPanel::load(workspace_handle.clone(), cx.clone());
 
         let attached = futures::join!(
             add_panel_when_ready(
@@ -2026,10 +2034,29 @@ fn load_core_panels(
                 "terminal"
             ),
             add_panel_when_ready(agent_panel, workspace_handle.clone(), cx.clone(), "agent"),
+            add_panel_when_ready(
+                project_manager_panel,
+                workspace_handle.clone(),
+                cx.clone(),
+                "project manager"
+            ),
+            add_panel_when_ready(
+                tmux_sessions_panel,
+                workspace_handle.clone(),
+                cx.clone(),
+                "tmux sessions"
+            ),
+            add_panel_when_ready(
+                claude_sessions_panel,
+                workspace_handle.clone(),
+                cx.clone(),
+                "claude sessions"
+            ),
         );
 
         if [
             attached.0, attached.1, attached.2, attached.3, attached.4, attached.5,
+            attached.6, attached.7, attached.8,
         ]
         .into_iter()
         .all(|attached| attached)
