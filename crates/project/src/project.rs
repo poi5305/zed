@@ -33,6 +33,20 @@ use git_store::{Repository, RepositoryId};
 pub mod search_history;
 pub mod yarn;
 
+macro_rules! spawn_project_work {
+    ($cx:expr, $future:expr) => {{
+        #[cfg(not(target_family = "wasm"))]
+        {
+            $cx.background_spawn($future)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            $cx.foreground_executor().spawn($future)
+        }
+    }};
+}
+pub(crate) use spawn_project_work;
+
 use dap::inline_value::{InlineValueLocation, VariableLookupKind, VariableScope};
 use itertools::{Either, Itertools};
 
@@ -3970,6 +3984,7 @@ impl Project {
             WorktreeStoreEvent::WorktreeOrderChanged => cx.emit(Event::WorktreeOrderChanged),
             WorktreeStoreEvent::WorktreeUpdateSent(_) => {}
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                #[cfg(not(target_family = "wasm"))]
                 self.client()
                     .telemetry()
                     .report_discovered_project_type_events(*worktree_id, changes);

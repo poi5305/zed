@@ -1,5 +1,7 @@
 use anyhow::Context as _;
-use gpui::{AppContext, WeakEntity};
+#[cfg(not(target_family = "wasm"))]
+use gpui::AppContext;
+use gpui::WeakEntity;
 use lsp::{LanguageServer, LanguageServerName};
 use serde_json::Value;
 
@@ -84,7 +86,7 @@ pub fn register_requests(lsp_store: WeakEntity<LspStore>, language_server: &Lang
                 for (request_id, command, payload) in requests.into_iter() {
                     let target_server = target_server.clone();
                     let vue_server = vue_server.clone();
-                    cx.background_spawn(async move {
+                    crate::spawn_project_work!(cx, async move {
                         let response = target_server
                             .request::<lsp::request::ExecuteCommand>(
                                 lsp::ExecuteCommandParams {

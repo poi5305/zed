@@ -730,9 +730,9 @@ impl LocalLspStore {
             && let Some(path) = settings.path.as_ref().map(PathBuf::from)
         {
             let settings = settings.clone();
-            return cx.background_spawn(async move {
+            let future = async move {
                 if let Some(mut wait_until_worktree_trust) = wait_until_worktree_trust {
-                    let already_trusted =  *wait_until_worktree_trust.borrow();
+                    let already_trusted = *wait_until_worktree_trust.borrow();
                     if !already_trusted {
                         log::info!(
                             "Waiting for worktree {worktree_abs_path:?} to be trusted, before starting language server {}",
@@ -763,7 +763,15 @@ impl LocalLspStore {
                         .map(Into::into)
                         .collect(),
                 })
-            });
+            };
+            #[cfg(not(target_family = "wasm"))]
+            {
+                return cx.background_spawn(future);
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                return cx.foreground_executor().spawn(future);
+            }
         }
 
         #[cfg(any(test, feature = "test-support"))]
@@ -6624,7 +6632,7 @@ impl LspStore {
             let request_timeout = ProjectSettings::get_global(cx)
                 .global_lsp_settings
                 .get_request_timeout();
-            cx.background_spawn(async move {
+            crate::spawn_project_work!(cx, async move {
                 server
                     .request::<lsp::request::ExecuteCommand>(
                         lsp::ExecuteCommandParams {
@@ -6680,7 +6688,7 @@ impl LspStore {
             let request_timeout = ProjectSettings::get_global(cx)
                 .global_lsp_settings
                 .get_request_timeout();
-            cx.background_spawn(async move {
+            crate::spawn_project_work!(cx, async move {
                 LocalLspStore::try_resolve_code_action(
                     &lang_server,
                     &mut action,
@@ -12114,7 +12122,7 @@ impl LspStore {
                     .global_lsp_settings
                     .get_request_timeout();
 
-                anyhow::Ok(cx.background_spawn(async move {
+                anyhow::Ok(crate::spawn_project_work!(cx, async move {
                     if can_resolve {
                         server
                             .request::<lsp::request::ResolveCompletionItem>(
@@ -16373,7 +16381,8 @@ impl LocalLspAdapterDelegate {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl LspAdapterDelegate for LocalLspAdapterDelegate {
     fn show_notification(&self, message: &str, cx: &mut App) {
         self.lsp_store

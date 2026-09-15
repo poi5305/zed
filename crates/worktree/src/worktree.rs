@@ -589,8 +589,24 @@ impl Worktree {
                         entry.is_hidden = settings.is_path_hidden(path);
                     }
                 }
+                #[cfg(not(target_family = "wasm"))]
                 cx.foreground_executor()
                     .block_on(snapshot.insert_entry(entry, fs.as_ref()));
+                // `cx.new` is sync, so we cannot `.await`. Skipping the insert (settings'
+                // precedent) would leave `root_entry()` empty: the scanner's initial scan is
+                // a no-op without it, and `is_single_file` is derived from `root_dir()` at
+                // scanner start. `insert_entry` only awaits when loading a `.gitignore`; the
+                // worktree root is `RelPath::empty`, so this future is ready.
+                #[cfg(target_family = "wasm")]
+                if snapshot
+                    .insert_entry(entry, fs.as_ref())
+                    .now_or_never()
+                    .is_none()
+                {
+                    panic!(
+                        "Worktree::local cannot block the wasm main thread; insert_entry of the worktree root suspended"
+                    );
+                }
             }
 
             let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
@@ -5867,6 +5883,7 @@ impl BackgroundScanner {
         let (ignore_queue_tx, ignore_queue_rx) = async_channel::unbounded();
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
+                #[cfg(not(target_family = "wasm"))]
                 ignore_queue_tx
                     .send_blocking(UpdateIgnoreStatusJob {
                         abs_path: parent_abs_path,
@@ -5874,6 +5891,18 @@ impl BackgroundScanner {
                         ignore_queue: ignore_queue_tx.clone(),
                         scan_queue: scan_job_tx.clone(),
                     })
+                    .unwrap();
+                // Unbounded channel, receiver still held: `send().await` cannot drop the job.
+                // Do not `try_send` — that is the §5.3.4 lossy-log refusal.
+                #[cfg(target_family = "wasm")]
+                ignore_queue_tx
+                    .send(UpdateIgnoreStatusJob {
+                        abs_path: parent_abs_path,
+                        ignore_stack,
+                        ignore_queue: ignore_queue_tx.clone(),
+                        scan_queue: scan_job_tx.clone(),
+                    })
+                    .await
                     .unwrap();
             }
         }
