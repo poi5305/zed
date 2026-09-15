@@ -17,8 +17,8 @@ commit messages and `docs/web-zed-plan.md` do not already say.
 | 2 | ✅ seven vendored forks + review round 2 |
 | 3 | ✅ 48 manifests + 72 `.rs` + review rounds 3 and 4 |
 | 4a · 4b · 4c | ✅ `build.sh`, three web crates, `zed_web_server` |
-| **5** | **in progress** — 28 crates compile for wasm32; `./web/build.sh` reaches `-Z build-std` and the WASI grammar C compile, then fails on whichever crate is next |
-| 6 | not started |
+| **5** | **in progress** — `cd web && cargo check --workspace --target wasm32-unknown-unknown` is down to `settings_ui` and `keymap_editor`. Everything else in the graph type-checks, including `language`, `languages`, `edit_prediction_ui` and `sidebar` |
+| 6 | `Home::` RPC done (server + the wasm seeding API); the four panels not started |
 
 **Desktop is unaffected and that is asserted, not assumed.** Root `Cargo.lock` has gained
 lines and deleted none across the whole port; the nine crates §9 pins keep their exact
@@ -65,6 +65,28 @@ edits directly and running one small `cargo check` at a time.
 
 **If the next session has more memory headroom, delegation is fine and faster.** If not,
 expect to do it inline.
+
+## 2b. Every remaining layer has had one of three shapes
+
+Worth knowing before opening the next error list, because it tells you which question to ask
+first:
+
+1. **A dependency gated out of the manifest whose `use` stayed unconditional.** Seen in
+   `sidebar` (`recent_projects`), `settings_ui` (five deps), `keymap_editor` (two grammars).
+   The plan names this as Phase 3's process defect — a manifest agent and a `.rs` agent with a
+   seam between them — and it is still the single commonest failure.
+2. **A gate that was over-conservative and can simply be removed.** Ask this *before* deleting
+   UI: `codestral`, `edit_prediction` and `edit_prediction_ui` were gated out of `settings_ui`
+   in Phase 3a and all three build for wasm today, so three settings pages were recovered by
+   deleting five lines of manifest rather than by cfg'ing out features.
+3. **A `std::time::Instant` the §5.5 sweep missed**, which compiles and then panics in a
+   browser. `web/check-wasm-time.sh` now finds these — see §5.6 of the plan for why it could
+   not before.
+
+**Measure shape 2 with a compile, not with a guess.** A probe that greps the output for
+`^error` reports success when cargo *panicked* before compiling anything, which happened here
+and produced a wrong ruling that had to be withdrawn. Check the exit code, or compile the
+dependent crate and read what actually changed.
 
 ## 3. Rulings that must not be quietly undone
 
@@ -149,7 +171,7 @@ Run all three before believing anything:
 | --- | --- |
 | `web/check-workspace-isolation.sh` | §9's desktop-isolation invariants, plus the §3.2 rules nothing else enforced. It has already caught a real regression — another agent rewrote `web/Cargo.toml` wholesale half an hour after the assertions landed, dropping `[profile.web-release]` and four `[patch]` entries |
 | `web/check-refusals.sh` | the four §5.3 refusals, bound to behavioural strings rather than line numbers |
-| `web/check-wasm-time.sh` + `wasm-std-instant.allowlist` | §5.5's `Instant` rule; needs `zed_web_workspace` so it cannot run before Phase 4 |
+| `web/check-wasm-time.sh` + `wasm-std-instant.allowlist` | §5.5's `Instant` rule. **It had never actually run** — it resolved `-p zed_web_workspace` against the *root* manifest, which excludes `web/`, so every invocation died on `package ID specification did not match any packages`. Fixed to use `web/Cargo.toml`; it went red immediately and found five live `Instant::now()` sites in the wasm graph |
 
 ### What the gate reports today, and which half of it is real
 

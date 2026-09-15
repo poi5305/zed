@@ -10,8 +10,11 @@ trap 'rm -f "$actual"' EXIT
 # std::time::Instant is valid in native and test-only code. Keep a normalized
 # inventory of those uses so an upstream sync fails when it introduces a new
 # occurrence anywhere in the web workspace dependency graph.
+# The web workspace's manifest, not the root's: `zed_web_workspace` is a member
+# of it, and the root excludes `web/`, so resolving the package from the root
+# fails outright rather than checking anything.
 cargo tree \
-    --manifest-path "$repo_root/Cargo.toml" \
+    --manifest-path "$repo_root/web/Cargo.toml" \
     -p zed_web_workspace \
     --target wasm32-unknown-unknown \
     -e normal \

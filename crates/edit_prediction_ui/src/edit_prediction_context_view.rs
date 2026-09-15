@@ -1,10 +1,9 @@
-use std::{
-    any::TypeId,
-    collections::VecDeque,
-    ops::Add,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{any::TypeId, collections::VecDeque, ops::Add, sync::Arc, time::Duration};
+
+// The timestamps here come from `edit_prediction`'s debug events, which are
+// `web_time::Instant` -- the same type as the standard library's off wasm, and a
+// distinct one on it (docs/web-zed-plan.md §5.5).
+use web_time::Instant;
 
 use anyhow::Result;
 use client::{Client, UserStore};

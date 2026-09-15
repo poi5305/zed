@@ -3,16 +3,11 @@
 1 crates/agent/src/tools/evals/fixtures/disable_cursor_blinking/before.rs:use std::{ any::TypeId, borrow::Cow, cell::RefCell, cmp::{self, Ordering, Reverse}, mem, num::NonZeroU32, ops::{ControlFlow, Deref, DerefMut, Not as _, Range, RangeInclusive}, path::{Path, PathBuf}, rc::Rc, time::{Duration, Instant}, };
 1 crates/agent_ui/src/agent_panel.rs:std::time::Instant
 1 crates/agent_ui/src/agent_panel.rs:use std::time::Instant;
-1 crates/alacritty_terminal/src/event_loop.rs:std::time::Instant
-1 crates/alacritty_terminal/src/event_loop.rs:use std::time::Instant;
-1 crates/alacritty_terminal/src/tty/unix.rs:use std::time::{Duration, Instant};
 1 crates/editor/src/editor.rs:std::time::Instant
 1 crates/editor/src/editor.rs:use std::time::Instant;
 1 crates/editor/src/editor_tests.rs:use std::{cell::RefCell, future::Future, rc::Rc, sync::atomic::AtomicBool, time::Instant};
 1 crates/editor/src/element/mouse.rs:std::time::Instant
 1 crates/editor/src/element/mouse.rs:use std::time::Instant;
-1 crates/editor/src/scroll.rs:std::time::Instant
-1 crates/editor/src/scroll.rs:use std::time::Instant;
 1 crates/git_ui/src/git_graph.rs:std::time::Instant
 1 crates/git_ui/src/git_graph.rs:use std::time::Instant;
 1 crates/gpui/src/executor.rs:std::time::Instant
