@@ -145,7 +145,7 @@ fn decode_row_value(value: &Value) -> Result<RemoteSqlValue> {
     }
 }
 
-fn bind_params<B: Bind>(bindings: B) -> Result<Vec<Value>> {
+pub fn bind_params<B: Bind>(bindings: B) -> Result<Vec<Value>> {
     let statement = Statement::unbound();
     statement.bind(&bindings, 1)?;
     Ok(statement
@@ -153,6 +153,20 @@ fn bind_params<B: Bind>(bindings: B) -> Result<Vec<Value>> {
         .iter()
         .map(encode_remote_value)
         .collect())
+}
+
+pub fn bound_query<B: Bind>(sql: &str, bindings: B) -> Result<Value> {
+    Ok(json!({
+        "sql": sql,
+        "params": bind_params(bindings)?,
+    }))
+}
+
+pub fn batch_last_rowid(query: usize) -> Value {
+    json!({
+        "type": "batch_last_rowid",
+        "query": query,
+    })
 }
 
 fn decode_rows(result: &Value) -> Result<Vec<Vec<RemoteSqlValue>>> {
