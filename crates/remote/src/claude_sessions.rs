@@ -452,7 +452,14 @@ pub fn start_time_in_proc_stat(stat: &str) -> Option<String> {
         .map(|start_time| start_time.to_string())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Also the wasm path, deliberately.
+///
+/// `util::command` on wasm wraps `smol::process`, which the web build patches to a shim
+/// that runs the command on the server over the `Process::*` RPC -- so this asks the
+/// machine the sessions actually live on, which is what docs/web-zed-plan.md §6.4 requires
+/// of liveness detection. `-o pid=,lstart=` is supported by both procps and BSD `ps`, so it
+/// does not matter which the server runs.
+#[cfg(any(all(unix, not(target_os = "linux")), target_family = "wasm"))]
 pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> {
     let mut start_times = HashMap::default();
     if process_ids.is_empty() {
@@ -494,17 +501,24 @@ pub async fn process_start_times(process_ids: Vec<u32>) -> HashMap<u32, String> 
 
 /// Windows has no equivalent of the registration files this reads, so there is nothing to
 /// check liveness against and every session is reported as gone.
-#[cfg(not(unix))]
+///
+/// wasm is excluded because its situation is the opposite: the registrations do exist, read
+/// from the server's `~/.claude/sessions` over the Fs RPC. Returning an empty map there
+/// would report every live session as `ProcessGone` and show the user an empty panel --
+/// a fabricated success, and the exact defect docs/web-zed-plan.md §10 predicted.
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 pub async fn process_start_times(_process_ids: Vec<u32>) -> HashMap<u32, String> {
     HashMap::default()
 }
 
-#[cfg(unix)]
+// wasm checks liveness through `process_start_times`'s `ps` arm, so it has a check to
+// offer just as unix does.
+#[cfg(any(unix, target_family = "wasm"))]
 pub fn liveness_unavailable_reason() -> Option<&'static str> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_family = "wasm")))]
 pub fn liveness_unavailable_reason() -> Option<&'static str> {
     Some("Claude session liveness checks are unavailable on this host.")
 }
