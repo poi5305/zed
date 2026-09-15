@@ -2403,6 +2403,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
+name = "claude_sessions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "collections",
+ "editor",
+ "fs",
+ "gpui",
+ "markdown",
+ "paths",
+ "project",
+ "remote",
+ "rpc",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol 2.0.2",
+ "task",
+ "terminal_view",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "client"
 version = "0.1.0"
 dependencies = [
@@ -10676,6 +10705,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures",
+ "gpui",
+ "paths",
+ "percent-encoding",
+ "recent_projects",
+ "remote",
+ "rope",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "serde_json_lenient",
+ "settings",
+ "shellexpand",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "project_panel"
 version = "0.1.0"
 dependencies = [
@@ -13958,6 +14013,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tmux_sessions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "remote",
+ "rpc",
+ "task",
+ "terminal_view",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "tokio"
 version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16828,6 +16899,7 @@ dependencies = [
  "assets",
  "async-trait",
  "breadcrumbs",
+ "claude_sessions",
  "client",
  "clock",
  "collections",
@@ -16874,6 +16946,7 @@ dependencies = [
  "paths",
  "platform_title_bar",
  "project",
+ "project_manager",
  "project_panel",
  "project_symbols",
  "prompt_store",
@@ -16904,6 +16977,7 @@ dependencies = [
  "theme",
  "theme_selector",
  "theme_settings",
+ "tmux_sessions",
  "toolchain_selector",
  "ui",
  "util",

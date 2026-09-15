@@ -45,6 +45,8 @@ pub use terminal_anchors::{
     TranscriptAnchor, align, anchor_rows, rows_match, screen_rows, skeleton,
 };
 pub use transcript::{AutoModeFlags, CompactMetadata, Transcript, TranscriptRecord};
+#[cfg(target_family = "wasm")]
+pub use session_source::{WebSource, set_remote_client};
 pub use usage::{ModelRates, Usage, rates_for_model};
 
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that
