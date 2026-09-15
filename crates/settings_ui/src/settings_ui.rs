@@ -9,10 +9,11 @@ use editor::{Editor, EditorEvent};
 use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
-    Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle, Stateful,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px, uniform_list,
+    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, DismissEvent, Div,
+    Entity, EventEmitter, FocusHandle, Focusable, Global, KeyContext, ListState, ReadGlobal as _,
+    Role, ScrollHandle, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, list, point,
+    prelude::*, px, uniform_list,
 };
 
 use language::Buffer;
@@ -4547,6 +4548,60 @@ impl SettingsWindow {
         return index.expect("No root entry found");
     }
 }
+
+/// The settings window as a modal inside an existing window.
+///
+/// The desktop app opens settings in a window of its own, so `new` stays private and
+/// its callers go through the window-opening helpers. A browser tab has no second
+/// window to open, so the web build hosts the same entity in a modal and needs the
+/// constructor, a focus handle to forward into, and a dismissal event to subscribe to.
+impl SettingsWindow {
+    pub fn new_modal(
+        original_window: Option<WindowHandle<MultiWorkspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(original_window, window, cx)
+    }
+}
+
+impl SettingsWindow {
+    /// Navigates to a settings page by its root navbar title.
+    ///
+    /// `open_settings_editor_to_page` does this too, but only after opening a window of
+    /// its own. The web build hosts this entity in a modal and so needs the navigation
+    /// without the window.
+    pub fn open_page(&mut self, page: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.opening_link = false;
+        self.search_bar.update(cx, |editor, cx| {
+            editor.set_text(String::new(), window, cx);
+        });
+        for page_filter in &mut self.filter_table {
+            page_filter.fill(true);
+        }
+        self.has_query = false;
+        self.filter_matches_to_file();
+
+        let Some(navbar_entry_index) = self
+            .navbar_entries
+            .iter()
+            .position(|entry| entry.is_root && entry.title.eq_ignore_ascii_case(page))
+        else {
+            log::error!("settings page not found: {page}");
+            return;
+        };
+
+        self.open_and_scroll_to_navbar_entry(navbar_entry_index, None, false, window, cx);
+    }
+}
+
+impl Focusable for SettingsWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for SettingsWindow {}
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
