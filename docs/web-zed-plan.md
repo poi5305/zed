@@ -327,61 +327,45 @@ build, but it means none of `zed-web`'s build wiring transfers verbatim — ever
 unification and `default-features` decision above has to be re-expressed in `web/Cargo.toml`, where
 feature unification works over a *different* crate set. That is the main thing Phase 2 has to prove.
 
-### 4.4 §4.2 re-measured on the built graph, and both halves of it were wrong [verified]
+### 4.4 The grammar question, measured three times and wrong twice [verified]
 
-§4.2 ruled that the web build compiles **18 tree-sitter grammar C libraries**, because
-`crates/markdown:51` and `crates/edit_prediction:83` enable `load-grammars`, and concluded from
-that that the WASI SDK is a hard prerequisite. Measured against the graph that now actually
-builds, with `cargo tree -p zed_web_workspace --target wasm32-unknown-unknown`:
+This section has been rewritten twice, and the shape of the two errors is worth more than
+the answer, because both were the same shape: **each time the question asked was "does this
+tool work?" when the question needed was "is this the right tool?"**
 
-```
-tree-sitter        v0.27.0 (web/vendor/tree_sitter_wasm)
-tree-sitter-json   v0.24.8
-tree-sitter-language v0.1.8
-```
+| Draft | Claim | Why it was wrong |
+| --- | --- | --- |
+| §4.2 | "The web build compiles 18 grammar C libraries, so the WASI SDK is a hard prerequisite." | The count was wrong — `load-grammars` was off, and the graph held exactly one grammar, pulled by `tasks_ui`. The prerequisite was right for the wrong reason. |
+| §4.4 draft 1 | "The grammars cannot build for wasm32 even with the WASI SDK, so the browser has no syntax highlighting — a BLOCKER with three expensive ways out." | The WASI sysroot was never the right headers. Its `<wasi/api.h>` refuses any target that is not WASI proper, and `wasm32-unknown-unknown` is not one. None of the three proposed routes was needed. |
 
-**One grammar, not eighteen** — and it arrives through `tasks_ui`, not through `grammars`.
-`grammars`, `languages`, `markdown` and `edit_prediction` all resolve with **no features at
-all** in the wasm graph, so `load-grammars` is off everywhere.
+**What is actually true**, measured: tree-sitter vendors the libc subset its parsers need for
+this exact target and publishes the headers from its `language` crate. Its own
+`src/wasm-stdlib/README.md` says so plainly — *"when the Tree-sitter Rust library is
+compiled for `wasm32-unknown-unknown`, the same vendored libc sources ... are linked directly
+into the application"*. Point `CFLAGS_wasm32_unknown_unknown` at
+`<tree-sitter-language>/wasm/include` instead of the WASI sysroot and the C compiles:
+`tree-sitter-json` and `tree-sitter-rust` both build, and `keymap_editor` keeps its syntax
+highlighting on the web. `web/build.sh` derives that path from `cargo metadata` rather than
+hard-coding it, since it lives under `~/.cargo/git`.
 
-Two corrections follow, and they point in opposite directions:
+The WASI SDK is still the *compiler* (`CC_wasm32_unknown_unknown`); it is its *sysroot* that
+was the wrong choice.
 
-**The conclusion survives; the reasoning does not.** The WASI SDK is still a hard prerequisite,
-because `tree-sitter-json`'s C still has to build for wasm32 — that is exactly why
-`debugger_ui` (→ `tasks_ui` → `tree-sitter-json`) failed when it was checked without the
-`CC_wasm32_unknown_unknown` export. The count and the causal story were both wrong.
+#### What still stops the other sixteen
 
-**And the missing 17 cannot simply be switched on.** Turning `load-grammars` on was tried:
-`tree-sitter-rust`'s build script fails for `wasm32-unknown-unknown` even with WASI clang and
-the WASI sysroot on the include path —
+`load-grammars` remains off, but no longer for an architectural reason. Enabling it fails on
+two things that have nothing to do with the toolchain:
 
-```
-wasi-sysroot/include/wasm32-wasi/wasi/api.h:23:2:
-error: <wasi/api.h> is only supported on WASI platforms.
-```
+1. `tree-sitter-bash` 0.25.1 and `tree-sitter-c` 0.24.2 reach
+   `tree-sitter-language`'s deliberate compatibility `#error`: *"tree-sitter 0.26 is
+   incompatible with this version of tree-sitter-language on wasm32-unknown-unknown; upgrade
+   tree-sitter to 0.27 or newer"*. These grammar versions predate the mechanism.
+2. Some scanners rely on the host's headers being transitively included — `tree-sitter-bash`'s
+   calls `isdigit` without including `<ctype.h>`, which a freestanding libc does not forgive.
 
-The sysroot's headers guard on `__wasi__`, which `wasm32-unknown-unknown` does not define.
-`tree-sitter-json` happens not to include anything that reaches that header; `tree-sitter-rust`'s
-scanner does.
-
-#### BLOCKER — the web build has no syntax highlighting, and this is why
-
-This is a product-level consequence, not a build detail, so it needs stating plainly: with
-`load-grammars` off, **no tree-sitter grammar is registered in the browser**. A project opens,
-the text is there, and it is unhighlighted — no highlighting, no structural selection, no
-outline. `crates/languages` compiling for wasm (which cost this port its `MaybeSend` work)
-delivers the LSP adapters, not the grammars.
-
-Whether that was a deliberate Phase 3a decision to dodge the C build or an accident nobody
-measured, it was never recorded as a ruling, and "first light" should not be declared without
-saying it out loud. Resolving it needs a real decision:
-
-| Option | Cost |
-| --- | --- |
-| Build the grammars against a sysroot whose headers do not guard on `__wasi__` (or patch the guard) | Unknown until tried on more than `tree-sitter-rust`; the guard is upstream WASI's, not ours |
-| Target `wasm32-wasip1` for the C only, linking it into a `wasm32-unknown-unknown` module | Mixed-target linking; likely fragile |
-| Ship the grammars as separate `.wasm` parsers loaded at runtime, which is what tree-sitter's own `wasm` feature is for | Reintroduces the `wasmtime` question §4 decided against, though possibly via the browser's own WebAssembly API rather than wasmtime |
-| Accept an unhighlighted editor for now | Honest, and cheap, but it should be a stated product decision rather than a silent one |
+Both are per-grammar and bounded, and neither requires changing the desktop build. This is a
+much better-specified problem than the blocker it replaces: **the browser can have syntax
+highlighting; what it needs is grammar version bumps, not an architecture.**
 
 ## 5. Porting the 273 modified files
 

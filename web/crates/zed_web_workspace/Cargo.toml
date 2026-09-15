@@ -18,6 +18,10 @@ workspace.workspace = true
 client.workspace = true
 project.workspace = true
 language.workspace = true
+# `load-grammars` is deliberately off; see docs/web-zed-plan.md §4.4. The grammars'
+# C does now compile for wasm32 against tree-sitter's own headers -- proven with
+# tree-sitter-json and tree-sitter-rust -- but enabling all eighteen hits two
+# per-grammar problems that are not about the toolchain.
 languages.workspace = true
 lsp.workspace = true
 async-trait.workspace = true
