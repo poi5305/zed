@@ -3575,7 +3575,11 @@ async fn load_json_language(workspace: WeakEntity<Workspace>, cx: &mut AsyncApp)
                 name: "JSON".into(),
                 ..Default::default()
             },
+            // tree-sitter grammars cannot build for wasm32-unknown-unknown; see Cargo.toml.
+            #[cfg(not(target_family = "wasm"))]
             Some(tree_sitter_json::LANGUAGE.into()),
+            #[cfg(target_family = "wasm")]
+            None,
         ))
     })
 }
@@ -3607,7 +3611,11 @@ async fn load_keybind_context_language(
                 name: "Zed Keybind Context".into(),
                 ..Default::default()
             },
+            // tree-sitter grammars cannot build for wasm32-unknown-unknown; see Cargo.toml.
+            #[cfg(not(target_family = "wasm"))]
             Some(tree_sitter_rust::LANGUAGE.into()),
+            #[cfg(target_family = "wasm")]
+            None,
         ))
     })
 }

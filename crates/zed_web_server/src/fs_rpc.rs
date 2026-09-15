@@ -110,6 +110,14 @@ impl FsRpc {
         Ok(candidate)
     }
 
+    pub(crate) fn path_escapes_restricted_root(&self, path: &Path) -> Result<bool> {
+        if !self.restrict_paths {
+            return Ok(false);
+        }
+        let resolved = canonicalize_existing_parent(path)?;
+        Ok(!resolved.starts_with(&*self.root))
+    }
+
     pub fn virtualize(&self, path: &Path) -> String {
         path.display().to_string()
     }

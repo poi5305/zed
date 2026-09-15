@@ -194,6 +194,13 @@ work is one nobody reads, and this one has already caught a real regression once
 gated in the manifest whose call sites never followed (seen nine times), a `block_on` the
 browser cannot perform, or a `std::time::Instant` the §5.5 sweep missed.
 
+**Known §6.4 gap, found while porting `recent_projects` and deliberately left for Phase 6:**
+the remote-server *UI* is gone from the wasm build, but a `ssh://` / `wsl://` / `docker://`
+entry already in the recents list still renders and is still clickable, falling through to
+`open_remote_project` (which `disconnected_overlay` also uses). §6.4 says those entries must be
+"hidden or refused"; today they are neither. It is not a compile error, which is exactly why it
+needs to be written down.
+
 **Phase 6:** not started. Note §6.5's finding before planning it — `forward_ports` has no
 meaning in a browser, and §6.2's count stands: `crates/remote/src/claude_sessions.rs` has
 113 `std::fs` sites.

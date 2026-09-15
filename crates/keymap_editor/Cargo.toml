@@ -42,6 +42,11 @@ web-time.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
+# Measured, not assumed: `tree-sitter-rust`'s build script fails for
+# wasm32-unknown-unknown even with the WASI SDK's clang and sysroot, because the
+# sysroot's <wasi/api.h> refuses any target that is not WASI proper. The keymap
+# editor's syntax highlighting is therefore native-only, and its two use sites are
+# cfg'd to match.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tree-sitter-json.workspace = true
 tree-sitter-rust.workspace = true

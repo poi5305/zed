@@ -90,7 +90,6 @@ language_models.workspace = true
 prompt_store.workspace = true
 settings_ui.workspace = true
 keymap_editor.workspace = true
-extensions_ui.workspace = true
 sidebar.workspace = true
 open_path_prompt.workspace = true
 recent_projects.workspace = true

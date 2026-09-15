@@ -720,6 +720,12 @@ async fn dispatch(
     if FsRpc::handles(&method) {
         return tokio::task::spawn_blocking(move || fs_rpc.dispatch(&method, &params)).await?;
     }
+    if crate::home_rpc::handles(&method) {
+        return tokio::task::spawn_blocking(move || {
+            crate::home_rpc::dispatch(&fs_rpc, &method, &params)
+        })
+        .await?;
+    }
     if crate::git_rpc::handles(&method) {
         return tokio::task::spawn_blocking(move || {
             crate::git_rpc::dispatch(&fs_rpc, &method, &params)
@@ -753,6 +759,7 @@ async fn dispatch(
 fn handles_stateless(method: &str) -> bool {
     (FsRpc::handles(method)
         && !matches!(method, "Fs::watch" | "Fs::attach_watches" | "Fs::unwatch"))
+        || crate::home_rpc::handles(method)
         || crate::git_rpc::handles(method)
         || (crate::process_rpc::handles(method) && !crate::process_rpc::handles_streaming(method))
         || crate::extension_rpc::handles(method)

@@ -1,21 +1,23 @@
 use gpui::{Action as _, App};
 use itertools::Itertools as _;
+#[cfg(not(target_family = "wasm"))]
+use settings::{AudioInputDeviceName, AudioOutputDeviceName};
 use settings::{
-    AudioInputDeviceName, AudioOutputDeviceName, EditPredictionDataCollectionChoice,
-    LanguageSettingsContent, SemanticTokens, SettingsContent,
+    EditPredictionDataCollectionChoice, LanguageSettingsContent, SemanticTokens, SettingsContent,
 };
 use std::sync::{Arc, OnceLock};
 use strum::{EnumMessage, IntoDiscriminant as _, VariantArray};
 use theme::SystemAppearance;
 use ui::IntoElement;
 
+#[cfg(not(target_family = "wasm"))]
+use crate::pages::{open_audio_test_window, render_mcp_servers_page};
 use crate::{
     ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
     SettingsPage, SettingsPageItem, SubPageLink, USER, active_language, all_language_names,
     pages::{
-        open_audio_test_window, render_edit_prediction_setup_page, render_external_agents_page,
-        render_llm_providers_page, render_mcp_servers_page, render_sandbox_settings_page,
-        render_skills_setup_page, render_tool_permissions_setup_page,
+        render_edit_prediction_setup_page, render_external_agents_page, render_llm_providers_page,
+        render_sandbox_settings_page, render_skills_setup_page, render_tool_permissions_setup_page,
     },
 };
 
@@ -24,9 +26,13 @@ const DEFAULT_STRING: String = String::new();
 /// to avoid the "NO DEFAULT" case.
 const DEFAULT_EMPTY_STRING: Option<&String> = Some(&DEFAULT_STRING);
 
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_AUDIO_OUTPUT: AudioOutputDeviceName = AudioOutputDeviceName(None);
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_EMPTY_AUDIO_OUTPUT: Option<&AudioOutputDeviceName> = Some(&DEFAULT_AUDIO_OUTPUT);
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_AUDIO_INPUT: AudioInputDeviceName = AudioInputDeviceName(None);
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_EMPTY_AUDIO_INPUT: Option<&AudioInputDeviceName> = Some(&DEFAULT_AUDIO_INPUT);
 
 macro_rules! concat_sections {
@@ -8492,6 +8498,7 @@ fn collaboration_page() -> SettingsPage {
         ]
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn audio_settings() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::ActionLink(ActionLink {
@@ -8556,13 +8563,22 @@ fn collaboration_page() -> SettingsPage {
 
     SettingsPage {
         title: "Collaboration",
-        items: concat_sections![calls_section(), audio_settings()],
+        items: {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                concat_sections![calls_section(), audio_settings()]
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                concat_sections![calls_section()]
+            }
+        },
     }
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 6] {
-        [
+    fn general_section() -> Vec<SettingsPageItem> {
+        vec![
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Disable AI",
@@ -8655,6 +8671,7 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
                 render: render_external_agents_page,
             }),
+            #[cfg(not(target_family = "wasm"))]
             SettingsPageItem::SubPageLink(SubPageLink {
                 title: "MCP Servers".into(),
                 r#type: Default::default(),

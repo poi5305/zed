@@ -48,6 +48,11 @@ mod web_settings_modal;
 #[cfg(target_family = "wasm")]
 mod web_quick_action_bar;
 
+/// Host-installed extensions, listed and installed over the `Extensions::*` RPC.
+/// `extensions_ui` is the native marketplace built on `extension_host`, which needs
+/// wasmtime -- the package docs/web-zed-plan.md §4 keeps out of the wasm graph.
+mod web_extensions;
+
 #[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -1467,13 +1472,8 @@ fn init_app_state(
     })
     .detach();
     web_agent_panel::init(cx);
-    extensions_ui::init_remote_store(
-        remote_client.clone(),
-        languages.clone(),
-        extension_assets,
-        cx,
-    );
-    extensions_ui::init(cx);
+    web_extensions::set_remote_client(remote_client.clone());
+    web_extensions::init(cx);
     web_user_menu::init(cx);
 
     // Keymaps after actions are registered.

@@ -23322,6 +23322,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "notify 9.0.0-rc.4",
+ "paths",
  "portable-pty",
  "rand 0.9.4",
  "rusqlite",
