@@ -1386,10 +1386,13 @@ impl RunningState {
             })?;
 
             terminal.read_with(cx, |terminal, _| {
-                terminal
-                    .pid()
-                    .map(|pid| pid.as_u32())
-                    .context("Terminal was spawned but PID was not available")
+                // Native reports a sysinfo `Pid`; the wasm terminal is a remote PTY whose
+                // RPC already carries the id as a plain u32.
+                #[cfg(not(target_family = "wasm"))]
+                let pid = terminal.pid().map(|pid| pid.as_u32());
+                #[cfg(target_family = "wasm")]
+                let pid = terminal.pid();
+                pid.context("Terminal was spawned but PID was not available")
             })
         });
 

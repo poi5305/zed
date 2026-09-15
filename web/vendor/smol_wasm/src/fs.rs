@@ -386,6 +386,55 @@ impl DirEntry {
     pub fn file_name(&self) -> std::ffi::OsString {
         self.path.file_name().unwrap_or_default().to_os_string()
     }
+
+    pub async fn file_type(&self) -> io::Result<FileType> {
+        let response: Option<FileTypeResponse> =
+            rpc_call("Fs::metadata", &json!({ "path": path_str(&self.path) })).await?;
+        let response = response.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no such path: {}", self.path.display()),
+            )
+        })?;
+        Ok(FileType {
+            is_dir: response.is_dir,
+            is_file: response.is_file,
+            is_symlink: response.is_symlink,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct FileTypeResponse {
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
+
+/// What `std::fs::FileType` answers, for a target that cannot construct one.
+///
+/// `std::fs::FileType`'s platform type is uninhabited on wasm32-unknown-unknown, so this shim
+/// cannot hand one back. Every field is reported by the server's real filesystem rather than
+/// derived here: `is_file` is not `!is_dir`, and inferring it that way would call a socket or
+/// a block device a regular file.
+pub struct FileType {
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
+
+impl FileType {
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
 }
 
 pub async fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {

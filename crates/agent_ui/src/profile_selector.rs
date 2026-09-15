@@ -5,9 +5,9 @@ use agent_settings::{
     AgentProfile, AgentProfileId, AgentSettings, AvailableProfiles, builtin_profiles,
 };
 use fs::Fs;
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 #[cfg(target_family = "wasm")]
 use fuzzy::match_strings_blocking;
+use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, AnyView, App, BackgroundExecutor, Context, DismissEvent, Empty, Entity,
     FocusHandle, Focusable, ForegroundExecutor, SharedString, Subscription, Task, Window,

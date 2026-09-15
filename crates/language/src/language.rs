@@ -39,7 +39,7 @@ use collections::{HashMap, HashSet};
 use futures::Future;
 use futures::future::LocalBoxFuture;
 use futures::lock::OwnedMutexGuard;
-use gpui::{App, AsyncApp, Entity, EntityId};
+use gpui::{App, AsyncApp, Entity, EntityId, Task};
 use http_client::HttpClient;
 
 pub use language_core::{
@@ -545,8 +545,40 @@ pub trait LspAdapterDelegate: lsp_adapter_delegate_bounds::Bounds {
     async fn try_exec(&self, binary: LanguageServerBinary) -> Result<()>;
 }
 
+/// `Send`, except on wasm.
+///
+/// `LspAdapter`'s futures are `Send` so the desktop app can drive them from a background
+/// thread. On wasm they capture an `LspAdapterDelegate`, which transitively holds a
+/// `tree_sitter::Language` -- deliberately `!Send`/`!Sync` there, because our tree-sitter
+/// base gates those impls behind upstream's #5851 soundness fix (see
+/// docs/web-zed-plan.md, Phase 5's BLOCKER section). The browser has one thread to run
+/// them on anyway, so dropping the bound there costs nothing and re-adding the `unsafe
+/// impl` would cost a soundness guarantee.
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSend {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSend for T {}
+
+/// `Sync`, except on wasm. The companion to [`MaybeSend`], for the same reason.
+///
+/// An `LspAdapter` is reached through `Arc<dyn LspAdapter>`, so requiring `Sync` of it also
+/// requires it of everything it holds -- including the `Arc<LanguageRegistry>` several
+/// adapters keep, which owns the `tree_sitter::Language` that is `!Sync` on wasm.
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Sync> MaybeSync for T {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSync {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSync for T {}
+
 #[async_trait(?Send)]
-pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
+pub trait LspAdapter: 'static + MaybeSend + MaybeSync + DynLspInstaller {
     fn name(&self) -> LanguageServerName;
 
     fn process_diagnostics(&self, _: &mut lsp::PublishDiagnosticsParams, _: LanguageServerId) {}
@@ -755,7 +787,7 @@ pub trait LspInstaller {
         _version: &Self::BinaryVersion,
         _container_dir: &PathBuf,
         _delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<Self> {
+    ) -> impl MaybeSend + Future<Output = Option<LanguageServerBinary>> + use<Self> {
         async { None }
     }
 
@@ -764,7 +796,7 @@ pub trait LspInstaller {
         latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         _delegate: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<Self>;
+    ) -> impl MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<Self>;
 
     fn cached_server_binary(
         &self,
@@ -793,6 +825,28 @@ pub trait DynLspInstaller {
     ) -> LanguageServerBinaryLocations;
 }
 
+/// Installs a language server off the foreground thread, except on wasm.
+///
+/// Fetching and unpacking a server binary is I/O the desktop app keeps off the main thread.
+/// On wasm an [`LspInstaller`] future is only [`MaybeSend`], so the background executor will
+/// not take it -- and the browser has one thread to run it on regardless, which makes the
+/// foreground executor there the equivalent choice rather than a lesser one.
+#[cfg(not(target_family = "wasm"))]
+fn spawn_installer_work<R: Send + 'static>(
+    cx: &AsyncApp,
+    future: impl Future<Output = R> + Send + 'static,
+) -> Task<R> {
+    cx.background_executor().spawn(future)
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn_installer_work<R: 'static>(
+    cx: &AsyncApp,
+    future: impl Future<Output = R> + 'static,
+) -> Task<R> {
+    cx.foreground_executor().spawn(future)
+}
+
 #[async_trait(?Send)]
 impl<LI, BinaryVersion> DynLspInstaller for LI
 where
@@ -815,10 +869,11 @@ where
             .fetch_latest_server_version(delegate, pre_release, cx)
             .await?;
 
-        if let Some(binary) = cx
-            .background_executor()
-            .spawn(self.check_if_version_installed(&latest_version, &container_dir, &delegate))
-            .await
+        if let Some(binary) = spawn_installer_work(
+            cx,
+            self.check_if_version_installed(&latest_version, &container_dir, &delegate),
+        )
+        .await
         {
             log::debug!("language server {:?} is already installed", name.0);
             delegate.update_status(name.clone(), BinaryStatus::None);
@@ -826,10 +881,11 @@ where
         } else {
             log::debug!("downloading language server {:?}", name.0);
             delegate.update_status(name.clone(), BinaryStatus::Downloading);
-            let binary = cx
-                .background_executor()
-                .spawn(self.fetch_server_binary(latest_version, container_dir, delegate))
-                .await;
+            let binary = spawn_installer_work(
+                cx,
+                self.fetch_server_binary(latest_version, container_dir, delegate),
+            )
+            .await;
 
             delegate.update_status(name.clone(), BinaryStatus::None);
             binary
@@ -1574,7 +1630,7 @@ impl LspInstaller for FakeLspAdapter {
         _: (),
         _: PathBuf,
         _: &Arc<dyn LspAdapterDelegate>,
-    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+    ) -> impl MaybeSend + Future<Output = Result<LanguageServerBinary>> + use<> {
         async {
             unreachable!();
         }
