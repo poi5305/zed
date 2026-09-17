@@ -18,11 +18,14 @@ workspace.workspace = true
 client.workspace = true
 project.workspace = true
 language.workspace = true
-# `load-grammars` is deliberately off; see docs/web-zed-plan.md §4.4. The grammars'
-# C does now compile for wasm32 against tree-sitter's own headers -- proven with
-# tree-sitter-json and tree-sitter-rust -- but enabling all eighteen hits two
-# per-grammar problems that are not about the toolchain.
-languages.workspace = true
+# `load-grammars` is on: the wasm build compiles the built-in tree-sitter grammar
+# C libraries so the browser has syntax highlighting. See docs/web-zed-plan.md
+# §4.4. tree-sitter-c is pinned to 0.24.1 in web/Cargo.toml ([patch]) because
+# 0.24.2 compiles tree-sitter-language's wasm/unsupported/tree-sitter-0.26
+# stubs, which are a deliberate #error; bash/markdown scanners need isdigit,
+# which the vendored wasm <ctype.h> does not provide — web/build.sh -include's
+# web/grammar-wasm-compat.h for that.
+languages = { workspace = true, features = ["load-grammars"] }
 
 # Phase 6's panels. `forward_ports` is deliberately absent: docs/web-zed-plan.md §6.5
 # rules that it has no meaning in a browser, which has no "this machine" to bind a port on.

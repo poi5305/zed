@@ -139,6 +139,14 @@ impl ProjectManagerPanel {
                         this.load_error = entry_errors_message(&parsed.errors);
                     }
                     Err(error) => {
+                        // Logged as well as drawn: the panel has to be open to be read,
+                        // and in the browser these panels have already spent a phase
+                        // being impossible to open, which made everything they had to
+                        // say unreachable.
+                        log::error!(
+                            "project manager: loading {}: {error:#}",
+                            paths::projects_file().display()
+                        );
                         this.load_error = Some(format!("{error:#}").into());
                     }
                 }
@@ -852,8 +860,76 @@ mod tests {
     use project::Project;
     use remote::SshConnectionOptions;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
     use util::path;
     use workspace::{AppState, MultiWorkspace};
+
+    /// A `projects.json` that is not JSON at all, which is a load failure rather than a
+    /// list with bad entries in it.
+    const UNPARSEABLE_PROJECTS_FILE: &str = "{ this is not the projects file";
+
+    /// Every `log` record this test binary emits, so that a test can prove a failure was
+    /// reported to the log and not only to the panel's own state.
+    ///
+    /// Keyed by the thread that logged it: these tests run concurrently in one binary,
+    /// and an assertion that something was NOT logged would otherwise be reading another
+    /// test's records. Every site under test logs from the foreground thread the test
+    /// itself drives.
+    static CAPTURED_RECORDS: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+    struct CapturingLogger;
+
+    static CAPTURING_LOGGER: CapturingLogger = CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            if let Ok(mut captured) = CAPTURED_RECORDS.lock() {
+                captured.push((
+                    std::thread::current().id(),
+                    format!("{}: {}", record.level(), record.args()),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// `log`'s logger slot is global and write-once, so this is installed once per test
+    /// binary and never removed. Records are never cleared: tests run concurrently, and
+    /// each one finds its own by what it is looking for.
+    fn capture_log_records() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&CAPTURING_LOGGER)
+                .expect("no other logger may be installed in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// What this thread has logged so far.
+    fn captured_records() -> Vec<String> {
+        let this_thread = std::thread::current().id();
+        CAPTURED_RECORDS
+            .lock()
+            .expect("reading the captured records")
+            .iter()
+            .filter(|(thread, _)| *thread == this_thread)
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+
+    /// What a record about loading `projects.json` starts with, whatever the failure
+    /// underneath it was.
+    fn load_failure_prefix() -> String {
+        format!(
+            "ERROR: project manager: loading {}",
+            paths::projects_file().display()
+        )
+    }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
@@ -904,6 +980,109 @@ mod tests {
             "a reload must not cancel the save: expected projects.json to contain {:?}, got {:?}",
             path!("/root"),
             recorded
+        );
+    }
+
+    /// A `projects.json` that cannot be read has to reach the log, not only the panel.
+    ///
+    /// The panel is the only place this failure is written down today, and a panel has
+    /// to be open to be read. In the browser this fork's three panels spent a whole
+    /// phase being impossible to open at all, so anything they had to say about a failed
+    /// load was said to nobody. The log is the channel that does not depend on the panel
+    /// being reachable.
+    ///
+    /// The file that reads is checked in the same test rather than in one of its own,
+    /// because the record buffer is one per test binary and two tests watching the same
+    /// prefix would see each other's records.
+    #[gpui::test]
+    async fn test_an_unreadable_projects_file_is_logged_as_well_as_drawn(cx: &mut TestAppContext) {
+        capture_log_records();
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                paths::config_dir(),
+                json!({ "projects.json": "[{\"name\":\"a\",\"rootPath\":\"/root\"}]" }),
+            )
+            .await;
+
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            ProjectManagerPanel::new(workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        // What the log line must not wrongly announce: a file that reads. A panel that
+        // logs an error every time it reloads trains its reader to ignore the log, which
+        // puts the failure back where it started.
+        let (drawn, names) = panel.read_with(cx, |panel, _| {
+            (
+                panel.load_error.clone(),
+                panel
+                    .projects
+                    .iter()
+                    .map(|project| project.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            names,
+            vec!["a".to_string()],
+            "the file has to have been read for the rest of this to prove anything; \
+             expected [\"a\"], got {names:?}"
+        );
+        assert_eq!(
+            drawn, None,
+            "a file that read has nothing to report; expected None, got {drawn:?}"
+        );
+        let after_a_good_load: Vec<String> = captured_records()
+            .into_iter()
+            .filter(|record| record.starts_with(&load_failure_prefix()))
+            .collect();
+        assert!(
+            after_a_good_load.is_empty(),
+            "a projects.json that read must log nothing about itself; expected [], got \
+             {after_a_good_load:?}"
+        );
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_file(
+                paths::projects_file(),
+                UNPARSEABLE_PROJECTS_FILE.as_bytes().to_vec(),
+            )
+            .await;
+        // Reloaded by the panel's own watcher rather than by hand, so that the file is
+        // read exactly once and "logged once" means once per load.
+        cx.executor().advance_clock(FS_WATCH_LATENCY * 2);
+        cx.run_until_parked();
+
+        let drawn = panel.read_with(cx, |panel, _| panel.load_error.clone());
+        assert!(
+            drawn.is_some(),
+            "the panel must still say so itself; expected a message, got {drawn:?}"
+        );
+
+        let records = captured_records();
+        let about_the_load: Vec<&String> = records
+            .iter()
+            .filter(|record| record.starts_with(&load_failure_prefix()))
+            .collect();
+        assert_eq!(
+            about_the_load.len(),
+            1,
+            "a projects.json that cannot be read must be logged once, at error level so \
+             that the browser's Info-level release filter keeps it; expected one record \
+             starting with {:?}, got {about_the_load:?} out of {} records this test \
+             binary logged",
+            load_failure_prefix(),
+            records.len()
         );
     }
 

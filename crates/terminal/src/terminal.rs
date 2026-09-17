@@ -2,6 +2,8 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+mod remote_pty;
 pub mod terminal_settings;
 
 #[cfg(all(not(windows), not(target_family = "wasm")))]
@@ -80,6 +82,8 @@ use crate::alacritty::{
 use crate::alacritty::{open_pty, pty_options, spawn_event_loop};
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
+#[cfg(target_family = "wasm")]
+use crate::remote_pty::spawn_remote_pty;
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -1285,16 +1289,57 @@ impl TerminalBuilder {
             } else {
                 #[cfg(target_family = "wasm")]
                 {
-                    bail!(TerminalError {
-                        directory: working_directory,
-                        program: shell_params.as_ref().map(|params| params.program.clone()),
-                        args: shell_params.as_ref().and_then(|params| params.args.clone()),
-                        title_override: terminal_title_override,
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "local PTY is not available in the browser until RemotePty RPC lands",
+                    let client = match remote_rpc_client() {
+                        Ok(client) => client,
+                        Err(error) => {
+                            bail!(TerminalError {
+                                directory: working_directory,
+                                program: shell_params.as_ref().map(|params| params.program.clone()),
+                                args: shell_params.as_ref().and_then(|params| params.args.clone()),
+                                title_override: terminal_title_override,
+                                source: error,
+                            });
+                        }
+                    };
+                    let (program, args) = match &shell_params {
+                        Some(params) => (
+                            Some(params.program.clone()),
+                            params.args.clone().unwrap_or_default(),
                         ),
-                    });
+                        None => (None, Vec::new()),
+                    };
+                    let remote = match spawn_remote_pty(
+                        client,
+                        program,
+                        args,
+                        working_directory.clone(),
+                        env.clone(),
+                        TerminalBounds::default(),
+                        term.clone(),
+                        events_tx,
+                        &background_executor,
+                    )
+                    .await
+                    {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            bail!(TerminalError {
+                                directory: working_directory,
+                                program: shell_params.as_ref().map(|params| params.program.clone()),
+                                args: shell_params.as_ref().and_then(|params| params.args.clone()),
+                                title_override: terminal_title_override,
+                                source: std::io::Error::other(format!("{error:#}")),
+                            });
+                        }
+                    };
+                    let pty_info = PtyProcessInfo::new(ProcessIdGetter::new(-1, 0));
+                    (
+                        TerminalType::Pty {
+                            resources: PtyResources::Active(PtySender::from_remote(remote)),
+                            info: Arc::new(pty_info),
+                        },
+                        None,
+                    )
                 }
                 #[cfg(not(target_family = "wasm"))]
                 {

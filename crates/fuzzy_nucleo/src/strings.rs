@@ -117,16 +117,50 @@ where
         return empty_query_results(candidates, max_results);
     };
 
+    // The browser's main thread has no other threads to fan out to, and `scoped` only
+    // completes once its spawned tasks have been polled -- which cannot happen while a
+    // caller is synchronously awaiting this future. Match inline instead: same results,
+    // no parallelism, which is what a single-threaded dispatcher gives either way.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = &executor;
+        let config = nucleo::Config::DEFAULT;
+        let mut matcher = matcher::get_matcher(config);
+        let mut results = Vec::with_capacity(max_results.min(candidates.len()));
+        match_string_helper(
+            candidates,
+            &query,
+            &mut matcher,
+            length_penalty,
+            &mut results,
+            cancel_flag,
+        )
+        .ok();
+        matcher::return_matcher(matcher);
+        if cancel_flag.load(atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
+        return results;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     let num_cpus = executor.num_cpus().min(candidates.len());
+    #[cfg(not(target_family = "wasm"))]
     let base_size = candidates.len() / num_cpus;
+    #[cfg(not(target_family = "wasm"))]
     let remainder = candidates.len() % num_cpus;
+    #[cfg(not(target_family = "wasm"))]
     let mut segment_results = (0..num_cpus)
         .map(|_| Vec::with_capacity(max_results.min(candidates.len())))
         .collect::<Vec<_>>();
 
+    #[cfg(not(target_family = "wasm"))]
     let config = nucleo::Config::DEFAULT;
+    #[cfg(not(target_family = "wasm"))]
     let mut matchers = matcher::get_matchers(num_cpus, config);
 
+    #[cfg(not(target_family = "wasm"))]
     executor
         .scoped(|scope| {
             for (segment_idx, (results, matcher)) in segment_results
@@ -154,15 +188,18 @@ where
         })
         .await;
 
-    matcher::return_matchers(matchers);
+    #[cfg(not(target_family = "wasm"))]
+    {
+        matcher::return_matchers(matchers);
 
-    if cancel_flag.load(atomic::Ordering::Acquire) {
-        return Vec::new();
+        if cancel_flag.load(atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let mut results = segment_results.concat();
+        gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
+        results
     }
-
-    let mut results = segment_results.concat();
-    gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
-    results
 }
 
 pub fn match_strings<T>(

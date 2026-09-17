@@ -26,8 +26,8 @@ fn extract_retry_after(headers: &http::HeaderMap) -> Option<std::time::Duration>
     if let Some(reset) = headers.get("X-RateLimit-Reset") {
         if let Ok(s) = reset.to_str() {
             if let Ok(epoch_ms) = s.parse::<u64>() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let now = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
                 if epoch_ms > now {

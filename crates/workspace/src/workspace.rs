@@ -2228,18 +2228,7 @@ impl Workspace {
                 db.next_id().await.unwrap_or_else(|_| Default::default())
             };
 
-            #[cfg(not(target_family = "wasm"))]
             let toolchains = db.toolchains(workspace_id).await?;
-            // `toolchains()` still needs a synchronous connection, which wasm does not
-            // have. Propagating that would abort a restore whose layout has already
-            // loaded, so the list degrades to empty -- logged, not swallowed, and the
-            // type comes from the same call so the two arms cannot drift apart.
-            #[cfg(target_family = "wasm")]
-            let toolchains = db
-                .toolchains(workspace_id)
-                .await
-                .log_err()
-                .unwrap_or_default();
 
             for (toolchain, worktree_path, path) in toolchains {
                 let toolchain_path = PathBuf::from(toolchain.path.clone().to_string());

@@ -10,6 +10,7 @@ mod highlight_rpc;
 mod home_rpc;
 mod process_rpc;
 mod rpc;
+mod shell_env_rpc;
 mod sql_rpc;
 mod terminal_rpc;
 mod workspace_state;
@@ -38,8 +39,10 @@ use tokio::fs;
 #[derive(Parser)]
 #[command(about = "Native backend for Zed Web")]
 struct Args {
-    root: PathBuf,
-    static_root: PathBuf,
+    #[arg(required_unless_present = "printenv")]
+    root: Option<PathBuf>,
+    #[arg(required_unless_present = "printenv")]
+    static_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8090)]
@@ -52,6 +55,9 @@ struct Args {
     restrict_paths: Option<bool>,
     #[arg(long)]
     no_restrict_paths: bool,
+    /// Output current environment variables as JSON to stdout
+    #[arg(long, hide = true)]
+    printenv: bool,
 }
 
 #[derive(Clone)]
@@ -93,9 +99,18 @@ pub async fn run() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let root = args.root.canonicalize().context("invalid project root")?;
+    if args.printenv {
+        util::shell_env::print_env();
+        return Ok(());
+    }
+    let root = args
+        .root
+        .context("missing project root")?
+        .canonicalize()
+        .context("invalid project root")?;
     let static_root = args
         .static_root
+        .context("missing static root")?
         .canonicalize()
         .context("invalid static root")?;
     let restrict_paths =
@@ -904,6 +919,25 @@ mod tests {
         assert_eq!(
             canonical_workspace_location(&uri, Path::new("/workspace")),
             None
+        );
+    }
+
+    #[test]
+    fn printenv_is_accepted_without_project_roots() {
+        assert_eq!(
+            Args::try_parse_from(["zed-web-server", "--printenv"])
+                .map(|_| "printenv")
+                .map_err(|error| error.to_string()),
+            Ok("printenv"),
+            "capture shells out to current_exe() --printenv; zed-web-server must accept that flag without <ROOT> and <STATIC_ROOT>"
+        );
+    }
+
+    #[test]
+    fn project_roots_are_still_required_without_printenv() {
+        assert!(
+            Args::try_parse_from(["zed-web-server"]).is_err(),
+            "omitting --printenv must still require the project and static roots"
         );
     }
 }

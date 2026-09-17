@@ -54,8 +54,8 @@ pub use language_core::{
     DecreaseIndentConfig, Grammar, GrammarId, HighlightsConfig, IndentConfig, InjectionConfig,
     InjectionPatternConfig, JsxTagAutoCloseConfig, LanguageConfig, LanguageConfigOverride,
     LanguageId, LanguageMatcher, OrderedListConfig, OutlineConfig, Override, OverrideConfig,
-    OverrideEntry, RedactionConfig, RunnableCapture, RunnableConfig, SoftWrap, Symbol,
-    TaskListConfig, TextObject, TextObjectConfig, WrapCharactersConfig, default_true,
+    OverrideEntry, ParseableLanguage, RedactionConfig, RunnableCapture, RunnableConfig, SoftWrap,
+    Symbol, TaskListConfig, TextObject, TextObjectConfig, WrapCharactersConfig, default_true,
     deserialize_regex, deserialize_regex_vec, regex_json_schema, regex_vec_json_schema,
     serialize_regex,
 };
@@ -1042,7 +1042,17 @@ pub struct Language {
 }
 
 impl Language {
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(config: LanguageConfig, ts_language: Option<tree_sitter::Language>) -> Self {
+        Self::new_with_id(
+            LanguageId::new(),
+            config,
+            ts_language.map(ParseableLanguage::from),
+        )
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn new(config: LanguageConfig, ts_language: Option<ParseableLanguage>) -> Self {
         Self::new_with_id(LanguageId::new(), config, ts_language)
     }
 
@@ -1053,24 +1063,12 @@ impl Language {
     fn new_with_id(
         id: LanguageId,
         config: LanguageConfig,
-        ts_language: Option<tree_sitter::Language>,
+        ts_language: Option<ParseableLanguage>,
     ) -> Self {
         Self {
             id,
             config,
-            grammar: ts_language.map(|ts_language| {
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    Arc::new(Grammar::new(ts_language))
-                }
-                #[cfg(target_family = "wasm")]
-                {
-                    let _ = ts_language;
-                    panic!(
-                        "Language::new cannot wrap a tree_sitter::Language on wasm; use Grammar::new(ParseableLanguage::from_resolver(...)) on the parsing thread"
-                    );
-                }
-            }),
+            grammar: ts_language.map(|ts_language| Arc::new(Grammar::new(ts_language))),
             context_provider: None,
             toolchain: None,
             manifest_name: None,
@@ -1772,7 +1770,7 @@ fn test_language(name: &str, grammar: tree_sitter::Language) -> Arc<Language> {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, rgba};
-    use pretty_assertions::assert_matches;
+    use pretty_assertions::{assert_eq, assert_matches};
 
     #[test]
     fn test_highlight_map() {
@@ -1807,6 +1805,64 @@ mod tests {
         assert_eq!(
             theme.get_capture_name(map.get(2).unwrap()),
             Some("variable.builtin")
+        );
+    }
+
+    #[test]
+    fn test_json_language_new_highlights_object_key() {
+        #[cfg(not(target_family = "wasm"))]
+        let ts_language = Some(tree_sitter_json::LANGUAGE.into());
+        #[cfg(target_family = "wasm")]
+        let ts_language = Some(ParseableLanguage::from_resolver(std::sync::Arc::new(
+            || Ok(tree_sitter_json::LANGUAGE.into()),
+        )));
+        let language = Arc::new(
+            Language::new(grammars::load_config("json"), ts_language)
+                .with_queries(grammars::load_queries("json"))
+                .expect("json queries must parse"),
+        );
+        assert!(
+            language.grammar().is_some(),
+            "Language::new with a json grammar must store it, got None"
+        );
+
+        let theme = SyntaxTheme::new(
+            [
+                ("property.json_key", rgba(0x100000ff)),
+                ("string", rgba(0x200000ff)),
+                ("number", rgba(0x300000ff)),
+                ("punctuation.bracket", rgba(0x400000ff)),
+                ("punctuation.delimiter", rgba(0x500000ff)),
+            ]
+            .iter()
+            .map(|(name, color)| (name.to_string(), (*color).into())),
+        );
+        language.set_theme(&theme);
+
+        let text = r#"{"hello": 1}"#;
+        let rope = Rope::from(text);
+        let highlights = language.highlight_text(&rope, 0..text.len());
+        let named: Vec<(String, String)> = highlights
+            .iter()
+            .map(|(range, highlight_id)| {
+                (
+                    text[range.clone()].to_string(),
+                    theme
+                        .get_capture_name(*highlight_id)
+                        .unwrap_or("?")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("{".to_string(), "punctuation.bracket".to_string()),
+                ("\"hello\"".to_string(), "property.json_key".to_string()),
+                (":".to_string(), "punctuation.delimiter".to_string()),
+                ("1".to_string(), "number".to_string()),
+                ("}".to_string(), "punctuation.bracket".to_string()),
+            ]
         );
     }
 
@@ -1938,7 +1994,13 @@ mod tests {
         );
 
         let (rust1, rust2) = futures::join!(rust1, rust2);
-        assert!(Arc::ptr_eq(&rust1.unwrap(), &rust2.unwrap()));
+        let rust1 = rust1.expect("Rust language must load");
+        let rust2 = rust2.expect("Rust language must load");
+        assert!(
+            rust1.grammar().is_some(),
+            "loaded Rust must have a tree-sitter grammar, got None"
+        );
+        assert!(Arc::ptr_eq(&rust1, &rust2));
 
         // Ensure language is still listed even after loading it.
         assert_eq!(

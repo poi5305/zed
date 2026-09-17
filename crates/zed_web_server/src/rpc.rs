@@ -726,9 +726,15 @@ async fn dispatch(
         })
         .await?;
     }
+    if crate::shell_env_rpc::handles(&method) {
+        return tokio::task::spawn_blocking(move || {
+            crate::shell_env_rpc::dispatch(&fs_rpc, &method, &params)
+        })
+        .await?;
+    }
     if crate::claude_sessions_rpc::handles(&method) {
         return tokio::task::spawn_blocking(move || {
-            crate::claude_sessions_rpc::dispatch(&method, &params)
+            crate::claude_sessions_rpc::dispatch(&fs_rpc, &method, &params)
         })
         .await?;
     }
@@ -766,6 +772,7 @@ fn handles_stateless(method: &str) -> bool {
     (FsRpc::handles(method)
         && !matches!(method, "Fs::watch" | "Fs::attach_watches" | "Fs::unwatch"))
         || crate::home_rpc::handles(method)
+        || crate::shell_env_rpc::handles(method)
         || crate::claude_sessions_rpc::handles(method)
         || crate::git_rpc::handles(method)
         || (crate::process_rpc::handles(method) && !crate::process_rpc::handles_streaming(method))
@@ -1619,5 +1626,14 @@ mod tests {
         );
         task.abort();
         Ok(())
+    }
+
+    #[test]
+    fn shell_env_capture_is_a_stateless_rpc() {
+        assert_eq!(
+            handles_stateless("ShellEnv::capture"),
+            true,
+            "browser capture must be a one-shot RPC; handles_stateless currently returns false so dispatch falls through to unknown method"
+        );
     }
 }

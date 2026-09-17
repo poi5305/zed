@@ -8,11 +8,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
+use crate::fs_rpc::FsRpc;
+
 pub fn handles(method: &str) -> bool {
     method.starts_with("ClaudeSessions::")
 }
 
-pub fn dispatch(method: &str, params: &Value) -> Result<Value> {
+pub fn dispatch(fs_rpc: &FsRpc, method: &str, params: &Value) -> Result<Value> {
+    refuse_if_claude_directory_restricted(fs_rpc)?;
     match method {
         "ClaudeSessions::list_sessions" => list_sessions(params),
         "ClaudeSessions::read_transcript_tail" => read_transcript_tail(params),
@@ -40,6 +43,17 @@ pub fn dispatch(method: &str, params: &Value) -> Result<Value> {
 
 fn home_directory() -> PathBuf {
     paths::home_dir().to_path_buf()
+}
+
+fn refuse_if_claude_directory_restricted(fs_rpc: &FsRpc) -> Result<()> {
+    let claude_directory = home_directory().join(".claude");
+    if fs_rpc.path_escapes_restricted_root(&claude_directory)? {
+        bail!(
+            "ZED_WEB_RESTRICT_PATHS is enabled and the Claude sessions directory {} is outside the workspace, so Claude sessions are unavailable in this deployment",
+            claude_directory.display()
+        );
+    }
+    Ok(())
 }
 
 fn required_string(params: &Value, key: &str) -> Result<String> {
@@ -424,4 +438,143 @@ fn validate_claude_file_path(path: &Path, home_directory: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs_rpc::FsRpc;
+    use serde_json::json;
+    use std::time::Duration;
+
+    const DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ClaudeDispatchOutcome {
+        Success { session_count: Option<usize> },
+        Refused { mentions_setting: bool },
+    }
+
+    fn dispatch_with_timeout(
+        fs_rpc: &FsRpc,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let method = method.to_string();
+        let params = params.clone();
+        let fs_rpc = fs_rpc.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if sender
+                .send(dispatch(&fs_rpc, &method, &params).map_err(|error| error.to_string()))
+                .is_err()
+            {
+                return;
+            }
+        });
+        receiver
+            .recv_timeout(DISPATCH_TIMEOUT)
+            .map_err(|_| "timed out dispatching ClaudeSessions RPC".to_string())?
+    }
+
+    fn list_sessions_outcome(fs_rpc: &FsRpc) -> Result<ClaudeDispatchOutcome, String> {
+        match dispatch_with_timeout(fs_rpc, "ClaudeSessions::list_sessions", &json!({})) {
+            Ok(value) => Ok(ClaudeDispatchOutcome::Success {
+                session_count: value
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+            }),
+            Err(error) if error == "timed out dispatching ClaudeSessions RPC" => Err(error),
+            Err(error) => Ok(ClaudeDispatchOutcome::Refused {
+                mentions_setting: error.contains("ZED_WEB_RESTRICT_PATHS"),
+            }),
+        }
+    }
+
+    #[test]
+    fn list_sessions_refuses_when_claude_directory_is_outside_the_restricted_root() {
+        let root = tempfile::tempdir().expect("temp workspace");
+        let fs_rpc = FsRpc::new(root.path().to_path_buf(), true).expect("FsRpc");
+        let outcome = list_sessions_outcome(&fs_rpc)
+            .expect("list_sessions should finish within the dispatch timeout");
+
+        assert_eq!(
+            outcome,
+            ClaudeDispatchOutcome::Refused {
+                mentions_setting: true,
+            },
+            "an empty session list would look like 'you have no sessions'; restriction must be an error that names ZED_WEB_RESTRICT_PATHS"
+        );
+    }
+
+    #[test]
+    fn list_sessions_does_not_name_restrict_paths_when_the_setting_is_off() {
+        let root = tempfile::tempdir().expect("temp workspace");
+        let fs_rpc = FsRpc::new(root.path().to_path_buf(), false).expect("FsRpc");
+        let outcome = list_sessions_outcome(&fs_rpc)
+            .expect("list_sessions should finish within the dispatch timeout");
+
+        assert_ne!(
+            outcome,
+            ClaudeDispatchOutcome::Refused {
+                mentions_setting: true,
+            },
+            "the default (restrict_paths off) must keep listing sessions rather than refusing because of ZED_WEB_RESTRICT_PATHS"
+        );
+    }
+
+    const CLAUDE_SESSIONS_METHODS: &[&str] = &[
+        "ClaudeSessions::list_sessions",
+        "ClaudeSessions::read_transcript_tail",
+        "ClaudeSessions::list_subagents",
+        "ClaudeSessions::list_slash_commands",
+        "ClaudeSessions::list_files_under",
+        "ClaudeSessions::write_pasted_file",
+        "ClaudeSessions::read_pending_question",
+        "ClaudeSessions::question_hook_is_installed",
+        "ClaudeSessions::read_live_message",
+        "ClaudeSessions::install_question_hook",
+        "ClaudeSessions::read_subagent_transcript_tail",
+        "ClaudeSessions::subagent_transcript_path",
+        "ClaudeSessions::pane_target",
+        "ClaudeSessions::send_text",
+        "ClaudeSessions::send_escape",
+        "ClaudeSessions::send_key",
+        "ClaudeSessions::capture_pane",
+        "ClaudeSessions::read_file",
+    ];
+
+    #[test]
+    fn every_claude_sessions_rpc_refuses_when_claude_directory_is_outside_the_restricted_root() {
+        let root = tempfile::tempdir().expect("temp workspace");
+        let fs_rpc = FsRpc::new(root.path().to_path_buf(), true).expect("FsRpc");
+        for method in CLAUDE_SESSIONS_METHODS {
+            let result = dispatch_with_timeout(&fs_rpc, method, &json!({}));
+            assert_eq!(
+                result
+                    .as_ref()
+                    .map(|_| "ok")
+                    .map_err(|error| error.contains("ZED_WEB_RESTRICT_PATHS")),
+                Err(true),
+                "{method} must refuse naming ZED_WEB_RESTRICT_PATHS, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_sessions_is_allowed_when_home_is_the_restricted_workspace() {
+        let home = paths::home_dir();
+        let fs_rpc = FsRpc::new(home.to_path_buf(), true).expect("FsRpc for the home directory");
+        let outcome = list_sessions_outcome(&fs_rpc)
+            .expect("list_sessions should finish within the dispatch timeout");
+
+        assert_ne!(
+            outcome,
+            ClaudeDispatchOutcome::Refused {
+                mentions_setting: true,
+            },
+            "serving the user's home with ZED_WEB_RESTRICT_PATHS must still list ~/.claude, which lives inside that root; got {outcome:?}"
+        );
+    }
 }

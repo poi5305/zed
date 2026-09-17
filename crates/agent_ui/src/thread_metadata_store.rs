@@ -8,6 +8,8 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
+#[cfg(target_family = "wasm")]
+use db::sqlez::remote_sql;
 use db::{
     kvp::KeyValueStore,
     sqlez::{
@@ -110,7 +112,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
         // `test_migration_awaits_thread_store_reload` pins this behavior.
         thread_store_ready.await;
 
-        let existing_list = db.list()?;
+        let existing_list = db.list().await?;
         let existing_session_ids: HashSet<Arc<str>> = existing_list
             .into_iter()
             .filter_map(|m| m.session_id.map(|s| s.0))
@@ -237,7 +239,7 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
+        for metadata in db.list().await? {
             if metadata.remote_connection.is_some() {
                 continue;
             }
@@ -282,7 +284,7 @@ fn migrate_thread_ids(cx: &mut App) {
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
+        for metadata in db.list().await? {
             db.save(metadata).await?;
             reloaded = true;
         }
@@ -658,8 +660,9 @@ impl ThreadMetadataStore {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            db.list().await.context("Failed to fetch sidebar metadata")
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
@@ -1124,7 +1127,7 @@ impl ThreadMetadataStore {
         cx: &App,
     ) -> Task<anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>>> {
         let db = self.db.clone();
-        cx.background_spawn(async move { db.get_all_archived_branch_names() })
+        cx.background_spawn(async move { db.get_all_archived_branch_names().await })
     }
 
     fn update_archived(&mut self, thread_id: ThreadId, archived: bool, cx: &mut Context<Self>) {
@@ -1467,13 +1470,58 @@ impl Domain for ThreadMetadataDb {
 
 db::static_connection!(ThreadMetadataDb, []);
 
+struct ThreadMetadataSaveBindings {
+    thread_id: ThreadId,
+    session_id: Option<Arc<str>>,
+    agent_id: Option<String>,
+    title: String,
+    updated_at: String,
+    created_at: Option<String>,
+    interacted_at: Option<String>,
+    folder_paths: Option<String>,
+    folder_paths_order: Option<String>,
+    archived: bool,
+    main_worktree_paths: Option<String>,
+    main_worktree_paths_order: Option<String>,
+    remote_connection: Option<String>,
+    title_override: Option<String>,
+}
+
+impl Bind for ThreadMetadataSaveBindings {
+    fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
+        let mut next_index = start_index;
+        next_index = self.thread_id.bind(statement, next_index)?;
+        next_index = self.session_id.bind(statement, next_index)?;
+        next_index = self.agent_id.bind(statement, next_index)?;
+        next_index = self.title.bind(statement, next_index)?;
+        next_index = self.updated_at.bind(statement, next_index)?;
+        next_index = self.created_at.bind(statement, next_index)?;
+        next_index = self.interacted_at.bind(statement, next_index)?;
+        next_index = self.folder_paths.bind(statement, next_index)?;
+        next_index = self.folder_paths_order.bind(statement, next_index)?;
+        next_index = self.archived.bind(statement, next_index)?;
+        next_index = self.main_worktree_paths.bind(statement, next_index)?;
+        next_index = self.main_worktree_paths_order.bind(statement, next_index)?;
+        next_index = self.remote_connection.bind(statement, next_index)?;
+        self.title_override.bind(statement, next_index)
+    }
+}
+
 impl ThreadMetadataDb {
+    const LIST_IDS_QUERY: &str = "SELECT thread_id FROM sidebar_threads \
+         ORDER BY updated_at DESC";
+
     #[allow(dead_code)]
-    pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
-        self.select::<ThreadId>(
-            "SELECT thread_id FROM sidebar_threads \
-             ORDER BY updated_at DESC",
-        )?()
+    pub async fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
+        #[cfg(target_family = "wasm")]
+        {
+            remote_sql::select::<ThreadId>(Self::LIST_IDS_QUERY).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.select::<ThreadId>(Self::LIST_IDS_QUERY)?()
+        }
     }
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
@@ -1485,8 +1533,16 @@ impl ThreadMetadataDb {
     /// List all sidebar thread metadata, ordered by updated_at descending.
     ///
     /// Only returns threads that have a `session_id`.
-    pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
-        self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+    pub async fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
+        #[cfg(target_family = "wasm")]
+        {
+            remote_sql::select::<ThreadMetadata>(Self::LIST_QUERY).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
+        }
     }
 
     /// Upsert metadata for a thread.
@@ -1529,11 +1585,41 @@ impl ThreadMetadataDb {
             .transpose()
             .context("serialize thread metadata remote connection")?;
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
-        let thread_id = row.thread_id;
-        let archived = row.archived;
+        let bindings = ThreadMetadataSaveBindings {
+            thread_id: row.thread_id,
+            session_id,
+            agent_id,
+            title,
+            updated_at,
+            created_at,
+            interacted_at,
+            folder_paths,
+            folder_paths_order,
+            archived: row.archived,
+            main_worktree_paths,
+            main_worktree_paths_order,
+            remote_connection,
+            title_override,
+        };
 
-        self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(Self::SAVE_SQL, bindings).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::SAVE_SQL)?;
+                stmt.bind(&bindings, 1)?;
+                stmt.exec()
+            })
+            .await
+        }
+    }
+
+    const SAVE_SQL: &str = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
@@ -1549,36 +1635,32 @@ impl ThreadMetadataDb {
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override";
-            let mut stmt = Statement::prepare(conn, sql)?;
-            let mut i = stmt.bind(&thread_id, 1)?;
-            i = stmt.bind(&session_id, i)?;
-            i = stmt.bind(&agent_id, i)?;
-            i = stmt.bind(&title, i)?;
-            i = stmt.bind(&updated_at, i)?;
-            i = stmt.bind(&created_at, i)?;
-            i = stmt.bind(&interacted_at, i)?;
-            i = stmt.bind(&folder_paths, i)?;
-            i = stmt.bind(&folder_paths_order, i)?;
-            i = stmt.bind(&archived, i)?;
-            i = stmt.bind(&main_worktree_paths, i)?;
-            i = stmt.bind(&main_worktree_paths_order, i)?;
-            i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
-            stmt.exec()
-        })
-        .await
-    }
+
+    const DELETE_SQL: &str = "DELETE FROM sidebar_threads WHERE thread_id = ?";
 
     /// Delete metadata for a single thread.
     pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
-        })
-        .await
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(Self::DELETE_SQL, thread_id).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::DELETE_SQL)?;
+                stmt.bind(&thread_id, 1)?;
+                stmt.exec()
+            })
+            .await
+        }
     }
+
+    /// Always compiled so native tests can pin the wasm INSERT … RETURNING path.
+    pub(crate) const CREATE_ARCHIVED_WORKTREE_SQL: &str = "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         RETURNING id";
 
     pub async fn create_archived_worktree(
         &self,
@@ -1589,106 +1671,189 @@ impl ThreadMetadataDb {
         unstaged_commit_hash: String,
         original_commit_hash: String,
     ) -> anyhow::Result<i64> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 RETURNING id",
-            )?;
-            let mut i = stmt.bind(&worktree_path, 1)?;
-            i = stmt.bind(&main_repo_path, i)?;
-            i = stmt.bind(&branch_name, i)?;
-            i = stmt.bind(&staged_commit_hash, i)?;
-            i = stmt.bind(&unstaged_commit_hash, i)?;
-            stmt.bind(&original_commit_hash, i)?;
-            stmt.maybe_row::<i64>()?.context("expected RETURNING id")
-        })
-        .await
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::select_row_bound::<_, i64>(
+                Self::CREATE_ARCHIVED_WORKTREE_SQL,
+                (
+                    worktree_path,
+                    main_repo_path,
+                    branch_name,
+                    staged_commit_hash,
+                    unstaged_commit_hash,
+                    original_commit_hash,
+                ),
+            )
+            .await?
+            .context("expected RETURNING id")
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::CREATE_ARCHIVED_WORKTREE_SQL)?;
+                let mut next_index = stmt.bind(&worktree_path, 1)?;
+                next_index = stmt.bind(&main_repo_path, next_index)?;
+                next_index = stmt.bind(&branch_name, next_index)?;
+                next_index = stmt.bind(&staged_commit_hash, next_index)?;
+                next_index = stmt.bind(&unstaged_commit_hash, next_index)?;
+                stmt.bind(&original_commit_hash, next_index)?;
+                stmt.maybe_row::<i64>()?.context("expected RETURNING id")
+            })
+            .await
+        }
     }
+
+    const LINK_ARCHIVED_WORKTREE_SQL: &str = "INSERT INTO thread_archived_worktrees(thread_id, archived_worktree_id) \
+         VALUES (?1, ?2)";
 
     pub async fn link_thread_to_archived_worktree(
         &self,
         thread_id: ThreadId,
         archived_worktree_id: i64,
     ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO thread_archived_worktrees(thread_id, archived_worktree_id) \
-                 VALUES (?1, ?2)",
-            )?;
-            let i = stmt.bind(&thread_id, 1)?;
-            stmt.bind(&archived_worktree_id, i)?;
-            stmt.exec()
-        })
-        .await
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(
+                Self::LINK_ARCHIVED_WORKTREE_SQL,
+                (thread_id, archived_worktree_id),
+            )
+            .await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::LINK_ARCHIVED_WORKTREE_SQL)?;
+                let next_index = stmt.bind(&thread_id, 1)?;
+                stmt.bind(&archived_worktree_id, next_index)?;
+                stmt.exec()
+            })
+            .await
+        }
     }
+
+    const ARCHIVED_WORKTREES_FOR_THREAD_QUERY: &str = "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash \
+         FROM archived_git_worktrees a \
+         JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id \
+         WHERE t.thread_id = ?1";
 
     pub async fn get_archived_worktrees_for_thread(
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Vec<ArchivedGitWorktree>> {
-        self.select_bound::<ThreadId, ArchivedGitWorktree>(
-            "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash \
-             FROM archived_git_worktrees a \
-             JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id \
-             WHERE t.thread_id = ?1",
-        )?(thread_id)
+        #[cfg(target_family = "wasm")]
+        {
+            remote_sql::select_bound::<ThreadId, ArchivedGitWorktree>(
+                Self::ARCHIVED_WORKTREES_FOR_THREAD_QUERY,
+                thread_id,
+            )
+            .await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.select_bound::<ThreadId, ArchivedGitWorktree>(
+                Self::ARCHIVED_WORKTREES_FOR_THREAD_QUERY,
+            )?(thread_id)
+        }
     }
+
+    const DELETE_THREAD_ARCHIVED_WORKTREE_LINK_SQL: &str =
+        "DELETE FROM thread_archived_worktrees WHERE archived_worktree_id = ?";
+    const DELETE_ARCHIVED_WORKTREE_SQL: &str = "DELETE FROM archived_git_worktrees WHERE id = ?";
 
     pub async fn delete_archived_worktree(&self, id: i64) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE archived_worktree_id = ?",
-            )?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()?;
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(Self::DELETE_THREAD_ARCHIVED_WORKTREE_LINK_SQL, id).await?;
+            remote_sql::exec_bound(Self::DELETE_ARCHIVED_WORKTREE_SQL, id).await
+        }
 
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM archived_git_worktrees WHERE id = ?")?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()
-        })
-        .await
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt =
+                    Statement::prepare(conn, Self::DELETE_THREAD_ARCHIVED_WORKTREE_LINK_SQL)?;
+                stmt.bind(&id, 1)?;
+                stmt.exec()?;
+
+                let mut stmt = Statement::prepare(conn, Self::DELETE_ARCHIVED_WORKTREE_SQL)?;
+                stmt.bind(&id, 1)?;
+                stmt.exec()
+            })
+            .await
+        }
     }
+
+    const UNLINK_THREAD_ARCHIVED_WORKTREES_SQL: &str =
+        "DELETE FROM thread_archived_worktrees WHERE thread_id = ?";
 
     pub async fn unlink_thread_from_all_archived_worktrees(
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE thread_id = ?",
-            )?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
-        })
-        .await
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(Self::UNLINK_THREAD_ARCHIVED_WORKTREES_SQL, thread_id).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt =
+                    Statement::prepare(conn, Self::UNLINK_THREAD_ARCHIVED_WORKTREES_SQL)?;
+                stmt.bind(&thread_id, 1)?;
+                stmt.exec()
+            })
+            .await
+        }
     }
+
+    const ARCHIVED_WORKTREE_REFERENCE_COUNT_QUERY: &str =
+        "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = ?1";
 
     pub async fn is_archived_worktree_referenced(
         &self,
         archived_worktree_id: i64,
     ) -> anyhow::Result<bool> {
-        self.select_row_bound::<i64, i64>(
-            "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = ?1",
-        )?(archived_worktree_id)
-        .map(|count| count.unwrap_or(0) > 0)
+        #[cfg(target_family = "wasm")]
+        let count = remote_sql::select_row_bound::<i64, i64>(
+            Self::ARCHIVED_WORKTREE_REFERENCE_COUNT_QUERY,
+            archived_worktree_id,
+        )
+        .await?;
+
+        #[cfg(not(target_family = "wasm"))]
+        let count = self
+            .select_row_bound::<i64, i64>(Self::ARCHIVED_WORKTREE_REFERENCE_COUNT_QUERY)?(
+            archived_worktree_id,
+        )?;
+
+        Ok(count.unwrap_or(0) > 0)
     }
 
-    pub fn get_all_archived_branch_names(
+    const ALL_ARCHIVED_BRANCH_NAMES_QUERY: &str = "SELECT t.thread_id, a.worktree_path, a.branch_name \
+         FROM thread_archived_worktrees t \
+         JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id \
+         WHERE a.branch_name IS NOT NULL \
+         ORDER BY a.id ASC";
+
+    pub async fn get_all_archived_branch_names(
         &self,
     ) -> anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>> {
-        let rows = self.select::<(ThreadId, String, String)>(
-            "SELECT t.thread_id, a.worktree_path, a.branch_name \
-             FROM thread_archived_worktrees t \
-             JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id \
-             WHERE a.branch_name IS NOT NULL \
-             ORDER BY a.id ASC",
-        )?()?;
+        #[cfg(target_family = "wasm")]
+        let rows =
+            remote_sql::select::<(ThreadId, String, String)>(Self::ALL_ARCHIVED_BRANCH_NAMES_QUERY)
+                .await?;
+
+        #[cfg(not(target_family = "wasm"))]
+        let rows =
+            self.select::<(ThreadId, String, String)>(Self::ALL_ARCHIVED_BRANCH_NAMES_QUERY)?()?;
 
         let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
         for (thread_id, worktree_path, branch_name) in rows {
@@ -1880,6 +2045,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_archived_worktree_sql_returns_the_new_id() {
+        let sql = ThreadMetadataDb::CREATE_ARCHIVED_WORKTREE_SQL;
+        assert!(
+            sql.contains("RETURNING id"),
+            "INSERT must return the new row id (Sql::query yields rows when column_count() > 0); got {sql}"
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
@@ -1966,7 +2140,7 @@ mod tests {
 
         db.save(metadata).await.unwrap();
 
-        let rows = db.list().unwrap();
+        let rows = db.list().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));

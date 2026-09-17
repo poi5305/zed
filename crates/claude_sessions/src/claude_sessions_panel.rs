@@ -125,6 +125,19 @@ const MAX_PERSISTED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
 const NO_SESSIONS: &str = "No Claude Code sessions are running on this project's host.";
 const SELECT_A_SESSION: &str = "Select a session to read its conversation.";
+
+/// Copy for a successful scan that found nothing. A refused scan must not use this:
+/// an empty list is a lie that reads as "you have no sessions".
+fn empty_sessions_placeholder(
+    session_count: usize,
+    listing_error: Option<&str>,
+) -> Option<&'static str> {
+    if session_count == 0 && listing_error.is_none() {
+        Some(NO_SESSIONS)
+    } else {
+        None
+    }
+}
 const WAITING_FOR_TRANSCRIPT: &str =
     "This session has not written a transcript file yet. It will appear as soon as it does.";
 const EMPTY_TRANSCRIPT: &str = "This conversation has no messages yet.";
@@ -651,8 +664,8 @@ fn step_forward_through_history(
 
 /// Wall-clock milliseconds, as the registrations record them.
 fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|since_epoch| since_epoch.as_millis() as i64)
         .unwrap_or(0)
 }
@@ -2593,6 +2606,7 @@ impl ClaudeSessionsPanel {
         let sessions = store.sessions().to_vec();
         let selected_process_id = store.selected();
         let error = store.error().cloned();
+        let no_sessions = empty_sessions_placeholder(sessions.len(), error.as_deref());
         let selected_name = sessions
             .iter()
             .find(|session| selected_process_id == Some(session.process_id))
@@ -2733,12 +2747,10 @@ impl ClaudeSessionsPanel {
                         .id("claude-sessions-list")
                         .flex_1()
                         .overflow_y_scroll()
-                        .when(sessions.is_empty(), |this| {
+                        .when_some(no_sessions, |this, copy| {
                             this.child(
                                 div().p_2().child(
-                                    Label::new(NO_SESSIONS)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    Label::new(copy).size(LabelSize::Small).color(Color::Muted),
                                 ),
                             )
                         })
@@ -13888,6 +13900,40 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(
             error.is_some(),
             "a refusal is reported today; expected Some(message), got {error:?}"
+        );
+    }
+
+    #[test]
+    fn refused_listing_does_not_claim_there_are_no_sessions() {
+        let error = "ZED_WEB_RESTRICT_PATHS is enabled and the Claude sessions directory /Users/me/.claude is outside the workspace, so Claude sessions are unavailable in this deployment";
+        assert_eq!(
+            empty_sessions_placeholder(0, Some(error)),
+            None,
+            "an empty list is a lie that reads as 'you have no sessions'; expected None, got Some({NO_SESSIONS:?})"
+        );
+    }
+
+    #[test]
+    fn a_successful_empty_scan_still_says_there_are_no_sessions() {
+        assert_eq!(
+            empty_sessions_placeholder(0, None),
+            Some(NO_SESSIONS),
+            "a host that answered with no sessions must still use the no-sessions copy"
+        );
+    }
+
+    #[test]
+    fn a_successful_scan_with_sessions_has_no_empty_copy() {
+        let error = "ZED_WEB_RESTRICT_PATHS is enabled";
+        assert_eq!(
+            empty_sessions_placeholder(1, None),
+            None,
+            "a non-empty list must not draw the no-sessions copy"
+        );
+        assert_eq!(
+            empty_sessions_placeholder(2, Some(error)),
+            None,
+            "a list that still has sessions from a previous scan must not be replaced by the no-sessions copy when a later poll fails"
         );
     }
 

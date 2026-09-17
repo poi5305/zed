@@ -12,6 +12,8 @@ pub mod remote_sql;
 
 pub mod domain;
 
+pub mod kvp_cache;
+
 #[cfg(not(target_family = "wasm"))]
 pub mod migrations;
 #[cfg(target_family = "wasm")]

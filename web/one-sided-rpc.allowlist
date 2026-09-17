@@ -1,0 +1,49 @@
+# RPC methods zed_web_server dispatches that nothing else calls.
+#
+# Checked by web/check-one-sided-rpc.sh. A method belongs here ONLY if it is
+# one-sided by design. The reason is mandatory: without it this file stops
+# being a record of decisions and becomes a list of things nobody looked at,
+# which is how `Sql::bootstrap_kvp` and the whole `Terminal::*` surface stayed
+# invisible. An entry that gains a caller must be deleted -- the script fails
+# on stale entries too, so it cannot rot quietly.
+#
+# Format: one method per line. Comments explain the entry above them.
+
+# Server -> client notification. The server sends it; the client subscribes via
+# RpcClient::on_notification with a name it builds elsewhere, so a literal match
+# is not expected here.
+Host::extensions_changed
+
+# --------------------------------------------------------------------------
+# NOT design decisions -- unfinished work, parked here so the gate is usable.
+# Each line below is a client half that was never written. Deleting a line and
+# watching the gate fail is how you pick up the work.
+# --------------------------------------------------------------------------
+
+# Extension management beyond install/list/search/uninstall. The browser's
+# extension UI (web_extensions.rs) wires the four it uses; these six are the
+# dev-extension and marketplace-detail paths it does not surface yet.
+Extensions::contributions
+Extensions::fetch
+Extensions::install_dev
+Extensions::rebuild_dev
+Extensions::runtime_call
+Extensions::versions
+
+# The claude_sessions panel resolves a pane target and a subagent transcript
+# path locally on wasm today. If the panel ever needs the server's answer
+# instead, these are already here.
+ClaudeSessions::pane_target
+ClaudeSessions::subagent_transcript_path
+
+# Written for a RemoteFs read_dir that wants entry types in one round trip.
+# RemoteFs still issues Fs::read_dir plus per-entry metadata.
+Fs::read_dir_with_types
+
+# Richer commit payload than GitRepository::show. The git panel has not been
+# moved onto it.
+GitRepository::commit_data
+
+# Drops and recreates the server database. No client should call this; it
+# exists for operator recovery and for the server's own tests.
+Sql::reset

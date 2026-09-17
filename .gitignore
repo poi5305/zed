@@ -67,3 +67,15 @@ scratchpad/
 # `web/build.sh` output. A previous commit in this port tracked
 # web/dist/bin/zed-web-server, so every rebuild added a 13 MB blob to history.
 web/dist/
+
+# `zed-web-server` state, written under whichever directory it is serving. A
+# repository served to the browser is also a working tree, so these land next
+# to the project settings `.zed/` legitimately tracks.
+/.zed/remote.sqlite*
+/.zed/web-workspace-state.json
+/.zed/web-auth-token
+
+# `zed-web-server` seeds a settings directory under whichever directory it is
+# serving, so serving this checkout writes into the repo's own `.config/`,
+# which already tracks `nextest.toml`.
+/.config/zed/

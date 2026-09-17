@@ -1237,6 +1237,7 @@ fn init_app_state(
     smol::set_remote_client(remote_client.clone());
     terminal::set_remote_client(remote_client.clone());
     claude_sessions::set_remote_client(remote_client.clone());
+    util::shell_env::set_remote_client(remote_client.clone());
     web_agent_panel::set_remote_client(remote_client.clone());
     // Server-side SQLite for workspace/KVP persistence.
     sqlez::remote_sql::set_sql_endpoint(format!("{server_origin}/sql"));
@@ -1354,6 +1355,14 @@ fn init_app_state(
     project_symbols::init(cx);
     project_panel::init(cx);
     outline_panel::init(cx);
+    // This fork's own panels. Attaching one to a dock is only half its wiring: its
+    // crate's `init` is the only thing that registers the `ToggleFocus` its status-bar
+    // button dispatches, and an action with no handler is dropped by gpui without a
+    // word. Leaving these out left all three panels loaded, drawn in the status bar and
+    // impossible to open. web/check-panel-actions.sh is what notices next time.
+    project_manager::init(cx);
+    tmux_sessions::init(cx);
+    claude_sessions::init(cx);
     search::init(cx);
     encoding_selector::init(cx);
     language_selector::init(cx);
@@ -1996,7 +2005,7 @@ fn load_core_panels(
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
         let mut debug_cx = cx.clone();
         let debug_panel = DebugPanel::load(workspace_handle.clone(), &mut debug_cx);
-        // Real desktop TerminalPanel: PTY I/O is RemotePty → server Terminal::*.
+        // TerminalPanel: in the browser, PtySender is RemotePty over host Terminal::* RPCs.
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         // Real desktop AgentPanel: native agent runs in-process over remote Fs +
         // remote SQL; model providers stream over the wasm Fetch HTTP client.
@@ -2058,8 +2067,8 @@ fn load_core_panels(
         );
 
         if [
-            attached.0, attached.1, attached.2, attached.3, attached.4, attached.5,
-            attached.6, attached.7, attached.8,
+            attached.0, attached.1, attached.2, attached.3, attached.4, attached.5, attached.6,
+            attached.7, attached.8,
         ]
         .into_iter()
         .all(|attached| attached)
@@ -2230,6 +2239,16 @@ pub fn main() {
         if let Err(error) = initialization {
             web_sys::console::error_1(
                 &format!("zed_web_workspace: initialization failed: {error:#}").into(),
+            );
+            return;
+        }
+        // Sequenced after the migrations above, which create the two tables it reads.
+        // Every synchronous `read_kvp` -- dock panel sizes, dismissed notices, the
+        // agent panel's last-used agent -- fails until this has run, so a failure here
+        // aborts startup rather than opening a window whose panels cannot restore.
+        if let Err(error) = db::prepare_web_key_value_cache().await {
+            web_sys::console::error_1(
+                &format!("zed_web_workspace: key-value cache load failed: {error:#}").into(),
             );
             return;
         }

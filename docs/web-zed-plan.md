@@ -351,10 +351,33 @@ hard-coding it, since it lives under `~/.cargo/git`.
 The WASI SDK is still the *compiler* (`CC_wasm32_unknown_unknown`); it is its *sysroot* that
 was the wrong choice.
 
-#### What still stops the other sixteen
+#### What stopped the other sixteen — RESOLVED 2026-09-16 [verified]
 
-`load-grammars` remains off, but no longer for an architectural reason. Enabling it fails on
-two things that have nothing to do with the toolchain:
+`load-grammars` is **on**. `web/crates/zed_web_workspace/Cargo.toml` enables it, `./web/build.sh`
+exits 0, and 17 grammar `.a` files plus the tree-sitter core are produced under
+`target/web-wasm/wasm32-unknown-unknown/web-release/build/`: bash, c, cpp, css, diff, gitcommit,
+go, gomod, gowork, jsdoc, json, md, python, regex, rust, typescript, yaml. The module grew from
+72 MB to 84 MB raw (14.5 MB brotli). Root `Cargo.toml` and `Cargo.lock` are untouched; the fixes
+are a `[patch]` in `web/Cargo.toml` and a forced-include header, both web-only.
+
+The two blockers named below were both real, and both turned out to be *narrower* than they read:
+
+1. The `#error` is not reached by upgrading tree-sitter — it is reached by tree-sitter-c
+   **0.24.2**, which compiles `DEP_TREE_SITTER_LANGUAGE_WASM_SRC` and so lands in
+   `tree-sitter-language` 0.1.8's `wasm/unsupported/tree-sitter-0.26` stub. **0.24.1 does not**,
+   and there is no newer crates.io release, so the direction of travel was backwards: pin the
+   0.24.1 git rev in the web workspace. The desktop still resolves crates.io 0.24.1 and is
+   unaffected. `tree-sitter-bash` 0.25.1 needed nothing but item 2.
+2. Three symbols, not a class of problem. `web/grammar-wasm-compat.h`, forced in by
+   `build.sh`'s `CFLAGS_wasm32_unknown_unknown -include`, supplies `isdigit` (the vendored wasm
+   `<ctype.h>` declares only `isblank`/`isprint`; bash and markdown call it), `wchar_t` (via
+   `<wchar.h>`, which tree-sitter-cpp's scanner assumes `<wctype.h>` pulls in) and
+   `static_assert`.
+
+The original diagnosis, kept because the shape of it is the lesson — *"what it needs is grammar
+version bumps, not an architecture"* was right about the scale and wrong about the direction:
+
+Enabling it failed on two things that have nothing to do with the toolchain:
 
 1. `tree-sitter-bash` 0.25.1 and `tree-sitter-c` 0.24.2 reach
    `tree-sitter-language`'s deliberate compatibility `#error`: *"tree-sitter 0.26 is
@@ -590,7 +613,7 @@ The ruling, in two parts:
 | Path | Where it runs |
 | --- | --- |
 | `query!`'s **async** arms | over `Sql::query`/`Sql::batch` to the server's real SQLite. Every caller already awaits, so none change. Covers KVP and most workspace queries |
-| `query!`'s **sync** arms | fail honestly on wasm. They carry debugger breakpoints and worktree trust, not layout |
+| ~~`query!`'s **sync** arms~~ | ~~fail honestly on wasm. They carry debugger breakpoints and worktree trust, not layout~~ **REVISED — see below** |
 | **the workspace layout itself** | a `Workspace::` RPC, **not** the SQL layer |
 
 The last row is the part worth arguing for. `zed_web_server` already serves
@@ -600,6 +623,141 @@ what is there. More importantly, `save_workspace`'s transaction then runs **unch
 machine that has a synchronous connection, instead of being re-expressed as a batch and
 trusted to still be equivalent. Nothing in the browser blocks, nothing needs
 `SharedArrayBuffer`, and the layout follows the user to another machine.
+
+#### Revision 1, 2026-09-16 — the two rows above contradicted each other, and row 1 wins
+
+Reported by the round that implemented this, and correct: **row 1 says the async arms "cover
+KVP"; row 2 says the sync arms "carry … not layout". `read_kvp` is a sync arm, and it carries
+layout** — dock panel sizes go through `ScopedKeyValueStore` — as well as dismissed notices and
+the agent panel's last-used agent. Both rows cannot be true, and the browser proved which one the
+code believed: every one of the nine `panel attached` lines was preceded by
+`workspace::dock: SQLite is not supported on wasm`.
+
+The error in row 2 was **assuming a call site's door follows from what it stores.** It does not.
+`read_kvp` is synchronous because of where it is *called from* — `Dismissable::dismissed(&App) -> bool`,
+`Panel::load`, render paths — none of which can await, whatever the data happens to be. Sorting
+the SQL layer by subject matter was the wrong axis; the axis that decides is the caller's ability
+to suspend.
+
+**The revised ruling, in three rows:**
+
+| Path | Where it runs |
+| --- | --- |
+| `query!`'s **async** arms | unchanged — over `Sql::query`/`Sql::batch`. Every caller already awaits |
+| **key-value reads whose callers cannot await** (`read_kvp`, `ScopedKeyValueStore::read`) | served synchronously from a **process-wide snapshot**, loaded once at startup from the server's `Sql::bootstrap_kvp` — which existed and had no client caller until this round. Writes go over `Sql::` and then mirror into the snapshot, so a write is visible to the next read. An unloaded snapshot **errors and names the loader**; it never reports an empty store |
+| every **other** sync arm, and hand-written `self.write`/`Statement::prepare` bodies | still fail honestly on wasm. These are reached on demand, not at startup, and each is a separate decision |
+
+The honesty rule is untouched by this: the snapshot is not a fabricated success, because the
+failure mode it replaces — "there is no answer" — is still reported as an error that names what
+must happen instead.
+
+**Consequence to hold on to:** `Sql::bootstrap_kvp` is a case of a server half built to a design
+whose client half was never written, and nothing failed until something executed it. That is the
+same shape as §1b's twelve defects in `zed_web_workspace` and as `smol_wasm/src/rpc.rs`'s
+stand-in. **Grep for server RPCs with no client caller; it is a cheap sweep and it has now paid
+out twice.**
+
+#### Revision 1b, 2026-09-16 — the deferred list was wrong in four of five ways, and the correction is the lesson
+
+Revision 1's round deferred twelve "Group B" sites with the reason *"`remote_sql` has no equivalent
+for a hand-bound `Statement`; giving it one is a new transport feature"* and *"async recursion with
+boxed futures or a server-side transaction batch protocol"*. The round that picked them up checked
+each one and found:
+
+| What the deferral said | What was there |
+| --- | --- |
+| variable parameter count, hand-bound `Statement` | **3 sites** were plain reads with one fixed binding or none, inside functions that were **already `pub async fn`**. `remote_sql::select_bound` / `select_row_bound` already took exactly that shape. Fixed. |
+| needs async recursion or a batch protocol | **3 sites** already had both, in this tree, on the wasm path: `SqlBatch`, `remote_sql::batch_last_rowid`, and `get_pane_group_remote` carrying `#[async_recursion(?Send)]`. The synchronous functions are the **native half of an existing cfg fork**, not an unported path. Converting them would have broken native. |
+| deferred SQL call site | **1 site** was a fixture inside `mod tests`. |
+| variable parameter count | **2 sites** genuinely were. Confirmed, still declined. |
+
+**The lesson is about how the deferral was written, not about the ports.** Every wrong row came from
+one habit: *classifying a call site by what it looked like from the call it makes, rather than by
+opening the function it is in.* "Uses `Statement::prepare`" and "recurses" are properties of a line;
+"is already `async`" and "already has a wasm fork ten lines up" are properties of the function, and
+only the second kind decides whether a conversion is possible. A deferred-work list is read by
+someone who will trust it — this one cost a round most of its budget re-deriving what it said.
+
+**When deferring, record the enclosing function's signature and whether a wasm arm already exists.**
+Those two facts would have made all four rows correct.
+
+#### Revision 1c, 2026-09-16 — `Sql::query` does return rows for `INSERT … RETURNING` [verified]
+
+Raised as the blocker for converting the key-value *write* path: `create_archived_worktree` reads
+back `RETURNING id`, and whether the server answers that could not be established from the client
+side. It can, and the answer is in `crates/zed_web_server/src/sql_rpc.rs:255`:
+
+```rust
+if prepared.column_count() > 0 {
+    rows = prepared.query_map(bind_values.as_slice(), encode_row)?…
+} else {
+    changes += prepared.execute(bind_values.as_slice())? as u64;
+}
+```
+
+The branch is on **column count, not statement kind**. `INSERT … RETURNING id` prepares with one
+column, so it takes the row-returning arm. No transport change is needed, and the write path is
+convertible whenever someone takes it. `delete_archived_worktree`'s two statements in one closure
+still need `SqlBatch` to stay atomic — that part of the deferral stands.
+
+#### Revision 2, 2026-09-16 — the snapshot is a snapshot, and that is accepted
+
+Raised by the same round as a new property needing a ruling. The snapshot is loaded once, so if
+another client — desktop Zed, or a second browser tab — mutates the server's key-value tables
+afterwards, this session's synchronous reads keep serving the old values until reload.
+
+**Accepted, with the boundary stated rather than left implicit.** Before this change those reads
+returned an error, so nothing regressed; and the desktop has the same property for a different
+reason (two Zed windows on one machine do not observe each other's `kv_store` writes mid-session
+either). What the web adds is that "another client" can now be a different *machine*. The data
+involved is per-user UI preference — dock sizes, dismissed notices, last-used agent — where a
+stale read costs a wrong panel width until reload, and where the writer is nearly always the only
+session open.
+
+This is **not** extended to anything else. If a future feature needs key-value data that a second
+client can meaningfully change underneath it, it does not get to reuse this snapshot: it needs
+either an invalidation notification from the server (the RPC layer already has `on_notification`,
+so this is a small job when someone needs it) or an async read.
+
+#### Revision 4, 2026-09-16 — an incomplete cfg fork is a defect, and these two are the open ones
+
+Referred up rather than guessed at, correctly. `workspace_for_roots` has a wasm arm
+(`persistence.rs:1135` native / `:1144` wasm). Two functions that reach the same synchronous
+`get_center_pane_group` → `get_pane_group` → `get_items` chain **do not**:
+`remote_workspace_for_roots` (`:1152`, called from `workspace.rs:11598` and `:12306`) and
+`workspace_for_id` (`:1285`, `pub(crate)`, called from `workspace.rs:11018` and `:19480`).
+
+**The rule, which is general and not about these two:** a function that reaches a synchronous SQL
+chain on wasm must either carry the cfg fork its siblings carry, or fail honestly naming what is
+missing. **It must not be left to bail from three frames down with `SQLite is not supported on
+wasm`** — that message names a mechanism, not a consequence, and a reader who meets it in a console
+cannot tell which feature just died. Every defect in this family has been expensive for exactly
+that reason: the error was accurate and told nobody anything.
+
+**A half-forked module is worse than an unforked one**, because the fork reads as evidence that
+someone checked. Whoever takes this must first establish whether those two call sites are reachable
+on wasm — `remote_workspace_for_roots` may well be dead there, since `dfce572479` refuses remote
+projects in the browser — and then fork them or make them refuse. *"Probably dead"* is not a
+disposition; if it is dead, delete it from the wasm path and say so in a comment.
+
+#### Revision 3, 2026-09-16 — one server table for both key-value stores is correct on the web
+
+Also raised by that round: on the desktop, `KeyValueStore` and `GlobalKeyValueStore` are two
+separate SQLite **files**; on wasm every `query!` reaches the one server database, so they are
+already collapsed onto one `kv_store` table. This predates the snapshot, which mirrors the
+existing behaviour rather than introducing it.
+
+**Ruling: the collapse is correct, keep it.** The two stores exist on the desktop to separate
+per-release-channel state from state shared across channels — a distinction created by one
+machine running several Zed builds. A `zed_web_server` instance *is* one channel; there is no
+second build to be shared with. Splitting the server table would add a distinction that nothing
+on the web can observe, and two snapshot maps to keep in step.
+
+The thing this does require: **key names must not collide across the two stores.** They do not
+today, and the snapshot's tests assert that an unscoped key and a scoped namespace of the same
+name stay separate. If a future key is added to one store with a name already used by the other,
+the web build silently merges them. That is the cost of this ruling and it is the one thing to
+watch.
 
 ## 6. The four local features
 
@@ -713,6 +871,60 @@ axum, it conflicts with `zed-web`'s whole trait-substitution approach, and it **
 `forward_ports`**, whose missing half is the client-side bind. The cheaper path is to call the same
 `remote::*` functions from the server over the JSON RPC.
 
+### 6.7 Ruling — `ZED_WEB_RESTRICT_PATHS` binds every RPC, including `ClaudeSessions::`
+
+Escalated by the Phase 6 implementation and decided here. The inconsistency: `Home::dirs` refuses
+when the home directory falls outside the served workspace, while the `ClaudeSessions::` RPCs read
+`~/.claude` regardless — as the SSH server does, which is where the code came from.
+
+**The SSH precedent does not transfer, because the threat model is not the same one.** An SSH
+remote server is reached by someone who already has a shell on that host; confining it buys
+nothing. `zed_web_server` is reached by anyone holding a token over a network, and
+`ZED_WEB_RESTRICT_PATHS` exists precisely to bound what that token can read. A confinement with a
+hole in it is not a confinement, and `~/.claude` is not an innocuous hole: it holds transcripts of
+every session on the machine, including ones about projects the workspace does not contain.
+
+**The rule: one confinement check, applied at every RPC, with no exemptions.** When
+`ZED_WEB_RESTRICT_PATHS` is true and `~/.claude` lies outside the served root, the
+`ClaudeSessions::` RPCs refuse in the same shape `Home::dirs` refuses, and the error names the
+variable so the reader knows the setting caused it rather than a missing file. The panel then
+shows that refusal; it does not show an empty list, because an empty list is a lie that reads as
+"you have no sessions".
+
+Two things this deliberately does **not** do:
+
+- It does not change the default. `ZED_WEB_RESTRICT_PATHS` defaults to false (§2.3), so the
+  deployment this fork actually uses — Tailscale Serve to a single user's own machine — is
+  unaffected. This decides what the setting *means* when someone turns it on.
+- It does not invent a per-feature exception list. The moment one RPC is allowed to read outside
+  the root "because the feature needs to", the setting documents an intention rather than
+  enforcing a boundary, and the next reader cannot tell which of the two it is.
+
+### 6.8 Ruling — `util::shell_env::capture` is implemented on wasm, not excused
+
+`crates/util/src/shell_env.rs:39-42` returns `Ok(HashMap::default())` on wasm. That is a
+fabricated success, which §"Every wasm stub fails honestly" forbids, and it was proposed for
+`wontfix` on the grounds that a browser cannot run `zed --printenv`.
+
+**Overturned, by two measured facts.** `Process::output` runs real commands on the server and the
+child inherits the server's full environment (§10 question 6) — so a login shell *can* be run from
+wasm. And `zed_web_server` is a native binary that already links `remote`, so the native
+`util::shell_env::capture` compiles and works *inside the server*, unmodified.
+
+The ruling is therefore the same one this port has applied to `claude_sessions` and `terminal`:
+**the browser asks the server to run the existing native code, through an injected
+`OnceLock<RpcClient>` hook, so that nothing is decided twice.** `crates/util` does not gain a
+dependency on the RPC crate; it gains a hook, exactly as `crates/terminal/src/terminal.rs:101-128`
+and `crates/claude_sessions/src/session_source.rs:527-546` already do.
+
+The completion that makes it work: `capture`'s native path shells out to
+`<shell> -lic "<zed> --printenv"`, and inside the server there is no `zed` — but the server is a
+binary and `util::shell_env::print_env()` already prints exactly the JSON the parser expects, so a
+`--printenv` flag on `zed-web-server` pointed at its own `current_exe()` closes the loop.
+
+If that cannot be reached, the stub fails honestly naming what is missing. It does not keep the
+empty map.
+
 ## 7. Deployment
 
 Target shape, no code changes required beyond the port itself:
@@ -735,13 +947,13 @@ Rendering is the least of the risks — `gpui_web` falls back to WebGL2 when Web
 
 ## 8. Execution plan
 
-### Phase 0 — measure the real rebase cost
+### Phase 0 — measure the real rebase cost ✅ DONE (2026-09-15)
 
 Run `web/sync-upstream.sh` **without** `--apply` against our base, in a throwaway worktree, to get
 the true conflict set rather than inferring it from the 152-commit diff. Nothing else should start
 before this number exists. This is measurement, not porting.
 
-### Phase 0b — ask the compiler what it thinks of our own crates
+### Phase 0b — ask the compiler what it thinks of our own crates ✅ DONE (2026-09-15)
 
 Cheapest measurement in the plan, and it can run beside Phase 0. Nothing in this document has been
 compiled for `wasm32-unknown-unknown` (§11, first row), so every "this will port" is read off source
@@ -830,7 +1042,7 @@ Phase 0b hit. Note the deliberate divergence: `zed-web` sets these with `export 
 builds `-p zed_web_workspace` **from the root workspace**; §3.2 rejects both, so `web/build.sh`
 cannot be adopted verbatim and will need a port.
 
-### Phase 2 — vendored dependencies, per §4 — **the four thin ones DONE (2026-09-15)**
+### Phase 2 — vendored dependencies, per §4 ✅ DONE (four thin ones 2026-09-15, the rest 2026-09-17)
 
 Take the four thin ones as `cfg` ports onto our own bases. Redo the `tree-sitter`, `lsp-types`,
 `which` and `async-tar` decisions from scratch. Do not import the stale snapshots.
@@ -861,9 +1073,19 @@ recording, because the same shape will recur in Phases 3 and 4:
 - `[patch.crates-io] wasm_thread` is **inert** — `gpui_web` and `scheduler` take it from the git URL,
   so only the `[patch."https://github.com/zed-industries/wasm_thread"]` table does any work.
 
-Still open per §4: `tree-sitter`, `lsp-types`, `which`, `async-tar`.
+#### The four open decisions — all closed, verified 2026-09-17 ✅
 
-### Phase 3 — the 174 `WASM_CFG` files plus manifests
+| Dependency | Disposition |
+| --- | --- |
+| `tree-sitter` | Forked to `web/vendor/tree_sitter_wasm`, patched through `[patch."https://github.com/tree-sitter/tree-sitter"]` — **not** `[patch.crates-io]`, which would be inert exactly as `wasm_thread`'s was. 17 grammars compile. The direction that worked was pinning `tree-sitter-c` *back* to 0.24.1: 0.24.2 is caret-compatible with the desktop pin but compiles `DEP_TREE_SITTER_LANGUAGE_WASM_SRC`, which `tree-sitter-language` 0.1.8 advertises as a deliberate `#error`. `web/grammar-wasm-compat.h` supplies the `isdigit` / `wchar_t` / `static_assert` the grammars expect. |
+| `async-tar` | Forked to `web/vendor/async_tar_wasm`, patched through its git source table for the same reason. |
+| `which` | **No fork.** `which::which` reaches `std::env::split_paths`, which panics on wasm; the call sites were moved to `crates/project/src/environment.rs`'s `lookup_system_binary` / `lookup_system_binary_impl`, which return `None` when `path_lookup_unsupported`. Replacing the caller beat forking the crate. |
+| `lsp-types` | **Nothing needed.** It is in the wasm graph and compiles unmodified; no patch entry exists for it. |
+
+`web/vendor/` also gained `alacritty_terminal`, which §4 did not anticipate — the terminal needed it
+before `crates/terminal/src/remote_pty.rs` could drive a browser PTY over `Terminal::*`.
+
+### Phase 3 — the 174 `WASM_CFG` files plus manifests ✅ DONE (2026-09-15)
 
 **Not mechanical — Phase 0 measured it** [verified]. `git merge-tree` of `andy/web-version` against
 `zedweb/zed-web` produces **32 conflicted files / 70 conflict hunks**, not the handful §5.4 implied,
@@ -911,11 +1133,19 @@ argument, and the 0 came from the tail of the pipeline. Had the exit code been t
 green would have entered this document and every later phase would have rested on it. **Read the
 output, not the status.**
 
-### Phase 4 — `zed_web_server`, `wasm_rpc`, `wasm_remote`, `zed_web_workspace`
+### Phase 4 — `zed_web_server`, `wasm_rpc`, `wasm_remote`, `zed_web_workspace` ✅ DONE
 
 Mostly new files, so mostly copy. `zed_web_server` goes in the root workspace.
 
-### Phase 5 — first light
+#### Landed — verified 2026-09-17
+
+All four crates exist and are in the build: `crates/zed_web_server` (18 `.rs`, root workspace),
+`web/crates/wasm_rpc`, `web/crates/wasm_remote`, `web/crates/zed_web_workspace`. The server
+dispatches **167 RPC methods**, every one of which `web/check-one-sided-rpc.sh` proves has a caller
+elsewhere in the tree — the gate exists precisely because a server half with no client half and a
+client half with no server half both compile.
+
+### Phase 5 — first light ✅ DONE (2026-09-16, commit `959371c99f` — “web: Zed draws in a browser”)
 
 #### The onion, peeled in layers [verified]
 
@@ -1005,11 +1235,100 @@ Until both exist, the honest status is "the Rust side type-checks for wasm", not
 Build, serve, open a project read-only in a desktop browser. This is the first point at which
 anything is demonstrable.
 
-### Phase 6 — the `Home::` RPC, then the four features in order
+### Phase 6 — the `Home::` RPC, then the four features in order ✅ DONE (server halves 2026-09-16, client halves 2026-09-17)
 
 `project_manager` → `tmux_sessions` → `claude_sessions` → `forward_ports`, per §6.4. tmux wiring
 must be verified before `claude_sessions`, which depends on the same machinery for its mirror
 attach.
+
+#### Server halves verified 2026-09-16 [verified] — and the question this closes
+
+`web/rpc-probe.mjs` calls the server's `/rpc` directly, no browser and no dependencies, and its
+default sweep exercises each of the three features by the route it actually uses in the browser:
+`project_manager` through `Fs::load` on `<config>/projects.json`, `tmux_sessions` through
+`Process::output` running the exact argv `remote::tmux_sessions` builds, `claude_sessions`
+through `ClaudeSessions::list_sessions`. **6 probes, 0 failures.**
+
+That settles §10's open question in the user's own words — *do these need a remote connection?*
+**No.** `tmux_sessions` in particular is worth stating plainly, because reading the panel source
+suggests otherwise: `project.remote_client()` is `None` in a browser, so `refresh` takes the
+**local** branch and shells out — and shelling out on wasm *is* the RPC, because
+`util::command::Command` wraps `smol_wasm`'s. The branch that looks like the wrong one is the
+right one.
+
+What remains after that is client-side and is **not specific to these three**: every panel
+attaches and loses its state to the synchronous `query!` door, and
+`crates/project/src/environment.rs:323` stats a path through a stub that rightly refuses.
+Both are written up in `docs/phase6-browser-defects.md`.
+
+#### Client halves verified 2026-09-17 [verified] — Phases 4, 5 and 6 are done
+
+Driven through CDP against a live Chrome, not inferred from `cargo check`. Each line below was
+observed in the browser: a real mouse click dispatched at the panel's status-bar button, then the
+main thread re-interrogated, a screenshot taken, and every console message since the click read
+back. **All three panels: main thread alive in 1–2 ms, zero console messages, panel drawn with
+real data.**
+
+| Defect | Cause | Where |
+| --- | --- | --- |
+| Three panels could not be opened at all | `init(cx)` never called, so the `ToggleFocus` their button dispatches was handled by nothing and gpui dropped it silently | `web/crates/zed_web_workspace/src/main.rs`; `web/check-panel-actions.sh` now asserts the pairing |
+| Every panel lost its state at attach | the synchronous `query!` door; the async form routes through `sqlez::remote_sql` | `crates/db`, `crates/sqlez`, `crates/workspace`, `crates/terminal_view`, `crates/agent_ui` |
+| tmux listed nothing while sessions existed | `Process::output` was reached through `spawn` without pipes, so stdout was `Stdio::null()` | `crates/util/src/command.rs` |
+| `Failed to open <root>` toast | `smol::fs::metadata` called only to ask "is this a directory"; the wasm stub rightly refuses to synthesise `std::fs::Metadata` | `crates/project/src/environment.rs` |
+| Chrome pinned at 100% CPU, unkillable | `executor.scoped()` reaching `Scope::drop` → `block_on_ready`, a busy spin with a noop waker whose spawned futures can only be polled by the thread already spinning | `crates/fuzzy`, `crates/fuzzy_nucleo`, `crates/worktree`, `crates/editor`; `block_on_ready` now panics naming the constraint instead of spinning |
+| Clicking Claude Sessions killed the app | `std::time::SystemTime::now()` — **unimplemented on `wasm32-unknown-unknown`**, so it aborts rather than returning a wrong value — called once per session row while the dock list renders | `crates/claude_sessions`, `crates/remote`, `crates/open_router`, `crates/openai_subscribed` |
+
+**Two method notes that cost rounds and are worth carrying forward.**
+
+*The first panic is the cause; everything after it is wake.* wasm panics abort without unwinding, so
+the first one leaves the `App` `RefCell` borrowed forever and every later `AsyncApp::update_entity`
+reports `RefCell already borrowed`. Three rounds chased that borrow. It was never the defect.
+
+*`[profile.web-release]` sets `strip = "symbols"`, so Chrome prints `wasm-function[330048]` instead
+of a Rust name.* Rebuilding with `CARGO_PROFILE_WEB_RELEASE_STRIP=none ./web/build.sh` — an
+environment override, changing no file — turns an unreadable stack into
+`<std::time::SystemTime>::now ← claude_sessions_panel::now_millis ← render_session_section`. That
+one command ended a defect three rounds of reading source had not. **Use it first, not last.**
+
+#### What is left, stated so it cannot drift
+
+- **`[ERROR] agent_ui::thread_metadata_store: SQLite is not supported on wasm`** — noise, not a
+  broken feature. Every `ThreadMetadataDb` method now has a wasm `remote_sql` arm; the line comes
+  from `db::static_connection!`'s migration step running against a local handle the wasm arms never
+  use. Confirmed against the live server: `sidebar_threads`, `archived_git_worktrees`,
+  `thread_archived_worktrees` and `terminals` all exist there and answer queries. An ERROR-level log
+  for something that is not failing trains its reader to ignore the log, so it should still go.
+- **`Failed to load direnv environment`** in the status bar — direnv is genuinely not installed on
+  this host, so "not found" is the correct answer being reported as a failure. The only remaining
+  user-visible defect.
+- **Three `std::time::SystemTime::now()` sites** in `crates/context_server/src/oauth.rs` and
+  `crates/language_models/src/provider/bedrock.rs`, allowlisted in
+  `web/wasm-std-systemtime.allowlist` with written reasons. Each feeds a consumer that demands the
+  std type — serde derives on `OAuthTokens`, and `aws_sigv4::SigningParams::time` — so closing them
+  needs either web-time's `serde` feature (a root `Cargo.toml` change) or an epoch conversion shim.
+  All three sit behind flows the browser cannot start: `oauth_callback_server` refuses to bind a
+  loopback port on wasm, and the AWS credential chain reads `~/.aws` from disk.
+- **The server writes `<served-root>/.config/zed/`** — some path resolves relative to the process's
+  working directory while `Home::dirs` correctly reports `/Users/andy/.config/zed`. Deliberately not
+  added to `.gitignore`: ignoring it would hide the defect rather than fix it.
+
+#### Gates standing at the close of Phase 6
+
+```
+web/check-refusals.sh          4 checks, 0 failures
+web/check-one-sided-rpc.sh     167 server RPC methods checked, 0 failures
+web/check-panel-actions.sh     all 3 attached panel crates call their init
+web/check-wasm-time.sh         std::time::Instant inventory matches its allowlist
+web/check-wasm-systemtime.sh   std::time::SystemTime inventory matches its allowlist
+web/rpc-probe.mjs              7 probes, 0 failures
+cargo fmt --all -- --check     clean
+```
+
+`check-wasm-systemtime.sh` exists because `check-wasm-time.sh` had been in the tree since 2026-09-15
+matching only `\bInstant\b`. A gate that names a class and enforces half of it is worse than no
+gate: it reads as coverage. The new one matches `SystemTime` and deliberately matches only `now()`,
+because `UNIX_EPOCH` is a const and `duration_since` / `checked_add` / `cmp` are all implemented on
+wasm — using `SystemTime` as a type is legitimate and must not be rejected.
 
 ## 9. Proving the desktop build is uncontaminated
 
@@ -1108,8 +1427,20 @@ None of these block starting, but each will need an answer before the phase that
    `tree-sitter-*` grammars all failed the same way — is the question `docs/phase2-dependency-wall.md`
    is measuring. Do not treat "tree-sitter cannot build for wasm" as settled; treat "we need a WASI
    SDK C toolchain, and §4's disposition has to be redone on top of that" as the finding.
-6. Whether `TMUX` and other environment variables survive `process_rpc`, which forwards only the
-   env the client supplies.
+6. ~~Whether `TMUX` and other environment variables survive `process_rpc`, which forwards only the
+   env the client supplies.~~ **ANSWERED 2026-09-16 — they survive, and the question's premise was
+   wrong** [verified]. `process_rpc` does *not* forward only the client's env: the spawned child
+   inherits the server process's own environment and the client's map is merged on top. Measured
+   with `web/rpc-probe.mjs`, calling `Process::output` on `/bin/sh -c` with `env: {}` — the child
+   reported a real `PATH` (`/opt/homebrew/opt/openjdk/bin:…`), `TMUX=/private/tmp/tmux-501/…` and
+   `HOME=/Users/andy`.
+
+   This matters twice over. It is why `tmux_sessions` works in the browser at all — the panel's
+   "local" branch shells out to `tmux`, which has to be *found* on `PATH`. And it bounds the damage
+   from `util::shell_env::capture` returning an empty map on wasm: the cost is not "the browser has
+   no `PATH`", it is the narrower loss of the per-directory layer (direnv, `.envrc`, per-project
+   shell rc). Do not let that stub's severity be overstated — or understated: an empty map is still
+   a fabricated success, and §6.8 rules that it must be implemented rather than accepted.
 7. Whether the four panels have native-only dependencies in their UI layers (icons, clipboard,
    notifications) that have not been surveyed.
 8. What a `project_manager` "local path" means to a user in a browser: these are server paths, and

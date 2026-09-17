@@ -1,0 +1,69 @@
+# std::time::SystemTime occurrences allowed to stay in the web dependency
+# graph. Checked by web/check-wasm-systemtime.sh. Every entry carries a reason,
+# because only SystemTime::now() panics on wasm32-unknown-unknown -- UNIX_EPOCH
+# is a const and duration_since / checked_add / cmp are implemented, so a
+# type-only use is harmless while a clock read aborts the whole app.
+#
+# Lines beginning with # and blank lines are ignored. Entries must stay in the
+# order `sort` produces for the `path:match` text, which is what the gate
+# compares against.
+
+# Type-only: the SystemTime arrives from fs metadata or from a caller.
+1 crates/agent/src/tools/edit_session/streaming_fuzzy_matcher.rs:use std::{ collections::HashMap, env, ffi::{OsStr, OsString}, fs, io::{BufRead, BufReader}, mem, path::{Path, PathBuf}, process::Command, sync::LazyLock, time::SystemTime, };
+# Eval fixture: a snapshot of someone else's file, never compiled as Zed code.
+1 crates/agent/src/tools/evals/fixtures/use_wasi_sdk_in_compile_parser_to_wasm/before.rs:use std::{ collections::HashMap, env, ffi::{OsStr, OsString}, fs, io::{BufRead, BufReader}, mem, path::{Path, PathBuf}, process::Command, sync::LazyLock, time::SystemTime, };
+# Test support: builds a SystemTime from UNIX_EPOCH + Duration, no clock read.
+1 crates/agent_ui/src/test_support.rs:use std::time::{Duration, SystemTime, UNIX_EPOCH};
+# Type-only: worktree archive timestamps come from fs metadata.
+1 crates/agent_ui/src/thread_worktree_archive.rs:use std::{ path::{Path, PathBuf}, sync::Arc, time::SystemTime, };
+# Compiled in but unreachable in the browser. cleanup_remote_server_cache does
+# read the clock, but its only caller, download_remote_server_release, bails
+# with "auto-update not initialized" because the web entry point never calls
+# auto_update::init, and the web build refuses remote projects anyway.
+# cleanup_stale_installer_dirs is already cfg(not(target_family = "wasm")).
+1 crates/auto_update/src/auto_update.rs:use std::{ env::{ self, consts::{ARCH, OS}, }, ffi::OsStr, ffi::OsString, path::{Path, PathBuf}, sync::Arc, time::{Duration, SystemTime}, };
+# Test-only: #[cfg(test)] blind registry fixtures.
+1 crates/claude_sessions/src/blind_subagent_tests.rs:use std::time::{SystemTime, UNIX_EPOCH};
+# Blocked by a consumer type, not skipped. This is a real clock read that would
+# abort the browser if reached. The value lands in
+# `OAuthTokens { expires_at: Option<SystemTime> }`, which derives Serialize and
+# Deserialize, and web_time::SystemTime has no serde impls unless web-time's
+# `serde` feature is enabled -- which would change the root workspace manifest.
+# The flow that produces the tokens also cannot start in a browser:
+# oauth_callback_server::start_oauth_callback_server()'s wasm arm returns Err
+# because it cannot bind a loopback TCP port.
+1 crates/context_server/src/oauth.rs:use std::time::{Duration, SystemTime};
+# Inside a test string literal, not code.
+1 crates/editor/src/display_map/tab_map.rs:std::time::SystemTime
+# Type-only: fake fs mtimes, all built from UNIX_EPOCH + Duration.
+1 crates/fs/src/fake_git_repo.rs:use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
+1 crates/fs/src/fs.rs:use std::{ io, path::{Path, PathBuf}, pin::Pin, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, };
+# Type-only: git commit timestamps come from the repository, not a clock.
+1 crates/git/src/repository.rs:std::time::SystemTime
+1 crates/git/src/repository.rs:use std::time::SystemTime;
+# Type-only: the worktree creation time is a parameter; the record is read back
+# as UNIX_EPOCH + Duration.
+1 crates/git_ui_core/src/created_worktrees.rs:use std::{ future::Future, path::Path, time::{Duration, SystemTime, UNIX_EPOCH}, };
+# cfg-excluded: unique_temp_socket_directory is #[cfg(unix)], and cfg(unix) is
+# false for wasm32-unknown-unknown.
+1 crates/http_proxy/src/proxy.rs:std::time::SystemTime
+# Blocked by a consumer type, not skipped. Another real clock read. The value
+# goes to aws_sigv4 (`v4::SigningParams::builder().time(time)`), whose API takes
+# std::time::SystemTime, and web-time 1.1.0 offers no conversion. Reaching it
+# also needs AWS credentials, and every auth mode but explicit IamCredentials
+# first calls aws_config::defaults(..).load(), which reads ~/.aws from disk.
+1 crates/language_models/src/provider/bedrock.rs:std::time::SystemTime
+1 crates/language_models/src/provider/bedrock.rs:use std::time::SystemTime;
+# Type-only: git index / status timestamps read from the repository.
+1 crates/project/src/git_store.rs:use std::{ cmp::Ordering, collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry}, future::Future, mem, ops::Range, path::{Path, PathBuf}, str::FromStr, sync::{ Arc, atomic::{self, AtomicU64}, }, time::{Duration, SystemTime}, };
+# Type-only: proto::Timestamp <-> SystemTime conversion, arithmetic on
+# UNIX_EPOCH only.
+1 crates/proto/src/proto.rs:use std::{ cmp, fmt::Debug, iter, mem, time::{Duration, SystemTime, UNIX_EPOCH}, };
+# Type-only, and it must stay std. READ_CONVERSATIONS caches
+# `Option<SystemTime>` taken from `fs::metadata(..).modified()`, which returns
+# std::time::SystemTime, so importing web_time::SystemTime here stops the cache
+# compiling for wasm (E0308: the two types are distinct). now_millis() reads the
+# clock through a fully qualified web_time:: path instead. A native build cannot
+# catch this, because web_time re-exports std verbatim off wasm -- only the
+# wasm32-unknown-unknown build separates the two types.
+1 crates/remote/src/claude_sessions.rs:use std::{ fs, io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom}, path::{Path, PathBuf}, sync::{ Mutex, atomic::{AtomicU64, Ordering}, }, time::SystemTime, };

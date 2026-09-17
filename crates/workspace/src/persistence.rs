@@ -3032,38 +3032,50 @@ impl WorkspaceDb {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<(Toolchain, Arc<Path>, Arc<RelPath>)>> {
-        self.write(move |this| {
-            let mut select = this
-                .select_bound(sql!(
-                    SELECT
-                        name, path, worktree_root_path, relative_worktree_path, language_name, raw_json
-                    FROM toolchains
-                    WHERE workspace_id = ?
-                ))
+        const SELECT_TOOLCHAINS: &str = sql!(
+            SELECT
+                name, path, worktree_root_path, relative_worktree_path, language_name, raw_json
+            FROM toolchains
+            WHERE workspace_id = ?
+        );
+
+        // The rows are read differently per target but decoded once below, so the two
+        // paths cannot drift into returning different toolchains.
+        #[cfg(target_family = "wasm")]
+        let toolchain: Vec<(String, String, String, String, String, String)> =
+            remote_sql::select_bound(SELECT_TOOLCHAINS, workspace_id)
+                .await
                 .context("select toolchains")?;
 
-            let toolchain: Vec<(String, String, String, String, String, String)> =
-                select(workspace_id)?;
+        #[cfg(not(target_family = "wasm"))]
+        let toolchain: Vec<(String, String, String, String, String, String)> = self
+            .write(move |this| {
+                let mut select = this
+                    .select_bound(SELECT_TOOLCHAINS)
+                    .context("select toolchains")?;
+                select(workspace_id)
+            })
+            .await?;
 
-            Ok(toolchain
-                .into_iter()
-                .filter_map(
-                    |(name, path, worktree_root_path, relative_worktree_path, language, json)| {
-                        Some((
-                            Toolchain {
-                                name: name.into(),
-                                path: path.into(),
-                                language_name: LanguageName::new(&language),
-                                as_json: serde_json::Value::from_str(&json).ok()?,
-                            },
-                           Arc::from(worktree_root_path.as_ref()),
-                            RelPath::from_unix_str(&relative_worktree_path).log_err()?.into(),
-                        ))
-                    },
-                )
-                .collect())
-        })
-        .await
+        Ok(toolchain
+            .into_iter()
+            .filter_map(
+                |(name, path, worktree_root_path, relative_worktree_path, language, json)| {
+                    Some((
+                        Toolchain {
+                            name: name.into(),
+                            path: path.into(),
+                            language_name: LanguageName::new(&language),
+                            as_json: serde_json::Value::from_str(&json).ok()?,
+                        },
+                        Arc::from(worktree_root_path.as_ref()),
+                        RelPath::from_unix_str(&relative_worktree_path)
+                            .log_err()?
+                            .into(),
+                    ))
+                },
+            )
+            .collect())
     }
 
     pub async fn set_toolchain(
@@ -3315,15 +3327,18 @@ pub fn delete_unloaded_items(
 ) -> Task<Result<()>> {
     let db = db.clone();
     cx.spawn(async move |_| {
-        let placeholders = alive_items
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<&str>>()
-            .join(", ");
-
-        let query = format!(
-            "DELETE FROM {table} WHERE workspace_id = ? AND item_id NOT IN ({placeholders})"
-        );
+        let query = if alive_items.is_empty() {
+            format!("DELETE FROM {table} WHERE workspace_id = ?")
+        } else {
+            let placeholders = alive_items
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<&str>>()
+                .join(", ");
+            format!(
+                "DELETE FROM {table} WHERE workspace_id = ? AND item_id NOT IN ({placeholders})"
+            )
+        };
 
         db.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;

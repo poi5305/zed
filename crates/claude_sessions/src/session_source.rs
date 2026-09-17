@@ -527,6 +527,35 @@ impl SessionSource for RemoteSource {
 #[cfg(target_family = "wasm")]
 static REMOTE_CLIENT: OnceLock<smol::RpcClient> = OnceLock::new();
 
+/// Joins one listing per session on the current task.
+///
+/// Nested `executor.spawn` then `await` on a single-threaded dispatcher is the
+/// `scoped` / `now_or_never` hang: the children are only polled by the thread
+/// that is blocked waiting for them.
+#[cfg(any(test, target_family = "wasm"))]
+async fn collect_subagents_by_session<F, Fut>(
+    session_ids: Vec<String>,
+    mut list_one: F,
+) -> HashMap<String, Vec<SubagentSummary>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<SubagentSummary>>>,
+{
+    let mut subagents_by_session = HashMap::default();
+    for session_id in session_ids {
+        // One session the far end cannot list must not hide every other
+        // session's agents: the dock draws them all, and an empty list for the
+        // one that failed is the same answer the local scan gives for a
+        // directory it could not read.
+        let subagents = match list_one(session_id.clone()).await.log_err() {
+            Some(subagents) => subagents,
+            None => Vec::new(),
+        };
+        subagents_by_session.insert(session_id, subagents);
+    }
+    subagents_by_session
+}
+
 /// Store the browser RPC client so wasm session I/O can run on the host.
 ///
 /// Same shape as `smol::set_remote_client` / `terminal::set_remote_client`.
@@ -627,42 +656,25 @@ impl SessionSource for WebSource {
             Ok(client) => client,
             Err(error) => return Task::ready(Err(error)),
         };
-        let executor = self.executor.clone();
-        let requests = session_ids
-            .into_iter()
-            .map(|session_id| {
+        self.executor.spawn(async move {
+            let listed = collect_subagents_by_session(session_ids, |session_id| {
                 let client = client.clone();
-                let session_id_for_request = session_id.clone();
-                let request = executor.spawn(async move {
-                    client
+                async move {
+                    let response = client
                         .call::<_, ListSubagentsJson>(
                             "ClaudeSessions::list_subagents",
-                            &json!({ "session_id": session_id_for_request }),
+                            &json!({ "session_id": session_id }),
                         )
-                        .await
-                });
-                (session_id, request)
-            })
-            .collect::<Vec<_>>();
-
-        self.executor.spawn(async move {
-            let mut subagents_by_session = HashMap::default();
-            for (session_id, request) in requests {
-                // One session the far end cannot list must not hide every other
-                // session's agents: the dock draws them all, and an empty list for the
-                // one that failed is the same answer the local scan gives for a
-                // directory it could not read.
-                let subagents = match request.await.log_err() {
-                    Some(response) => response
+                        .await?;
+                    Ok(response
                         .subagents
                         .into_iter()
                         .map(subagent_summary_from_json)
-                        .collect(),
-                    None => Vec::new(),
-                };
-                subagents_by_session.insert(session_id, subagents);
-            }
-            Ok(subagents_by_session)
+                        .collect())
+                }
+            })
+            .await;
+            Ok(listed)
         })
     }
 
@@ -1513,5 +1525,88 @@ mod tests {
         assert!(progress.pending.is_empty());
         assert!(progress.lines.is_empty());
         assert!(!progress.restarted);
+    }
+
+    #[test]
+    fn collect_subagents_by_session_includes_every_asked_for_id() {
+        let listed = smol::block_on(collect_subagents_by_session(
+            vec!["a".into(), "b".into()],
+            |_session_id| async { Ok(Vec::new()) },
+        ));
+
+        assert_eq!(
+            listed.len(),
+            2,
+            "every id asked for must appear, mapping to an empty list when that session spawned nothing"
+        );
+        assert!(
+            listed
+                .get("a")
+                .is_some_and(|subagents| subagents.is_empty())
+        );
+        assert!(
+            listed
+                .get("b")
+                .is_some_and(|subagents| subagents.is_empty())
+        );
+    }
+
+    #[test]
+    fn collect_subagents_by_session_keeps_a_session_whose_listing_failed() {
+        let listed = smol::block_on(collect_subagents_by_session(
+            vec!["ok".into(), "fail".into()],
+            |session_id| async move {
+                if session_id == "fail" {
+                    anyhow::bail!("unreachable host");
+                }
+                Ok(Vec::new())
+            },
+        ));
+
+        assert!(
+            listed
+                .get("fail")
+                .is_some_and(|subagents| subagents.is_empty()),
+            "one session the far end cannot list must not hide every other session's agents"
+        );
+        assert!(listed.contains_key("ok"));
+    }
+
+    #[test]
+    fn awaiting_a_oneshot_whose_sender_is_never_polled_stays_pending() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn noop_waker() -> Waker {
+            const VTABLE: RawWakerVTable =
+                RawWakerVTable::new(|ptr| RawWaker::new(ptr, &VTABLE), |_| {}, |_| {}, |_| {});
+            // SAFETY: the vtable is a no-op; the future is only polled to observe Pending.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+        struct WaitFlag(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Future for WaitFlag {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                if self.0.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut parent = Box::pin(WaitFlag(ready.clone()));
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        for _ in 0..32 {
+            assert_eq!(
+                parent.as_mut().poll(&mut context),
+                Poll::Pending,
+                "a sibling that is never polled cannot make the parent Ready — the hang class of nested spawn+await"
+            );
+        }
+        drop(ready);
     }
 }

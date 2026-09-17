@@ -1,9 +1,15 @@
 use anyhow::{Context as _, bail};
+use fs::Fs;
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
 use worktree::Worktree;
@@ -209,6 +215,11 @@ impl ProjectEnvironment {
                 let load_direnv = ProjectSettings::get_global(cx).load_direnv.clone();
                 let shell = shell.clone();
                 let tx = self.environment_error_messages_tx.clone();
+                let fs = self
+                    .worktree_store
+                    .read_with(cx, |worktree_store, _| worktree_store.fs())
+                    .ok()
+                    .flatten();
                 cx.spawn(async move |cx| {
                     let mut shell_env = match cx
                         .background_spawn(load_directory_shell_environment(
@@ -216,6 +227,7 @@ impl ProjectEnvironment {
                             abs_path.clone(),
                             load_direnv,
                             tx,
+                            fs,
                         ))
                         .await
                     {
@@ -310,34 +322,175 @@ impl From<EnvironmentOrigin> for String {
     }
 }
 
-async fn load_directory_shell_environment(
-    shell: Shell,
-    abs_path: Arc<Path>,
-    load_direnv: DirenvSettings,
-    tx: mpsc::UnboundedSender<String>,
-) -> anyhow::Result<HashMap<String, String>> {
-    if let DirenvSettings::Disabled = load_direnv {
-        return Ok(HashMap::default());
+async fn path_is_directory(abs_path: &Path, fs: Option<&dyn Fs>) -> anyhow::Result<bool> {
+    #[cfg(target_family = "wasm")]
+    {
+        let Some(fs) = fs else {
+            anyhow::bail!(
+                "std::fs::Metadata cannot be synthesized on WASM; use RemoteFs / Fs::is_dir instead"
+            );
+        };
+        return directory_from_fs_metadata(abs_path, fs).await;
     }
 
-    let meta = smol::fs::metadata(&abs_path).await.with_context(|| {
-        tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
-            .ok();
-        format!("stat {abs_path:?}")
-    })?;
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if cfg!(any(test, feature = "test-support"))
+            && let Some(fs) = fs
+        {
+            return directory_from_fs_metadata(abs_path, fs).await;
+        }
+        Ok(smol::fs::metadata(abs_path).await?.is_dir())
+    }
+}
 
-    let dir = if meta.is_dir() {
-        abs_path.clone()
+async fn directory_from_fs_metadata(abs_path: &Path, fs: &dyn Fs) -> anyhow::Result<bool> {
+    match fs.metadata(abs_path).await? {
+        Some(metadata) => Ok(metadata.is_dir),
+        None => anyhow::bail!("path does not exist"),
+    }
+}
+
+async fn resolve_shell_environment_directory(
+    abs_path: Arc<Path>,
+    fs: Option<Arc<dyn Fs>>,
+    tx: mpsc::UnboundedSender<String>,
+) -> anyhow::Result<Arc<Path>> {
+    let is_directory = path_is_directory(&abs_path, fs.as_deref())
+        .await
+        .with_context(|| {
+            tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
+                .ok();
+            format!("stat {abs_path:?}")
+        })?;
+
+    if is_directory {
+        Ok(abs_path)
     } else {
-        abs_path
+        Ok(abs_path
             .parent()
             .with_context(|| {
                 tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
                     .ok();
                 format!("getting parent of {abs_path:?}")
             })?
-            .into()
-    };
+            .into())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn resolve_shell_environment_directory_for_tests(
+    abs_path: Arc<Path>,
+    fs: Option<Arc<dyn Fs>>,
+) -> anyhow::Result<Arc<Path>> {
+    let (tx, _rx) = mpsc::unbounded();
+    resolve_shell_environment_directory(abs_path, fs, tx).await
+}
+
+/// Locate a host binary via PATH.
+///
+/// On wasm32-unknown-unknown `std::env::split_paths` panics (`unsupported`),
+/// and `which` uses it. Callers must pass `path_lookup_unsupported` rather
+/// than calling `which` themselves.
+pub(crate) fn lookup_system_binary(
+    program: &str,
+    search_paths: Option<&OsStr>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    lookup_system_binary_impl(program, search_paths, cwd, cfg!(target_family = "wasm"))
+}
+
+/// Compiled on every target so native tests can pin the wasm disposition
+/// without a wasm runtime.
+pub(crate) fn lookup_system_binary_impl(
+    program: &str,
+    search_paths: Option<&OsStr>,
+    cwd: &Path,
+    path_lookup_unsupported: bool,
+) -> Option<PathBuf> {
+    if path_lookup_unsupported {
+        return None;
+    }
+    match search_paths {
+        Some(paths) => which::which_in(program, Some(paths), cwd).ok(),
+        None => which::which(program).ok(),
+    }
+}
+
+/// PATH lookup used by LSP/DAP `which()` after the shell environment is loaded.
+///
+/// On wasm `which::which_in` calls `std::env::split_paths` and panics. Returning
+/// "not found" would skip a host rust-analyzer / rustup. Returning a host
+/// absolute path would be a local lookup we cannot do. The bare program name
+/// lets `Process::output` resolve PATH on the host, matching `direnv_spawn_path`.
+pub(crate) fn lookup_adapter_binary(
+    program: &OsStr,
+    search_paths: Option<&OsStr>,
+    cwd: &Path,
+    path_lookup_unsupported: bool,
+) -> Option<PathBuf> {
+    if program.is_empty() {
+        return None;
+    }
+    if path_lookup_unsupported {
+        return Some(PathBuf::from(program));
+    }
+    match search_paths {
+        Some(paths) => which::which_in(program, Some(paths), cwd).ok(),
+        None => which::which(program).ok(),
+    }
+}
+
+/// Program to spawn for `direnv export json`.
+///
+/// When PATH lookup is unsupported, spawn by name so `Process::output` can
+/// resolve PATH on the host. Returning "not found" would drop a real host
+/// direnv.
+pub(crate) fn direnv_spawn_path(path_lookup_unsupported: bool) -> Option<PathBuf> {
+    match lookup_system_binary_impl("direnv", None, Path::new("."), path_lookup_unsupported) {
+        Some(path) => Some(path),
+        None if path_lookup_unsupported => Some(PathBuf::from("direnv")),
+        None => None,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn lookup_system_binary_impl_for_tests(
+    program: &str,
+    search_paths: Option<&OsStr>,
+    cwd: &Path,
+    path_lookup_unsupported: bool,
+) -> Option<PathBuf> {
+    lookup_system_binary_impl(program, search_paths, cwd, path_lookup_unsupported)
+}
+
+#[cfg(feature = "test-support")]
+pub fn direnv_spawn_path_for_tests(path_lookup_unsupported: bool) -> Option<PathBuf> {
+    direnv_spawn_path(path_lookup_unsupported)
+}
+
+#[cfg(feature = "test-support")]
+pub fn lookup_adapter_binary_for_tests(
+    program: &OsStr,
+    search_paths: Option<&OsStr>,
+    cwd: &Path,
+    path_lookup_unsupported: bool,
+) -> Option<PathBuf> {
+    lookup_adapter_binary(program, search_paths, cwd, path_lookup_unsupported)
+}
+
+async fn load_directory_shell_environment(
+    shell: Shell,
+    abs_path: Arc<Path>,
+    load_direnv: DirenvSettings,
+    tx: mpsc::UnboundedSender<String>,
+    fs: Option<Arc<dyn Fs>>,
+) -> anyhow::Result<HashMap<String, String>> {
+    if let DirenvSettings::Disabled = load_direnv {
+        return Ok(HashMap::default());
+    }
+
+    let dir = resolve_shell_environment_directory(abs_path.clone(), fs, tx.clone()).await?;
 
     let (shell, args) = shell.program_and_args();
     let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
@@ -391,19 +544,24 @@ async fn load_direnv_environment(
     env: &HashMap<String, String>,
     dir: &Path,
 ) -> anyhow::Result<HashMap<String, Option<String>>> {
-    let Some(direnv_path) = which::which("direnv").ok() else {
+    let Some(direnv_path) = direnv_spawn_path(cfg!(target_family = "wasm")) else {
         return Ok(HashMap::default());
     };
 
     let args = &["export", "json"];
-    let direnv_output = new_command(&direnv_path)
+    let direnv_output = match new_command(&direnv_path)
         .args(args)
         .envs(env)
         .env("TERM", "dumb")
         .current_dir(dir)
         .output()
         .await
-        .context("running direnv")?;
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashMap::default());
+        }
+        result => result.context("running direnv")?,
+    };
 
     if !direnv_output.status.success() {
         bail!(

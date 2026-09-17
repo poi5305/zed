@@ -209,6 +209,13 @@ pub async fn exec_bound<B: Bind>(sql: &str, bindings: B) -> Result<()> {
     Ok(())
 }
 
+/// Run SQL with a parameter list that is not a fixed-arity `Bind` tuple
+/// (dynamic `IN (...)` lists, or more columns than the tuple impls cover).
+pub async fn exec_params(sql: &str, params: Vec<Value>) -> Result<()> {
+    query_sql(sql, params).await?;
+    Ok(())
+}
+
 pub async fn select<C: Column>(sql: &str) -> Result<Vec<C>> {
     let result = query_sql(sql, Vec::new()).await?;
     decode_rows(&result)?
@@ -248,6 +255,72 @@ pub async fn script(sql: &str) -> Result<Value> {
 
 pub async fn batch(queries: Vec<Value>) -> Result<Value> {
     sql_call("Sql::batch", json!({ "queries": queries })).await
+}
+
+/// Both key-value tables, in one round trip.
+///
+/// The synchronous `db::kvp` reads cannot await, so they are served from
+/// `crate::kvp_cache`, which this fills. The server has answered `Sql::bootstrap_kvp`
+/// since the RPC layer was written; nothing had ever called it.
+pub struct BootstrapKeyValues {
+    /// `(key, value)` from `kv_store`.
+    pub unscoped: Vec<(String, String)>,
+    /// `(namespace, key, value)` from `scoped_kv_store`.
+    pub scoped: Vec<(String, String, String)>,
+}
+
+pub async fn bootstrap_kvp() -> Result<BootstrapKeyValues> {
+    let result = sql_call("Sql::bootstrap_kvp", json!({})).await?;
+
+    let mut unscoped = Vec::new();
+    for row in text_rows(&result, "kv", 2)? {
+        let mut cells = row.into_iter();
+        let (Some(key), Some(value)) = (cells.next(), cells.next()) else {
+            bail!("Sql::bootstrap_kvp kv row lost a column after being width-checked");
+        };
+        unscoped.push((key, value));
+    }
+
+    let mut scoped = Vec::new();
+    for row in text_rows(&result, "scoped", 3)? {
+        let mut cells = row.into_iter();
+        let (Some(namespace), Some(key), Some(value)) = (cells.next(), cells.next(), cells.next())
+        else {
+            bail!("Sql::bootstrap_kvp scoped row lost a column after being width-checked");
+        };
+        scoped.push((namespace, key, value));
+    }
+
+    Ok(BootstrapKeyValues { unscoped, scoped })
+}
+
+/// Decodes the server's `collect_text_rows` shape: an array of rows, each an array of
+/// exactly `columns` JSON strings.
+fn text_rows(result: &Value, field: &str, columns: usize) -> Result<Vec<Vec<String>>> {
+    let rows = result
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("Sql::bootstrap_kvp result missing '{field}'"))?;
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .as_array()
+                .with_context(|| format!("Sql::bootstrap_kvp '{field}' row was not an array"))?;
+            anyhow::ensure!(
+                cells.len() == columns,
+                "Sql::bootstrap_kvp '{field}' row has {} columns, expected {columns}",
+                cells.len()
+            );
+            cells
+                .iter()
+                .map(|cell| {
+                    cell.as_str().map(str::to_string).with_context(|| {
+                        format!("Sql::bootstrap_kvp '{field}' cell was not a string: {cell}")
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Debug)]

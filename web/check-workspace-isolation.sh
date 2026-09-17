@@ -855,6 +855,9 @@ problems = []
 for relative in git("diff", "--name-only", base, "--", "*Cargo.toml").split():
     if relative == "Cargo.toml":
         continue
+    # Upstream manifests kept verbatim.
+    if relative.startswith("web/vendor/"):
+        continue
     crate = pathlib.Path(relative).parent
     added = dependency_names((repo / relative).read_text()) \
         - dependency_names(git("show", f"{base}:{relative}"))
@@ -907,6 +910,9 @@ workspace_pinned = set(tomllib.load(open(repo / "Cargo.toml", "rb"))
 problems = []
 for relative in git("diff", "--name-only", base, "--", "*Cargo.toml").split():
     if relative == "Cargo.toml":
+        continue
+    # Upstream manifests kept verbatim.
+    if relative.startswith("web/vendor/"):
         continue
     before = dependency_specs(git("show", f"{base}:{relative}"))
     for name, specs in dependency_specs((repo / relative).read_text()).items():

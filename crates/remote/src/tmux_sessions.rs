@@ -149,11 +149,8 @@ pub async fn list_tmux_sessions() -> Result<TmuxSessionList> {
 
     // `tmux list-sessions` exits non-zero with "no server running on ..." when
     // no server has been started yet, which is a normal state and not an error.
-    let mut sessions = parse_tmux_sessions(&String::from_utf8_lossy(&list_sessions.stdout));
-    // The mirrors Zed groups with a session to hold a terminal on one of its windows
-    // are its own bookkeeping, not sessions the user started; see
-    // [`crate::claude_sessions::attach_arguments`].
-    sessions.retain(|session| !is_zed_mirror_session(&session.name));
+    let sessions =
+        sessions_from_list_sessions_stdout(&String::from_utf8_lossy(&list_sessions.stdout));
     if sessions.is_empty() {
         return Ok(TmuxSessionList {
             sessions: Vec::new(),
@@ -177,6 +174,16 @@ pub async fn list_tmux_sessions() -> Result<TmuxSessionList> {
         sessions: merge_sessions_and_windows(sessions, windows),
         tmux_available: true,
     })
+}
+
+/// Parses `tmux list-sessions` stdout and drops Zed's own mirror sessions.
+fn sessions_from_list_sessions_stdout(stdout: &str) -> Vec<TmuxSession> {
+    let mut sessions = parse_tmux_sessions(stdout);
+    // The mirrors Zed groups with a session to hold a terminal on one of its windows
+    // are its own bookkeeping, not sessions the user started; see
+    // [`crate::claude_sessions::attach_arguments`].
+    sessions.retain(|session| !is_zed_mirror_session(&session.name));
+    sessions
 }
 
 #[cfg(test)]
@@ -319,6 +326,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("first", 2), ("second", 1), ("third", 4)],
             "a non-numeric window count and a row without tabs are dropped alone"
+        );
+    }
+
+    #[test]
+    fn live_list_sessions_stdout_keeps_user_sessions_and_drops_only_the_mirror() {
+        let stdout = "poc\t0\t1\nzed\t1\t1\nzed-claude-mirror-76859-50\t1\t1\n";
+
+        let sessions = sessions_from_list_sessions_stdout(stdout);
+        let names: Vec<&str> = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["poc", "zed"],
+            "the host listing that reached Process::output must survive parse and the mirror filter"
+        );
+    }
+
+    #[test]
+    fn mirror_filter_does_not_drop_sessions_that_only_share_a_prefix() {
+        let stdout = "zed\t1\t1\nzed-claude-mirror\t0\t1\nzed-claude-mirror-1\t0\t1\n";
+
+        let sessions = sessions_from_list_sessions_stdout(stdout);
+        let names: Vec<&str> = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["zed", "zed-claude-mirror"],
+            "only names that start with zed-claude-mirror- are bookkeeping"
         );
     }
 

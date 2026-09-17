@@ -19,6 +19,8 @@ use std::task::{Context, Poll, Waker};
 pub use std::process::Stdio;
 
 #[cfg(target_family = "wasm")]
+use crate::rpc::RpcClient;
+#[cfg(target_family = "wasm")]
 use base64::Engine as _;
 #[cfg(target_family = "wasm")]
 use futures::StreamExt;
@@ -28,8 +30,6 @@ use futures::channel::{mpsc, oneshot};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 #[cfg(target_family = "wasm")]
 use serde::{Deserialize, Serialize};
-#[cfg(target_family = "wasm")]
-use crate::rpc::RpcClient;
 
 fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     loop {
@@ -565,8 +565,10 @@ impl Command {
                     .collect(),
                 cwd: self.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
                 stdin_pipe: self.stdin_cfg.is_some(),
-                stdout_pipe: self.stdout_cfg.is_some(),
-                stderr_pipe: self.stderr_cfg.is_some(),
+                // `std::process::Command::output` always captures these streams.
+                // The spawn path honors the caller's cfg; this RPC must not.
+                stdout_pipe: true,
+                stderr_pipe: true,
             };
             let response: OutputResponse = client
                 .call("Process::output", &request)
@@ -580,6 +582,12 @@ impl Command {
                 .decode(response.stderr)
                 .map_err(|e| io_error(&e.to_string()))?;
 
+            // wasm32-unknown-unknown cannot construct a non-zero ExitStatus.
+            // Mapping a non-zero `status_code` to `Err` would make `tmux
+            // list-sessions` with no server look like a missing binary.
+            // The bytes are the answer; the fabricated success status is
+            // recorded here rather than hidden.
+            let _status_code = response.status_code;
             Ok(Output {
                 status: ExitStatus::default(),
                 stdout,

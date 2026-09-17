@@ -173,7 +173,13 @@ impl TmuxSessionsPanel {
                     .collect();
                 self.expanded_sessions.retain(|name| names.contains(name));
             }
-            Err(error) => self.error = Some(error.to_string().into()),
+            Err(error) => {
+                // Logged as well as drawn: the panel has to be open to be read, and in
+                // the browser these panels have already spent a phase being impossible
+                // to open, which made everything they had to say unreachable.
+                log::error!("tmux sessions: {error:#}");
+                self.error = Some(error.to_string().into());
+            }
         }
         cx.notify();
     }
@@ -544,8 +550,66 @@ mod tests {
     use gpui::TestAppContext;
     use rpc::{ProtoClient, ProtoMessageHandlerSet, proto::EnvelopedMessage};
     use std::future::Future;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
+
+    /// The text of a listing failure this test recognizes among whatever else the test
+    /// binary logs.
+    const LISTING_FAILURE: &str = "tmux-listing-probe: the host refused";
+
+    /// Every `log` record this test binary emits, so that a test can prove a failure was
+    /// reported to the log and not only to the panel's own state.
+    ///
+    /// Keyed by the thread that logged it: these tests run concurrently in one binary,
+    /// and an assertion that something was NOT logged would otherwise be reading another
+    /// test's records. Every site under test logs from the foreground thread the test
+    /// itself drives.
+    static CAPTURED_RECORDS: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+    struct CapturingLogger;
+
+    static CAPTURING_LOGGER: CapturingLogger = CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            if let Ok(mut captured) = CAPTURED_RECORDS.lock() {
+                captured.push((
+                    std::thread::current().id(),
+                    format!("{}: {}", record.level(), record.args()),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// `log`'s logger slot is global and write-once, so this is installed once per test
+    /// binary and never removed. Records are never cleared: tests run concurrently, and
+    /// each one finds its own by the text it put in the failure.
+    fn capture_log_records() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&CAPTURING_LOGGER)
+                .expect("no other logger may be installed in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// What this thread has logged so far.
+    fn captured_records() -> Vec<String> {
+        let this_thread = std::thread::current().id();
+        CAPTURED_RECORDS
+            .lock()
+            .expect("reading the captured records")
+            .iter()
+            .filter(|(thread, _)| *thread == this_thread)
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
 
     /// Longer than any bound a listing may put on its own request, so that a panel that
     /// is still waiting after this has stopped waiting for a reason rather than because
@@ -740,7 +804,8 @@ mod tests {
         let panel = panel_for(client, cx);
 
         panel.update(cx, |panel, cx| panel.refresh(cx));
-        cx.executor().advance_clock(nearly_the_bound + Duration::from_millis(1));
+        cx.executor()
+            .advance_clock(nearly_the_bound + Duration::from_millis(1));
         cx.run_until_parked();
 
         let (message, names) = panel.read_with(cx, |panel, _| {
@@ -762,6 +827,80 @@ mod tests {
         assert_eq!(
             message, None,
             "a panel with sessions to draw has no empty message; expected None, got {message:?}"
+        );
+    }
+
+    /// A listing that failed has to reach the log, not only the panel.
+    ///
+    /// The panel is the only place this failure is written down today, and a panel has
+    /// to be open to be read. In the browser this fork's three panels spent a whole
+    /// phase being impossible to open at all, so anything they had to say about a failed
+    /// load was said to nobody. The log is the channel that does not depend on the panel
+    /// being reachable.
+    #[gpui::test]
+    async fn a_failed_listing_is_logged_as_well_as_drawn(cx: &mut TestAppContext) {
+        capture_log_records();
+        let client = AnyProtoClient::new(SilentHost::never_answering(cx.executor()));
+        let panel = panel_for(client, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.apply_listing(Err(anyhow::anyhow!("{LISTING_FAILURE}")), cx)
+        });
+
+        let drawn = panel.read_with(cx, |panel, _| panel.error.clone());
+        assert_eq!(
+            drawn.as_deref(),
+            Some(LISTING_FAILURE),
+            "the panel must still say so itself; expected {LISTING_FAILURE:?}, got {drawn:?}"
+        );
+
+        let records = captured_records();
+        let about_this_failure: Vec<&String> = records
+            .iter()
+            .filter(|record| record.contains(LISTING_FAILURE))
+            .collect();
+        assert_eq!(
+            about_this_failure,
+            vec![&format!("ERROR: tmux sessions: {LISTING_FAILURE}")],
+            "a failed listing must be logged once, at error level so that the browser's \
+             Info-level release filter keeps it; expected \
+             [\"ERROR: tmux sessions: {LISTING_FAILURE}\"], got {about_this_failure:?} \
+             out of {} records this test binary logged",
+            records.len()
+        );
+    }
+
+    /// What the log line above must not wrongly announce: a listing that worked.
+    ///
+    /// A panel that logs an error every time it refreshes trains its reader to ignore
+    /// the log, which puts the failure back where it started.
+    #[gpui::test]
+    async fn a_listing_that_succeeded_logs_nothing(cx: &mut TestAppContext) {
+        capture_log_records();
+        let client = AnyProtoClient::new(SilentHost::answering_after(
+            Duration::ZERO,
+            one_session(),
+            cx.executor(),
+        ));
+        let panel = panel_for(client, cx);
+
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        cx.run_until_parked();
+
+        let drawn = panel.read_with(cx, |panel, _| panel.error.clone());
+        assert_eq!(
+            drawn, None,
+            "a listing that arrived leaves nothing to report; expected None, got {drawn:?}"
+        );
+        let records = captured_records();
+        let about_tmux: Vec<&String> = records
+            .iter()
+            .filter(|record| record.contains("tmux sessions: "))
+            .collect();
+        assert!(
+            about_tmux.is_empty(),
+            "a listing that succeeded must log nothing about itself; expected [], got \
+             {about_tmux:?}"
         );
     }
 }

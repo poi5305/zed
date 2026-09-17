@@ -261,14 +261,17 @@ pub fn match_fixed_path_set(
     results
 }
 
-pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
+/// Always compiled for wasm and for native tests so results can be pinned
+/// without a wasm runtime. The browser path of [`match_path_sets`] calls this
+/// instead of `executor.scoped`.
+#[cfg(any(target_family = "wasm", test))]
+fn match_path_sets_inline<'a, Set: PathMatchCandidateSet<'a>>(
     candidate_sets: &'a [Set],
     query: &str,
     relative_to: &Option<Arc<RelPath>>,
     case: Case,
     max_results: usize,
     cancel_flag: &AtomicBool,
-    executor: BackgroundExecutor,
 ) -> Vec<PathMatch> {
     let path_count: usize = candidate_sets.iter().map(|s| s.len()).sum();
     if path_count == 0 {
@@ -287,14 +290,100 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
         return Vec::new();
     };
 
+    let mut config = nucleo::Config::DEFAULT;
+    config.set_match_paths();
+    let mut matcher = matcher::get_matcher(config);
+    let mut results = Vec::with_capacity(max_results.min(path_count));
+
+    for candidate_set in candidate_sets {
+        if path_match_helper(
+            &mut matcher,
+            &query,
+            candidate_set.candidates(0),
+            &mut results,
+            candidate_set.id(),
+            &candidate_set.prefix(),
+            candidate_set.root_is_file(),
+            relative_to,
+            path_style,
+            cancel_flag,
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+
+    matcher::return_matcher(matcher);
+    if cancel_flag.load(atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+
+    gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
+    results
+}
+
+pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
+    candidate_sets: &'a [Set],
+    query: &str,
+    relative_to: &Option<Arc<RelPath>>,
+    case: Case,
+    max_results: usize,
+    cancel_flag: &AtomicBool,
+    executor: BackgroundExecutor,
+) -> Vec<PathMatch> {
+    let path_count: usize = candidate_sets.iter().map(|s| s.len()).sum();
+    if path_count == 0 {
+        return Vec::new();
+    }
+
+    // The browser's main thread has no other threads to fan out to, and `scoped` only
+    // completes once its spawned tasks have been polled -- which cannot happen while a
+    // caller is synchronously awaiting this future. Match inline instead: same results,
+    // no parallelism, which is what a single-threaded dispatcher gives either way.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = &executor;
+        return match_path_sets_inline(
+            candidate_sets,
+            query,
+            relative_to,
+            case,
+            max_results,
+            cancel_flag,
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    let path_style = candidate_sets[0].path_style();
+
+    #[cfg(not(target_family = "wasm"))]
+    let query = if path_style.is_windows() {
+        query.replace('\\', "/")
+    } else {
+        query.to_owned()
+    };
+
+    #[cfg(not(target_family = "wasm"))]
+    let Some(query) = Query::build(&query, case) else {
+        return Vec::new();
+    };
+
+    #[cfg(not(target_family = "wasm"))]
     let num_cpus = executor.num_cpus().min(path_count);
+    #[cfg(not(target_family = "wasm"))]
     let segment_size = path_count.div_ceil(num_cpus);
+    #[cfg(not(target_family = "wasm"))]
     let mut segment_results = (0..num_cpus)
         .map(|_| Vec::with_capacity(max_results))
         .collect::<Vec<_>>();
+    #[cfg(not(target_family = "wasm"))]
     let mut config = nucleo::Config::DEFAULT;
+    #[cfg(not(target_family = "wasm"))]
     config.set_match_paths();
+    #[cfg(not(target_family = "wasm"))]
     let mut matchers = matcher::get_matchers(num_cpus, config);
+    #[cfg(not(target_family = "wasm"))]
     executor
         .scoped(|scope| {
             for (segment_idx, (results, matcher)) in segment_results
@@ -345,12 +434,157 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
         })
         .await;
 
-    matcher::return_matchers(matchers);
-    if cancel_flag.load(atomic::Ordering::Acquire) {
-        return Vec::new();
+    #[cfg(not(target_family = "wasm"))]
+    {
+        matcher::return_matchers(matchers);
+        if cancel_flag.load(atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let mut results = segment_results.concat();
+        gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
+        results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use path::{
+        PathStyle,
+        rel_path::{RelPath, RelPathBuf},
+    };
+
+    use super::{PathMatchCandidate, PathMatchCandidateSet, match_path_sets_inline};
+    use crate::Case;
+    use fuzzy::CharBag;
+
+    struct TestCandidateSet {
+        id: usize,
+        prefix: Arc<RelPath>,
+        root_is_file: bool,
+        entries: Vec<(bool, RelPathBuf, CharBag)>,
     }
 
-    let mut results = segment_results.concat();
-    gpui_util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
-    results
+    struct TestCandidateIter<'a> {
+        entries: std::slice::Iter<'a, (bool, RelPathBuf, CharBag)>,
+    }
+
+    impl<'a> Iterator for TestCandidateIter<'a> {
+        type Item = PathMatchCandidate<'a>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.entries
+                .next()
+                .map(|(is_dir, path, char_bag)| PathMatchCandidate {
+                    is_dir: *is_dir,
+                    path: path.as_rel_path(),
+                    char_bag: *char_bag,
+                })
+        }
+    }
+
+    impl<'a> PathMatchCandidateSet<'a> for TestCandidateSet {
+        type Candidates = TestCandidateIter<'a>;
+
+        fn id(&self) -> usize {
+            self.id
+        }
+
+        fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        fn root_is_file(&self) -> bool {
+            self.root_is_file
+        }
+
+        fn prefix(&self) -> Arc<RelPath> {
+            self.prefix.clone()
+        }
+
+        fn candidates(&'a self, start: usize) -> Self::Candidates {
+            TestCandidateIter {
+                entries: self.entries[start..].iter(),
+            }
+        }
+
+        fn path_style(&self) -> PathStyle {
+            PathStyle::Unix
+        }
+    }
+
+    fn rel(path: &str) -> RelPathBuf {
+        RelPath::new_test(path).into_owned()
+    }
+
+    fn entry(path: &str, is_dir: bool) -> (bool, RelPathBuf, CharBag) {
+        let path = rel(path);
+        let char_bag = CharBag::from(path.as_rel_path().as_unix_str());
+        (is_dir, path, char_bag)
+    }
+
+    fn sample_set() -> TestCandidateSet {
+        TestCandidateSet {
+            id: 7,
+            prefix: RelPath::empty_arc(),
+            root_is_file: false,
+            entries: vec![
+                entry("src/main.rs", false),
+                entry("src/lib.rs", false),
+                entry("README.md", false),
+            ],
+        }
+    }
+
+    fn matched_paths(query: &str, max_results: usize, cancel: bool) -> Vec<String> {
+        let set = sample_set();
+        let cancel_flag = AtomicBool::new(cancel);
+        match_path_sets_inline(
+            std::slice::from_ref(&set),
+            query,
+            &None,
+            Case::Ignore,
+            max_results,
+            &cancel_flag,
+        )
+        .into_iter()
+        .map(|path_match| path_match.path.as_unix_str().to_string())
+        .collect()
+    }
+
+    #[test]
+    fn inline_match_main_returns_only_main_rs() {
+        let actual = matched_paths("main", 10, false);
+        let correct = vec!["src/main.rs".to_string()];
+        assert_eq!(
+            actual, correct,
+            "actual vs correct for query 'main' (max_results=10)"
+        );
+    }
+
+    #[test]
+    fn inline_match_rs_returns_rust_sources_not_readme() {
+        let actual = matched_paths("rs", 10, false);
+        let correct_count = 2;
+        assert_eq!(
+            actual.len(),
+            correct_count,
+            "actual len {} vs correct {correct_count} for query 'rs'; actual={actual:?}",
+            actual.len()
+        );
+        assert!(
+            actual.contains(&"src/main.rs".to_string()),
+            "actual {actual:?} vs correct containing src/main.rs"
+        );
+        assert!(
+            actual.contains(&"src/lib.rs".to_string()),
+            "actual {actual:?} vs correct containing src/lib.rs"
+        );
+        assert!(
+            !actual.contains(&"README.md".to_string()),
+            "actual {actual:?} vs correct not containing README.md"
+        );
+    }
 }

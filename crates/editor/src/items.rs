@@ -11,7 +11,9 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use file_icons::FileIcons;
 use fs::MTime;
-use futures::{channel::oneshot, future::try_join_all};
+#[cfg(not(target_family = "wasm"))]
+use futures::channel::oneshot;
+use futures::future::try_join_all;
 use git::status::GitSummary;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, Font,
@@ -2030,6 +2032,7 @@ impl SearchableItem for Editor {
             } else {
                 search_within_ranges
             };
+            #[cfg(not(target_family = "wasm"))]
             let num_cpus = executor.num_cpus();
             for range in search_within_ranges {
                 for (search_buffer, search_range, deleted_hunk_anchor) in
@@ -2037,61 +2040,103 @@ impl SearchableItem for Editor {
                 {
                     let query = query.clone();
 
-                    let mut results = Vec::new();
-                    executor
-                        .scoped(|scope| {
-                            for search_range in chunk_search_range(
-                                search_buffer.text.clone(),
-                                &query,
-                                num_cpus as u32,
-                                search_range,
-                            ) {
-                                let query = query.clone();
-                                let buffer = buffer.clone();
-
-                                let (tx, rx) = oneshot::channel();
-                                results.push(rx);
-                                scope.spawn(async move {
-                                    let chunk_result = query
-                                        .search(
-                                            search_buffer,
-                                            Some(search_range.start..search_range.end),
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let _ = &executor;
+                        let search_chunks: Vec<_> =
+                            chunk_search_range(search_buffer.text.clone(), &query, 1, search_range)
+                                .collect();
+                        for search_range in search_chunks {
+                            let query = query.clone();
+                            let buffer = buffer.clone();
+                            let chunk_result = query
+                                .search(search_buffer, Some(search_range.start..search_range.end))
+                                .await
+                                .into_iter()
+                                .filter_map(|match_range| {
+                                    if let Some(deleted_hunk_anchor) = deleted_hunk_anchor {
+                                        let start = search_buffer
+                                            .anchor_after(search_range.start + match_range.start);
+                                        let end = search_buffer
+                                            .anchor_before(search_range.start + match_range.end);
+                                        Some(
+                                            deleted_hunk_anchor.with_diff_base_anchor(start)
+                                                ..deleted_hunk_anchor.with_diff_base_anchor(end),
                                         )
-                                        .await
-                                        .into_iter()
-                                        .filter_map(|match_range| {
-                                            if let Some(deleted_hunk_anchor) = deleted_hunk_anchor {
-                                                let start = search_buffer.anchor_after(
-                                                    search_range.start + match_range.start,
-                                                );
-                                                let end = search_buffer.anchor_before(
-                                                    search_range.start + match_range.end,
-                                                );
-                                                Some(
-                                                    deleted_hunk_anchor.with_diff_base_anchor(start)
-                                                        ..deleted_hunk_anchor
-                                                            .with_diff_base_anchor(end),
-                                                )
-                                            } else {
-                                                let start = search_buffer.anchor_after(
-                                                    search_range.start + match_range.start,
-                                                );
-                                                let end = search_buffer.anchor_before(
-                                                    search_range.start + match_range.end,
-                                                );
-                                                buffer.anchor_range_in_buffer(start..end)
-                                            }
-                                        })
-                                        .collect::<Vec<_>>();
-                                    _ = tx.send(chunk_result);
-                                });
-                            }
-                        })
-                        .await;
+                                    } else {
+                                        let start = search_buffer
+                                            .anchor_after(search_range.start + match_range.start);
+                                        let end = search_buffer
+                                            .anchor_before(search_range.start + match_range.end);
+                                        buffer.anchor_range_in_buffer(start..end)
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            ranges.extend(chunk_result);
+                        }
+                    }
 
-                    for rx in results {
-                        if let Ok(results) = rx.await {
-                            ranges.extend(results);
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let mut results = Vec::new();
+                        executor
+                            .scoped(|scope| {
+                                for search_range in chunk_search_range(
+                                    search_buffer.text.clone(),
+                                    &query,
+                                    num_cpus as u32,
+                                    search_range,
+                                ) {
+                                    let query = query.clone();
+                                    let buffer = buffer.clone();
+
+                                    let (tx, rx) = oneshot::channel();
+                                    results.push(rx);
+                                    scope.spawn(async move {
+                                        let chunk_result = query
+                                            .search(
+                                                search_buffer,
+                                                Some(search_range.start..search_range.end),
+                                            )
+                                            .await
+                                            .into_iter()
+                                            .filter_map(|match_range| {
+                                                if let Some(deleted_hunk_anchor) =
+                                                    deleted_hunk_anchor
+                                                {
+                                                    let start = search_buffer.anchor_after(
+                                                        search_range.start + match_range.start,
+                                                    );
+                                                    let end = search_buffer.anchor_before(
+                                                        search_range.start + match_range.end,
+                                                    );
+                                                    Some(
+                                                        deleted_hunk_anchor
+                                                            .with_diff_base_anchor(start)
+                                                            ..deleted_hunk_anchor
+                                                                .with_diff_base_anchor(end),
+                                                    )
+                                                } else {
+                                                    let start = search_buffer.anchor_after(
+                                                        search_range.start + match_range.start,
+                                                    );
+                                                    let end = search_buffer.anchor_before(
+                                                        search_range.start + match_range.end,
+                                                    );
+                                                    buffer.anchor_range_in_buffer(start..end)
+                                                }
+                                            })
+                                            .collect::<Vec<_>>();
+                                        _ = tx.send(chunk_result);
+                                    });
+                                }
+                            })
+                            .await;
+
+                        for rx in results {
+                            if let Ok(results) = rx.await {
+                                ranges.extend(results);
+                            }
                         }
                     }
                 }

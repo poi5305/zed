@@ -56,7 +56,7 @@ pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyPty = ();
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
-pub(super) type AlacrittyTermLock = FairMutex<AlacrittyTerm>;
+pub(crate) type AlacrittyTermLock = FairMutex<AlacrittyTerm>;
 pub(super) type AlacrittyCell = AlacCell;
 pub(super) type AlacrittyGridIterator<'a> = GridIterator<'a, AlacCell>;
 pub(super) type AlacrittyHyperlink = AlacHyperlink;
@@ -118,20 +118,26 @@ impl PtySender {
 }
 
 #[cfg(target_family = "wasm")]
-pub(super) struct PtySender;
+pub(super) struct PtySender {
+    remote: crate::remote_pty::RemotePtyHandle,
+}
 
 #[cfg(target_family = "wasm")]
 impl PtySender {
-    pub(super) fn notify(&self, _input: impl Into<Cow<'static, [u8]>>) {
-        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
+    pub(super) fn from_remote(remote: crate::remote_pty::RemotePtyHandle) -> Self {
+        Self { remote }
     }
 
-    pub(super) fn resize(&self, _bounds: TerminalBounds) {
-        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
+    pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
+        self.remote.write(input);
+    }
+
+    pub(super) fn resize(&self, bounds: TerminalBounds) {
+        self.remote.resize(bounds);
     }
 
     pub(super) fn shutdown(&self) {
-        panic!("local PTY I/O is not available in the browser until RemotePty RPC lands");
+        self.remote.shutdown();
     }
 }
 

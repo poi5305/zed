@@ -26,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 thiserror.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }

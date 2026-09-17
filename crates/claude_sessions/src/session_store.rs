@@ -768,6 +768,10 @@ impl ClaudeSessionStore {
         let listing = match scan {
             Ok(listing) => listing,
             Err(error) => {
+                // Logged as well as stored: the panel has to be open to be read, and in
+                // the browser these panels have already spent a phase being impossible
+                // to open, which made everything they had to say unreachable.
+                log::error!("claude sessions: reading the session registry: {error:#}");
                 // The previous list is kept: a directory that is momentarily unreadable
                 // should not empty the panel.
                 self.error = Some((
@@ -1011,11 +1015,69 @@ impl ClaudeSessionStore {
 mod tests {
     use super::*;
     use std::sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicU32, Ordering},
     };
 
     use gpui::AppContext as _;
+
+    /// The text of a scan failure this test recognizes among whatever else the test
+    /// binary logs.
+    const SCAN_FAILURE: &str = "claude-scan-probe: the registry directory is unreadable";
+
+    /// Every `log` record this test binary emits, so that a test can prove a failure was
+    /// reported to the log and not only to the store's own state.
+    ///
+    /// Keyed by the thread that logged it: these tests run concurrently in one binary,
+    /// and an assertion that something was NOT logged would otherwise be reading another
+    /// test's records. Every site under test logs from the foreground thread the test
+    /// itself drives.
+    static CAPTURED_RECORDS: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+    struct CapturingLogger;
+
+    static CAPTURING_LOGGER: CapturingLogger = CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            if let Ok(mut captured) = CAPTURED_RECORDS.lock() {
+                captured.push((
+                    std::thread::current().id(),
+                    format!("{}: {}", record.level(), record.args()),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// `log`'s logger slot is global and write-once, so this is installed once per test
+    /// binary and never removed. Records are never cleared: tests run concurrently, and
+    /// each one finds its own by the text it put in the failure.
+    fn capture_log_records() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            log::set_logger(&CAPTURING_LOGGER)
+                .expect("no other logger may be installed in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// What this thread has logged so far.
+    fn captured_records() -> Vec<String> {
+        let this_thread = std::thread::current().id();
+        CAPTURED_RECORDS
+            .lock()
+            .expect("reading the captured records")
+            .iter()
+            .filter(|(thread, _)| *thread == this_thread)
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
 
     use crate::{
         session_registry::{
@@ -1921,6 +1983,79 @@ mod tests {
 "procStart":"{FAKE_PROCESS_START}","version":"2.1.267","kind":"interactive",
 "tmux":"{tmux}","name":"live"}}"#
         )
+    }
+
+    /// A registry scan that failed has to reach the log, not only the store.
+    ///
+    /// The panel is the only place this failure is written down today, and a panel has
+    /// to be open to be read. In the browser this fork's three panels spent a whole
+    /// phase being impossible to open at all, so anything they had to say about a failed
+    /// scan was said to nobody. The log is the channel that does not depend on the panel
+    /// being reachable.
+    ///
+    /// The scan that works is checked in the same test rather than in one of its own,
+    /// because the record buffer is one per test binary.
+    #[gpui::test]
+    async fn test_a_failed_registry_scan_is_logged_as_well_as_stored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        capture_log_records();
+        let home_directory = temporary_directory("scan-failure");
+        let source = Arc::new(FakeSource::new(
+            home_directory.clone(),
+            fake_process_starts(Vec::new()),
+        ));
+        let store = cx.new(|cx| ClaudeSessionStore::new(source, None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        // What the log line must not wrongly announce: a scan that found nothing. An
+        // empty registry is the ordinary state of a machine with no session running, and
+        // a store that logs an error every poll trains its reader to ignore the log.
+        let stored = store.read_with(cx, |store, _| store.error().cloned());
+        assert_eq!(
+            stored, None,
+            "an empty registry is not a failure; expected None, got {stored:?}"
+        );
+        let after_a_good_scan: Vec<String> = captured_records()
+            .into_iter()
+            .filter(|record| record.contains("claude sessions: reading the session registry"))
+            .collect();
+        assert!(
+            after_a_good_scan.is_empty(),
+            "a scan that succeeded must log nothing about itself; expected [], got \
+             {after_a_good_scan:?}"
+        );
+
+        store.update(cx, |store, cx| {
+            store.apply_registry_scan(Err(anyhow::anyhow!("{SCAN_FAILURE}")), cx)
+        });
+
+        let stored = store.read_with(cx, |store, _| store.error().cloned());
+        assert_eq!(
+            stored.as_deref(),
+            Some(format!("Reading Claude sessions: {SCAN_FAILURE}").as_str()),
+            "the store must still say so itself; got {stored:?}"
+        );
+
+        let records = captured_records();
+        let about_the_scan: Vec<&String> = records
+            .iter()
+            .filter(|record| record.contains(SCAN_FAILURE))
+            .collect();
+        assert_eq!(
+            about_the_scan,
+            vec![&format!(
+                "ERROR: claude sessions: reading the session registry: {SCAN_FAILURE}"
+            )],
+            "a failed scan must be logged once, at error level so that the browser's \
+             Info-level release filter keeps it; expected [\"ERROR: claude sessions: \
+             reading the session registry: {SCAN_FAILURE}\"], got {about_the_scan:?} out \
+             of {} records this test binary logged",
+            records.len()
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
     }
 
     /// A store reading through `source` with `process_id` selected, which is the state

@@ -14,7 +14,7 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
 use anyhow::{Context as _, Result};
@@ -299,8 +299,8 @@ pub fn normalize_whitespace(value: &str) -> String {
 /// A clock that is behind the epoch cannot happen in practice; reporting zero keeps every
 /// session visible, which is the safer failure for a list the user is looking at.
 pub fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
 }
@@ -2715,6 +2715,7 @@ async fn run_with_stdin(program: &str, arguments: &[&str], stdin_contents: &[u8]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+    use std::time::UNIX_EPOCH;
 
     /// On Linux, `procStart` is field 22 of `/proc/<pid>/stat`. Counting that field from
     /// the left is what a reader of the format gets wrong: field 2 is the executable's

@@ -3100,6 +3100,7 @@ dependencies = [
  "editor",
  "fs",
  "gpui",
+ "log",
  "markdown",
  "paths",
  "project",
@@ -3114,6 +3115,7 @@ dependencies = [
  "theme",
  "ui",
  "util",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
@@ -12369,6 +12371,7 @@ dependencies = [
  "serde_json",
  "settings",
  "thiserror 2.0.17",
+ "web-time",
 ]
 
 [[package]]
@@ -12393,6 +12396,7 @@ dependencies = [
  "smol",
  "url",
  "util",
+ "web-time",
 ]
 
 [[package]]
@@ -14091,6 +14095,7 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "gpui",
+ "log",
  "paths",
  "percent-encoding",
  "project",
@@ -18363,6 +18368,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "collections",
  "futures 0.3.32",
  "futures-lite 2.6.1",
@@ -18377,6 +18383,7 @@ dependencies = [
  "release_channel",
  "schemars 1.0.4",
  "serde",
+ "serde_json",
  "settings",
  "smol",
  "sysinfo 0.39.6",
@@ -18799,6 +18806,7 @@ dependencies = [
  "anyhow",
  "collections",
  "gpui",
+ "log",
  "parking_lot",
  "remote",
  "rpc",
@@ -23344,6 +23352,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "util",
  "walkdir",
  "zed-reqwest",
 ]

@@ -17,6 +17,22 @@ pub fn new_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
+/// Pipes a one-shot `Command::output` should request from the host.
+///
+/// `std::process::Command::output` captures stdout and stderr even when the
+/// caller never called `.stdout()` / `.stderr()`. The wasm shim must do the
+/// same: `list_tmux_sessions` never configures those streams, and a false
+/// pipe is the host discarding the listing while the caller sees empty success.
+#[cfg(any(test, target_family = "wasm"))]
+pub(crate) fn output_capture_pipes(
+    stdin_configured: bool,
+    stdout_configured: bool,
+    stderr_configured: bool,
+) -> (bool, bool, bool) {
+    let _ = (stdout_configured, stderr_configured);
+    (stdin_configured, true, true)
+}
+
 #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
 pub type Child = smol::process::Child;
 
@@ -216,7 +232,17 @@ impl Command {
     }
 
     pub async fn output(&mut self) -> std::io::Result<std::process::Output> {
-        self.spawn()?.output().await
+        // `std::process::Command::output` captures stdout and stderr even when
+        // the caller never configured them. Spawn without those pipes makes the
+        // host discard the bytes and `Child::output` returns empty success.
+        let (_stdin_pipe, stdout_pipe, stderr_pipe) = output_capture_pipes(false, false, false);
+        if stdout_pipe {
+            self.stdout(Stdio::piped());
+        }
+        if stderr_pipe {
+            self.stderr(Stdio::piped());
+        }
+        self.0.output().await
     }
 
     pub async fn status(&mut self) -> std::io::Result<std::process::ExitStatus> {
@@ -225,5 +251,29 @@ impl Command {
 
     pub fn get_program(&self) -> &OsStr {
         self.0.get_program()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_capture_pipes;
+
+    #[test]
+    fn output_captures_stdout_and_stderr_even_when_unconfigured() {
+        assert_eq!(
+            output_capture_pipes(false, false, false),
+            (false, true, true),
+            "list_tmux_sessions never calls .stdout(); stdout_pipe false is the host discarding the bytes"
+        );
+    }
+
+    #[test]
+    fn output_does_not_invent_a_stdin_pipe() {
+        assert_eq!(output_capture_pipes(false, false, false).0, false);
+    }
+
+    #[test]
+    fn output_keeps_a_caller_configured_stdin_pipe() {
+        assert_eq!(output_capture_pipes(true, false, false), (true, true, true));
     }
 }
