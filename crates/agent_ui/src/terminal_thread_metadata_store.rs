@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
+#[cfg(target_family = "wasm")]
+use db::sqlez::remote_sql;
 use db::{
     sqlez::{
         bindable::Column, domain::Domain, statement::Statement,
@@ -451,14 +453,16 @@ impl TerminalThreadMetadataStore {
         let db = self.db.clone();
         self.reload_task = Some(
             cx.spawn(async move |this, cx| {
-                let rows = cx
-                    .background_spawn(async move {
-                        db.list()
-                            .context("Failed to fetch terminal thread metadata")
-                    })
-                    .await
-                    .log_err()
-                    .unwrap_or_default();
+                let list_task = cx.background_spawn(async move {
+                    db.list()
+                        .await
+                        .context("Failed to fetch terminal thread metadata")
+                });
+                // A failed read is not an empty database: replacing the cache with
+                // `Vec::new()` here would report the failure to the user as "no terminals".
+                let Some(rows) = list_task.await.log_err() else {
+                    return;
+                };
 
                 this.update(cx, |this, cx| {
                     this.terminals.clear();
@@ -502,14 +506,22 @@ impl Domain for TerminalThreadMetadataDb {
 db::static_connection!(TerminalThreadMetadataDb, []);
 
 impl TerminalThreadMetadataDb {
-    pub fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
-        self.select::<TerminalThreadMetadata>(
-            "SELECT terminal_id, title, custom_title, created_at, \
-            working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
-            FROM sidebar_terminal_threads \
-            ORDER BY created_at DESC",
-        )?()
+    const LIST_QUERY: &str = "SELECT terminal_id, title, custom_title, created_at, \
+        working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
+        main_worktree_paths_order, remote_connection \
+        FROM sidebar_terminal_threads \
+        ORDER BY created_at DESC";
+
+    pub async fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
+        #[cfg(target_family = "wasm")]
+        {
+            remote_sql::select::<TerminalThreadMetadata>(Self::LIST_QUERY).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.select::<TerminalThreadMetadata>(Self::LIST_QUERY)?()
+        }
     }
 
     pub async fn save(&self, row: TerminalThreadMetadata) -> anyhow::Result<()> {
@@ -541,8 +553,48 @@ impl TerminalThreadMetadataDb {
             .transpose()
             .context("serialize terminal thread remote connection")?;
 
-        self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(
+                Self::SAVE_SQL,
+                (
+                    terminal_id,
+                    title,
+                    custom_title,
+                    created_at,
+                    working_directory,
+                    folder_paths,
+                    folder_paths_order,
+                    main_worktree_paths,
+                    main_worktree_paths_order,
+                    remote_connection,
+                ),
+            )
+            .await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::SAVE_SQL)?;
+                let mut next_index = stmt.bind(&terminal_id, 1)?;
+                next_index = stmt.bind(&title, next_index)?;
+                next_index = stmt.bind(&custom_title, next_index)?;
+                next_index = stmt.bind(&created_at, next_index)?;
+                next_index = stmt.bind(&working_directory, next_index)?;
+                next_index = stmt.bind(&folder_paths, next_index)?;
+                next_index = stmt.bind(&folder_paths_order, next_index)?;
+                next_index = stmt.bind(&main_worktree_paths, next_index)?;
+                next_index = stmt.bind(&main_worktree_paths_order, next_index)?;
+                stmt.bind(&remote_connection, next_index)?;
+                stmt.exec()
+            })
+            .await
+        }
+    }
+
+    const SAVE_SQL: &str = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
@@ -554,33 +606,26 @@ impl TerminalThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection";
-            let mut stmt = Statement::prepare(conn, sql)?;
-            let mut i = stmt.bind(&terminal_id, 1)?;
-            i = stmt.bind(&title, i)?;
-            i = stmt.bind(&custom_title, i)?;
-            i = stmt.bind(&created_at, i)?;
-            i = stmt.bind(&working_directory, i)?;
-            i = stmt.bind(&folder_paths, i)?;
-            i = stmt.bind(&folder_paths_order, i)?;
-            i = stmt.bind(&main_worktree_paths, i)?;
-            i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
-            stmt.exec()
-        })
-        .await
-    }
+
+    const DELETE_SQL: &str = "DELETE FROM sidebar_terminal_threads WHERE terminal_id = ?";
 
     pub async fn delete(&self, terminal_id: TerminalId) -> anyhow::Result<()> {
         let terminal_id = terminal_id.to_key_string();
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM sidebar_terminal_threads WHERE terminal_id = ?",
-            )?;
-            stmt.bind(&terminal_id, 1)?;
-            stmt.exec()
-        })
-        .await
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = self;
+            remote_sql::exec_bound(Self::DELETE_SQL, terminal_id).await
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.write(move |conn| {
+                let mut stmt = Statement::prepare(conn, Self::DELETE_SQL)?;
+                stmt.bind(&terminal_id, 1)?;
+                stmt.exec()
+            })
+            .await
+        }
     }
 }
 
@@ -735,6 +780,129 @@ mod tests {
                 .expect("renamed terminal metadata should exist");
             assert_eq!(metadata.custom_title, None);
             assert_eq!(metadata.display_title().as_ref(), "⠋ Dev Server");
+        });
+    }
+
+    /// Bounds the database write so a stalled write queue fails the test instead of
+    /// hanging the run.
+    async fn run_database_write<T: 'static + Send + Sync>(
+        cx: &mut TestAppContext,
+        label: &str,
+        db: &TerminalThreadMetadataDb,
+        callback: impl 'static + Send + FnOnce(&db::sqlez::connection::Connection) -> T,
+    ) -> T {
+        let write = db.write(callback);
+        let timeout = cx
+            .background_executor
+            .timer(std::time::Duration::from_secs(10));
+        futures::pin_mut!(write);
+        futures::pin_mut!(timeout);
+        futures::select_biased! {
+            value = write.fuse() => value,
+            _ = timeout.fuse() => panic!("{label} did not finish within 10s"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_reload_preserves_cached_terminals_when_list_fails(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let metadata = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let terminal_id = metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let db = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
+        run_database_write(cx, "dropping sidebar_terminal_threads", &db, |connection| {
+            connection.exec("DROP TABLE sidebar_terminal_threads")?()
+        })
+        .await
+        .expect("dropping sidebar_terminal_threads should succeed");
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.reload(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.entries().count(),
+                1,
+                "a reload whose database read failed must leave the cache alone: \
+                 expected 1 cached terminal, found {}",
+                store.entries().count(),
+            );
+            assert!(
+                store.entry(terminal_id).is_some(),
+                "terminal {} was dropped from the cache by a failed reload",
+                terminal_id.to_key_string(),
+            );
+        });
+    }
+
+    /// The boundary added by the test above must not swallow a legitimately empty table:
+    /// a successful read of zero rows still clears the cache.
+    #[gpui::test]
+    async fn test_reload_clears_cached_terminals_when_table_is_empty(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let metadata = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let terminal_id = metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert!(
+                store.read(cx).entry(terminal_id).is_some(),
+                "the terminal should be cached before the table is emptied",
+            );
+        });
+
+        let db = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
+        run_database_write(cx, "emptying sidebar_terminal_threads", &db, |connection| {
+            connection.exec("DELETE FROM sidebar_terminal_threads")?()
+        })
+        .await
+        .expect("emptying sidebar_terminal_threads should succeed");
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.reload(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store.entries().count(),
+                0,
+                "a successful read of an empty table must still clear the cache: \
+                 expected 0 cached terminals, found {}",
+                store.entries().count(),
+            );
         });
     }
 

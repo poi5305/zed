@@ -520,7 +520,7 @@ impl<'a> Scope<'a> {
     }
 }
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::pin::pin;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -534,11 +534,11 @@ fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
     let mut future = pin!(future);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
-    loop {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {}
-        }
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "Scope/executor.scoped() cannot complete on the browser's single-threaded dispatcher; the caller must match inline instead of using scoped"
+        ),
     }
 }
 
@@ -610,5 +610,23 @@ mod test {
             *task_ran.borrow(),
             "Task should run normally when app is alive"
         );
+    }
+
+    #[test]
+    fn block_on_ready_returns_when_future_is_already_ready() {
+        let actual = super::block_on_ready(std::future::ready(7));
+        let correct = 7;
+        assert_eq!(
+            actual, correct,
+            "actual vs correct for a completed future: Scope drop after scoped tasks finish must not panic"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Scope/executor.scoped() cannot complete on the browser's single-threaded dispatcher"
+    )]
+    fn block_on_ready_panics_when_future_is_pending() {
+        super::block_on_ready(std::future::pending::<()>());
     }
 }

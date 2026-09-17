@@ -1,10 +1,28 @@
 use std::path::Path;
+#[cfg(target_family = "wasm")]
+use std::sync::OnceLock;
 
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use collections::HashMap;
 use serde::Deserialize;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::shell::ShellKind;
+
+#[cfg(target_family = "wasm")]
+static REMOTE_CLIENT: OnceLock<smol::RpcClient> = OnceLock::new();
+
+/// Store the browser RPC client so wasm `capture` can run native capture on the host.
+///
+/// Same shape as `smol::set_remote_client` / `terminal::set_remote_client`.
+#[cfg(target_family = "wasm")]
+pub fn set_remote_client(client: smol::RpcClient) {
+    if REMOTE_CLIENT.set(client).is_err() {
+        log::warn!("shell_env remote client already installed");
+    }
+}
 
 fn parse_env_map_from_noisy_output(output: &str) -> Result<collections::HashMap<String, String>> {
     for (position, _) in output.match_indices('{') {
@@ -37,10 +55,41 @@ pub async fn capture(
     #[cfg(unix)]
     return capture_unix(shell_path.as_ref(), args, directory.as_ref()).await;
     #[cfg(target_family = "wasm")]
-    {
-        let _ = (shell_path, args, directory);
-        Ok(collections::HashMap::default())
-    }
+    return capture_via_rpc(shell_path, args, directory).await;
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+fn missing_remote_client() -> anyhow::Error {
+    anyhow::anyhow!(
+        "shell_env remote RPC client is not initialized; call util::shell_env::set_remote_client"
+    )
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+fn capture_without_remote_client(
+    shell_path: impl AsRef<Path>,
+    args: &[String],
+    directory: impl AsRef<Path>,
+) -> Result<collections::HashMap<String, String>> {
+    let _ = (shell_path, args, directory);
+    Err(missing_remote_client())
+}
+
+#[cfg(target_family = "wasm")]
+async fn capture_via_rpc(
+    shell_path: impl AsRef<Path>,
+    args: &[String],
+    directory: impl AsRef<Path>,
+) -> Result<collections::HashMap<String, String>> {
+    let Some(client) = REMOTE_CLIENT.get().cloned() else {
+        return capture_without_remote_client(shell_path, args, directory);
+    };
+    let params = serde_json::json!({
+        "shell_path": shell_path.as_ref().to_string_lossy(),
+        "args": args,
+        "directory": directory.as_ref().to_string_lossy(),
+    });
+    client.call("ShellEnv::capture", &params).await
 }
 
 /// Try to parse the environment output before checking the exit status.
@@ -312,6 +361,8 @@ async fn capture_windows(
 mod tests {
     use std::process::ExitStatus;
 
+    use std::path::Path;
+
     use super::*;
     use crate::path;
 
@@ -327,6 +378,35 @@ mod tests {
         use std::os::windows::process::ExitStatusExt;
 
         ExitStatus::from_raw(code)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum CaptureWithoutClientOutcome {
+        EmptySuccess,
+        HonestError(String),
+        UnexpectedSuccess { key_count: usize },
+    }
+
+    fn capture_without_client_outcome() -> CaptureWithoutClientOutcome {
+        match capture_without_remote_client(Path::new("/bin/sh"), &[], Path::new("/tmp")) {
+            Ok(environment) if environment.is_empty() => CaptureWithoutClientOutcome::EmptySuccess,
+            Ok(environment) => CaptureWithoutClientOutcome::UnexpectedSuccess {
+                key_count: environment.len(),
+            },
+            Err(error) => CaptureWithoutClientOutcome::HonestError(error.to_string()),
+        }
+    }
+
+    #[test]
+    fn capture_without_remote_client_fails_honestly_instead_of_returning_an_empty_map() {
+        assert_eq!(
+            capture_without_client_outcome(),
+            CaptureWithoutClientOutcome::HonestError(
+                "shell_env remote RPC client is not initialized; call util::shell_env::set_remote_client"
+                    .into()
+            ),
+            "wasm capture currently returns Ok({{}}) which is a fabricated success; without an RPC client it must fail naming set_remote_client"
+        );
     }
 
     #[test]

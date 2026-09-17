@@ -257,7 +257,9 @@ install -m 0755 \
             "They come from the \`tree-sitter-language\` crate's wasm/include directory," \
             "and every tree-sitter grammar's C build needs them on wasm32-unknown-unknown."
     fi
-    export CFLAGS_wasm32_unknown_unknown="-isystem ${tree_sitter_wasm_headers} -matomics -mbulk-memory -mmutable-globals"
+    # -include grammar-wasm-compat.h: tree-sitter-language's wasm <ctype.h> has
+    # no isdigit; bash 0.25.1 and the markdown scanner need it. See that header.
+    export CFLAGS_wasm32_unknown_unknown="-isystem ${tree_sitter_wasm_headers} -include ${web_dir}/grammar-wasm-compat.h -matomics -mbulk-memory -mmutable-globals"
     rustup run "${nightly_toolchain}" "${cargo_bin}" build \
         -p zed_web_workspace \
         --target wasm32-unknown-unknown \

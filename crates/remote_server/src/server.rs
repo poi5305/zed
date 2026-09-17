@@ -634,7 +634,10 @@ pub fn execute_run(
                 shell_environment_ready_tx.send(()).ok();
             })
             .detach();
-        (Some(shell_env_loaded_rx), shell_environment_ready_rx.shared())
+        (
+            Some(shell_env_loaded_rx),
+            shell_environment_ready_rx.shared(),
+        )
     };
     #[cfg(windows)]
     let (shell_env_loaded_rx, shell_environment_ready): (Option<oneshot::Receiver<()>>, _) = {

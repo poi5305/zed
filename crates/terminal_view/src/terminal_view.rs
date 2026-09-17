@@ -15,7 +15,9 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
-use persistence::TerminalDb;
+#[cfg(target_family = "wasm")]
+use persistence::delete_unloaded_terminals_sql;
+use persistence::{TerminalDb, resolve_custom_title, resolve_working_directory};
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -48,9 +50,11 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use workspace::delete_unloaded_items;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    ToolbarItemLocation, Workspace, WorkspaceId,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -1864,8 +1868,23 @@ impl SerializableItem for TerminalView {
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
-        let db = TerminalDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        #[cfg(target_family = "wasm")]
+        {
+            use db::sqlez::remote_sql;
+            cx.spawn(async move |_| {
+                let sql = delete_unloaded_terminals_sql(alive_items.len());
+                let mut params = remote_sql::bind_params(workspace_id)?;
+                for item_id in alive_items {
+                    params.extend(remote_sql::bind_params(item_id)?);
+                }
+                remote_sql::exec_params(&sql, params).await
+            })
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let db = TerminalDb::global(cx);
+            delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        }
     }
 
     fn serialize(
@@ -1914,32 +1933,33 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
-                .update(|_window, cx| {
-                    let db = TerminalDb::global(cx);
-                    let from_db = db
+            let (cwd, custom_title) = match cx.update(|_window, cx| TerminalDb::global(cx)) {
+                Ok(db) => {
+                    let from_database = db
                         .get_working_directory(item_id, workspace_id)
+                        .await
                         .log_err()
                         .flatten();
-                    let cwd = if from_db
-                        .as_ref()
-                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
-                    {
-                        from_db
-                    } else {
-                        workspace
-                            .upgrade()
-                            .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
-                    };
-                    let custom_title = db
+                    let from_database_title = db
                         .get_custom_title(item_id, workspace_id)
+                        .await
                         .log_err()
-                        .flatten()
-                        .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
-                })
-                .ok()
-                .unwrap_or((None, None));
+                        .flatten();
+                    let fallback_working_directory = cx
+                        .update(|_window, cx| {
+                            workspace.upgrade().and_then(|workspace| {
+                                default_working_directory(workspace.read(cx), cx)
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    (
+                        resolve_working_directory(from_database, fallback_working_directory),
+                        resolve_custom_title(from_database_title),
+                    )
+                }
+                Err(_) => (None, None),
+            };
 
             let terminal = project
                 .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))

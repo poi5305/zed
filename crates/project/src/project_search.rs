@@ -367,28 +367,45 @@ impl Search {
 
                 let should_find_all_matches = !tx.is_closed();
 
+                #[cfg(not(target_family = "wasm"))]
                 let _executor = executor.clone();
                 let worker_pool = executor.spawn(async move {
-                    let num_cpus = _executor.num_cpus();
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let worker = Worker {
+                            query: query.clone(),
+                            open_buffers: open_buffers.clone(),
+                            candidates: candidate_searcher.clone(),
+                            find_all_matches_rx: find_all_matches_rx.clone(),
+                        };
+                        drop(find_all_matches_rx);
+                        drop(candidate_searcher);
+                        worker.run().await;
+                    }
 
-                    assert!(num_cpus > 0);
-                    _executor
-                        .scoped(|scope| {
-                            let worker_count = (num_cpus - 1).max(1);
-                            for _ in 0..worker_count {
-                                let worker = Worker {
-                                    query: query.clone(),
-                                    open_buffers: open_buffers.clone(),
-                                    candidates: candidate_searcher.clone(),
-                                    find_all_matches_rx: find_all_matches_rx.clone(),
-                                };
-                                scope.spawn(worker.run());
-                            }
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let num_cpus = _executor.num_cpus();
 
-                            drop(find_all_matches_rx);
-                            drop(candidate_searcher);
-                        })
-                        .await;
+                        assert!(num_cpus > 0);
+                        _executor
+                            .scoped(|scope| {
+                                let worker_count = (num_cpus - 1).max(1);
+                                for _ in 0..worker_count {
+                                    let worker = Worker {
+                                        query: query.clone(),
+                                        open_buffers: open_buffers.clone(),
+                                        candidates: candidate_searcher.clone(),
+                                        find_all_matches_rx: find_all_matches_rx.clone(),
+                                    };
+                                    scope.spawn(worker.run());
+                                }
+
+                                drop(find_all_matches_rx);
+                                drop(candidate_searcher);
+                            })
+                            .await;
+                    }
                 });
 
                 let (sorted_matches_tx, sorted_matches_rx) = unbounded();

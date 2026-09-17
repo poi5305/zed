@@ -778,12 +778,11 @@ impl LocalRepositoryState {
             .background_spawn({
                 let fs = fs.clone();
                 async move {
-                    let system_git_binary_path = search_paths
-                        .and_then(|search_paths| {
-                            which::which_in("git", Some(search_paths), &work_directory_abs_path)
-                                .ok()
-                        })
-                        .or_else(|| which::which("git").ok());
+                    let system_git_binary_path = crate::environment::lookup_system_binary(
+                        "git",
+                        search_paths.as_deref().map(std::ffi::OsStr::new),
+                        &work_directory_abs_path,
+                    );
                     fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }

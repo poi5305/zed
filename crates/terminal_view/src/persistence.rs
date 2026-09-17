@@ -501,7 +501,7 @@ impl TerminalDb {
     }
 
     query! {
-        pub fn get_working_directory(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
+        pub async fn get_working_directory(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
             SELECT working_directory
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
@@ -535,10 +535,112 @@ impl TerminalDb {
     }
 
     query! {
-        pub fn get_custom_title(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
+        pub async fn get_custom_title(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
             SELECT custom_title
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }
+    }
+}
+
+/// Fallback used when restoring a terminal. A stored non-empty path wins; otherwise
+/// `default_working_directory` is consulted. Compiled on every target so native tests
+/// can pin the wasm restore path without a wasm runtime.
+pub(crate) fn resolve_working_directory(
+    from_database: Option<PathBuf>,
+    default_working_directory: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if from_database
+        .as_ref()
+        .is_some_and(|from_database| !from_database.as_os_str().is_empty())
+    {
+        from_database
+    } else {
+        default_working_directory
+    }
+}
+
+pub(crate) fn resolve_custom_title(from_database: Option<String>) -> Option<String> {
+    from_database.filter(|title| !title.trim().is_empty())
+}
+
+/// SQL for dropping terminal rows that are no longer in the restored pane.
+/// An empty alive set is a real workspace with no terminals, not `NOT IN ()`.
+#[cfg_attr(not(any(test, target_family = "wasm")), allow(dead_code))]
+pub(crate) fn delete_unloaded_terminals_sql(alive_count: usize) -> String {
+    if alive_count == 0 {
+        "DELETE FROM terminals WHERE workspace_id = ?".to_string()
+    } else {
+        let placeholders = (0..alive_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+        format!("DELETE FROM terminals WHERE workspace_id = ? AND item_id NOT IN ({placeholders})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_working_directory_is_not_replaced_by_the_default() {
+        let stored = PathBuf::from("/Users/andy/project");
+        let default = PathBuf::from("/tmp");
+        assert_eq!(
+            resolve_working_directory(Some(stored.clone()), Some(default.clone())),
+            Some(stored),
+            "stored cwd must win; default was {default:?}"
+        );
+    }
+
+    #[test]
+    fn empty_stored_path_uses_the_default() {
+        let default = PathBuf::from("/tmp/default");
+        assert_eq!(
+            resolve_working_directory(Some(PathBuf::from("")), Some(default.clone())),
+            Some(default.clone()),
+        );
+        assert_eq!(
+            resolve_working_directory(None, Some(default.clone())),
+            Some(default),
+        );
+    }
+
+    #[test]
+    fn stored_custom_title_is_kept() {
+        assert_eq!(
+            resolve_custom_title(Some("Fix bug".into())),
+            Some("Fix bug".into()),
+        );
+    }
+
+    #[test]
+    fn whitespace_custom_title_is_dropped() {
+        assert_eq!(resolve_custom_title(Some("   ".into())), None);
+        assert_eq!(resolve_custom_title(Some(String::new())), None);
+        assert_eq!(resolve_custom_title(None), None);
+    }
+
+    #[test]
+    fn delete_unloaded_with_no_alive_items_does_not_emit_empty_in_list() {
+        let sql = delete_unloaded_terminals_sql(0);
+        assert_eq!(
+            sql, "DELETE FROM terminals WHERE workspace_id = ?",
+            "empty alive set must delete by workspace only, got {sql}"
+        );
+        assert!(
+            !sql.contains("NOT IN ()"),
+            "NOT IN () is invalid SQL and would refuse a legitimate empty panel, got {sql}"
+        );
+    }
+
+    #[test]
+    fn delete_unloaded_with_alive_items_keeps_those_ids() {
+        assert_eq!(
+            delete_unloaded_terminals_sql(2),
+            "DELETE FROM terminals WHERE workspace_id = ? AND item_id NOT IN (?, ?)",
+        );
+        assert_eq!(
+            delete_unloaded_terminals_sql(1),
+            "DELETE FROM terminals WHERE workspace_id = ? AND item_id NOT IN (?)",
+        );
     }
 }
