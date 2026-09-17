@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
 use anyhow::Context as _;
+#[cfg(all(feature = "load-grammars", target_family = "wasm"))]
+use language_core::ParseableLanguage;
 use language_core::{LanguageConfig, LanguageQueries, QueryFile, QueryFileContents};
 
 // Dev builds read the checkout's query files at runtime instead of embedding
@@ -16,7 +18,7 @@ util::fs_embed! {
 ///
 /// Each grammar is registered as a `(&str, tree_sitter_language::LanguageFn)` pair.
 /// This must be called before loading language configs/queries.
-#[cfg(feature = "load-grammars")]
+#[cfg(all(feature = "load-grammars", not(target_family = "wasm")))]
 pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
     vec![
         ("bash", tree_sitter_bash::LANGUAGE.into()),
@@ -42,6 +44,53 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
         ),
         ("yaml", tree_sitter_yaml::LANGUAGE.into()),
         ("gitcommit", tree_sitter_gitcommit::LANGUAGE.into()),
+    ]
+}
+
+#[cfg(all(feature = "load-grammars", target_family = "wasm"))]
+fn parseable(resolve: fn() -> tree_sitter::Language) -> ParseableLanguage {
+    ParseableLanguage::from_resolver(std::sync::Arc::new(move || Ok(resolve())))
+}
+
+/// Register all built-in native tree-sitter grammars with the provided registration function.
+///
+/// On wasm each entry is a thread-safe resolver: `tree_sitter::Language` is `!Send` there,
+/// so the registry stores `LanguageFn` lookups rather than a language value.
+#[cfg(all(feature = "load-grammars", target_family = "wasm"))]
+pub fn native_grammars() -> Vec<(&'static str, ParseableLanguage)> {
+    vec![
+        ("bash", parseable(|| tree_sitter_bash::LANGUAGE.into())),
+        ("c", parseable(|| tree_sitter_c::LANGUAGE.into())),
+        ("cpp", parseable(|| tree_sitter_cpp::LANGUAGE.into())),
+        ("css", parseable(|| tree_sitter_css::LANGUAGE.into())),
+        ("diff", parseable(|| tree_sitter_diff::LANGUAGE.into())),
+        ("go", parseable(|| tree_sitter_go::LANGUAGE.into())),
+        ("gomod", parseable(|| tree_sitter_go_mod::LANGUAGE.into())),
+        ("gowork", parseable(|| tree_sitter_gowork::LANGUAGE.into())),
+        ("jsdoc", parseable(|| tree_sitter_jsdoc::LANGUAGE.into())),
+        ("json", parseable(|| tree_sitter_json::LANGUAGE.into())),
+        ("jsonc", parseable(|| tree_sitter_json::LANGUAGE.into())),
+        ("markdown", parseable(|| tree_sitter_md::LANGUAGE.into())),
+        (
+            "markdown-inline",
+            parseable(|| tree_sitter_md::INLINE_LANGUAGE.into()),
+        ),
+        ("python", parseable(|| tree_sitter_python::LANGUAGE.into())),
+        ("regex", parseable(|| tree_sitter_regex::LANGUAGE.into())),
+        ("rust", parseable(|| tree_sitter_rust::LANGUAGE.into())),
+        (
+            "tsx",
+            parseable(|| tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ),
+        (
+            "typescript",
+            parseable(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        ),
+        ("yaml", parseable(|| tree_sitter_yaml::LANGUAGE.into())),
+        (
+            "gitcommit",
+            parseable(|| tree_sitter_gitcommit::LANGUAGE.into()),
+        ),
     ]
 }
 

@@ -533,8 +533,8 @@ pub fn normalize_whitespace(value: &str) -> String {
 /// A clock that is behind the epoch cannot happen in practice; reporting zero keeps every
 /// session visible, which is the safer failure for a list the user is looking at.
 pub fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
 }
@@ -3846,6 +3846,7 @@ fn mirror_arguments(session_name: &str, window_target: &str, mirror_name: &str) 
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+    use std::time::UNIX_EPOCH;
 
     const EVENTS_FILE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 

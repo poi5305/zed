@@ -52,9 +52,21 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
                 line_comments: vec![Arc::from("#")],
                 ..LanguageConfig::default()
             },
-            Some(tree_sitter_gitcommit::LANGUAGE.into()),
+            git_commit_grammar(),
         ))
     });
+
+#[cfg(all(feature = "tree-sitter-gitcommit", not(target_family = "wasm")))]
+fn git_commit_grammar() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_gitcommit::LANGUAGE.into())
+}
+
+#[cfg(all(feature = "tree-sitter-gitcommit", target_family = "wasm"))]
+fn git_commit_grammar() -> Option<ParseableLanguage> {
+    Some(ParseableLanguage::from_resolver(std::sync::Arc::new(
+        || Ok(tree_sitter_gitcommit::LANGUAGE.into()),
+    )))
+}
 
 pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
     #[cfg(feature = "load-grammars")]

@@ -144,6 +144,13 @@ codegen-units = 1
 # rpc, remote, project and editor under `cargo metadata --filter-platform
 # wasm32-unknown-unknown`. web/check-workspace-isolation.sh recomputes it.
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+# tree-sitter-c 0.24.2 (latest crates.io, caret-compatible with the desktop pin
+# "0.24.1") compiles DEP_TREE_SITTER_LANGUAGE_WASM_SRC, which
+# tree-sitter-language 0.1.8 at 43623ec advertises as
+# wasm/unsupported/tree-sitter-0.26 — a deliberate #error. 0.24.1 does not.
+# There is no newer crates.io release. Pin the 0.24.1 git rev so the web lock
+# cannot float to 0.24.2. Desktop still resolves crates.io 0.24.1.
+tree-sitter-c = { git = "https://github.com/tree-sitter/tree-sitter-c", rev = "7fa1be1b694b6e763686793d97da01f36a0e5c12" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }

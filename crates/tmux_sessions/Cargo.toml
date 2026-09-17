@@ -16,6 +16,7 @@ doctest = false
 anyhow.workspace = true
 collections.workspace = true
 gpui.workspace = true
+log.workspace = true
 project_manager.workspace = true
 remote.workspace = true
 rpc.workspace = true

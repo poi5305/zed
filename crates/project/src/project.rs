@@ -28,6 +28,11 @@ mod environment;
 use buffer_diff::BufferDiff;
 use context_server_store::ContextServerStore;
 pub use environment::ProjectEnvironmentEvent;
+#[cfg(feature = "test-support")]
+pub use environment::{
+    direnv_spawn_path_for_tests, lookup_adapter_binary_for_tests,
+    lookup_system_binary_impl_for_tests, resolve_shell_environment_directory_for_tests,
+};
 use git::repository::get_git_committer;
 use git_store::{Repository, RepositoryId};
 pub mod search_history;

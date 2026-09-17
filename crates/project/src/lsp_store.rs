@@ -37,7 +37,7 @@ use crate::{
     ManifestProvidersStore, Project, ProjectItem, ProjectPath, ProjectTransaction,
     PulledDiagnostics, ResolveState, Symbol,
     buffer_store::{BufferStore, BufferStoreEvent},
-    environment::ProjectEnvironment,
+    environment::{ProjectEnvironment, lookup_adapter_binary},
     lsp_command::{self, *},
     lsp_store::{
         self,
@@ -16461,7 +16461,12 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
 
         let shell_path = env.get("PATH").cloned();
 
-        which::which_in(command, shell_path.as_ref(), worktree_abs_path).ok()
+        lookup_adapter_binary(
+            command,
+            shell_path.as_deref().map(std::ffi::OsStr::new),
+            &worktree_abs_path,
+            cfg!(target_family = "wasm"),
+        )
     }
 
     async fn try_exec(&self, command: LanguageServerBinary) -> Result<()> {

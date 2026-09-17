@@ -3468,6 +3468,7 @@ mod tests {
 
             let actual = db
                 .get_reattach_task(item_id, workspace_id)
+                .await
                 .expect("Failed to read the row");
             assert_eq!(
                 actual, None,
@@ -3517,6 +3518,7 @@ mod tests {
         });
         assert!(
             db.get_reattach_task(item_id, workspace_id)
+                .await
                 .expect("Failed to read the row")
                 .is_some(),
             "precondition: the panel's attach terminal saved its task"
@@ -3538,6 +3540,7 @@ mod tests {
 
         let actual = db
             .get_reattach_task(item_id, workspace_id)
+            .await
             .expect("Failed to read the row");
         assert!(
             actual.is_some(),
@@ -3585,6 +3588,7 @@ mod tests {
         cx.run_until_parked();
         assert!(
             db.get_reattach_task(item_id, workspace_id)
+                .await
                 .expect("Failed to read the row")
                 .is_some(),
             "precondition: the center's attach terminal saved its task"
@@ -3606,6 +3610,7 @@ mod tests {
 
         let actual = db
             .get_reattach_task(item_id, workspace_id)
+            .await
             .expect("Failed to read the row");
         assert!(
             actual.is_some(),

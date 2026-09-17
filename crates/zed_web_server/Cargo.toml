@@ -37,6 +37,7 @@ toml.workspace = true
 tracing.workspace = true
 url.workspace = true
 urlencoding.workspace = true
+util.workspace = true
 walkdir.workspace = true
 
 # Direct crates.io pins for keys the root workspace table does not declare.

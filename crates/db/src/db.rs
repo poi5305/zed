@@ -352,6 +352,27 @@ pub async fn prepare_web_database() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Loads the server's `kv_store` and `scoped_kv_store` into `sqlez::kvp_cache`.
+///
+/// Must be awaited after `prepare_web_database` (whose migrations create both tables)
+/// and before the window opens. `KeyValueStore::read_kvp` and `ScopedKeyValueStore::read`
+/// are synchronous and have nothing to read until this has run.
+#[cfg(target_family = "wasm")]
+pub async fn prepare_web_key_value_cache() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let values = sqlez::remote_sql::bootstrap_kvp()
+        .await
+        .context("Failed to load the web key-value cache via Sql::bootstrap_kvp")?;
+    log::info!(
+        "web key-value cache loaded ({} key-value pairs, {} scoped pairs)",
+        values.unscoped.len(),
+        values.scoped.len()
+    );
+    sqlez::kvp_cache::global().load(values.unscoped, values.scoped);
+    Ok(())
+}
+
 #[cfg(target_family = "wasm")]
 async fn migrate_web_domain(reg: &DomainMigration) -> anyhow::Result<()> {
     use anyhow::bail;

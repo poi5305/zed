@@ -21,9 +21,10 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use url::form_urlencoded;
 use util::ResultExt as _;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use open_ai::completion::{OpenAiResponseEventMapper, into_open_ai_response};
 

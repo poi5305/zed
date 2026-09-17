@@ -63,14 +63,34 @@ pub trait Dismissable {
 }
 
 impl KeyValueStore {
+    #[cfg(not(target_family = "wasm"))]
     query! {
         pub fn read_kvp(key: &str) -> Result<Option<String>> {
             SELECT value FROM kv_store WHERE key = (?)
         }
     }
 
+    /// Served from `sqlez::kvp_cache`, which `db::prepare_web_key_value_cache` fills from
+    /// the server before the window opens. This call cannot await and there is no local
+    /// sqlite behind it; an unloaded cache reports that rather than an empty store.
+    ///
+    /// On wasm every `query!` routes to the one server database, so this store and
+    /// `GlobalKeyValueStore` already share a `kv_store` table, and therefore a cache.
+    #[cfg(target_family = "wasm")]
+    pub fn read_kvp(&self, key: &str) -> anyhow::Result<Option<String>> {
+        crate::sqlez::kvp_cache::global().read(key)
+    }
+
     pub async fn write_kvp(&self, key: String, value: String) -> anyhow::Result<()> {
         log::debug!("Writing key-value pair for key {key}");
+
+        #[cfg(target_family = "wasm")]
+        {
+            self.write_kvp_inner(key.clone(), value.clone()).await?;
+            return crate::sqlez::kvp_cache::global().write(key, value);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.write_kvp_inner(key, value).await
     }
 
@@ -80,8 +100,19 @@ impl KeyValueStore {
         }
     }
 
+    pub async fn delete_kvp(&self, key: String) -> anyhow::Result<()> {
+        #[cfg(target_family = "wasm")]
+        {
+            self.delete_kvp_inner(key.clone()).await?;
+            return crate::sqlez::kvp_cache::global().delete(&key);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        self.delete_kvp_inner(key).await
+    }
+
     query! {
-        pub async fn delete_kvp(key: String) -> Result<()> {
+        async fn delete_kvp_inner(key: String) -> Result<()> {
             DELETE FROM kv_store WHERE key = (?)
         }
     }
@@ -95,25 +126,60 @@ impl KeyValueStore {
 }
 
 pub struct ScopedKeyValueStore<'a> {
+    // Unread on wasm, where every method goes to the server instead of a local connection.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     store: &'a KeyValueStore,
     namespace: &'a str,
 }
 
+#[cfg(not(target_family = "wasm"))]
+const SCOPED_READ_SQL: &str =
+    "SELECT value FROM scoped_kv_store WHERE namespace = (?) AND key = (?)";
+const SCOPED_WRITE_SQL: &str =
+    "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))";
+const SCOPED_DELETE_SQL: &str = "DELETE FROM scoped_kv_store WHERE namespace = (?) AND key = (?)";
+const SCOPED_DELETE_ALL_SQL: &str = "DELETE FROM scoped_kv_store WHERE namespace = (?)";
+
 impl ScopedKeyValueStore<'_> {
+    /// See `KeyValueStore::read_kvp`: synchronous, so on wasm it reads the cache that
+    /// `db::prepare_web_key_value_cache` filled from `scoped_kv_store`.
     pub fn read(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.store.select_row_bound::<(&str, &str), String>(
-            "SELECT value FROM scoped_kv_store WHERE namespace = (?) AND key = (?)",
-        )?((self.namespace, key))
-        .context("Failed to read from scoped_kv_store")
+        #[cfg(target_family = "wasm")]
+        {
+            return crate::sqlez::kvp_cache::global().read_scoped(self.namespace, key);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.store
+                .select_row_bound::<(&str, &str), String>(SCOPED_READ_SQL)?((
+                self.namespace,
+                key,
+            ))
+            .context("Failed to read from scoped_kv_store")
+        }
     }
 
     pub async fn write(&self, key: String, value: String) -> anyhow::Result<()> {
         let namespace = self.namespace.to_owned();
+
+        #[cfg(target_family = "wasm")]
+        {
+            crate::sqlez::remote_sql::exec_bound(
+                SCOPED_WRITE_SQL,
+                (namespace.as_str(), key.as_str(), value.as_str()),
+            )
+            .await
+            .context("Failed to write to scoped_kv_store")?;
+            return crate::sqlez::kvp_cache::global().write_scoped(namespace, key, value);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.store
             .write(move |connection| {
-                connection.exec_bound::<(&str, &str, &str)>(
-                    "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
-                )?((&namespace, &key, &value))
+                connection.exec_bound::<(&str, &str, &str)>(SCOPED_WRITE_SQL)?((
+                    &namespace, &key, &value,
+                ))
                 .context("Failed to write to scoped_kv_store")
             })
             .await
@@ -121,25 +187,43 @@ impl ScopedKeyValueStore<'_> {
 
     pub async fn delete(&self, key: String) -> anyhow::Result<()> {
         let namespace = self.namespace.to_owned();
+
+        #[cfg(target_family = "wasm")]
+        {
+            crate::sqlez::remote_sql::exec_bound(
+                SCOPED_DELETE_SQL,
+                (namespace.as_str(), key.as_str()),
+            )
+            .await
+            .context("Failed to delete from scoped_kv_store")?;
+            return crate::sqlez::kvp_cache::global().delete_scoped(&namespace, &key);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.store
             .write(move |connection| {
-                connection.exec_bound::<(&str, &str)>(
-                    "DELETE FROM scoped_kv_store WHERE namespace = (?) AND key = (?)",
-                )?((&namespace, &key))
-                .context("Failed to delete from scoped_kv_store")
+                connection.exec_bound::<(&str, &str)>(SCOPED_DELETE_SQL)?((&namespace, &key))
+                    .context("Failed to delete from scoped_kv_store")
             })
             .await
     }
 
     pub async fn delete_all(&self) -> anyhow::Result<()> {
         let namespace = self.namespace.to_owned();
+
+        #[cfg(target_family = "wasm")]
+        {
+            crate::sqlez::remote_sql::exec_bound(SCOPED_DELETE_ALL_SQL, namespace.as_str())
+                .await
+                .context("Failed to delete_all from scoped_kv_store")?;
+            return crate::sqlez::kvp_cache::global().delete_scoped_namespace(&namespace);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.store
             .write(move |connection| {
-                connection
-                    .exec_bound::<&str>("DELETE FROM scoped_kv_store WHERE namespace = (?)")?(
-                    &namespace,
-                )
-                .context("Failed to delete_all from scoped_kv_store")
+                connection.exec_bound::<&str>(SCOPED_DELETE_ALL_SQL)?(&namespace)
+                    .context("Failed to delete_all from scoped_kv_store")
             })
             .await
     }
@@ -291,14 +375,30 @@ impl GlobalKeyValueStore {
         &GLOBAL_KEY_VALUE_STORE
     }
 
+    #[cfg(not(target_family = "wasm"))]
     query! {
         pub fn read_kvp(key: &str) -> Result<Option<String>> {
             SELECT value FROM kv_store WHERE key = (?)
         }
     }
 
+    /// See `KeyValueStore::read_kvp`, whose cache this shares: on wasm both stores
+    /// resolve to the same server `kv_store` table.
+    #[cfg(target_family = "wasm")]
+    pub fn read_kvp(&self, key: &str) -> anyhow::Result<Option<String>> {
+        crate::sqlez::kvp_cache::global().read(key)
+    }
+
     pub async fn write_kvp(&self, key: String, value: String) -> anyhow::Result<()> {
         log::debug!("Writing global key-value pair for key {key}");
+
+        #[cfg(target_family = "wasm")]
+        {
+            self.write_kvp_inner(key.clone(), value.clone()).await?;
+            return crate::sqlez::kvp_cache::global().write(key, value);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         self.write_kvp_inner(key, value).await
     }
 
@@ -308,8 +408,19 @@ impl GlobalKeyValueStore {
         }
     }
 
+    pub async fn delete_kvp(&self, key: String) -> anyhow::Result<()> {
+        #[cfg(target_family = "wasm")]
+        {
+            self.delete_kvp_inner(key.clone()).await?;
+            return crate::sqlez::kvp_cache::global().delete(&key);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        self.delete_kvp_inner(key).await
+    }
+
     query! {
-        pub async fn delete_kvp(key: String) -> Result<()> {
+        async fn delete_kvp_inner(key: String) -> Result<()> {
             DELETE FROM kv_store WHERE key = (?)
         }
     }

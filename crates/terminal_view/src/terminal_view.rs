@@ -15,7 +15,9 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
-use persistence::{ReattachableTask, TerminalDb};
+#[cfg(target_family = "wasm")]
+use persistence::delete_unloaded_terminals_sql;
+use persistence::{ReattachableTask, TerminalDb, resolve_custom_title, resolve_working_directory};
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -48,9 +50,11 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use workspace::delete_unloaded_items;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, MultiWorkspace, NewCenterTerminal, NewTerminal,
-    Pane, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    Pane, ToolbarItemLocation, Workspace, WorkspaceId,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -1889,7 +1893,7 @@ impl SerializableItem for TerminalView {
         // kept. They are read once the caller is done with its workspace, which it is
         // still updating when it asks for this cleanup.
         window.spawn(cx, async move |cx| {
-            let cleanup = cx.update(|window, cx| {
+            let alive_items = cx.update(|window, cx| {
                 let mut alive_items = alive_items;
                 if let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>() {
                     for workspace in multi_workspace.read(cx).workspaces() {
@@ -1910,10 +1914,26 @@ impl SerializableItem for TerminalView {
                         }
                     }
                 }
-                let db = TerminalDb::global(cx);
-                delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+                alive_items
             })?;
-            cleanup.await
+            #[cfg(target_family = "wasm")]
+            {
+                use db::sqlez::remote_sql;
+                let sql = delete_unloaded_terminals_sql(alive_items.len());
+                let mut params = remote_sql::bind_params(workspace_id)?;
+                for item_id in alive_items {
+                    params.extend(remote_sql::bind_params(item_id)?);
+                }
+                remote_sql::exec_params(&sql, params).await
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let cleanup = cx.update(|_window, cx| {
+                    let db = TerminalDb::global(cx);
+                    delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+                })?;
+                cleanup.await
+            }
         })
     }
 
@@ -1992,37 +2012,40 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title, reattach_task) = cx
-                .update(|_window, cx| {
-                    let db = TerminalDb::global(cx);
-                    let from_db = db
+            let (cwd, custom_title, reattach_task) = match cx.update(|_window, cx| TerminalDb::global(cx)) {
+                Ok(db) => {
+                    let from_database = db
                         .get_working_directory(item_id, workspace_id)
+                        .await
                         .log_err()
                         .flatten();
-                    let cwd = if from_db
-                        .as_ref()
-                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
-                    {
-                        from_db
-                    } else {
-                        workspace
-                            .upgrade()
-                            .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
-                    };
-                    let custom_title = db
+                    let from_database_title = db
                         .get_custom_title(item_id, workspace_id)
+                        .await
                         .log_err()
-                        .flatten()
-                        .filter(|title| !title.trim().is_empty());
+                        .flatten();
                     let reattach_task = db
                         .get_reattach_task(item_id, workspace_id)
+                        .await
                         .log_err()
                         .flatten()
                         .and_then(|task| serde_json::from_str::<ReattachableTask>(&task).log_err());
-                    (cwd, custom_title, reattach_task)
-                })
-                .ok()
-                .unwrap_or((None, None, None));
+                    let fallback_working_directory = cx
+                        .update(|_window, cx| {
+                            workspace.upgrade().and_then(|workspace| {
+                                default_working_directory(workspace.read(cx), cx)
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    (
+                        resolve_working_directory(from_database, fallback_working_directory),
+                        resolve_custom_title(from_database_title),
+                        reattach_task,
+                    )
+                }
+                Err(_) => (None, None, None),
+            };
 
             let terminal = project
                 .update(cx, |project, cx| match reattach_task {

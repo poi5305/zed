@@ -1,7 +1,7 @@
 use crate::available_languages::{AvailableLanguage, LanguageOrigin};
 use crate::{
     CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
-    LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
+    LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ParseableLanguage, ToolchainLister,
     available_languages::AvailableLanguages, language_settings::all_language_settings,
     task_context::ContextProvider, with_parser,
 };
@@ -81,11 +81,11 @@ pub struct FakeLanguageServerEntry {
 }
 
 enum AvailableGrammar {
-    Native(tree_sitter::Language),
+    Native(ParseableLanguage),
     Loaded(#[allow(unused)] PathBuf, tree_sitter::Language),
     Loading(
         #[allow(unused)] PathBuf,
-        Vec<oneshot::Sender<Result<tree_sitter::Language, Arc<anyhow::Error>>>>,
+        Vec<oneshot::Sender<Result<ParseableLanguage, Arc<anyhow::Error>>>>,
     ),
     Unloaded(PathBuf),
     LoadFailed(Arc<anyhow::Error>),
@@ -472,14 +472,31 @@ impl LanguageRegistry {
 
     /// Adds grammars to the registry. Language configurations reference a grammar by name. The
     /// grammar controls how the source code is parsed.
+    #[cfg(not(target_family = "wasm"))]
     pub fn register_native_grammars(
         &self,
         grammars: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<tree_sitter::Language>)>,
     ) {
+        self.state
+            .write()
+            .grammars
+            .extend(grammars.into_iter().map(|(name, grammar)| {
+                (
+                    name.into(),
+                    AvailableGrammar::Native(ParseableLanguage::from(grammar.into())),
+                )
+            }));
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn register_native_grammars(
+        &self,
+        grammars: impl IntoIterator<Item = (impl Into<Arc<str>>, ParseableLanguage)>,
+    ) {
         self.state.write().grammars.extend(
             grammars
                 .into_iter()
-                .map(|(name, grammar)| (name.into(), AvailableGrammar::Native(grammar.into()))),
+                .map(|(name, grammar)| (name.into(), AvailableGrammar::Native(grammar))),
         );
     }
 
@@ -837,7 +854,7 @@ impl LanguageRegistry {
     fn get_or_load_grammar(
         self: &Arc<Self>,
         name: Arc<str>,
-    ) -> impl Future<Output = Result<tree_sitter::Language>> {
+    ) -> impl Future<Output = Result<ParseableLanguage>> {
         let span = ztracing::debug_span!("get_or_load_grammar", name = &*name.clone());
         let _enter = span.enter();
         let (tx, rx) = oneshot::channel();
@@ -848,8 +865,19 @@ impl LanguageRegistry {
                 AvailableGrammar::LoadFailed(error) => {
                     tx.send(Err(error.clone())).ok();
                 }
-                AvailableGrammar::Native(grammar) | AvailableGrammar::Loaded(_, grammar) => {
+                AvailableGrammar::Native(grammar) => {
                     tx.send(Ok(grammar.clone())).ok();
+                }
+                #[cfg(not(target_family = "wasm"))]
+                AvailableGrammar::Loaded(_, grammar) => {
+                    tx.send(Ok(ParseableLanguage::from(grammar.clone()))).ok();
+                }
+                #[cfg(target_family = "wasm")]
+                AvailableGrammar::Loaded(_, _) => {
+                    tx.send(Err(Arc::new(anyhow!(
+                        "WASM grammars are not supported in the browser"
+                    ))))
+                    .ok();
                 }
                 AvailableGrammar::Loading(_, txs) => {
                     txs.push(tx);
@@ -876,7 +904,12 @@ impl LanguageRegistry {
                         .map_err(Arc::new);
 
                         let value = match &grammar_result {
+                            #[cfg(not(target_family = "wasm"))]
                             Ok(grammar) => AvailableGrammar::Loaded(wasm_path, grammar.clone()),
+                            #[cfg(target_family = "wasm")]
+                            Ok(_) => AvailableGrammar::LoadFailed(Arc::new(anyhow!(
+                                "WASM grammars are not supported in the browser"
+                            ))),
                             Err(error) => AvailableGrammar::LoadFailed(error.clone()),
                         };
 
@@ -884,7 +917,17 @@ impl LanguageRegistry {
                         let old_value = this.state.write().grammars.insert(name, value);
                         if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
                             for tx in txs {
-                                tx.send(grammar_result.clone()).ok();
+                                #[cfg(not(target_family = "wasm"))]
+                                tx.send(grammar_result.clone().map(ParseableLanguage::from))
+                                    .ok();
+                                #[cfg(target_family = "wasm")]
+                                tx.send(Err(match &grammar_result {
+                                    Ok(_) => Arc::new(anyhow!(
+                                        "WASM grammars are not supported in the browser"
+                                    )),
+                                    Err(error) => error.clone(),
+                                }))
+                                .ok();
                             }
                         }
                     };
