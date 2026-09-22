@@ -816,6 +816,16 @@ pub struct ClaudeSessionsSettingsContent {
     ///
     /// Default: right
     pub dock: Option<DockSide>,
+    /// Character that starts a user prompt line in the Claude Code terminal.
+    /// A value that is not exactly one character is ignored.
+    ///
+    /// Default: ">"
+    pub user_prompt_glyph: Option<String>,
+    /// Character that starts an assistant block or tool call in the Claude Code terminal.
+    /// A value that is not exactly one character is ignored.
+    ///
+    /// Default: "⏺"
+    pub assistant_glyph: Option<String>,
 }
 
 #[with_fallible_options]

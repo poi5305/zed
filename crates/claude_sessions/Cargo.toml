@@ -16,29 +16,33 @@ doctest = false
 anyhow.workspace = true
 chrono.workspace = true
 collections.workspace = true
-editor.workspace = true
 fs.workspace = true
 gpui.workspace = true
 markdown.workspace = true
 paths.workspace = true
+project.workspace = true
 remote.workspace = true
 rpc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 settings.workspace = true
 similar = "2.7.0"
 task.workspace = true
+terminal.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
 tmux_sessions.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
-zed_actions.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 smol.workspace = true
+# `./script/clippy` passes `--all-features`, which turns on remote's `test-support`
+# and exposes `Mock` connection variants. The match arms in project and workspace
+# are behind those crates' own `test-support` features; workspace's feature turns
+# both on for a joint clippy of this crate and remote.
+workspace = { workspace = true, features = ["test-support"] }

@@ -3,7 +3,7 @@
 //!
 //! One type draws both halves, in two views that share a store: the dock panel draws the
 //! list of sessions, and an editor tab — the same type with `in_pane` set — draws the
-//! conversation and the input that talks to it. A transcript is not readable at the
+//! conversation beside the session's terminal. A transcript is not readable at the
 //! width of a dock, and the selection lives in the store rather than in either view, so
 //! choosing a session in the dock is what the tab shows.
 //!
@@ -22,27 +22,25 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
-use editor::{Editor, EditorEvent, actions::Paste};
 use fs::Fs;
 use gpui::{
-    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ClipboardEntry,
-    ClipboardItem, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Hsla, Image, ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, Pixels, Rems,
-    Render, ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, img, list,
-    pulsating_between, relative,
+    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, DragMoveEvent,
+    Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
+    Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
+    MouseUpEvent, Pixels, Point, Rems, Render, ScrollHandle, Subscription, Task,
+    TextStyleRefinement, WeakEntity, canvas, img, list, pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use project::Project;
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
-use sha2::{Digest as _, Sha256};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
-use terminal_view::terminal_panel::TerminalPanel;
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme::Appearance;
 use tmux_sessions::tmux_attach_command;
 use ui::{
-    Button, ButtonStyle, Checkbox, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes,
-    Scrollbars, SelectableButton as _, TintColor, ToggleState, Tooltip, WithScrollbar as _,
-    prelude::*,
+    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes, Scrollbars,
+    SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
@@ -50,20 +48,14 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use zed_actions::editor::{MoveDown, MoveUp};
-
 use crate::{
-    ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, DismissMenus, EndedReason,
-    EndedSession, HookInstallOutcome, LiveSession, LiveState, ModelRates, NextMessage,
-    OpenInEditor, PasteIntoMessage, PreviousMessage, RegisteredSession, RunningTool, SendMessage,
-    SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus, TranscriptRecord, TranscriptTarget,
-    Turn, Usage, rates_for_model,
-    session_registry::{
-        CHANNEL_ARGUMENT_SLASH_COMMANDS, CHANNEL_DIALOG_SLASH_COMMANDS, SlashCommand,
-        SlashCommandScope, channel_setup_commands,
-    },
+    ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, EndedReason, EndedSession,
+    HookInstallOutcome, LiveSession, LiveState, ModelRates, OpenInEditor, RegisteredSession,
+    RunningTool, SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus, TranscriptRecord,
+    TranscriptTarget, Turn, Usage, rates_for_model,
     session_registry::{attachment_is_readable, tmux_session_name, workflow_run_id_in_tool_result},
     session_source::{FileContents, LocalSource, RemoteSource, SessionSource},
+    terminal_anchors::{self, Anchoring, Glyphs, ScreenRow},
     transcript::{AutoModeFlags, Spend},
 };
 
@@ -72,6 +64,23 @@ const NOW_ROW_ENTRY_KEY: &str = "now-row";
 
 /// Drag payload for the live-message box's top-edge resize handle.
 struct DraggedLiveMessageDivider;
+
+/// Drag payload for the rail's width handle. The panel consumes it itself: it is not
+/// a workspace dock, so nothing above this view is watching the drag.
+#[derive(Clone)]
+struct DraggedRail;
+
+impl Render for DraggedRail {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Clone)]
+struct ZoomedImage {
+    key: SharedString,
+    image: Arc<Image>,
+}
 
 /// How tall, in rems, the box holding what the session is saying right now may grow
 /// before what does not fit is scrolled to instead.
@@ -98,6 +107,9 @@ const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 
 /// The field every record Claude Code writes carries the time in, as RFC 3339 in UTC.
 const TIMESTAMP_FIELD: &str = "timestamp";
+/// Names the API call a record was written from. Claude Code writes one record per
+/// content block, so the records of one answer share this and differ in their uuids.
+const REQUEST_ID_FIELD: &str = "requestId";
 
 /// Hours and minutes on a 24-hour clock, which is what an answer's line has room for.
 const CLOCK_FORMAT: &str = "%H:%M";
@@ -168,18 +180,9 @@ const SELECT_A_SESSION: &str = "Select a session to read its conversation.";
 const WAITING_FOR_TRANSCRIPT: &str =
     "This session has not written a transcript file yet. It will appear as soon as it does.";
 const EMPTY_TRANSCRIPT: &str = "This conversation has no messages yet.";
-const READ_ONLY_NOTE: &str = "Zed channel not loaded — click Setup";
-const SELECT_A_SESSION_TO_REPLY: &str = "Select a session to reply to it.";
-const OPEN_IN_TERMINAL_NOTE: &str = "open in terminal / claude.ai";
-const CHANNEL_DELIVERED_NOTE: &str = "delivered to Claude";
-const CHANNEL_WAITING_NOTE: &str = "sent, waiting for the session to pick it up";
 const CHANNEL_PERMISSION_WAITING: &str = "answered — waiting for the session";
 const CHANNEL_PERMISSION_UNAVAILABLE: &str =
     "Approve in the terminal or on claude.ai (channel not loaded)";
-const QUESTION_CHANNEL_NOTE: &str = "The answer is delivered as a message because Claude Code does not relay questions to channels.";
-const CHANNEL_WAIT_FOR_TRANSCRIPT_MS: i64 = 60_000;
-const MESSAGE_PLACEHOLDER: &str = "Message this session…";
-const SENDING_NOTE: &str = "Sending…";
 const THINKING_NOTE: &str = "Thinking…";
 
 const ASSISTANT_RECORD_TYPE: &str = "assistant";
@@ -212,9 +215,6 @@ const MAX_EDIT_DIFF_BYTES: usize = 128 * 1024;
 /// not arrived, a session that is answering. Matches the period the agent panel pulses
 /// its own icons at.
 const PULSE_PERIOD: Duration = Duration::from_secs(1);
-const FILE_LIST_DEBOUNCE: Duration = Duration::from_millis(150);
-const SLASH_COMMAND_CACHE_DURATION: Duration = Duration::from_secs(30);
-const MESSAGE_HISTORY_LIMIT: usize = 200;
 
 /// How long a second click on Stop is accepted before the control disarms itself.
 const STOP_ARM_MS: i64 = 5_000;
@@ -223,6 +223,12 @@ const STOP_ARM_MS: i64 = 5_000;
 /// disclosure. A build log or a test run is thousands of lines, and one of them drawn
 /// whole leaves no room in the panel for the conversation around it.
 const MAX_UNCLAMPED_OUTPUT_LINES: usize = 12;
+const ANCHOR_GUTTER_WIDTH_PIXELS: f32 = 28.;
+const RAIL_WIDTH_DEFAULT_PIXELS: f32 = 380.;
+const RAIL_WIDTH_MIN_PIXELS: f32 = 240.;
+const RAIL_WIDTH_MAX_PIXELS: f32 = 900.;
+const TERMINAL_MIN_WIDTH_PIXELS: f32 = 320.;
+const RAIL_RESIZE_HANDLE_PIXELS: f32 = 6.;
 
 /// The one tool whose input is a command rather than a description of one, so the
 /// command itself is what is drawn, in the shell's own syntax.
@@ -302,8 +308,6 @@ const SHELL_TOOLTIP_COMMAND_CHARACTERS: usize = 240;
 const SHELL_RUNNING_NOTE: &str = "Running";
 
 const MAIN_CONVERSATION_CHIP: &str = "Main";
-const AGENT_READ_ONLY_NOTE: &str =
-    "This is an agent's conversation, and can only be read. Switch to Main to reply.";
 
 const NO_OUTPUT_NOTE: &str = "(no output)";
 
@@ -543,268 +547,12 @@ fn compact_token_count(tokens: u64) -> String {
     }
 }
 
-/// The file a partly typed `@` names, or `None` when nothing is being named.
-///
-/// Read from the end of what is typed rather than from the caret: a mention is finished
-/// by picking one, and the one being typed is always the last thing in the box.
-/// Whitespace ends a mention, and a `@` with something other than whitespace in front of
-/// it is not one at all — which is what keeps an email address from opening a menu.
-fn file_being_named(text: &str) -> Option<&str> {
-    let at = text.rfind('@')?;
-    let before = text.get(..at)?;
-    if !before.is_empty() && !before.ends_with(char::is_whitespace) {
-        return None;
-    }
-
-    let named = text.get(at.saturating_add(1)..)?;
-    (!named.contains(char::is_whitespace)).then_some(named)
-}
-
-/// What is in the box once the `@` being typed is replaced by `path`.
-///
-/// A trailing space, because a mention is finished when it is picked: what follows is
-/// the sentence it is part of, not more of the path.
-fn message_with_mention(text: &str, path: &str) -> Option<String> {
-    let at = text.rfind('@')?;
-    let before = text.get(..at)?;
-    Some(format!("{before}@{path} "))
-}
-
-fn pasted_file_name(now_ms: i64, extension: &str, contents: &[u8]) -> String {
-    let digest = Sha256::digest(contents);
-    let short_hash: String = format!("{digest:x}").chars().take(6).collect();
-    format!("pasted-{}-{short_hash}.{extension}", now_ms.max(0),)
-}
-
-fn pasted_path_for_message(path: &Path, session_directory: Option<&Path>) -> String {
-    if let Some(relative) = session_directory
-        .and_then(|directory| path.strip_prefix(directory).ok())
-        .filter(|relative| !relative.as_os_str().is_empty())
-    {
-        format!("@{}", relative.to_string_lossy())
-    } else {
-        path.to_string_lossy().into_owned()
-    }
-}
-
 fn uninstall_hooks_note(result: anyhow::Result<()>) -> SharedString {
     match result {
         Ok(()) => SharedString::from(
             "Hooks uninstalled. Run `claude mcp remove zed-claude` to remove the MCP server.",
         ),
         Err(error) => SharedString::from(format!("Could not uninstall: {error:#}")),
-    }
-}
-
-fn matching_files(files: &[SharedString], query: &str) -> Vec<SharedString> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let query = query.to_lowercase();
-    let mut starting = Vec::new();
-    let mut containing = Vec::new();
-    for path in files {
-        let relative_path = path.to_lowercase();
-        if relative_path.starts_with(&query) {
-            starting.push(path.clone());
-        } else if relative_path.contains(&query) {
-            containing.push(path.clone());
-        }
-    }
-    starting.extend(containing);
-    starting.truncate(FILE_MENU_ROWS);
-    starting
-}
-
-/// A step through the commands menu, or none at all when the highlight is only being
-/// read back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuStep {
-    Up,
-    Down,
-    Stay,
-}
-
-/// Where the highlight lands after `step`, over a menu of `offered` rows.
-///
-/// The highlight is kept as a plain index rather than as the command it names, because
-/// the menu is rebuilt from what is typed on every keystroke — so it is clamped here
-/// rather than trusted: a row that was highlighted before the name was typed out further
-/// can be past the end of what is left.
-fn step_through_menu(highlighted: usize, offered: usize, step: MenuStep) -> usize {
-    let Some(last) = offered.checked_sub(1) else {
-        return 0;
-    };
-    let highlighted = highlighted.min(last);
-
-    // Held at both ends rather than wrapped: a menu that jumps from its last row to its
-    // first reads as having lost the keypress.
-    match step {
-        MenuStep::Up => highlighted.saturating_sub(1),
-        MenuStep::Down => highlighted.saturating_add(1).min(last),
-        MenuStep::Stay => highlighted,
-    }
-}
-
-/// What Enter does while the commands menu is open.
-#[derive(Debug, PartialEq, Eq)]
-enum EnterInMenu {
-    /// Put this command in the box: what is typed does not name it in full yet.
-    Complete(String),
-    /// Send what is typed, which is already the whole command.
-    Send,
-}
-
-fn enter_in_slash_menu(typed: &str, highlighted: &SlashCommand) -> EnterInMenu {
-    // A command that takes arguments is not whole when its name is: what it is about has
-    // still to be typed, so Enter fills the name in and leaves the reader there.
-    let whole = highlighted.argument_hint.is_none()
-        && typed.strip_prefix('/') == Some(highlighted.name.as_str());
-    if whole {
-        EnterInMenu::Send
-    } else {
-        EnterInMenu::Complete(highlighted.name.clone())
-    }
-}
-
-/// Which way the arrow key moves the cursor when the box holds a draft rather than a
-/// recalled message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CursorDirection {
-    Up,
-    Down,
-}
-
-/// What an arrow key does to the message box, decided before anything is touched.
-#[derive(Debug, PartialEq)]
-enum HistoryStep {
-    /// Put this message in the box, standing at `index` in the history.
-    Recall { index: usize, message: SharedString },
-    /// Empty the box: the walk is back where it started.
-    Draft,
-    /// The key belongs to the cursor — the box holds a draft the reader is writing, and
-    /// a message box that threw a half-written message away would be worse than no
-    /// history at all.
-    MoveCursor(CursorDirection),
-    /// The walk has run out of history this way; the box keeps what it is holding.
-    Stay,
-}
-
-/// The messages the reader has already sent, newest first.
-///
-/// Read back out of the conversation rather than remembered as they are sent: this panel
-/// is opened on sessions it has sent nothing to, and the terminal's Up walks the whole
-/// session either way.
-#[cfg(test)]
-fn message_history(
-    pending_sends: &PendingSends,
-    transcript: &crate::Transcript,
-) -> Vec<SharedString> {
-    message_history_matching(pending_sends, transcript, |_| true)
-}
-
-/// The same, for the conversation `selected` is being read in. A message still waiting in
-/// another session is not this conversation's history: switching session now hides those
-/// rows rather than dropping them, and Up must still walk what was typed here.
-fn message_history_for(
-    pending_sends: &PendingSends,
-    transcript: &crate::Transcript,
-    selected: Option<&str>,
-) -> Vec<SharedString> {
-    message_history_matching(pending_sends, transcript, |send| {
-        Some(send.session_id.as_str()) == selected
-    })
-}
-
-fn message_history_matching(
-    pending_sends: &PendingSends,
-    transcript: &crate::Transcript,
-    belongs: impl Fn(&PendingSend) -> bool,
-) -> Vec<SharedString> {
-    let transcript_entries = user_message_entries(&transcript.full_path());
-    let transcript_messages = user_messages(&transcript_entries);
-    let mut history = Vec::new();
-    let messages = pending_sends
-        .sends
-        .iter()
-        .rev()
-        .filter(|send| belongs(send))
-        .map(|send| send.text.as_ref())
-        .chain(
-            transcript_messages
-                .iter()
-                .rev()
-                .map(|(_, text)| text.as_ref()),
-        );
-    for message in messages {
-        let message = message.trim();
-        if message.is_empty()
-            || history
-                .last()
-                .is_some_and(|last: &SharedString| last.as_ref() == message)
-        {
-            continue;
-        }
-        history.push(SharedString::from(message.to_string()));
-        if history.len() == MESSAGE_HISTORY_LIMIT {
-            break;
-        }
-    }
-    history
-}
-
-/// Where in the history the box is standing, or `None` when what it holds is the
-/// reader's own draft.
-///
-/// The recorded position and the box's contents are checked against each other rather
-/// than the position being trusted on its own: the moment the reader edits a recalled
-/// message it is a draft again, and the arrows are the cursor's.
-fn standing_in_history(at: Option<usize>, history: &[SharedString], typed: &str) -> Option<usize> {
-    at.filter(|index| history.get(*index).is_some_and(|message| message == typed))
-}
-
-fn step_back_through_history(
-    history: &[SharedString],
-    at: Option<usize>,
-    typed: &str,
-) -> HistoryStep {
-    let older = match standing_in_history(at, history, typed) {
-        Some(index) => index + 1,
-        // An empty box is where a walk starts, whether or not one was under way: the
-        // reader cleared what they had.
-        None if typed.is_empty() => 0,
-        None => return HistoryStep::MoveCursor(CursorDirection::Up),
-    };
-
-    match history.get(older) {
-        Some(message) => HistoryStep::Recall {
-            index: older,
-            message: message.clone(),
-        },
-        None => HistoryStep::Stay,
-    }
-}
-
-fn step_forward_through_history(
-    history: &[SharedString],
-    at: Option<usize>,
-    typed: &str,
-) -> HistoryStep {
-    let Some(index) = standing_in_history(at, history, typed) else {
-        return HistoryStep::MoveCursor(CursorDirection::Down);
-    };
-
-    // Walked back past the newest message, which is where the walk started.
-    let Some(newer) = index.checked_sub(1) else {
-        return HistoryStep::Draft;
-    };
-
-    match history.get(newer) {
-        Some(message) => HistoryStep::Recall {
-            index: newer,
-            message: message.clone(),
-        },
-        None => HistoryStep::Stay,
     }
 }
 
@@ -865,6 +613,44 @@ const CONVERSATION_SCROLLBAR_COLOR: Hsla = Hsla {
     a: 1.,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalTarget {
+    /// The tmux pane and the process in it, never the conversation: `/clear` gives the
+    /// session a new id while the process stays in the pane it was already attached in,
+    /// and re-attaching there would cost the reader their terminal and leave a second
+    /// mirror behind.
+    pane: String,
+    process_id: u32,
+}
+
+/// What [`ClaudeSessionsPanel::sync_terminal`] does with the client it already has.
+///
+/// `attach_arguments` mints a mirror name every time it is read, so it is read only from
+/// [`TerminalSync::Attach`]. [`TerminalSync::Keep`] and [`TerminalSync::Drop`] return
+/// before that call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSync {
+    /// The pane and the process are unchanged, including across `/clear`.
+    Keep,
+    /// Nothing attachable is selected. The client is dropped.
+    Drop,
+    /// A different pane or process. The client is dropped and attached again.
+    Attach,
+}
+
+fn terminal_sync(
+    current: Option<&TerminalTarget>,
+    wanted: Option<&TerminalTarget>,
+) -> TerminalSync {
+    if current == wanted {
+        TerminalSync::Keep
+    } else if wanted.is_some() {
+        TerminalSync::Attach
+    } else {
+        TerminalSync::Drop
+    }
+}
+
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -875,19 +661,12 @@ pub struct ClaudeSessionsPanel {
     /// The same source the store reads through, kept here for the one read the panel
     /// performs on its own behalf: a persisted tool output.
     source: Arc<dyn SessionSource>,
-    /// What the user is typing to the selected session. Disabled, rather than hidden,
-    /// while there is no pane to type into.
-    message_editor: Entity<Editor>,
     /// Used only to shorten the working directory of sessions opened inside this project.
     project_root: Option<PathBuf>,
     /// The flattened conversation, one entry per rendered item. Rebuilt from the
     /// transcript whenever the store reports a change, and spliced into `list_state` so
     /// that the items which did not move keep their measured height.
     entries: Vec<Entry>,
-    /// The messages that have left for the selected session but have not appeared in its
-    /// transcript yet. Drawn after the entries built from the transcript, and never
-    /// mixed into them: see [`PendingSends`].
-    pending_sends: PendingSends,
     /// What the selected session is doing, as of the last change to its transcript; see
     /// [`activity`].
     activity: Activity,
@@ -896,6 +675,14 @@ pub struct ClaudeSessionsPanel {
     /// rather than cached with them, because the state of what a call started changes
     /// while the call's own record never does.
     agent_calls: HashMap<SharedString, AgentCall>,
+    /// What each record of the conversation was billed. Held beside the entries rather
+    /// than on them: most billed records write no text block, and so produce no entry
+    /// that could carry a bill.
+    billing: HashMap<SharedString, Billed>,
+    /// One turn's calls, taken before collapse drops the thinking and tool entries.
+    /// The last record of a call is often one of those. Keyed by the turn's first
+    /// entry, which collapse keeps.
+    turn_bills: HashMap<SharedString, (Vec<Usage>, Usage)>,
     list_state: ListState,
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
@@ -907,30 +694,21 @@ pub struct ClaudeSessionsPanel {
     /// True for the copy opened as an editor tab, which is already where opening one
     /// would take the reader.
     in_pane: bool,
-    /// Whether the message input is showing. Open by default: a question that arrives has
-    /// nowhere to draw itself if this is shut.
-    input_expanded: bool,
-    /// How far up the messages already sent the reader has walked with the Up key, as
-    /// the terminal's own history walks. `None` while the box holds their own draft.
-    history_index: Option<usize>,
-    /// Options ticked on a multi-select question, as `(question_index, option_index)`.
-    question_ticks: HashSet<(usize, usize)>,
-    /// The call whose question those ticks were made on. A tick is a position, so ticks
-    /// left over from the question before would come up ticked on the next one.
-    ticked_question: Option<SharedString>,
+    terminal: Option<Entity<TerminalView>>,
+    terminal_for: Option<TerminalTarget>,
+    _terminal_attach: Task<()>,
+    /// Hides the transcript rail. The embedded terminal stays: collapsing the rail is
+    /// not detaching, and an attached client is what the reader is looking at.
+    rail_expanded: bool,
+    /// False leaves the rail for what the terminal cannot show. True is the escape
+    /// hatch that draws the conversation in the rail as well.
+    rail_shows_everything: bool,
     /// Set after Allow/Deny until the hook's pending permission clears.
     permission_answered: bool,
     /// The call whose permission that answer was for. Two prompts of one turn can land in
     /// a single poll — the tool that was allowed finishes and the next permission is asked
     /// for — and the second one has been answered by nobody.
     permission_answered_for: Option<SharedString>,
-    /// Why the last Enter did not send, when a slash command needs the terminal or an
-    /// argument.
-    slash_send_note: Option<SharedString>,
-    /// The call whose question the input was last opened for, so that it is opened once
-    /// per question rather than held open for as long as one is on screen; see
-    /// [`ClaudeSessionsPanel::open_the_input_for_a_new_question`].
-    opened_input_for_question: Option<SharedString>,
     /// Where the reader has scrolled what the session is saying right now, and how long
     /// that was when it was last looked at; see
     /// [`ClaudeSessionsPanel::follow_the_live_message`].
@@ -945,35 +723,6 @@ pub struct ClaudeSessionsPanel {
     stop_armed_until_ms: Option<(String, i64)>,
     lifecycle_note: Option<SharedString>,
     _lifecycle_command: Task<()>,
-    /// The paths the `@` menu is offering, and the query they were listed for. Listed
-    /// on the machine the session runs on, so the answer arrives after the keystroke
-    /// that asked for it and has to say what it is an answer to.
-    file_matches: Vec<SharedString>,
-    file_matches_for: Option<String>,
-    file_query: Option<String>,
-    file_highlight: usize,
-    dismissed_file_menu_for: Option<String>,
-    /// Held so that dropping it cancels a listing that is still running, and so that a
-    /// slower answer cannot land on top of a newer one.
-    _listing_files: Task<()>,
-    /// Held so that dropping it cancels a paste that is still being written.
-    _pasting: Task<()>,
-    paste_error: Option<SharedString>,
-    /// Which row of the commands menu the arrow keys are on. Kept as an index rather
-    /// than as the command it names, because the menu is rebuilt from what is typed on
-    /// every keystroke; see [`step_through_menu`].
-    slash_highlight: usize,
-    /// The text the commands menu was closed at, so that Escape can put it away without
-    /// taking what is typed with it — and so that typing on brings it back.
-    dismissed_slash_menu_for: Option<String>,
-    /// The slash commands the selected session answers to, as the machine it runs on last
-    /// listed them. Read once per session rather than per keystroke: the files behind
-    /// them change far less often than the reader types.
-    slash_commands: Vec<SlashCommand>,
-    slash_commands_for: Option<String>,
-    slash_commands_fresh: bool,
-    /// Held so that dropping it cancels a listing that is still running.
-    _listing_slash_commands: Task<()>,
     /// What installing the hook did, kept on screen afterwards because it says where the
     /// settings it changed were copied to. Cleared when a question can be read, which is
     /// the install having taken effect.
@@ -996,7 +745,8 @@ pub struct ClaudeSessionsPanel {
     /// Whether the conversation is read with [`crate::Transcript::full_path`], which
     /// includes everything compaction dropped from the model's context.
     show_full_history: bool,
-    /// Whether what each answer cost is drawn beneath it.
+    /// Whether a turn's cost is drawn. Beside the terminal that is one card per
+    /// turn; with [`Self::rail_shows_everything`] it is the line under each answer.
     show_costs: bool,
     /// Whether the session's tool calls, their results, and its thinking are drawn.
     /// Closed by default: one turn can hold dozens of them, and a conversation read for
@@ -1025,9 +775,33 @@ pub struct ClaudeSessionsPanel {
     /// not draw a second diff of their own; see [`edit_card_diff`].
     patched_calls: HashSet<SharedString>,
     attachment_loads: HashMap<SharedString, Task<()>>,
+    /// Bumped when `entries` is replaced, and when the pre-collapse anchors change
+    /// without the collapsed list changing. Alignment reuses a generation only while
+    /// those anchors are the same, so a frame does not parse tool inputs again.
+    entries_generation: u64,
+    /// Anchors from the entries before collapse. A finished turn drops its tool
+    /// rows, and the chip has to survive that; `index` is into [`Self::entries`].
+    reachable_anchors: Vec<ReachableAnchor>,
+    anchor_cache: Option<AnchorCache>,
+    /// Whether the cached alignment was built for a scrolled-back screen.
+    /// The same visible rows at the bottom and in the scrollback use different
+    /// transcript windows.
+    cached_scrolled_back: bool,
+    /// Width of the transcript rail. Lives only on this panel; nothing persists it.
+    rail_width: Pixels,
+    /// Width left for the terminal and the rail together, measured from the row.
+    /// `None` until the first layout, so the terminal floor is not applied to a
+    /// width of zero.
+    rail_row_budget: Option<Pixels>,
+    rail_drag_position: Option<Point<Pixels>>,
+    zoomed_image: Option<ZoomedImage>,
+    /// Entry keys whose anchors are on the terminal's visible screen this frame.
+    anchored_on_screen: HashSet<SharedString>,
+    hovered_anchor: Option<SharedString>,
+    /// Last rail index a scroll-back followed. The same index on the next frame
+    /// must not scroll again, or the reader can never move the rail themselves.
+    followed_index: Option<usize>,
     _store_subscription: Subscription,
-    /// Held so that the `@` menu is asked for files as the box changes.
-    _editor_subscription: Subscription,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1068,6 +842,9 @@ enum EntryKind {
         label: SharedString,
         is_error: bool,
         body: ToolResultBody,
+        /// The `tool_use` id this result answers. `None` on a record that never
+        /// named its call; those still pair by position.
+        tool_use_id: Option<SharedString>,
     },
     Image {
         image: Arc<Image>,
@@ -1089,19 +866,11 @@ enum EntryKind {
     SlashCommand {
         text: SharedString,
     },
-    /// A message that has left for the session but has not appeared in its transcript
-    /// yet; see [`PendingSends`]. The only entry that does not come from a record.
     /// A message the CLI is holding behind the turn it is running, read from the queue
-    /// log. Unlike [`Self::Pending`] it carries no id: the queue is the session's, so
-    /// there is nothing here for the panel to take back.
+    /// log. It carries no id: the queue is the session's, so there is nothing here for
+    /// the panel to take back.
     Queued {
         text: SharedString,
-    },
-    Pending {
-        id: u64,
-        text: SharedString,
-        note: SharedString,
-        failed: bool,
     },
     CompactBoundary {
         trigger: SharedString,
@@ -1353,8 +1122,14 @@ impl EntryCache {
 /// live inside the single context entry rather than being entries themselves.
 fn live_cache_keys(entries: &[Entry]) -> HashSet<SharedString> {
     let mut keys = HashSet::default();
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         keys.insert(entry.key.clone());
+        // A turn's cost card is opened under a key derived from the turn's first entry,
+        // and that key has to survive the rebuild that runs four times a second, or a
+        // card the reader opened closes itself while the session is answering.
+        if index == 0 || entry_starts_user_turn(&entry.kind) {
+            keys.insert(turn_cost_key(&entry.key));
+        }
         match &entry.kind {
             // An output is clamped behind an expansion key of its own, which has to
             // survive the rebuild that runs on every change to the transcript, or an
@@ -1404,6 +1179,10 @@ fn turn_summary_key(turn_id: &SharedString) -> SharedString {
     SharedString::from(format!("{turn_id}#summary"))
 }
 
+fn turn_cost_key(turn_id: &SharedString) -> SharedString {
+    SharedString::from(format!("{turn_id}#cost"))
+}
+
 fn entry_starts_user_turn(kind: &EntryKind) -> bool {
     matches!(
         kind,
@@ -1422,6 +1201,732 @@ fn is_turn_detail(kind: &EntryKind) -> bool {
             | EntryKind::Thinking { .. }
             | EntryKind::TurnFooter { .. }
     )
+}
+
+/// What a rail entry is worth drawing beside a terminal that already shows the
+/// conversation as text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RailWorth {
+    /// The terminal already renders this well; the rail leaves it out.
+    TerminalHasIt,
+    /// Drawn in the rail: the terminal cannot show it, or shows it truncated.
+    Draw,
+}
+
+fn rail_worth(kind: &EntryKind) -> RailWorth {
+    match kind {
+        EntryKind::Image { .. }
+        | EntryKind::SentFiles { .. }
+        | EntryKind::Attachments { .. }
+        | EntryKind::TurnSummary { .. }
+        | EntryKind::TurnFooter { .. }
+        | EntryKind::CompactBoundary { .. }
+        | EntryKind::SystemNote { .. }
+        | EntryKind::Unknown { .. } => RailWorth::Draw,
+        // An Edit's diff is not text the terminal can show. Every other call is.
+        EntryKind::ToolUse { diff, .. } => {
+            if diff.is_some() {
+                RailWorth::Draw
+            } else {
+                RailWorth::TerminalHasIt
+            }
+        }
+        EntryKind::ToolResult { body, .. } => match body {
+            // The terminal shows a short result in full. A persisted file, or an
+            // inline body past the same line ceiling the rail already clamps, is
+            // what the terminal replaces with a "ctrl+o to expand" preview.
+            ToolResultBody::Persisted(_) => RailWorth::Draw,
+            ToolResultBody::Inline(text) if output_is_clamped(text, MAX_UNCLAMPED_OUTPUT_LINES) => {
+                RailWorth::Draw
+            }
+            ToolResultBody::Inline(_) => RailWorth::TerminalHasIt,
+        },
+        // Usage on a message is the turn's bill, drawn on the cost card, not by
+        // drawing the message the terminal already has.
+        EntryKind::Message { .. }
+        | EntryKind::Thinking { .. }
+        | EntryKind::LocalCommand { .. }
+        | EntryKind::SlashCommand { .. }
+        | EntryKind::Queued { .. } => RailWorth::TerminalHasIt,
+    }
+}
+
+/// One decision per entry, in entry order. The same length as `entries`: a body
+/// the terminal already shows is an empty element at that index, not a removed one.
+#[cfg(test)]
+fn rail_draw_slots(entries: &[Entry]) -> Vec<RailWorth> {
+    entries
+        .iter()
+        .map(|entry| rail_worth(&entry.kind))
+        .collect()
+}
+
+/// What one API call was billed, and what tells it apart from the next one.
+///
+/// Claude Code writes one record per content block, so one call arrives as two or three
+/// records with different uuids and one `requestId`. Each carries a copy of the call's
+/// usage. The copies match except while the answer is still streaming, when an earlier
+/// record's `output_tokens` is only the tokens produced so far and the last record is
+/// the call that was billed. `call_id` is that call; counting the records instead would
+/// bill it two or three times.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Billed {
+    call_id: SharedString,
+    usage: Usage,
+}
+
+/// What every record of the conversation was billed, keyed the way `build_entries` keys
+/// the entries it derives from that record.
+///
+/// Read from the records rather than from the entries because most billed records have
+/// no text block, and it is the text block alone that becomes an entry carrying usage:
+/// an answer that thought and called a tool is billed without ever being a message.
+fn billing_of_path(path: &[&TranscriptRecord]) -> HashMap<SharedString, Billed> {
+    let mut billing = HashMap::default();
+    for (path_index, record) in path.iter().enumerate() {
+        let Some(usage) = Usage::from_record(&record.raw) else {
+            continue;
+        };
+        let base_key = record_base_key(record, path_index);
+        // A record written before `requestId` existed stands alone as its own call.
+        // A blank id is not an id: grouping on it would merge records that do not
+        // name a call. Those stand alone too.
+        let call_id = record
+            .raw
+            .get(REQUEST_ID_FIELD)
+            .and_then(Value::as_str)
+            .filter(|request_id| !request_id.is_empty())
+            .map(|request_id| SharedString::from(request_id.to_string()))
+            .unwrap_or_else(|| base_key.clone());
+        billing.insert(base_key, Billed { call_id, usage });
+    }
+    billing
+}
+
+/// The record an entry came from: the entry key without the block index appended to it.
+fn record_id_of(key: &SharedString) -> SharedString {
+    match key.split_once('#') {
+        Some((record_id, _)) => SharedString::from(record_id),
+        None => key.clone(),
+    }
+}
+
+/// What an entry's own record was billed, if anything: the bill read from the record,
+/// or, for entries built without one, the usage the message itself carries.
+fn billed_entry(entry: &Entry, billing: &HashMap<SharedString, Billed>) -> Option<Billed> {
+    let record_id = record_id_of(&entry.key);
+    if let Some(billed) = billing.get(&record_id) {
+        return Some(billed.clone());
+    }
+    let EntryKind::Message {
+        usage: Some(usage), ..
+    } = &entry.kind
+    else {
+        return None;
+    };
+    Some(Billed {
+        call_id: record_id,
+        usage: *usage,
+    })
+}
+
+/// Every billed API call of one turn, oldest first, and their total.
+fn turn_billing(
+    entries: &[Entry],
+    turn_start: usize,
+    billing: &HashMap<SharedString, Billed>,
+) -> (Vec<Usage>, Usage) {
+    let mut calls = Vec::new();
+    let Some(turn) = entries.get(turn_start..) else {
+        return (calls, Usage::default());
+    };
+
+    // The call stays where it started. A later record of the same call is a fuller
+    // snapshot, not a second call, and must not jump past a call that began after it.
+    let mut call_index: HashMap<SharedString, usize> = HashMap::default();
+    for (offset, entry) in turn.iter().enumerate() {
+        if offset > 0 && entry_starts_user_turn(&entry.kind) {
+            break;
+        }
+        let Some(billed) = billed_entry(entry, billing) else {
+            continue;
+        };
+        if let Some(&index) = call_index.get(&billed.call_id) {
+            if let Some(call) = calls.get_mut(index) {
+                *call = billed.usage;
+            }
+        } else {
+            call_index.insert(billed.call_id, calls.len());
+            calls.push(billed.usage);
+        }
+    }
+    let mut total = Usage::default();
+    for usage in &calls {
+        total = total.add(*usage);
+    }
+    (calls, total)
+}
+
+/// `[start, end)` of the turn that contains `index`. A turn runs from a user
+/// message up to, but not including, the next one. Entries before the first
+/// user message are their own span.
+fn turn_bounds(entries: &[Entry], index: usize) -> Option<(usize, usize)> {
+    if index >= entries.len() {
+        return None;
+    }
+    let start = entries[..=index]
+        .iter()
+        .rposition(|entry| entry_starts_user_turn(&entry.kind))
+        .unwrap_or(0);
+    let end = entries
+        .iter()
+        .enumerate()
+        .skip(start.saturating_add(1))
+        .find(|(_, entry)| entry_starts_user_turn(&entry.kind))
+        .map(|(end, _)| end)
+        .unwrap_or(entries.len());
+    Some((start, end))
+}
+
+/// The entry a turn's cost card is drawn under: its summary, or, when the turn
+/// was not collapsed, the last entry whose record was billed.
+///
+/// Tests that build entries by hand have no bill taken before collapse, so they
+/// ask the entries themselves. The panel uses the bill taken before collapse.
+#[cfg(test)]
+fn turn_cost_anchor(
+    entries: &[Entry],
+    index: usize,
+    billing: &HashMap<SharedString, Billed>,
+) -> bool {
+    let Some((start, _)) = turn_bounds(entries, index) else {
+        return false;
+    };
+    let has_calls = !turn_billing(entries, start, billing).0.is_empty();
+    cost_anchor_at(entries, index, has_calls, billing)
+}
+
+/// Where the card hangs, once the caller already knows the turn was billed.
+///
+/// `has_calls` is not recomputed here. Collapse drops the thinking and tool entries
+/// a call was read from, so a caller that still has the pre-collapse bill must say
+/// so itself; recomputing from the entries on screen would hide that turn.
+fn cost_anchor_at(
+    entries: &[Entry],
+    index: usize,
+    has_calls: bool,
+    billing: &HashMap<SharedString, Billed>,
+) -> bool {
+    if !has_calls {
+        return false;
+    }
+    let Some((start, end)) = turn_bounds(entries, index) else {
+        return false;
+    };
+    let Some(turn) = entries.get(start..end) else {
+        return false;
+    };
+    if let Some(offset) = turn
+        .iter()
+        .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
+    {
+        return start.saturating_add(offset) == index;
+    }
+    // Not "the last billed message": a turn can be several calls deep without having
+    // written a text block, and the running turn is never collapsed into a summary.
+    turn.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| billed_entry(entry, billing).is_some())
+        .is_some_and(|(offset, _)| start.saturating_add(offset) == index)
+}
+
+/// Each turn's calls, keyed by the entry collapse leaves in place (the turn's first).
+///
+/// Computed from the entries before collapse. A finished turn then drops the thinking
+/// and tool entries, and the last record of a call is often one of those.
+fn turn_bills(
+    entries: &[Entry],
+    billing: &HashMap<SharedString, Billed>,
+) -> HashMap<SharedString, (Vec<Usage>, Usage)> {
+    let mut bills = HashMap::default();
+    for (index, entry) in entries.iter().enumerate() {
+        if index != 0 && !entry_starts_user_turn(&entry.kind) {
+            continue;
+        }
+        let bill = turn_billing(entries, index, billing);
+        if bill.0.is_empty() {
+            continue;
+        }
+        bills.insert(entry.key.clone(), bill);
+    }
+    bills
+}
+
+/// The calls drawn for the turn that contains `index`, from a bill taken before collapse.
+fn displayed_turn_usage(
+    entries: &[Entry],
+    index: usize,
+    bills: &HashMap<SharedString, (Vec<Usage>, Usage)>,
+) -> Option<(Vec<Usage>, Usage)> {
+    let (start, _) = turn_bounds(entries, index)?;
+    let turn_id = &entries.get(start)?.key;
+    bills.get(turn_id).cloned()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkArea {
+    TerminalOnly,
+    TerminalAndRail,
+    RailOnly,
+}
+
+fn work_area(rail_expanded: bool, reading_an_agent: bool) -> WorkArea {
+    // Collapsing the rail gives the terminal the width. A subagent has no
+    // terminal, so a collapsed rail would be an empty pane.
+    if reading_an_agent {
+        WorkArea::RailOnly
+    } else if rail_expanded {
+        WorkArea::TerminalAndRail
+    } else {
+        WorkArea::TerminalOnly
+    }
+}
+
+/// The gutter sits between the terminal and the rail. A subagent has no terminal
+/// (`RailOnly`), and a session that has not attached has nothing to align to.
+fn anchor_gutter_shown(area: WorkArea, has_terminal: bool) -> bool {
+    has_terminal && !matches!(area, WorkArea::RailOnly)
+}
+
+fn anchor_chip_top(row: usize, line_height: Pixels) -> Pixels {
+    line_height * (row as f32)
+}
+
+/// `available` is the width shared by the terminal and the rail, after the gutter and
+/// the resize handle. When that cannot satisfy both floors, the rail gives way: a
+/// terminal under 320px makes tmux reflow the whole TUI.
+fn clamped_rail_width(requested: Pixels, available: Pixels) -> Pixels {
+    let minimum = px(RAIL_WIDTH_MIN_PIXELS);
+    let maximum = px(RAIL_WIDTH_MAX_PIXELS);
+    let terminal_limit = available - px(TERMINAL_MIN_WIDTH_PIXELS);
+    if terminal_limit < minimum {
+        return terminal_limit.clamp(px(0.), maximum);
+    }
+    requested.clamp(minimum, terminal_limit.min(maximum))
+}
+
+/// Budget passed to [`clamped_rail_width`] before the row has been measured. Large
+/// enough that the terminal floor does not bind, so the 240..=900 clamp is the only
+/// one applied.
+fn unconstrained_rail_budget() -> Pixels {
+    px(RAIL_WIDTH_MAX_PIXELS + TERMINAL_MIN_WIDTH_PIXELS)
+}
+
+fn terminal_and_rail_budget(row_width: Pixels, gutter_shown: bool) -> Pixels {
+    let chrome = px(RAIL_RESIZE_HANDLE_PIXELS)
+        + if gutter_shown {
+            px(ANCHOR_GUTTER_WIDTH_PIXELS)
+        } else {
+            px(0.)
+        };
+    row_width - chrome
+}
+
+fn anchored_on_screen_keys(anchorings: &[Anchoring]) -> HashSet<SharedString> {
+    anchorings
+        .iter()
+        .map(|anchoring| SharedString::from(anchoring.key.as_str()))
+        .collect()
+}
+
+fn rail_follow_index(
+    anchorings: &[Anchoring],
+    reachable_anchors: &[ReachableAnchor],
+    scrolled_back: bool,
+    entries_len: usize,
+) -> Option<usize> {
+    if !scrolled_back {
+        return None;
+    }
+    // Several anchors can share the top row. A later one on that row is still the top
+    // of the screen; skipping it because an earlier key does not resolve would drop a
+    // legal index. A lower row is a different place and is not a substitute.
+    let top_row = anchorings.iter().map(|anchoring| anchoring.row).min()?;
+    anchorings
+        .iter()
+        .filter(|anchoring| anchoring.row == top_row)
+        .find_map(|top| {
+            reachable_anchors.iter().find_map(|anchor| {
+                (anchor.anchor.key == top.key && anchor.index < entries_len).then_some(anchor.index)
+            })
+        })
+}
+
+/// `None` means do not scroll. The same index as last time is `None` on purpose:
+/// calling scroll every frame would pin the rail.
+fn rail_follow_scroll(
+    previous: Option<usize>,
+    next: Option<usize>,
+    scrolled_back: bool,
+) -> Option<usize> {
+    if !scrolled_back {
+        return None;
+    }
+    match next {
+        Some(index) if previous != Some(index) => Some(index),
+        _ => None,
+    }
+}
+
+fn hover_anchor_changed(current: Option<&str>, next: Option<&str>) -> bool {
+    current != next
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorChip {
+    EditDiff,
+    Image,
+    ExpandOutput,
+    Other,
+}
+
+fn anchor_chip(kind: &EntryKind) -> AnchorChip {
+    match kind {
+        EntryKind::ToolUse { name, diff, .. }
+            if name.as_ref() == EDIT_TOOL_NAME && diff.is_some() =>
+        {
+            AnchorChip::EditDiff
+        }
+        EntryKind::Image { .. } => AnchorChip::Image,
+        EntryKind::ToolResult { body, .. } if tool_result_needs_expand(body) => {
+            AnchorChip::ExpandOutput
+        }
+        _ => AnchorChip::Other,
+    }
+}
+
+fn tool_result_needs_expand(body: &ToolResultBody) -> bool {
+    match body {
+        // The terminal replaces a persisted output with a short preview.
+        ToolResultBody::Persisted(_) => true,
+        ToolResultBody::Inline(text) => output_is_clamped(text, MAX_UNCLAMPED_OUTPUT_LINES),
+    }
+}
+
+fn anchor_chip_icon(chip: AnchorChip) -> IconName {
+    match chip {
+        AnchorChip::EditDiff => IconName::FileDiff,
+        AnchorChip::Image => IconName::Image,
+        AnchorChip::ExpandOutput => IconName::ExpandVertical,
+        AnchorChip::Other => IconName::ChevronRight,
+    }
+}
+
+/// What a call produced. A result that names its `tool_use` id is paired by that id,
+/// wherever it sits; a result with no id still follows the call, which is all an old
+/// record can say. Images have no id of their own, so they stay with the result they
+/// were written beside.
+// The rail builds the id index once and goes through `call_results_with_starts`.
+// This stays so a test can ask about one call on its own.
+#[cfg(test)]
+fn call_results(entries: &[Entry], call_index: usize) -> &[Entry] {
+    call_results_with_starts(entries, call_index, &first_result_of_each_call(entries))
+}
+
+/// Where each `tool_use` id is first answered. Built once per pass over the entries,
+/// because searching the whole conversation for every call is quadratic in its length
+/// and the pass runs on the foreground thread on every rebuild.
+fn first_result_of_each_call(entries: &[Entry]) -> HashMap<&str, usize> {
+    let mut starts: HashMap<&str, usize> = HashMap::default();
+    for (index, entry) in entries.iter().enumerate() {
+        if let EntryKind::ToolResult {
+            tool_use_id: Some(id),
+            ..
+        } = &entry.kind
+        {
+            starts.entry(id.as_ref()).or_insert(index);
+        }
+    }
+    starts
+}
+
+fn call_results_with_starts<'a>(
+    entries: &'a [Entry],
+    call_index: usize,
+    starts: &HashMap<&str, usize>,
+) -> &'a [Entry] {
+    if let Some(id) = entries.get(call_index).and_then(|entry| match &entry.kind {
+        EntryKind::ToolUse { id, .. } => id.as_ref(),
+        _ => None,
+    }) && let Some(start) = starts.get(id.as_ref()).copied()
+    {
+        return identified_call_results(entries, id, start);
+    }
+    positional_call_results(entries, call_index)
+}
+
+fn identified_call_results<'a>(
+    entries: &'a [Entry],
+    id: &SharedString,
+    start: usize,
+) -> &'a [Entry] {
+    let mut end = start.saturating_add(1);
+    while end < entries.len() {
+        match &entries[end].kind {
+            EntryKind::Image { .. } => end = end.saturating_add(1),
+            EntryKind::ToolResult { tool_use_id, .. } if tool_use_id.as_ref() == Some(id) => {
+                end = end.saturating_add(1);
+            }
+            _ => break,
+        }
+    }
+    // A result whose content puts the image before the text writes the image entry
+    // first, so the run reaches back over it. It stops before an earlier result,
+    // whose own trailing images those would be.
+    let mut first = start;
+    while first > 0 && matches!(entries[first - 1].kind, EntryKind::Image { .. }) {
+        first -= 1;
+    }
+    let start = match first.checked_sub(1).and_then(|before| entries.get(before)) {
+        Some(entry) if matches!(entry.kind, EntryKind::ToolResult { .. }) => start,
+        _ => first,
+    };
+    entries.get(start..end).unwrap_or(&[])
+}
+
+/// Results that never named a call. A result that does name one is left for
+/// [`identified_call_results`]; taking it here would hand it to the wrong call.
+fn positional_call_results(entries: &[Entry], call_index: usize) -> &[Entry] {
+    let Some(start) = call_index.checked_add(1) else {
+        return &[];
+    };
+    let Some(rest) = entries.get(start..) else {
+        return &[];
+    };
+    let length = rest
+        .iter()
+        .take_while(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::ToolResult {
+                    tool_use_id: None,
+                    ..
+                } | EntryKind::Image { .. }
+            )
+        })
+        .count();
+    &rest[..length]
+}
+
+/// Which chip the anchored row draws, or `None` for no chip. An `Image` and a
+/// `ToolResult` have no anchor row of their own — a result's first column is `⎿`, and an
+/// image sits inside one — so the call's own row says what that call produced.
+fn anchored_chip(kind: &EntryKind, results: &[Entry]) -> Option<AnchorChip> {
+    if !matches!(kind, EntryKind::ToolUse { .. }) {
+        return Some(anchor_chip(kind));
+    }
+    if matches!(anchor_chip(kind), AnchorChip::EditDiff) {
+        return Some(AnchorChip::EditDiff);
+    }
+    let mut expands = false;
+    for result in results {
+        match anchor_chip(&result.kind) {
+            AnchorChip::Image => return Some(AnchorChip::Image),
+            AnchorChip::ExpandOutput => expands = true,
+            AnchorChip::EditDiff | AnchorChip::Other => {}
+        }
+    }
+    expands.then_some(AnchorChip::ExpandOutput)
+}
+
+/// Grid lines are counted from the top of the screen, so scrolling back by
+/// `display_offset` rows puts the visible rows at negative lines; see
+/// `terminal_view::viewport_line_for_point`, which is the same conversion.
+fn visible_grid_line(line: i32, display_offset: usize) -> i32 {
+    line.saturating_add(i32::try_from(display_offset).unwrap_or(i32::MAX))
+}
+
+/// The transcript anchors a cache miss can keep. Parsing every call's input again is the
+/// expensive half of a rebuild, and only a change to the entries can change the result.
+fn reusable_anchors(
+    cache: Option<AnchorCache>,
+    entries_generation: u64,
+) -> Option<Vec<terminal_anchors::TranscriptAnchor>> {
+    cache
+        .filter(|cache| cache.entries_generation == entries_generation)
+        .map(|cache| cache.transcript)
+}
+
+struct AnchorCache {
+    entries_generation: u64,
+    glyphs: Glyphs,
+    columns: usize,
+    screen_lines: usize,
+    line_height: Pixels,
+    cell_width: Pixels,
+    rows: Vec<ScreenRow>,
+    transcript: Vec<terminal_anchors::TranscriptAnchor>,
+    anchorings: Vec<Anchoring>,
+}
+
+/// An anchor plus the collapsed-list index a click can scroll to, and the chip
+/// computed from the pre-collapse entries (collapse drops the result the chip reads).
+struct ReachableAnchor {
+    anchor: terminal_anchors::TranscriptAnchor,
+    index: usize,
+    chip: Option<AnchorChip>,
+}
+
+fn same_anchor_identity(left: &[ReachableAnchor], right: &[ReachableAnchor]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.anchor == right.anchor)
+}
+
+/// Maps each anchor in `before` onto an index in `after`. An entry collapse kept
+/// stays itself; one collapse dropped points at that turn's summary. The chip is
+/// read from `before`, because `after` no longer holds the result.
+fn reachable_anchors(before: &[Entry], after: &[Entry]) -> Vec<ReachableAnchor> {
+    let mut index_of: HashMap<&str, usize> = HashMap::default();
+    for (index, entry) in after.iter().enumerate() {
+        index_of.insert(entry.key.as_ref(), index);
+    }
+
+    let result_starts = first_result_of_each_call(before);
+    let mut turn_id: Option<&SharedString> = None;
+    let mut anchors = Vec::new();
+    for (pre_index, entry) in before.iter().enumerate() {
+        if entry_starts_user_turn(&entry.kind) {
+            turn_id = Some(&entry.key);
+        }
+        let Some(anchor) = transcript_anchor(entry) else {
+            continue;
+        };
+        let index = if let Some(index) = index_of.get(entry.key.as_ref()).copied() {
+            index
+        } else if let Some(turn_id) = turn_id {
+            let summary_key = turn_summary_key(turn_id);
+            let Some(index) = index_of.get(summary_key.as_ref()).copied() else {
+                continue;
+            };
+            index
+        } else {
+            continue;
+        };
+        let chip = anchored_chip(
+            &entry.kind,
+            call_results_with_starts(before, pre_index, &result_starts),
+        );
+        anchors.push(ReachableAnchor {
+            anchor,
+            index,
+            chip,
+        });
+    }
+    anchors
+}
+
+fn transcript_anchor(entry: &Entry) -> Option<terminal_anchors::TranscriptAnchor> {
+    match &entry.kind {
+        EntryKind::Message { role, source, .. } => Some(terminal_anchors::TranscriptAnchor {
+            key: entry.key.to_string(),
+            glyph: if matches!(role, MessageRole::User) {
+                terminal_anchors::AnchorGlyph::UserPrompt
+            } else {
+                terminal_anchors::AnchorGlyph::Assistant
+            },
+            text: message_anchor_text(source),
+        }),
+        EntryKind::ToolUse { name, input, .. } => Some(terminal_anchors::TranscriptAnchor {
+            key: entry.key.to_string(),
+            glyph: terminal_anchors::AnchorGlyph::Assistant,
+            text: tool_anchor_text(name, input),
+        }),
+        _ => None,
+    }
+}
+
+// The rail reads `reachable_anchors`. This stays so the anchor-text test can
+// still ask for the pre-collapse list on its own.
+#[cfg(test)]
+fn transcript_anchors(entries: &[Entry]) -> Vec<terminal_anchors::TranscriptAnchor> {
+    entries.iter().filter_map(transcript_anchor).collect()
+}
+
+/// Which transcript slice `align` should see.
+///
+/// At the bottom of the screen the tail window is the one the spec asks for.
+/// Scrolled back, that tail is the newest tool calls, and a visible older row
+/// either matches nothing or matches a newer copy of the same text. A window
+/// that covers more of the visible rows wins; a tie keeps the newer start.
+/// A visible span longer than one window cannot be covered in full, so that
+/// tie-break drops the oldest rows of the span.
+fn transcript_window_for_screen<'a>(
+    screen: &[terminal_anchors::AnchorRow],
+    transcript: &'a [terminal_anchors::TranscriptAnchor],
+    scrolled_back: bool,
+) -> &'a [terminal_anchors::TranscriptAnchor] {
+    let window = terminal_anchors::MAX_TRANSCRIPT_ANCHORS;
+    if !scrolled_back || screen.is_empty() || transcript.len() <= window {
+        return transcript;
+    }
+
+    // This runs on every frame the terminal spends scrolled back, and `rows_match`
+    // builds a fresh skeleton for both sides of every comparison, so the skeletons
+    // are taken once here the way `align` takes its own.
+    let screen_skeletons = screen
+        .iter()
+        .map(|row| (row.glyph, terminal_anchors::skeleton(&row.text)))
+        .collect::<Vec<_>>();
+    let mut hits = vec![Vec::new(); screen.len()];
+    for (transcript_index, anchor) in transcript.iter().enumerate() {
+        let anchor_skeleton = terminal_anchors::skeleton(&anchor.text);
+        for (screen_index, (glyph, row_skeleton)) in screen_skeletons.iter().enumerate() {
+            if terminal_anchors::skeletons_match(
+                *glyph,
+                row_skeleton,
+                anchor.glyph,
+                &anchor_skeleton,
+            ) {
+                hits[screen_index].push(transcript_index);
+            }
+        }
+    }
+
+    let last_start = transcript.len() - window;
+    let mut chosen: Option<(usize, usize)> = None;
+    for start in 0..=last_start {
+        let end = start + window;
+        let cover = hits
+            .iter()
+            .filter(|hit| {
+                let lower = hit.partition_point(|index| *index < start);
+                lower < hit.len() && hit[lower] < end
+            })
+            .count();
+        let replace = match chosen {
+            Some((_, best_cover)) => cover >= best_cover,
+            None => true,
+        };
+        if replace {
+            chosen = Some((start, cover));
+        }
+    }
+    let best_start = chosen.map_or(last_start, |(start, _)| start);
+    &transcript[best_start..best_start + window]
+}
+
+fn message_anchor_text(source: &str) -> String {
+    source.lines().next().unwrap_or("").to_string()
+}
+
+fn tool_anchor_text(name: &str, input: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(input).ok();
+    let target = tool_target_from_input(parsed.as_ref());
+    format!("{name}({target})")
 }
 
 fn edited_file_path(name: &str, input: &str) -> Option<SharedString> {
@@ -2057,6 +2562,28 @@ impl MessageRole {
     }
 }
 
+/// Whether the pane should embed a tmux client for the selected conversation.
+///
+/// The identity is the tmux pane and the process in it. `/clear` replaces the
+/// conversation id and leaves both where they were; keying on the conversation would
+/// detach the reader and mint a second mirror.
+///
+/// `attach_arguments` mints a mirror name as it answers, so calling it on every frame
+/// would burn a name the terminal never uses. It returns `None` only when the field has
+/// no pane id, which is [`pane_target`].
+fn wanted_terminal(
+    in_pane: bool,
+    transcript_is_main: bool,
+    live_session: Option<(&str, u32, Option<&str>)>,
+) -> Option<TerminalTarget> {
+    if !in_pane || !transcript_is_main {
+        return None;
+    }
+    let (_session_id, process_id, tmux_target) = live_session?;
+    let pane = crate::session_registry::pane_target(tmux_target?)?;
+    Some(TerminalTarget { pane, process_id })
+}
+
 impl ClaudeSessionsPanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -2286,49 +2813,28 @@ impl ClaudeSessionsPanel {
     ) -> Self {
         let store_subscription = cx.observe(&store, |this: &mut Self, _, cx| {
             this.rebuild_entries(cx);
-            this.sync_input_availability(cx);
-            this.open_the_input_for_a_new_question(cx);
             this.follow_the_live_message(cx);
             if this.in_pane {
                 cx.emit(ItemNameChanged);
             }
-            // The session list changes on scans that leave the conversation
-            // untouched, so the panel is redrawn whether or not entries moved.
             cx.notify();
         });
 
-        let message_editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 8, window, cx);
-            editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
-            // Nothing is selected yet, so there is nothing to type into.
-            editor.set_read_only(true);
-            editor
-        });
-
-        // The `@` menu needs a listing from the machine the session runs on, so unlike
-        // the commands menu it cannot be answered from what is already here: the ask has
-        // to be made when the box changes rather than when it is drawn.
-        let editor_subscription = cx.subscribe(&message_editor, |this, _, event, cx| {
-            this.handle_message_editor_event(event, cx);
-        });
-
-        let mut this = Self {
+        Self {
             workspace,
             focus_handle: cx.focus_handle(),
             fs,
             store,
             source,
-            message_editor,
             project_root,
             in_pane: false,
-            input_expanded: true,
-            history_index: None,
-            question_ticks: HashSet::default(),
-            ticked_question: None,
+            terminal: None,
+            terminal_for: None,
+            _terminal_attach: Task::ready(()),
+            rail_expanded: true,
+            rail_shows_everything: false,
             permission_answered: false,
             permission_answered_for: None,
-            slash_send_note: None,
-            opened_input_for_question: None,
             live_message_scroll: ScrollHandle::new(),
             live_message_length: 0,
             live_message_markdown_key: None,
@@ -2340,26 +2846,13 @@ impl ClaudeSessionsPanel {
             stop_armed_until_ms: None,
             lifecycle_note: None,
             _lifecycle_command: Task::ready(()),
-            file_matches: Vec::new(),
-            file_matches_for: None,
-            file_query: None,
-            file_highlight: 0,
-            dismissed_file_menu_for: None,
-            _listing_files: Task::ready(()),
-            _pasting: Task::ready(()),
-            paste_error: None,
-            slash_highlight: 0,
-            dismissed_slash_menu_for: None,
-            slash_commands: Vec::new(),
-            slash_commands_for: None,
-            slash_commands_fresh: false,
-            _listing_slash_commands: Task::ready(()),
             hook_install_note: None,
             _installing_hook: Task::ready(()),
             entries: Vec::new(),
-            pending_sends: PendingSends::default(),
             activity: Activity::Idle,
             agent_calls: HashMap::default(),
+            billing: HashMap::default(),
+            turn_bills: HashMap::default(),
             list_state: scroll_tracking_list_state(cx),
             session_list_expanded: true,
             collapsed_session_agents: HashSet::default(),
@@ -2368,7 +2861,7 @@ impl ClaudeSessionsPanel {
             expanded: HashSet::default(),
             show_full_history: false,
             show_tool_calls: false,
-            show_costs: false,
+            show_costs: true,
             markdowns: HashMap::default(),
             entry_cache: EntryCache::default(),
             cached_transcript_generation: 0,
@@ -2381,23 +2874,18 @@ impl ClaudeSessionsPanel {
             dispatch_prompts: HashMap::default(),
             patched_calls: HashSet::default(),
             attachment_loads: HashMap::default(),
+            entries_generation: 0,
+            reachable_anchors: Vec::new(),
+            anchor_cache: None,
+            cached_scrolled_back: false,
+            rail_width: px(RAIL_WIDTH_DEFAULT_PIXELS),
+            rail_row_budget: None,
+            rail_drag_position: None,
+            zoomed_image: None,
+            anchored_on_screen: HashSet::default(),
+            hovered_anchor: None,
+            followed_index: None,
             _store_subscription: store_subscription,
-            _editor_subscription: editor_subscription,
-        };
-        // Read once here rather than per keystroke: the files behind these change far
-        // less often than the reader types.
-        this.load_slash_commands(cx);
-        this
-    }
-
-    fn handle_message_editor_event(&mut self, event: &EditorEvent, cx: &mut Context<Self>) {
-        match event {
-            EditorEvent::BufferEdited => {
-                self.paste_error = None;
-                self.list_files_for_mention(cx);
-            }
-            EditorEvent::Focused | EditorEvent::FocusedIn => self.load_slash_commands(cx),
-            _ => {}
         }
     }
 
@@ -2405,7 +2893,6 @@ impl ClaudeSessionsPanel {
         self.show_the_newest_of_another_conversation();
         self.store
             .update(cx, |store, cx| store.select(session_id, cx));
-        self.load_slash_commands(cx);
     }
 
     /// What is owed to a reader who has been moved to another conversation, whichever
@@ -2418,415 +2905,10 @@ impl ClaudeSessionsPanel {
         self.unread_below.reset();
         self.list_state.scroll_to_end();
         self.scrolled_to_end = true;
-        // Both are about the session being left: a place in its history, and a quit
-        // aimed at it. Neither means anything against the one arrived at.
-        self.history_index = None;
-        self.question_ticks.clear();
-        self.ticked_question = None;
+        // Aimed at the session being left: an Allow/Deny for its prompt is not an
+        // answer to the next session's.
         self.permission_answered = false;
         self.permission_answered_for = None;
-        self.slash_send_note = None;
-        self.file_matches.clear();
-        self.file_matches_for = None;
-        self.file_query = None;
-        self.file_highlight = 0;
-        self.dismissed_file_menu_for = None;
-        self._listing_files = Task::ready(());
-        self.dismissed_slash_menu_for = None;
-        self.slash_highlight = 0;
-        self.slash_commands.clear();
-        self.slash_commands_for = None;
-        self.slash_commands_fresh = false;
-    }
-
-    fn copy_setup_commands(&self, cx: &mut Context<Self>) {
-        let Some(home) = self.store.read(cx).home_directory() else {
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(channel_setup_commands(home)));
-    }
-
-    /// Puts the previous message sent to this session in the box, as Up does in the
-    /// terminal.
-    fn recall_previous_message(
-        &mut self,
-        _: &PreviousMessage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.step_through_slash_menu(MenuStep::Up, cx)
-            || self.step_through_file_menu(MenuStep::Up, cx)
-        {
-            return;
-        }
-
-        let store = self.store.read(cx);
-        let history = message_history_for(
-            &self.pending_sends,
-            store.main_transcript(),
-            store.selected(),
-        );
-        let typed = self.message_editor.read(cx).text(cx);
-        let step = step_back_through_history(&history, self.history_index, &typed);
-        self.take_history_step(step, window, cx);
-    }
-
-    /// Walks back down towards the box's own draft, as Down does in the terminal.
-    fn recall_next_message(
-        &mut self,
-        _: &NextMessage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.step_through_slash_menu(MenuStep::Down, cx)
-            || self.step_through_file_menu(MenuStep::Down, cx)
-        {
-            return;
-        }
-
-        let store = self.store.read(cx);
-        let history = message_history_for(
-            &self.pending_sends,
-            store.main_transcript(),
-            store.selected(),
-        );
-        let typed = self.message_editor.read(cx).text(cx);
-        let step = step_forward_through_history(&history, self.history_index, &typed);
-        self.take_history_step(step, window, cx);
-    }
-
-    /// The files the `@` menu is offering, or `None` when nothing is being named.
-    ///
-    fn offered_files(&self, cx: &Context<Self>) -> Option<Vec<SharedString>> {
-        if !self.can_send(cx) {
-            return None;
-        }
-        let typed = self.message_editor.read(cx).text(cx);
-        if self.dismissed_file_menu_for.as_deref() == Some(typed.as_str()) {
-            return None;
-        }
-        let named = file_being_named(&typed)?;
-        let offered = matching_files(&self.file_matches, named);
-        if offered.is_empty() {
-            return None;
-        }
-        Some(offered)
-    }
-
-    /// Asks the machine the session runs on for the files a newly typed `@` names.
-    ///
-    fn list_files_for_mention(&mut self, cx: &mut Context<Self>) {
-        let typed = self.message_editor.read(cx).text(cx);
-        let named = file_being_named(&typed)
-            .filter(|named| !named.is_empty())
-            .map(str::to_string);
-        self.list_files_for_query(named, cx);
-    }
-
-    fn list_files_for_query(&mut self, named: Option<String>, cx: &mut Context<Self>) {
-        self.file_query = named.clone();
-        let Some(named) = named else {
-            self.file_highlight = 0;
-            self._listing_files = Task::ready(());
-            cx.notify();
-            return;
-        };
-        if self.file_matches_for.as_deref() == Some(named.as_str()) {
-            return;
-        }
-
-        let Some(directory) = self.store.read(cx).session_directory() else {
-            return;
-        };
-        let Some(session_id) = self.store.read(cx).selected().map(str::to_string) else {
-            return;
-        };
-        let source = self.source.clone();
-        self._listing_files = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(FILE_LIST_DEBOUNCE).await;
-            let still_current = this
-                .read_with(cx, |this, cx| {
-                    this.file_query.as_deref() == Some(named.as_str())
-                        && this.store.read(cx).selected() == Some(session_id.as_str())
-                })
-                .unwrap_or(false);
-            if !still_current {
-                return;
-            }
-            let list = source.list_session_files_in(session_id.clone(), directory, named.clone());
-            let Ok(paths) = list.await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                // Checked again here: the reader has typed on while this was in flight,
-                // and an answer to a query they have left is not the menu they want.
-                if this.file_query.as_deref() != Some(named.as_str())
-                    || this.store.read(cx).selected() != Some(session_id.as_str())
-                {
-                    return;
-                }
-                this.file_matches = paths.into_iter().map(SharedString::from).collect();
-                this.file_matches_for = Some(named);
-                this.file_highlight = 0;
-                cx.notify();
-            })
-            .log_err();
-        });
-    }
-
-    /// Puts a file's path in the box in place of the `@` being typed.
-    fn use_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.message_editor.read(cx).text(cx);
-        let Some(text) = message_with_mention(&typed, path) else {
-            return;
-        };
-
-        self.message_editor.update(cx, |editor, cx| {
-            editor.set_text(text.clone(), window, cx);
-            editor.move_to_end(&Default::default(), window, cx);
-        });
-        // The mention is finished, so the menu is too — and the text now ends in a space,
-        // which closes it anyway.
-        self.dismissed_file_menu_for = Some(text);
-        self.file_highlight = 0;
-        cx.notify();
-    }
-
-    /// The file the `@` menu's highlight is on.
-    fn highlighted_file(&self, cx: &Context<Self>) -> Option<SharedString> {
-        let offered = self.offered_files(cx)?;
-        let at = step_through_menu(self.file_highlight, offered.len(), MenuStep::Stay);
-        offered.get(at).cloned()
-    }
-
-    /// Moves the `@` menu's highlight, and reports whether it was open to take the key.
-    fn step_through_file_menu(&mut self, step: MenuStep, cx: &mut Context<Self>) -> bool {
-        let Some(offered) = self.offered_files(cx).map(|offered| offered.len()) else {
-            return false;
-        };
-        self.file_highlight = step_through_menu(self.file_highlight, offered, step);
-        cx.notify();
-        true
-    }
-
-    fn dismiss_file_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.offered_files(cx).is_none() {
-            return false;
-        }
-        self.dismissed_file_menu_for = Some(self.message_editor.read(cx).text(cx));
-        self.file_highlight = 0;
-        cx.notify();
-        true
-    }
-
-    /// Pastes into the message box, writing an image out as a file the session can read.
-    ///
-    /// The terminal takes text and nothing else, so an image cannot be sent as itself.
-    /// Written where the session can open it and named in the message by its path, which
-    /// is what Claude Code reads a picture from anyway.
-    fn paste_into_message(
-        &mut self,
-        _: &PasteIntoMessage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let image = cx.read_from_clipboard().and_then(|item| {
-            item.entries().iter().find_map(|entry| match entry {
-                ClipboardEntry::Image(image) => Some(image.clone()),
-                _ => None,
-            })
-        });
-
-        let Some(image) = image.filter(|_| self.can_send(cx)) else {
-            self.message_editor
-                .update(cx, |editor, cx| editor.paste(&Paste, window, cx));
-            return;
-        };
-
-        let name = pasted_file_name(now_millis(), image.format.extension(), &image.bytes);
-        let session_directory = self.store.read(cx).session_directory();
-        let write = self.source.write_session_file(name, image.bytes);
-        self._pasting = cx.spawn_in(window, async move |this, cx| {
-            let written = write.await;
-            this.update_in(cx, |this, window, cx| match written {
-                Ok(path) => {
-                    this.paste_error = None;
-                    let path =
-                        pasted_path_for_message(Path::new(&path), session_directory.as_deref());
-                    this.put_path_in_message_box(&path, window, cx);
-                }
-                Err(error) => {
-                    this.paste_error =
-                        Some(SharedString::from(format!("Pasting the image: {error:#}")));
-                    cx.notify();
-                }
-            })
-            .log_err();
-        });
-    }
-
-    /// Inserts a path at the caret, which is what a pasted file is in a message.
-    fn put_path_in_message_box(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.message_editor.update(cx, |editor, cx| {
-            editor.insert(&format!("{path} "), window, cx);
-        });
-        cx.notify();
-    }
-
-    /// Moves the highlight, and reports whether the menu was open to take the key.
-    fn step_through_slash_menu(&mut self, step: MenuStep, cx: &mut Context<Self>) -> bool {
-        let Some(offered) = self.offered_slash_commands(cx).map(|offered| offered.len()) else {
-            return false;
-        };
-        self.slash_highlight = step_through_menu(self.slash_highlight, offered, step);
-        cx.notify();
-        true
-    }
-
-    /// The command the menu's highlight is on, clamped to what the menu is still
-    /// offering.
-    fn highlighted_slash_command(&self, cx: &Context<Self>) -> Option<SlashCommand> {
-        let offered = self.offered_slash_commands(cx)?;
-        let at = step_through_menu(self.slash_highlight, offered.len(), MenuStep::Stay);
-        offered.get(at).map(|command| (*command).clone())
-    }
-
-    /// Puts the menu away without taking what is typed with it. Typing on brings it back.
-    fn dismiss_slash_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.offered_slash_commands(cx).is_none() {
-            return false;
-        }
-        self.dismissed_slash_menu_for = Some(self.message_editor.read(cx).text(cx));
-        self.slash_highlight = 0;
-        cx.notify();
-        true
-    }
-
-    fn take_history_step(
-        &mut self,
-        step: HistoryStep,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = match step {
-            HistoryStep::Stay => return,
-            HistoryStep::MoveCursor(direction) => {
-                self.message_editor
-                    .update(cx, |editor, cx| match direction {
-                        CursorDirection::Up => editor.move_up(&MoveUp, window, cx),
-                        CursorDirection::Down => editor.move_down(&MoveDown, window, cx),
-                    });
-                return;
-            }
-            HistoryStep::Draft => {
-                self.history_index = None;
-                String::new()
-            }
-            HistoryStep::Recall { index, message } => {
-                self.history_index = Some(index);
-                message.to_string()
-            }
-        };
-
-        self.message_editor.update(cx, |editor, cx| {
-            editor.set_text(text, window, cx);
-            editor.move_to_end(&Default::default(), window, cx);
-        });
-        cx.notify();
-    }
-
-    /// Reads the slash commands the machine holds, once, in the background.
-    ///
-    /// The files behind them change far less often than the reader types, so this is not
-    /// redone per keystroke — and a listing that fails leaves the menu with what it had,
-    /// which for a first read is nothing and for a later one is still true enough to
-    /// choose from.
-    fn load_slash_commands(&mut self, cx: &mut Context<Self>) {
-        let (session_id, session_directory) = {
-            let store = self.store.read(cx);
-            let Some(session_id) = store.selected().map(str::to_string) else {
-                return;
-            };
-            let Some(session_directory) = store.session_directory() else {
-                return;
-            };
-            (session_id, session_directory)
-        };
-        if self.slash_commands_fresh
-            && self.slash_commands_for.as_deref() == Some(session_id.as_str())
-        {
-            return;
-        }
-        self.slash_commands_fresh = true;
-        self.slash_commands_for = Some(session_id.clone());
-        let list = self
-            .source
-            .list_slash_commands_for(Some(session_directory), Some(session_id.clone()));
-        self._listing_slash_commands = cx.spawn(async move |this, cx| {
-            let commands = list.await.log_err();
-            if let Some(commands) = commands {
-                this.update(cx, |this, cx| {
-                    if this.store.read(cx).selected() == Some(session_id.as_str()) {
-                        this.slash_commands = commands;
-                        cx.notify();
-                    }
-                })
-                .log_err();
-            }
-            cx.background_executor()
-                .timer(SLASH_COMMAND_CACHE_DURATION)
-                .await;
-            this.update(cx, |this, _| {
-                if this.slash_commands_for.as_deref() == Some(session_id.as_str()) {
-                    this.slash_commands_fresh = false;
-                }
-            })
-            .log_err();
-        });
-    }
-
-    /// The commands the menu is offering, or `None` when what is typed names none.
-    fn offered_slash_commands(&self, cx: &Context<Self>) -> Option<Vec<&SlashCommand>> {
-        if !self.can_send(cx) {
-            return None;
-        }
-        let typed = self.message_editor.read(cx).text(cx);
-        if self.dismissed_slash_menu_for.as_deref() == Some(typed.as_str()) {
-            return None;
-        }
-        let named = slash_command_being_named(&typed)?;
-
-        let matches = matching_slash_commands(&self.slash_commands, named);
-        // Nothing matching is not a menu: the reader is typing a command this machine
-        // does not hold, and an empty box under the input says less than no box.
-        (!matches.is_empty()).then_some(matches)
-    }
-
-    /// Puts a command into the message box, ready for whatever it takes after its name.
-    ///
-    /// Not sent: a command that takes arguments is only half typed at this point, and one
-    /// that takes none is a keypress away from going.
-    fn use_slash_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let takes_arguments = self
-            .slash_commands
-            .iter()
-            .find(|command| command.name == name)
-            .is_some_and(|command| command.argument_hint.is_some());
-        let text = if takes_arguments {
-            format!("/{name} ")
-        } else {
-            format!("/{name}")
-        };
-
-        self.message_editor.update(cx, |editor, cx| {
-            editor.set_text(text.clone(), window, cx);
-            editor.move_to_end(&Default::default(), window, cx);
-        });
-        // A command whose name is now whole would otherwise leave the menu open on the
-        // one row it still matches, with Enter completing what is already complete.
-        self.dismissed_slash_menu_for = Some(text);
-        self.slash_highlight = 0;
-        cx.notify();
     }
 
     fn install_hooks(&mut self, cx: &mut Context<Self>) {
@@ -2877,33 +2959,6 @@ impl ClaudeSessionsPanel {
         });
         cx.notify();
     }
-    fn toggle_input(&mut self, cx: &mut Context<Self>) {
-        self.input_expanded = !self.input_expanded;
-        cx.notify();
-    }
-
-    /// Opens the input for a question that has just arrived, once.
-    ///
-    /// A question stops the session until it is answered, and a reader who does not know
-    /// one is waiting reads the session as stuck while the answer sits behind a
-    /// disclosure they have no reason to open. Only its arrival opens it, so the reader
-    /// can close it again and have it stay closed.
-    fn open_the_input_for_a_new_question(&mut self, cx: &mut Context<Self>) {
-        let asking = self
-            .store
-            .read(cx)
-            .live()
-            .pending_question
-            .as_ref()
-            .map(|question| SharedString::from(question.tool_use_id.clone()));
-        if self.opened_input_for_question == asking {
-            return;
-        }
-        self.opened_input_for_question = asking.clone();
-        if asking.is_some() {
-            self.input_expanded = true;
-        }
-    }
 
     fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
         self.session_list_expanded = !self.session_list_expanded;
@@ -2931,6 +2986,15 @@ impl ClaudeSessionsPanel {
     /// loses a line of cost changes height, and the list holds the heights it measured.
     fn toggle_costs(&mut self, cx: &mut Context<Self>) {
         self.show_costs = !self.show_costs;
+        let count = self.entries.len();
+        self.list_state.remeasure_items(0..count);
+        cx.notify();
+    }
+
+    /// The entries stay put — list indices are the entries — but a body that
+    /// appears or disappears changes the height the list measured.
+    fn toggle_rail_shows_everything(&mut self, cx: &mut Context<Self>) {
+        self.rail_shows_everything = !self.rail_shows_everything;
         let count = self.entries.len();
         self.list_state.remeasure_items(0..count);
         cx.notify();
@@ -2997,6 +3061,170 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
+    fn displayed_rail_width(&self) -> Pixels {
+        let available = self
+            .rail_row_budget
+            .unwrap_or_else(unconstrained_rail_budget);
+        clamped_rail_width(self.rail_width, available)
+    }
+
+    fn remember_rail_budget(&mut self, row_width: Pixels, cx: &mut Context<Self>) {
+        let budget = terminal_and_rail_budget(row_width, self.terminal.is_some());
+        if self.rail_row_budget == Some(budget) {
+            return;
+        }
+        self.rail_row_budget = Some(budget);
+        let next = clamped_rail_width(self.rail_width, budget);
+        if self.rail_width != next {
+            self.rail_width = next;
+            cx.notify();
+        }
+    }
+
+    fn on_rail_drag_move(&mut self, event: &DragMoveEvent<DraggedRail>, cx: &mut Context<Self>) {
+        if self.rail_drag_position == Some(event.event.position) {
+            return;
+        }
+        self.rail_drag_position = Some(event.event.position);
+        let budget = terminal_and_rail_budget(event.bounds.size.width, self.terminal.is_some());
+        self.rail_row_budget = Some(budget);
+        let requested = event.bounds.right() - event.event.position.x;
+        let next = clamped_rail_width(requested, budget);
+        if self.rail_width != next {
+            self.rail_width = next;
+            cx.notify();
+        }
+    }
+
+    fn set_hovered_anchor(&mut self, next: Option<SharedString>, cx: &mut Context<Self>) {
+        if !hover_anchor_changed(self.hovered_anchor.as_deref(), next.as_deref()) {
+            return;
+        }
+        self.hovered_anchor = next;
+        cx.notify();
+    }
+
+    fn open_zoomed_image(&mut self, key: SharedString, image: Arc<Image>, cx: &mut Context<Self>) {
+        self.zoomed_image = Some(ZoomedImage { key, image });
+        cx.notify();
+    }
+
+    fn render_zoomed_image(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let zoomed = self.zoomed_image.clone()?;
+        let overlay_id = SharedString::from(format!("claude-zoomed-image-{}", zoomed.key));
+        let image_id = SharedString::from(format!("claude-zoomed-image-content-{}", zoomed.key));
+        Some(
+            div()
+                .id(overlay_id)
+                .absolute()
+                .inset_0()
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().colors().background.opacity(0.8))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.zoomed_image = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(
+                    img(zoomed.image)
+                        .id(image_id)
+                        .max_w_full()
+                        .max_h_full()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.zoomed_image = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_rail_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel_id = cx.entity_id();
+        div()
+            .id(SharedString::from(format!(
+                "claude-rail-resize-{panel_id:?}"
+            )))
+            .w(px(RAIL_RESIZE_HANDLE_PIXELS))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .occlude()
+            .on_drag(DraggedRail, |rail, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| rail.clone())
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.rail_drag_position = None;
+                    if event.click_count == 2 {
+                        let budget = this
+                            .rail_row_budget
+                            .unwrap_or_else(unconstrained_rail_budget);
+                        let next = clamped_rail_width(px(RAIL_WIDTH_DEFAULT_PIXELS), budget);
+                        if this.rail_width != next {
+                            this.rail_width = next;
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn present_anchored_entry(
+        &mut self,
+        key: &SharedString,
+        element: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on_screen = self.anchored_on_screen.contains(key);
+        let hovered = self.hovered_anchor.as_ref() == Some(key);
+        let has_anchor = self
+            .reachable_anchors
+            .iter()
+            .any(|anchor| anchor.anchor.key == key.as_ref());
+        if !on_screen && !hovered && !has_anchor {
+            return element;
+        }
+        let hover_key = key.clone();
+        let accent = cx.theme().colors().icon_accent;
+        let hover_background = cx.theme().colors().element_hover;
+        div()
+            .id(SharedString::from(format!("claude-anchored-entry-{key}")))
+            .w_full()
+            .when(on_screen, move |this| {
+                this.border_l_2().border_color(accent)
+            })
+            .when(hovered, move |this| this.bg(hover_background))
+            .when(has_anchor, |this| {
+                this.on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let next = if *hovered {
+                        Some(hover_key.clone())
+                    } else {
+                        None
+                    };
+                    this.set_hovered_anchor(next, cx);
+                }))
+            })
+            .child(element)
+            .into_any_element()
+    }
+
     fn forget_live_message_markdown(&mut self) {
         if let Some(old_key) = self.live_message_markdown_key.take() {
             self.markdowns.remove(&old_key);
@@ -3025,38 +3253,44 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
+    fn reveal_anchored_entry(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        // The index is the one from the latest rebuild, not the frame that drew the
+        // chip: entries are replaced on a timer, and a captured index would scroll
+        // to whatever later landed in that slot.
+        let Some(index) = self
+            .reachable_anchors
+            .iter()
+            .find(|anchor| anchor.anchor.key == key.as_ref())
+            .map(|anchor| anchor.index)
+        else {
+            return;
+        };
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        if entry.key == key && !self.expanded.contains(&entry.key) {
+            let entry_key = entry.key.clone();
+            self.toggle_expanded(entry_key, index, cx);
+        }
+        self.list_state.scroll_to_reveal_item(index);
+        cx.notify();
+    }
+
     fn rebuild_entries(&mut self, cx: &mut Context<Self>) {
         self.refresh_entry_cache(cx);
 
-        // Rebind first: a just-cleared session's rows must follow the new id, not be
-        // marked failed because the old id is no longer live.
-        let rebinds = self
-            .store
-            .update(cx, |store, _cx| store.take_cleared_rebinds());
-        for (old_session_id, new_session_id) in rebinds {
-            self.pending_sends.rebind(&old_session_id, &new_session_id);
-        }
-        {
-            let store = self.store.read(cx);
-            self.pending_sends.fail_in_flight_of_unknown_sessions(
-                store
-                    .sessions()
-                    .iter()
-                    .map(|session| session.session.session_id.as_str())
-                    .chain(
-                        store
-                            .ended_sessions()
-                            .iter()
-                            .map(|ended| ended.session_id.as_str()),
-                    ),
-            );
-        }
-        self.pending_sends.evict_finished_over_bound();
+        // Pending sends were the only reader of a `/clear` rebind. The store still
+        // records one pair per `/clear` of the selected session and keeps every pair
+        // until something takes it, and the store lives as long as this panel does.
+        drop(
+            self.store
+                .update(cx, |store, _cx| store.take_cleared_rebinds()),
+        );
 
         // Moved out for the duration of the build so that the transcript can be borrowed
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
-        let (mut new_entries, activity, agent_calls, patched_calls, sent_to_the_session) = {
+        let (mut new_entries, billing, activity, agent_calls, patched_calls) = {
             let store = self.store.read(cx);
             let home_directory = store.home_directory();
             let transcript = store.transcript();
@@ -3065,10 +3299,7 @@ impl ClaudeSessionsPanel {
             } else {
                 transcript.active_path()
             };
-            // What the session is doing, and which records a sent message may have been
-            // written as, are questions about the session rather than about the
-            // conversation on screen: both are read from the session's own conversation
-            // whichever one the reader has open.
+            // Activity is about the session, not whichever agent conversation is open.
             let session_path = store.main_transcript().active_path();
             let live = store.live();
             let activity = if live.last_event_at_ms == 0 {
@@ -3086,26 +3317,20 @@ impl ClaudeSessionsPanel {
             } else {
                 Activity::Idle
             };
-            let walk_the_session = self.pending_sends.has_row_for(store.selected());
-            #[cfg(test)]
-            if walk_the_session {
-                self.pending_sends.session_transcript_walks = self
-                    .pending_sends
-                    .session_transcript_walks
-                    .saturating_add(1);
-            }
             (
                 build_entries(&path, home_directory, &mut cache),
+                billing_of_path(&path),
                 activity,
                 agent_calls(&path),
                 calls_answered_with_a_patch(&path),
-                // Read only while a message of this session is waiting. A Failed row
-                // left in another session must not keep walking this transcript; see
-                // [`user_message_entries`].
-                walk_the_session.then(|| user_message_entries(&session_path)),
             )
         };
         self.entry_cache = cache;
+        // Taken before collapse. A streaming rewrite can change a record's usage without
+        // changing the entry derived from it, and the early return below would otherwise
+        // leave the card on the previous snapshot.
+        self.turn_bills = turn_bills(&new_entries, &billing);
+        self.billing = billing;
         self.activity = activity;
         self.agent_calls = agent_calls;
         self.patched_calls = patched_calls;
@@ -3114,6 +3339,9 @@ impl ClaudeSessionsPanel {
         if !turn_running {
             self.interrupt_sent_at_ms = None;
         }
+        // Collapse consumes the list. The anchors have to be taken from the copy,
+        // because a finished turn's tool rows are what the terminal still shows.
+        let pre_collapse = new_entries.clone();
         new_entries = collapse_turns(
             new_entries,
             &self.expanded,
@@ -3126,60 +3354,28 @@ impl ClaudeSessionsPanel {
         // Answer state is aimed at one call, not at "something is pending": the tool a
         // reader allowed can finish and the next permission be asked for inside a single
         // poll, and the prompt that arrives then has been answered by nobody.
-        let (asking_permission, asking_question) = {
+        let asking_permission = {
             let live = self.store.read(cx).live();
-            (
-                live.pending_permission
-                    .as_ref()
-                    .map(|permission| SharedString::from(permission.tool_use_id.clone())),
-                live.pending_question
-                    .as_ref()
-                    .map(|question| SharedString::from(question.tool_use_id.clone())),
-            )
+            live.pending_permission
+                .as_ref()
+                .map(|permission| SharedString::from(permission.tool_use_id.clone()))
         };
         if self.permission_answered_for != asking_permission {
             self.permission_answered = false;
             self.permission_answered_for = None;
         }
-        if self.ticked_question != asking_question {
-            self.question_ticks.clear();
-            self.ticked_question = asking_question;
+
+        if matches!(
+            self.store.read(cx).transcript_target(),
+            TranscriptTarget::Main
+        ) {
+            let store = self.store.read(cx);
+            new_entries.extend(queued_entries(store.transcript().queued_messages()));
         }
 
-        let selected = self.store.read(cx).selected().map(str::to_string);
-        if let (Some(session_id), sent_to_the_session) = (selected.as_deref(), sent_to_the_session)
-        {
-            self.pending_sends.pair_with_channel_for(
-                self.store.read(cx).channel_events(),
-                now_millis(),
-                session_id,
-            );
-            // Paired against the session's own conversation and never against an agent's: an
-            // agent is given its task as a user record of its own conversation, so an agent's
-            // records hold the very text a send carries, and a pairing there would take down a
-            // message that had never arrived. Against records only, so that a pending message
-            // is never paired with another pending message and nothing derived from one
-            // reaches the entry cache. Only this session's rows: another session's in-flight
-            // send can carry the same text, and an echo here must not take that one down.
-            if let Some(sent_to_the_session) = sent_to_the_session {
-                self.pending_sends
-                    .pair_with_session(&sent_to_the_session, session_id);
-            }
-        }
-        if pending_is_drawn_in(self.store.read(cx).transcript_target()) {
-            new_entries.extend(self.pending_sends.entries_for(selected.as_deref()));
-            // Drawn after the pending sends and behind the same rule, because both are
-            // messages that have not reached the conversation yet. A message sent from
-            // Zed is in the session's queue as well, and is already drawn as a pending
-            // send — the one the panel can take down when the send fails — so the queue
-            // entry matching it is left to that.
-            let store = self.store.read(cx);
-            new_entries.extend(queued_entries(
-                store.transcript().queued_messages(),
-                &self.pending_sends,
-                selected.as_deref(),
-            ));
-        }
+        let anchors = reachable_anchors(&pre_collapse, &new_entries);
+        let anchors_changed = !same_anchor_identity(&self.reachable_anchors, &anchors);
+        self.reachable_anchors = anchors;
 
         let old_length = self.entries.len();
         let new_length = new_entries.len();
@@ -3206,6 +3402,11 @@ impl ClaudeSessionsPanel {
         let changed_old = common_prefix..(old_length - common_suffix);
         let changed_count = (new_length - common_suffix) - common_prefix;
         if changed_old.is_empty() && changed_count == 0 {
+            // The collapsed list can stay put while a hidden tool row's text changes.
+            // The alignment cache keys off this generation, so it has to move too.
+            if anchors_changed {
+                self.entries_generation = self.entries_generation.wrapping_add(1);
+            }
             return;
         }
 
@@ -3224,6 +3425,7 @@ impl ClaudeSessionsPanel {
             .entries_arrived(arrived, was_scrolled_to_end);
 
         self.entries = new_entries;
+        self.entries_generation = self.entries_generation.wrapping_add(1);
         self.list_state.splice(changed_old, changed_count);
 
         let live_keys = self.live_cache_keys();
@@ -5085,102 +5287,6 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
-    /// Whether a reply can be typed at all.
-    ///
-    /// The Zed channel has to be live, and the conversation on screen has to be the
-    /// session's own. An agent's conversation is something to read: a reply sent from
-    /// under an agent's records would arrive in a conversation the reader is not looking
-    /// at.
-    fn can_send(&self, cx: &App) -> bool {
-        let store = self.store.read(cx);
-        !store.selected_is_ended()
-            && !store.live().session_ended
-            && store.channel_live()
-            && *store.transcript_target() == TranscriptTarget::Main
-    }
-
-    /// A session whose channel is not loaded can only be read, and so can no session at
-    /// all; the input is disabled in both cases rather than hidden, so that the reason is
-    /// visible where the reply would be typed.
-    fn sync_input_availability(&mut self, cx: &mut Context<Self>) {
-        let read_only = !self.can_send(cx);
-        self.message_editor.update(cx, |editor, cx| {
-            if editor.read_only(cx) != read_only {
-                editor.set_read_only(read_only);
-                cx.notify();
-            }
-        });
-    }
-
-    /// Only ever reached from a user gesture — the Send button, or the binding on the
-    /// input's `enter`.
-    fn send_message(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
-            return;
-        }
-
-        // Enter belongs to the commands menu while it is open, as it does in every other
-        // completion menu — except when what is typed is already the whole command, for
-        // which completing it would cost a second Enter every time.
-        if let Some(highlighted) = self.highlighted_slash_command(cx) {
-            let typed = self.message_editor.read(cx).text(cx);
-            if let EnterInMenu::Complete(name) = enter_in_slash_menu(&typed, &highlighted) {
-                self.use_slash_command(&name, window, cx);
-                return;
-            }
-        }
-        // A mention is never whole until it is picked: what is typed is a query, and the
-        // path it names is the thing the session can open.
-        if let Some(path) = self.highlighted_file(cx) {
-            self.use_file(&path, window, cx);
-            return;
-        }
-
-        let text = self.message_editor.read(cx).text(cx);
-        if text.trim().is_empty() {
-            return;
-        }
-
-        match slash_send_decision(&text) {
-            SlashSendDecision::SendAsText => {}
-            SlashSendDecision::OpenInTerminal => {
-                self.slash_send_note = Some(SharedString::from(OPEN_IN_TERMINAL_NOTE));
-                cx.notify();
-                return;
-            }
-            SlashSendDecision::NeedsArgument { example } => {
-                self.slash_send_note = Some(SharedString::from(example));
-                cx.notify();
-                return;
-            }
-        }
-
-        self.dispatch_message(text, window, cx);
-    }
-
-    fn dispatch_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
-            return;
-        }
-        let Some(session_id) = self.store.read(cx).selected().map(str::to_string) else {
-            return;
-        };
-
-        self.slash_send_note = None;
-        let send = self
-            .store
-            .update(cx, |store, cx| store.send_message(text.clone(), cx));
-        self.message_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.history_index = None;
-        let pending_send = self
-            .pending_sends
-            .remember(session_id, &text, &self.entries);
-        self.rebuild_entries(cx);
-        cx.notify();
-        self.wait_for_pending_send(pending_send, send, cx);
-    }
-
     fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
         if self.permission_answered {
             return;
@@ -5210,62 +5316,6 @@ impl ClaudeSessionsPanel {
             .log_err();
         })
         .detach();
-    }
-
-    /// Takes down one pending message. Reached only from the button on that message: a
-    /// message that never turns up in the transcript is left where it is until the user
-    /// says otherwise, because dropping it on a timer is the very thing that made the
-    /// text look lost in the first place.
-    fn dismiss_pending_send(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.pending_sends.dismiss(id);
-        self.rebuild_entries(cx);
-        cx.notify();
-    }
-
-    fn retry_pending_send(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(text) = self.pending_sends.retry(id, &self.entries) else {
-            return;
-        };
-        let send = self
-            .store
-            .update(cx, |store, cx| store.send_message(text.to_string(), cx));
-        self.rebuild_entries(cx);
-        cx.notify();
-        self.wait_for_pending_send(id, send, cx);
-    }
-
-    fn wait_for_pending_send(
-        &mut self,
-        id: u64,
-        send: Task<anyhow::Result<String>>,
-        cx: &mut Context<Self>,
-    ) {
-        cx.spawn(async move |this, cx| {
-            let outcome = send.await;
-            this.update(cx, |this, cx| {
-                this.pending_sends.resolve(id, &outcome);
-                this.rebuild_entries(cx);
-                cx.notify();
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    fn copy_pending_send(&self, id: u64, cx: &mut Context<Self>) {
-        let Some(text) = self.pending_sends.text(id) else {
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-    }
-
-    fn dismiss_menus(&mut self, _: &DismissMenus, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dismiss_slash_menu(cx) || self.dismiss_file_menu(cx) {
-            return;
-        }
-        self.question_ticks.clear();
-        self.focus_handle.focus(window, cx);
-        cx.notify();
     }
 
     /// The one control the conversation needs of its own: whether the session's tool
@@ -5505,6 +5555,35 @@ impl ClaudeSessionsPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .child(
+                        IconButton::new(
+                            "claude-session-toggle-rail",
+                            if self.rail_expanded {
+                                IconName::ThreadsSidebarRightOpen
+                            } else {
+                                IconName::ThreadsSidebarRightClosed
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Show/Hide details"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.rail_expanded = !this.rail_expanded;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        IconButton::new("claude-session-rail-scope", IconName::Info)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.rail_shows_everything)
+                            .tooltip(Tooltip::text(if self.rail_shows_everything {
+                                "Show only what the terminal cannot"
+                            } else {
+                                "Show everything"
+                            }))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_rail_shows_everything(cx)),
+                            ),
+                    )
                     .children(claude_ai_url.map(|url| {
                         Button::new("claude-session-open-claude-ai", "Open in claude.ai")
                             .label_size(LabelSize::XSmall)
@@ -5531,175 +5610,6 @@ impl ClaudeSessionsPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
                     ),
             )
-    }
-
-    fn render_slash_commands(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let offered = self.offered_slash_commands(cx)?;
-        let highlighted = step_through_menu(self.slash_highlight, offered.len(), MenuStep::Stay);
-        // Taken by value here: the rows outlive the borrow of the commands, because each
-        // row's handler carries the name it will put in the box.
-        let rows: Vec<(
-            SharedString,
-            Option<SharedString>,
-            SharedString,
-            String,
-            bool,
-        )> = offered
-            .into_iter()
-            .map(|command| {
-                let scope = match command.scope {
-                    SlashCommandScope::Builtin => "built in",
-                    SlashCommandScope::Project => "this project",
-                    SlashCommandScope::User => "yours",
-                };
-                let shown = match command.argument_hint.as_deref() {
-                    Some(hint) => format!("/{} {hint}", command.name),
-                    None => format!("/{}", command.name),
-                };
-                let needs_terminal = slash_command_needs_terminal(&command.name);
-                (
-                    SharedString::from(shown),
-                    command.description.clone().map(SharedString::from),
-                    SharedString::from(scope),
-                    command.name.clone(),
-                    needs_terminal,
-                )
-            })
-            .collect();
-
-        let mut menu = v_flex().w_full().px_2().pb_1().gap_0p5().child(
-            h_flex()
-                .w_full()
-                .gap_1()
-                .flex_wrap()
-                .justify_between()
-                .child(
-                    Label::new("Commands")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                // Said because the menu is new: one nobody knows takes the arrow keys is
-                // a menu picked with the mouse.
-                .child(
-                    Label::new("\u{2191}\u{2193} choose \u{b7} enter use \u{b7} esc close")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-        );
-
-        for (index, (name, description, scope, command_name, needs_terminal)) in
-            rows.into_iter().enumerate()
-        {
-            let is_highlighted = index == highlighted;
-            menu = menu.child(
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .justify_between()
-                    // On the row rather than only on the button, so that which row Enter
-                    // would take is legible across the whole width of the menu.
-                    .when(is_highlighted, |this| {
-                        this.rounded_sm().bg(cx.theme().colors().element_selected)
-                    })
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("claude-session-slash-{index}")),
-                            name,
-                        )
-                        .toggle_state(is_highlighted)
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text(
-                            description
-                                .clone()
-                                .unwrap_or_else(|| SharedString::from("Put this in the box")),
-                        ))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.use_slash_command(&command_name, window, cx)
-                            },
-                        )),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .when(needs_terminal, |this| {
-                                this.child(
-                                    Label::new("terminal")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .child(
-                                Label::new(scope)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    ),
-            );
-        }
-
-        Some(menu.into_any_element())
-    }
-
-    /// The files the `@` being typed could be naming, drawn as rows to pick from.
-    fn render_file_matches(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let offered = self.offered_files(cx)?;
-        let highlighted = step_through_menu(self.file_highlight, offered.len(), MenuStep::Stay);
-
-        let mut menu = v_flex().w_full().px_2().pb_1().gap_0p5().child(
-            h_flex()
-                .w_full()
-                .gap_1()
-                .flex_wrap()
-                .justify_between()
-                .child(
-                    Label::new("Files")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new("\u{2191}\u{2193} choose \u{b7} enter use \u{b7} esc close")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-        );
-
-        for (index, path) in offered.into_iter().enumerate() {
-            let is_highlighted = index == highlighted;
-            let chosen = path.clone();
-            menu = menu.child(
-                h_flex()
-                    .w_full()
-                    .when(is_highlighted, |this| {
-                        this.rounded_sm().bg(cx.theme().colors().element_selected)
-                    })
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("claude-session-file-{index}")),
-                            path,
-                        )
-                        .toggle_state(is_highlighted)
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text("Name this file in the message"))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| this.use_file(&chosen, window, cx),
-                        )),
-                    ),
-            );
-        }
-
-        Some(menu.into_any_element())
-    }
-
-    fn render_hook_install_note(&self) -> Option<AnyElement> {
-        let note = self.hook_install_note.clone()?;
-        Some(
-            div()
-                .px_2()
-                .pb_1()
-                .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
-                .into_any_element(),
-        )
     }
 
     fn render_pending_permission(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5788,187 +5698,24 @@ impl ClaudeSessionsPanel {
         Some(card.into_any_element())
     }
 
-    fn render_question(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let pending = self.store.read(cx).live().pending_question.as_ref()?;
-        let questions = pending.questions.as_array().cloned().unwrap_or_default();
-        let can_send = self.can_send(cx);
-        let ticks = self.question_ticks.clone();
-
-        let mut section = v_flex()
-            .w_full()
-            .gap_1()
-            .px_2()
-            .pb_1()
-            .child(
-                Label::new("Waiting for your answer")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Accent),
-            )
-            .child(
-                Label::new(QUESTION_CHANNEL_NOTE)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-
-        for (question_index, question) in questions.into_iter().enumerate() {
-            let header = question
-                .get("header")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let asked = question
-                .get("question")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let multi_select = question
-                .get("multiSelect")
-                .or_else(|| question.get("multi_select"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if !header.is_empty() {
-                section = section.child(
-                    Label::new(SharedString::from(header.clone()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-            }
-            if !asked.is_empty() {
-                section = section
-                    .child(Label::new(SharedString::from(asked.clone())).size(LabelSize::Small));
-            }
-            let options = question
-                .get("options")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let option_labels: Vec<String> = options
-                .iter()
-                .filter_map(|option| {
-                    option
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .map(|label| label.trim().to_string())
-                        .filter(|label| !label.is_empty())
-                })
-                .collect();
-
-            if multi_select {
-                for (option_index, label) in option_labels.iter().enumerate() {
-                    let selected = ticks.contains(&(question_index, option_index));
-                    let button_label = label.clone();
-                    section = section.child(
-                        Checkbox::new(
-                            SharedString::from(format!(
-                                "claude-session-q-{question_index}-{option_index}"
-                            )),
-                            if selected {
-                                ToggleState::Selected
-                            } else {
-                                ToggleState::Unselected
-                            },
-                        )
-                        .label(SharedString::from(button_label))
-                        .disabled(!can_send)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.question_ticks.remove(&(question_index, option_index)) {
-                                this.question_ticks.insert((question_index, option_index));
-                            }
-                            cx.notify();
-                        })),
-                    );
-                }
-                let header_for_submit = header.clone();
-                let labels_for_submit = option_labels.clone();
-                section = section.child(
-                    Button::new(
-                        SharedString::from(format!("claude-session-q-submit-{question_index}")),
-                        "Submit",
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .disabled(!can_send)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let selected: Vec<String> = labels_for_submit
-                            .iter()
-                            .enumerate()
-                            .filter(|(option_index, _)| {
-                                this.question_ticks
-                                    .contains(&(question_index, *option_index))
-                            })
-                            .map(|(_, label)| label.clone())
-                            .collect();
-                        if selected.is_empty() {
-                            return;
-                        }
-                        let text = compose_multi_question_answer(&header_for_submit, &selected);
-                        this.dispatch_message(text, window, cx);
-                    })),
-                );
-            } else {
-                for label in option_labels {
-                    let composed = compose_single_question_answer(&header, &asked, &label);
-                    let option_label = label.clone();
-                    section = section.child(
-                        Button::new(
-                            SharedString::from(format!(
-                                "claude-session-q-{question_index}-{option_label}"
-                            )),
-                            SharedString::from(option_label),
-                        )
-                        .label_size(LabelSize::XSmall)
-                        .disabled(!can_send)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.dispatch_message(composed.clone(), window, cx)
-                            },
-                        )),
-                    );
-                }
-            }
-
-            let prefix = compose_type_something_prefix(&header, &asked);
-            section = section.child(
-                Button::new(
-                    SharedString::from(format!("claude-session-q-type-{question_index}")),
-                    "Type something",
-                )
-                .label_size(LabelSize::XSmall)
-                .disabled(!can_send)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.message_editor.update(cx, |editor, cx| {
-                        editor.set_text(prefix.clone(), window, cx);
-                        editor.move_to_end(&Default::default(), window, cx);
-                    });
-                    cx.notify();
-                })),
-            );
-        }
-
-        Some(section.into_any_element())
-    }
-
-    fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_send = self.can_send(cx);
-        let (
-            has_selection,
-            is_reading_an_agent,
-            can_copy_setup,
-            can_interrupt,
-            interrupt_sent,
-            interrupt_tooltip,
-            interrupt_label,
-        ) = {
+    fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (line, tooltip, can_interrupt, interrupt_sent, interrupt_label, interrupt_tooltip) = {
             let store = self.store.read(cx);
-            let has_selection = store.selected().is_some();
-            let is_reading_an_agent =
-                matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
             let now_ms = now_millis();
             let running = matches!(store.live().turn, Turn::Running { .. });
             let interrupt_sent =
                 running && interrupt_is_awaiting_result(self.interrupt_sent_at_ms, now_ms);
-            let can_interrupt = store.can_interrupt();
+            let line = format_status_line(
+                &store.live().turn,
+                store.permission_mode().as_deref(),
+                store.channel_live(),
+                now_ms,
+            );
+            let tooltip = permission_tooltip(
+                store.permission_mode().as_deref(),
+                store.transcript().auto_mode(),
+                store.transcript().auto_mode_steer(),
+            );
             let interrupt_tooltip = if interrupt_sent {
                 "interrupt sent".to_string()
             } else {
@@ -5983,150 +5730,13 @@ impl ClaudeSessionsPanel {
                 "Stop"
             };
             (
-                has_selection,
-                is_reading_an_agent,
-                store.home_directory().is_some(),
-                can_interrupt,
+                line,
+                tooltip,
+                store.can_interrupt(),
                 interrupt_sent,
-                interrupt_tooltip,
                 interrupt_label,
+                interrupt_tooltip,
             )
-        };
-        let note = input_note(can_send, is_reading_an_agent, has_selection);
-        let show_setup = has_selection && !is_reading_an_agent && !can_send;
-        let slash_send_note = self.slash_send_note.clone();
-        let paste_error = self.paste_error.clone();
-
-        let hook_note = self.render_hook_install_note();
-        let slash_commands = self.render_slash_commands(cx);
-        let file_matches = self.render_file_matches(cx);
-        let expanded = self.input_expanded;
-
-        v_flex()
-            .w_full()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .key_context("ClaudeSessionsInput")
-            .on_action(cx.listener(Self::send_message))
-            .on_action(cx.listener(Self::dismiss_menus))
-            .on_action(cx.listener(Self::recall_previous_message))
-            .on_action(cx.listener(Self::recall_next_message))
-            .on_action(cx.listener(Self::paste_into_message))
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .child(
-                        Disclosure::new("claude-session-input", expanded)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_input(cx))),
-                    )
-                    .child(
-                        Label::new("Message")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-            .when(expanded, |this| this.p_2().gap_1())
-            .children(hook_note)
-            .when_some(note.filter(|_| expanded), |this, note| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Icon::new(IconName::Lock)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
-                        .when(show_setup, |this| {
-                            this.child(
-                                Button::new("claude-session-copy-setup", "Copy setup commands")
-                                    .label_size(LabelSize::XSmall)
-                                    .disabled(!can_copy_setup)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.copy_setup_commands(cx)),
-                                    ),
-                            )
-                        }),
-                )
-            })
-            .when_some(slash_send_note.filter(|_| expanded), |this, note| {
-                this.child(
-                    Label::new(note)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                )
-            })
-            .when(expanded, |this| {
-                this.child(
-                    div().w_full().px_2().child(
-                        div()
-                            .w_full()
-                            .px_1()
-                            .py_0p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .bg(cx.theme().colors().editor_background)
-                            .child(self.message_editor.clone()),
-                    ),
-                )
-            })
-            .when_some(paste_error.filter(|_| expanded), |this, error| {
-                this.child(
-                    Label::new(error)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
-                )
-            })
-            .children(slash_commands.filter(|_| expanded))
-            .children(file_matches.filter(|_| expanded))
-            .when(expanded, |this| {
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .px_2()
-                        .pb_2()
-                        .gap_1()
-                        .justify_end()
-                        .child(
-                            Button::new("claude-session-interrupt", interrupt_label)
-                                .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
-                                .label_size(LabelSize::XSmall)
-                                .disabled(!can_interrupt || interrupt_sent)
-                                .tooltip(Tooltip::text(interrupt_tooltip))
-                                .on_click(cx.listener(|this, _, _, cx| this.request_interrupt(cx))),
-                        )
-                        .child(
-                            Button::new("claude-session-send", "Send")
-                                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
-                                .label_size(LabelSize::XSmall)
-                                .disabled(!can_send)
-                                .tooltip(Tooltip::text("Send to this session"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.send_message(&SendMessage, window, cx)
-                                })),
-                        ),
-                )
-            })
-    }
-
-    fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (line, tooltip) = {
-            let store = self.store.read(cx);
-            let line = format_status_line(
-                &store.live().turn,
-                store.permission_mode().as_deref(),
-                store.channel_live(),
-                now_millis(),
-            );
-            let tooltip = permission_tooltip(
-                store.permission_mode().as_deref(),
-                store.transcript().auto_mode(),
-                store.transcript().auto_mode_steer(),
-            );
-            (line, tooltip)
         };
         h_flex()
             .id("claude-session-status-line")
@@ -6134,6 +5744,8 @@ impl ClaudeSessionsPanel {
             .flex_none()
             .px_2()
             .py_0p5()
+            .justify_between()
+            .gap_1()
             .child(
                 Label::new(line)
                     .size(LabelSize::XSmall)
@@ -6141,6 +5753,14 @@ impl ClaudeSessionsPanel {
                     .single_line(),
             )
             .tooltip(Tooltip::text(tooltip))
+            .child(
+                Button::new("claude-session-interrupt", interrupt_label)
+                    .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
+                    .label_size(LabelSize::XSmall)
+                    .disabled(!can_interrupt || interrupt_sent)
+                    .tooltip(Tooltip::text(interrupt_tooltip))
+                    .on_click(cx.listener(|this, _, _, cx| this.request_interrupt(cx))),
+            )
             .into_any_element()
     }
 
@@ -6153,10 +5773,28 @@ impl ClaudeSessionsPanel {
         let Some(entry) = self.entries.get(index).cloned() else {
             return div().into_any_element();
         };
-        let key = entry.key;
+        let show_body = self.rail_shows_everything || rail_worth(&entry.kind) == RailWorth::Draw;
+        // The cost card is not the message body. A billed message the terminal
+        // already shows still carries the card when it is that card's anchor.
+        let has_calls = displayed_turn_usage(&self.entries, index, &self.turn_bills).is_some();
+        let cost_anchor = !self.rail_shows_everything
+            && self.show_costs
+            && cost_anchor_at(&self.entries, index, has_calls, &self.billing);
+        // An empty slot, not a removed entry: `list_state` is indexed by
+        // `self.entries`, and dropping one would shift every splice.
+        let key = entry.key.clone();
+        let anchor_key = key.clone();
+        if !show_body {
+            // A hidden body is an empty list slot, not a card. A border on that slot
+            // would paint a sliver for a message the rail is not drawing.
+            return match self.render_turn_cost(index, cost_anchor, cx) {
+                Some(element) => self.present_anchored_entry(&anchor_key, element, cx),
+                None => div().h(px(0.)).min_h(px(0.)).into_any_element(),
+            };
+        }
         let is_expanded = self.expanded.contains(&key);
 
-        match entry.kind {
+        let element = match entry.kind {
             EntryKind::Message {
                 role,
                 source,
@@ -6192,61 +5830,66 @@ impl ClaudeSessionsPanel {
                     } else {
                         None
                     };
-                    return v_flex()
+                    v_flex()
                         .w_full()
                         .child(header)
                         .children(body)
-                        .into_any_element();
+                        .into_any_element()
+                } else {
+                    let markdown = self.markdown_for(&key, source, cx);
+                    let cost = self
+                        .show_costs
+                        .then_some(usage)
+                        .flatten()
+                        .and_then(|usage| {
+                            answer_cost(usage, answered_at.as_ref(), self.store.read(cx))
+                        });
+                    v_flex()
+                        .w_full()
+                        .px_4()
+                        .py_1()
+                        // What the reader typed is given a ground of its own, so that their
+                        // own words are told apart from the session's answers by more than
+                        // the colour of a rail two characters wide. A wash of the foreground
+                        // rather than a fixed grey: it lifts off a dark background and
+                        // settles onto a light one, so either theme reads as a step.
+                        .when(role == MessageRole::User, |this| {
+                            let ground = if self.hovered_anchor.as_ref() == Some(&key) {
+                                cx.theme().colors().element_hover
+                            } else {
+                                USER_MESSAGE_GROUND
+                            };
+                            this.bg(ground).rounded_sm()
+                        })
+                        .gap_0p5()
+                        .border_l_2()
+                        .border_color(role.color().color(cx).opacity(ROLE_RAIL_OPACITY))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(role.icon())
+                                        .size(IconSize::XSmall)
+                                        .color(role.color()),
+                                )
+                                .child(
+                                    Label::new(role.label())
+                                        .size(LabelSize::XSmall)
+                                        .color(role.color()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
+                        )
+                        .children(cost.map(|cost| {
+                            Label::new(cost)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Hidden)
+                        }))
+                        .into_any_element()
                 }
-
-                let markdown = self.markdown_for(&key, source, cx);
-                let cost = self
-                    .show_costs
-                    .then_some(usage)
-                    .flatten()
-                    .and_then(|usage| {
-                        answer_cost(usage, answered_at.as_ref(), self.store.read(cx))
-                    });
-                v_flex()
-                    .w_full()
-                    .px_4()
-                    .py_1()
-                    // What the reader typed is given a ground of its own, so that their
-                    // own words are told apart from the session's answers by more than
-                    // the colour of a rail two characters wide. A wash of the foreground
-                    // rather than a fixed grey: it lifts off a dark background and
-                    // settles onto a light one, so either theme reads as a step.
-                    .when(role == MessageRole::User, |this| {
-                        this.bg(USER_MESSAGE_GROUND).rounded_sm()
-                    })
-                    .gap_0p5()
-                    .border_l_2()
-                    .border_color(role.color().color(cx).opacity(ROLE_RAIL_OPACITY))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Icon::new(role.icon())
-                                    .size(IconSize::XSmall)
-                                    .color(role.color()),
-                            )
-                            .child(
-                                Label::new(role.label())
-                                    .size(LabelSize::XSmall)
-                                    .color(role.color()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
-                    )
-                    .children(cost.map(|cost| {
-                        Label::new(cost)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Hidden)
-                    }))
-                    .into_any_element()
             }
 
             EntryKind::Thinking { source } => {
@@ -6286,24 +5929,13 @@ impl ClaudeSessionsPanel {
                 input,
                 id,
                 diff,
-            } => {
-                return self.render_tool_use(
-                    index,
-                    key,
-                    name,
-                    input,
-                    id,
-                    diff,
-                    is_expanded,
-                    window,
-                    cx,
-                );
-            }
+            } => self.render_tool_use(index, key, name, input, id, diff, is_expanded, window, cx),
 
             EntryKind::ToolResult {
                 label,
                 is_error,
                 body,
+                tool_use_id: _,
             } => {
                 let ask_user_answers = (label.as_ref() == ASK_USER_QUESTION_TOOL_NAME)
                     .then(|| ask_user_answer_text(&body))
@@ -6399,7 +6031,18 @@ impl ClaudeSessionsPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(img(image).max_w_full().max_h(px(480.)))
+                .child({
+                    let zoom_key = key.clone();
+                    let zoom_image = image.clone();
+                    img(image)
+                        .id(SharedString::from(format!("claude-entry-image-{key}")))
+                        .max_w_full()
+                        .max_h(px(480.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_zoomed_image(zoom_key.clone(), zoom_image.clone(), cx);
+                        }))
+                })
                 .into_any_element(),
 
             EntryKind::SentFiles {
@@ -6533,7 +6176,11 @@ impl ClaudeSessionsPanel {
                         .color(cx)
                         .opacity(ROLE_RAIL_OPACITY),
                 )
-                .bg(USER_MESSAGE_GROUND)
+                .bg(if self.hovered_anchor.as_ref() == Some(&key) {
+                    cx.theme().colors().element_hover
+                } else {
+                    USER_MESSAGE_GROUND
+                })
                 .rounded_sm()
                 .child(
                     h_flex()
@@ -6555,125 +6202,6 @@ impl ClaudeSessionsPanel {
                         .child(Label::new(text).size(LabelSize::Small).color(Color::Muted)),
                 )
                 .into_any_element(),
-
-            EntryKind::Pending {
-                id,
-                text,
-                note,
-                failed,
-            } => {
-                v_flex()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_0p5()
-                    .border_l_2()
-                    .border_color(
-                        MessageRole::User
-                            .color()
-                            .color(cx)
-                            .opacity(ROLE_RAIL_OPACITY),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_1()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Icon::new(MessageRole::User.icon())
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(note).size(LabelSize::XSmall).color(if failed {
-                                            Color::Error
-                                        } else {
-                                            Color::Muted
-                                        }),
-                                    )
-                                    .map(|header| {
-                                        if failed {
-                                            header.into_any_element()
-                                        } else {
-                                            header
-                                                .with_animation(
-                                                    SharedString::from(format!(
-                                                        "pending-send-{id}"
-                                                    )),
-                                                    Animation::new(PULSE_PERIOD)
-                                                        .repeat()
-                                                        .with_easing(pulsating_between(0.4, 0.8)),
-                                                    |header, delta| header.opacity(delta),
-                                                )
-                                                .into_any_element()
-                                        }
-                                    }),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .when(failed, |this| {
-                                        this.child(
-                                            Button::new(
-                                                SharedString::from(format!(
-                                                    "retry-pending-send-{id}"
-                                                )),
-                                                "Retry",
-                                            )
-                                            .label_size(LabelSize::XSmall)
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.retry_pending_send(id, cx)
-                                                }),
-                                            ),
-                                        )
-                                        .child(
-                                            Button::new(
-                                                SharedString::from(format!(
-                                                    "copy-pending-send-{id}"
-                                                )),
-                                                "Copy",
-                                            )
-                                            .label_size(LabelSize::XSmall)
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.copy_pending_send(id, cx)
-                                                }),
-                                            ),
-                                        )
-                                    })
-                                    .child(
-                                        IconButton::new(
-                                            SharedString::from(format!(
-                                                "dismiss-pending-send-{id}"
-                                            )),
-                                            IconName::Close,
-                                        )
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text("Remove this message"))
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.dismiss_pending_send(id, cx)
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    )
-                    // A plain label rather than markdown: nothing about a message that has
-                    // not arrived is worth deriving, and the record that replaces it is
-                    // where the rendered form belongs.
-                    .child(
-                        Label::new(text)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .italic(),
-                    )
-                    .into_any_element()
-            }
 
             EntryKind::CompactBoundary {
                 trigger,
@@ -6857,7 +6385,11 @@ impl ClaudeSessionsPanel {
                 if let Some(tooltip) = tooltip {
                     row = row.tooltip(Tooltip::text(tooltip));
                 }
-                row.into_any_element()
+                if let Some(cost) = self.render_turn_cost(index, cost_anchor, cx) {
+                    v_flex().w_full().child(row).child(cost).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             }
 
             EntryKind::Unknown { label, raw } => {
@@ -6891,7 +6423,8 @@ impl ClaudeSessionsPanel {
                     .children(body)
                     .into_any_element()
             }
-        }
+        };
+        self.present_anchored_entry(&anchor_key, element, cx)
     }
 
     fn render_attachment(
@@ -7658,12 +7191,21 @@ impl ClaudeSessionsPanel {
             .collect();
 
         let preview = match self.loaded_attachments.get(&file_key) {
-            Some(AttachmentLoad::Loaded(image)) => Some(
-                img(image.clone())
-                    .max_w_full()
-                    .max_h(px(480.))
-                    .into_any_element(),
-            ),
+            Some(AttachmentLoad::Loaded(image)) => {
+                let zoom_key = file_key.clone();
+                let zoom_image = image.clone();
+                Some(
+                    img(image.clone())
+                        .id(SharedString::from(format!("claude-sent-image-{file_key}")))
+                        .max_w_full()
+                        .max_h(px(480.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_zoomed_image(zoom_key.clone(), zoom_image.clone(), cx);
+                        }))
+                        .into_any_element(),
+                )
+            }
             Some(AttachmentLoad::Loading) => Some(
                 Label::new("Loading the image…")
                     .size(LabelSize::XSmall)
@@ -7864,6 +7406,475 @@ impl ClaudeSessionsPanel {
                 this.toggle_expanded(click_key.clone(), entry_index, cx)
             }))
     }
+
+    fn terminal_focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some(terminal) = &self.terminal {
+            terminal.focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
+        }
+    }
+
+    fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = {
+            let store = self.store.read(cx);
+            let transcript_is_main = matches!(store.transcript_target(), TranscriptTarget::Main);
+            let live_session = store.selected_session().map(|session| {
+                (
+                    session.session_id.clone(),
+                    session.process_id,
+                    session.tmux_target.clone(),
+                )
+            });
+            wanted_terminal(
+                self.in_pane,
+                transcript_is_main,
+                live_session
+                    .as_ref()
+                    .map(|(session_id, process_id, tmux_target)| {
+                        (session_id.as_str(), *process_id, tmux_target.as_deref())
+                    }),
+            )
+        };
+        // `Keep` is the only path that does not read `attach_arguments`. A `/clear` lands
+        // here: the conversation id changed and the pane did not, so the client stays.
+        if terminal_sync(self.terminal_for.as_ref(), wanted.as_ref()) == TerminalSync::Keep {
+            return;
+        }
+
+        self.terminal = None;
+        self.terminal_for = wanted.clone();
+        self._terminal_attach = Task::ready(());
+        self.lifecycle_note = None;
+
+        let Some(target) = wanted else {
+            cx.notify();
+            return;
+        };
+        let Some(arguments) = self.store.read(cx).attach_arguments() else {
+            self.lifecycle_note = Some(SharedString::from(
+                "This session is not running in a tmux pane. Attach from the sessions list.",
+            ));
+            cx.notify();
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.lifecycle_note = Some(SharedString::from("The workspace is not available."));
+            cx.notify();
+            return;
+        };
+        let project: Entity<Project> = workspace.read(cx).project().clone();
+        // `command` is spawned as a program with `args`, never through a shell, so every
+        // target reaches tmux as its own argument.
+        let label = format!("tmux {}", arguments.join(" "));
+        let spawn = SpawnInTerminal {
+            id: TaskId(format!("claude-session-attach-{}", target.process_id)),
+            full_label: label.clone(),
+            label: label.clone(),
+            command: Some("tmux".to_string()),
+            args: arguments,
+            command_label: label,
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::NoFocus,
+            ..Default::default()
+        };
+        let terminal_task =
+            project.update(cx, |project, cx| project.create_terminal_task(spawn, cx));
+        let project = project.downgrade();
+        self._terminal_attach = cx.spawn_in(window, async move |this, cx| {
+            let terminal = match terminal_task.await {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        if this.terminal_for.as_ref() == Some(&target) {
+                            this.lifecycle_note = Some(SharedString::from(format!(
+                                "Attaching to the session: {error:#}"
+                            )));
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                    return;
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                if this.terminal_for.as_ref() != Some(&target) {
+                    return;
+                }
+                let workspace = this.workspace.clone();
+                let project = project.clone();
+                this.terminal = Some(cx.new(|cx| {
+                    let mut terminal_view =
+                        TerminalView::new(terminal, workspace, None, project, window, cx);
+                    // Not embedded mode: it sizes the element to the lines the terminal has
+                    // used, which resizes the pty to that height. tmux then sizes the shared
+                    // window to this client, so a freshly attached pane locks itself to the
+                    // one row it started with. The pane has to fill the area it is given.
+                    terminal_view.set_show_workspace_actions(false, cx);
+                    terminal_view
+                }));
+                this.lifecycle_note = None;
+                cx.notify();
+            })
+            .log_err();
+        });
+        cx.notify();
+    }
+
+    fn terminal_placeholder(&self, cx: &App) -> SharedString {
+        if self.terminal_for.is_some() {
+            if let Some(note) = &self.lifecycle_note {
+                return note.clone();
+            }
+            return SharedString::from("Attaching…");
+        }
+        let store = self.store.read(cx);
+        if store.selected_is_ended() {
+            return SharedString::from("This session has ended.");
+        }
+        if store.selected_session().is_some() {
+            return SharedString::from(
+                "This session is not running in a tmux pane. Attach from the sessions list.",
+            );
+        }
+        SharedString::from(SELECT_A_SESSION)
+    }
+
+    fn render_terminal_area(&self, cx: &mut Context<Self>) -> AnyElement {
+        let body = if let Some(terminal) = self.terminal.clone() {
+            div().size_full().child(terminal)
+        } else {
+            div().size_full().p_2().child(
+                Label::new(self.terminal_placeholder(cx))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+        };
+        div()
+            .flex_grow_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_turn_cost(
+        &mut self,
+        index: usize,
+        attach: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !attach {
+            return None;
+        }
+        let (start, _) = turn_bounds(&self.entries, index)?;
+        let (calls, total) = displayed_turn_usage(&self.entries, index, &self.turn_bills)?;
+        if calls.is_empty() {
+            return None;
+        }
+        let model = self.store.read(cx).transcript().spend().model;
+        let rates = rates_for_model(model.as_deref()?)?;
+        let turn_id = self.entries.get(start)?.key.clone();
+        let cost_key = turn_cost_key(&turn_id);
+        let expanded = self.expanded.contains(&cost_key);
+        let usages = if expanded { calls } else { vec![total] };
+        let lines: Vec<SharedString> = usages
+            .into_iter()
+            .map(|usage| SharedString::from(answer_summary(usage, rates, None)))
+            .collect();
+        let toggle_key = cost_key;
+        Some(
+            v_flex()
+                .id(SharedString::from(format!("turn-cost-{turn_id}")))
+                .w_full()
+                .px_2()
+                .py_0p5()
+                .gap_0p5()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_expanded(toggle_key.clone(), index, cx);
+                }))
+                .children(lines.into_iter().map(|line| {
+                    Label::new(line)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Hidden)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn anchor_glyphs(cx: &App) -> Glyphs {
+        let settings = ClaudeSessionsSettings::get_global(cx);
+        Glyphs {
+            user_prompt: settings.user_prompt_glyph,
+            assistant: settings.assistant_glyph,
+        }
+    }
+
+    fn cached_anchorings(
+        &mut self,
+        rows: &[ScreenRow],
+        glyphs: Glyphs,
+        columns: usize,
+        screen_lines: usize,
+        line_height: Pixels,
+        cell_width: Pixels,
+        scrolled_back: bool,
+    ) -> Vec<Anchoring> {
+        // `grid_lines_change` stays Unchanged when a cell is rewritten in place, so
+        // the cache key is the visible rows. A frame whose rows, entries, glyphs,
+        // and terminal size match the last one does not run the subsequence again.
+        // The same rows at the bottom and in the scrollback use different windows.
+        if let Some(cache) = &self.anchor_cache
+            && cache.entries_generation == self.entries_generation
+            && cache.glyphs == glyphs
+            && cache.columns == columns
+            && cache.screen_lines == screen_lines
+            && cache.line_height == line_height
+            && cache.cell_width == cell_width
+            && self.cached_scrolled_back == scrolled_back
+            && cache.rows == rows
+        {
+            return cache.anchorings.clone();
+        }
+
+        let transcript = reusable_anchors(self.anchor_cache.take(), self.entries_generation)
+            .unwrap_or_else(|| {
+                self.reachable_anchors
+                    .iter()
+                    .map(|anchor| anchor.anchor.clone())
+                    .collect()
+            });
+        let anchors = terminal_anchors::anchor_rows(rows, &glyphs);
+        let window = transcript_window_for_screen(&anchors, &transcript, scrolled_back);
+        let anchorings = terminal_anchors::align(&anchors, window);
+        self.cached_scrolled_back = scrolled_back;
+        self.anchor_cache = Some(AnchorCache {
+            entries_generation: self.entries_generation,
+            glyphs,
+            columns,
+            screen_lines,
+            line_height,
+            cell_width,
+            rows: rows.to_vec(),
+            transcript,
+            anchorings: anchorings.clone(),
+        });
+        anchorings
+    }
+
+    fn render_anchor_gutter(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(terminal) = self.terminal.clone() else {
+            self.anchored_on_screen.clear();
+            self.followed_index = None;
+            return div().into_any_element();
+        };
+        let (cells, screen_lines, columns, line_height, cell_width, scrolled_back) = terminal
+            .read_with(cx, |terminal_view, cx| {
+                let terminal = terminal_view.terminal().clone();
+                terminal.read_with(cx, |terminal, _| {
+                    let content = terminal.last_content();
+                    let display_offset = content.display_offset;
+                    let cells = content
+                        .cells
+                        .iter()
+                        .filter(|cell| !cell.is_wide_char_spacer())
+                        .map(|cell| {
+                            (
+                                visible_grid_line(cell.point.line, display_offset),
+                                cell.point.column,
+                                cell.character(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        cells,
+                        content.screen_lines,
+                        content.columns,
+                        content.terminal_bounds.line_height,
+                        content.terminal_bounds.cell_width,
+                        display_offset > 0,
+                    )
+                })
+            });
+        let glyphs = Self::anchor_glyphs(cx);
+        let rows = terminal_anchors::screen_rows(cells.into_iter(), screen_lines);
+        let anchorings = self.cached_anchorings(
+            &rows,
+            glyphs,
+            columns,
+            screen_lines,
+            line_height,
+            cell_width,
+            scrolled_back,
+        );
+        self.anchored_on_screen = anchored_on_screen_keys(&anchorings);
+        let follow = rail_follow_index(
+            &anchorings,
+            &self.reachable_anchors,
+            scrolled_back,
+            self.entries.len(),
+        );
+        if let Some(index) = rail_follow_scroll(self.followed_index, follow, scrolled_back) {
+            self.list_state.scroll_to_reveal_item(index);
+            self.followed_index = Some(index);
+        } else if !scrolled_back || follow.is_none() {
+            self.followed_index = None;
+        }
+        let chips = anchorings
+            .into_iter()
+            .filter_map(|anchoring| {
+                let stored = self
+                    .reachable_anchors
+                    .iter()
+                    .find(|anchor| anchor.anchor.key == anchoring.key)?;
+                let chip = stored.chip?;
+                if self.entries.get(stored.index).is_none() {
+                    return None;
+                }
+                Some((anchoring.row, anchoring.key, anchor_chip_icon(chip)))
+            })
+            .collect::<Vec<_>>();
+        let panel_id = cx.entity_id();
+
+        div()
+            .id(SharedString::from(format!(
+                "claude-anchor-gutter-{panel_id:?}"
+            )))
+            .w(px(ANCHOR_GUTTER_WIDTH_PIXELS))
+            .h_full()
+            .flex_none()
+            .relative()
+            .overflow_hidden()
+            .children(chips.into_iter().map(|(row, key, icon)| {
+                let key = SharedString::from(key);
+                let emphasized = self.hovered_anchor.as_ref() == Some(&key);
+                let hover_key = key.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "claude-anchor-chip-{panel_id:?}-{row}"
+                    )))
+                    .absolute()
+                    .top(anchor_chip_top(row, line_height))
+                    .left_0()
+                    .w_full()
+                    .h(line_height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        let next = if *hovered {
+                            Some(hover_key.clone())
+                        } else {
+                            None
+                        };
+                        this.set_hovered_anchor(next, cx);
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reveal_anchored_entry(key.clone(), cx);
+                    }))
+                    .child(
+                        Icon::new(icon)
+                            .size(if emphasized {
+                                IconSize::Small
+                            } else {
+                                IconSize::XSmall
+                            })
+                            .color(if emphasized {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    fn render_terminal_and_rail(
+        &mut self,
+        reading_an_agent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let area = work_area(self.rail_expanded, reading_an_agent);
+        let gutter_shown = anchor_gutter_shown(area, self.terminal.is_some());
+        if !gutter_shown {
+            self.anchored_on_screen.clear();
+            self.followed_index = None;
+        }
+        let gutter = gutter_shown.then(|| self.render_anchor_gutter(cx));
+        match area {
+            WorkArea::TerminalOnly => {
+                let terminal = self.render_terminal_area(cx);
+                if let Some(gutter) = gutter {
+                    h_flex()
+                        .flex_grow_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .w_full()
+                        .h_full()
+                        .child(terminal)
+                        .child(gutter)
+                        .into_any_element()
+                } else {
+                    terminal
+                }
+            }
+            WorkArea::RailOnly => {
+                let transcript = self.render_transcript_section(window, cx);
+                let live_message = self.render_live_message(window, cx);
+                v_flex()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .flex_grow_1()
+                    .w_full()
+                    .child(transcript)
+                    .children(live_message)
+                    .into_any_element()
+            }
+            WorkArea::TerminalAndRail => {
+                let transcript = self.render_transcript_section(window, cx);
+                let live_message = self.render_live_message(window, cx);
+                let rail_width = self.displayed_rail_width();
+                let panel = cx.entity().downgrade();
+                let rail = v_flex()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .w(rail_width)
+                    .h_full()
+                    .flex_none()
+                    .child(transcript)
+                    .children(live_message);
+                h_flex()
+                    .relative()
+                    .flex_grow_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.remember_rail_budget(bounds.size.width, cx);
+                                    })
+                                    .log_err();
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(self.render_terminal_area(cx))
+                    .children(gutter)
+                    .child(self.render_rail_resize_handle(cx))
+                    .child(rail)
+                    .into_any_element()
+            }
+        }
+    }
 }
 
 impl Render for ClaudeSessionsPanel {
@@ -7873,13 +7884,9 @@ impl Render for ClaudeSessionsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.in_pane {
             self.set_store_visible(true, cx);
+            self.sync_terminal(window, cx);
         }
-        // An agent's conversation is a record of something already said to something that
-        // is not listening: the only thing there is to type into is the session's own
-        // pane, and a reply sent from under an agent's records would arrive in a
-        // conversation the reader is not looking at. So a tab reading one is read-only,
-        // which is also what leaves it readable after the session it belonged to has
-        // exited — neither the pane nor the input outlives the session.
+        // A subagent's records are not the tmux pane the session is running in.
         let reading_an_agent = matches!(
             self.store.read(cx).transcript_target(),
             TranscriptTarget::Subagent { .. }
@@ -7887,33 +7894,37 @@ impl Render for ClaudeSessionsPanel {
 
         v_flex()
             .key_context("ClaudeSessionsPanel")
-            .on_action(cx.listener(Self::dismiss_menus))
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedRail>, _, cx| {
+                    this.on_rail_drag_move(event, cx);
+                }),
+            )
+            .on_drop::<DraggedRail>(cx.listener(|this, _, _, _cx| {
+                this.rail_drag_position = None;
+            }))
             .map(|this| {
-                if self.in_pane {
+                let this = if self.in_pane {
                     this.bg(conversation_background(cx))
                         .child(self.render_conversation_toolbar(window, cx))
                         .children(self.render_error(cx))
                         .children(self.render_agent_chips(cx))
-                        .child(self.render_transcript_section(window, cx))
-                        .children(self.render_live_message(window, cx))
+                        .child(self.render_terminal_and_rail(reading_an_agent, window, cx))
                         .children(self.render_pending_permission(cx))
-                        .children(self.render_question(cx))
-                        .children(
-                            (!reading_an_agent).then(|| self.render_input(cx).into_any_element()),
-                        )
                         .children((!reading_an_agent).then(|| self.render_status_line(cx)))
                 } else {
                     this.child(self.render_session_section(cx))
-                }
+                };
+                this.children(self.render_zoomed_image(cx))
             })
     }
 }
 
 impl Focusable for ClaudeSessionsPanel {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.terminal_focus_handle(cx)
     }
 }
 
@@ -7926,9 +7937,8 @@ pub struct ItemNameChanged;
 impl EventEmitter<ItemNameChanged> for ClaudeSessionsPanel {}
 
 /// Lets the same view be opened as a tab in the editor area, where a conversation has
-/// the width of a pane to be read at. The tab is the same element tree as the dock
-/// panel, input included, rather than a second rendering of the transcript to keep in
-/// step with this one.
+/// the width of a pane to be read at. The tab draws the session's terminal beside the
+/// transcript; the dock draws the session list.
 impl Item for ClaudeSessionsPanel {
     type Event = ItemNameChanged;
 
@@ -8017,8 +8027,8 @@ impl Panel for ClaudeSessionsPanel {
         CLAUDE_SESSIONS_PANEL_KEY
     }
 
-    fn activation_focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.terminal_focus_handle(cx)
     }
 
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
@@ -8068,388 +8078,20 @@ impl Panel for ClaudeSessionsPanel {
         11
     }
 
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.set_store_visible(active, cx);
+        if active && let Some(terminal) = &self.terminal {
+            terminal.focus_handle(cx).focus(window, cx);
+        }
     }
 }
 
-/// One message that has left for a session and has not appeared in its transcript yet.
-#[derive(Clone, PartialEq)]
-struct PendingSend {
-    id: u64,
-    /// The session it was sent to. A pending message belongs to that conversation and
-    /// does not follow the reader to another one.
-    session_id: String,
-    /// Trimmed, because that is the form it is compared in: Claude Code appends its own
-    /// context to the text it records, and [`user_visible_text`] hands back what is left
-    /// of it trimmed.
-    text: SharedString,
-    /// The records that were already showing this same text when the send left. One of
-    /// them cannot be the record this send will become, and this is what stops a message
-    /// sent twice from being paired with the first record both times.
-    preexisting_keys: HashSet<SharedString>,
-    /// The newest of the user's own messages the conversation held when the send left,
-    /// whatever its text. The record this send becomes is written after it, so nothing
-    /// at or before it can be this send arriving — which is the only thing that holds
-    /// when the conversation later shows more of itself than the send was measured
-    /// against, as the history behind a compaction does when the reader opens it.
-    newest_preexisting_key: Option<SharedString>,
-    /// The outbox file the channel accepted this send as, once the write has returned.
-    outbox_file: Option<String>,
-    /// Host-clock `at_ms` from the inbox `message_sent` line. Display only — never the
-    /// origin of the 60 s wait; that is [`Self::observed_at_ms`].
-    delivered_at_ms: Option<i64>,
-    /// Local time the store/panel observed that inbox event. The 60 s
-    /// "sent, waiting for the session to pick it up" wait is measured from here.
-    observed_at_ms: Option<i64>,
-    error: Option<SharedString>,
-}
-
-/// The messages the panel is drawing on its own behalf, because the transcript has
-/// nothing for them yet.
+/// The reader's own messages, keyed as the entries are.
 ///
-/// Claude Code writes the user's record when it *starts* the turn, not when the text
-/// reaches its input, so on a busy session a sent message is in the terminal's input
-/// queue and nowhere in the transcript for seconds or minutes. Without this the panel
-/// showed nothing at all in that window, and the message looked like it had been
-/// swallowed.
-///
-/// Nothing here is a timer: a pending message is taken down when the record it was sent
-/// as arrives, when the reader dismisses it, or when Retry succeeds — never because the
-/// reader switched session, dismissed an ended row, or the process went away. Switching
-/// hides the row; switching back shows it again.
-#[derive(Default)]
-struct PendingSends {
-    sends: Vec<PendingSend>,
-    next_id: u64,
-    #[cfg(test)]
-    session_transcript_walks: u32,
-}
-
-/// Finished (delivered or failed) rows kept across all sessions. In-flight rows are not
-/// counted and are never evicted, so a burst of concurrent sends is not dropped to make
-/// room. 3 sessions × 5 failed rows is 15, well under this, and loses nothing.
-const FINISHED_PENDING_SEND_BOUND: usize = 50;
-const SESSION_ENDED_BEFORE_ARRIVAL: &str = "the session ended before this message arrived";
-
-impl PendingSends {
-    /// Draws `text` as sent to `session_id`, against the conversation `entries` was built
-    /// from, and reports the id that addresses it.
-    fn remember(&mut self, session_id: impl Into<String>, text: &str, entries: &[Entry]) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-
-        let text = SharedString::from(text.trim().to_string());
-        // Noted now rather than looked for later: these records are already in the
-        // conversation, so none of them can be the one this send will be written as, and
-        // a second send of the same text must not be paired with the first send's record.
-        let messages = user_messages(entries);
-        let newest_preexisting_key = messages.last().map(|(key, _)| key.clone());
-        let preexisting_keys = messages
-            .into_iter()
-            .filter(|(_, source)| source.trim() == text.as_ref())
-            .map(|(key, _)| key)
-            .collect();
-
-        self.sends.push(PendingSend {
-            id,
-            session_id: session_id.into(),
-            text,
-            preexisting_keys,
-            newest_preexisting_key,
-            outbox_file: None,
-            delivered_at_ms: None,
-            observed_at_ms: None,
-            error: None,
-        });
-        id
-    }
-
-    /// Takes down the message the user dismissed, and only that one: two sends of the
-    /// same text are two messages, and the button belongs to the one it sits on.
-    fn dismiss(&mut self, id: u64) {
-        self.sends.retain(|send| send.id != id);
-    }
-
-    fn resolve(&mut self, id: u64, outcome: &anyhow::Result<String>) {
-        match outcome {
-            Ok(outbox_file) => {
-                if let Some(send) = self.sends.iter_mut().find(|send| send.id == id) {
-                    send.outbox_file = Some(outbox_file.clone());
-                }
-            }
-            Err(error) => {
-                if let Some(send) = self.sends.iter_mut().find(|send| send.id == id) {
-                    send.error = Some(SharedString::from(format!("Failed: {error:#}")));
-                }
-                self.evict_finished_over_bound();
-            }
-        }
-    }
-
-    fn retry(&mut self, id: u64, entries: &[Entry]) -> Option<SharedString> {
-        let messages = user_messages(entries);
-        let send = self.sends.iter_mut().find(|send| send.id == id)?;
-        send.preexisting_keys = messages
-            .iter()
-            .filter(|(_, source)| source.trim() == send.text.as_ref())
-            .map(|(key, _)| key.clone())
-            .collect();
-        send.newest_preexisting_key = messages.last().map(|(key, _)| key.clone());
-        send.outbox_file = None;
-        send.delivered_at_ms = None;
-        send.observed_at_ms = None;
-        send.error = None;
-        Some(send.text.clone())
-    }
-
-    fn text(&self, id: u64) -> Option<&SharedString> {
-        self.sends
-            .iter()
-            .find(|send| send.id == id)
-            .map(|send| &send.text)
-    }
-
-    /// Marks a send "delivered to Claude" when the inbox reports `message_sent` for the
-    /// outbox file the write returned. Tests pair against every row; production uses
-    /// [`Self::pair_with_channel_for`].
-    #[cfg(test)]
-    fn pair_with_channel(&mut self, events: &[ChannelInboxEvent], now_ms: i64) {
-        self.deliver_channel_events(events, now_ms, None);
-    }
-
-    /// The same, considering only rows sent to `session_id`.
-    fn pair_with_channel_for(
-        &mut self,
-        events: &[ChannelInboxEvent],
-        now_ms: i64,
-        session_id: &str,
-    ) {
-        self.deliver_channel_events(events, now_ms, Some(session_id));
-    }
-
-    fn deliver_channel_events(
-        &mut self,
-        events: &[ChannelInboxEvent],
-        now_ms: i64,
-        only_session: Option<&str>,
-    ) {
-        if self.is_empty() {
-            return;
-        }
-        for event in events {
-            let ChannelInboxEvent::MessageSent {
-                outbox_file, at_ms, ..
-            } = event
-            else {
-                continue;
-            };
-            for send in &mut self.sends {
-                if only_session.is_some_and(|session_id| send.session_id != session_id) {
-                    continue;
-                }
-                if send.error.is_none()
-                    && send.delivered_at_ms.is_none()
-                    && send.outbox_file.as_deref() == Some(outbox_file.as_str())
-                {
-                    send.delivered_at_ms = Some(*at_ms);
-                    send.observed_at_ms = Some(now_ms);
-                }
-            }
-        }
-        self.evict_finished_over_bound();
-    }
-
-    /// Rewrites rows of `old_session_id` so they belong to `new_session_id`, which is
-    /// what `/clear` does: same conversation, new id.
-    fn rebind(&mut self, old_session_id: &str, new_session_id: &str) {
-        for send in &mut self.sends {
-            if send.session_id == old_session_id {
-                send.session_id = new_session_id.to_string();
-            }
-        }
-    }
-
-    /// Takes down the messages whose records have turned up in `entries`.
-    ///
-    /// The record carries nothing that ties it back to a send, so the pairing is by text
-    /// and by order: the oldest send that is still waiting takes the oldest record it
-    /// could be, which is what makes two sends of the same text come down as their two
-    /// records arrive rather than both at the first one.
-    #[cfg(test)]
-    fn pair_with(&mut self, entries: &[Entry]) {
-        self.pair_sends(entries, None);
-    }
-
-    /// The same, considering only rows sent to `session_id`.
-    fn pair_with_session(&mut self, entries: &[Entry], session_id: &str) {
-        self.pair_sends(entries, Some(session_id));
-    }
-
-    fn pair_sends(&mut self, entries: &[Entry], only_session: Option<&str>) {
-        // Walking the conversation for arrivals costs the length of the transcript, and
-        // there is nothing waiting for them the overwhelming majority of the time.
-        if self.is_empty() {
-            return;
-        }
-
-        let arrivals = user_messages(entries);
-        let mut claimed: HashSet<SharedString> = HashSet::default();
-        let mut paired: HashSet<u64> = HashSet::default();
-
-        for send in &self.sends {
-            if only_session.is_some_and(|session_id| send.session_id != session_id) {
-                continue;
-            }
-            if send.error.is_some() {
-                continue;
-            }
-            // Only the records written after the conversation the send was measured
-            // against are candidates. Without this, a conversation that shows more of
-            // itself than the send was measured against — the history behind a
-            // compaction being opened — offers an older record of the same text, and the
-            // message comes down having never arrived.
-            //
-            // A conversation that no longer holds that record leaves every arrival a
-            // candidate: compaction runs as a turn starts, which is the same moment the
-            // user's record is written, so the record a send was measured against can
-            // be gone by the time the send's own turns up.
-            let written_after_the_conversation_as_it_was = send
-                .newest_preexisting_key
-                .as_ref()
-                .and_then(|newest| {
-                    arrivals
-                        .iter()
-                        .position(|(key, _)| key == newest)
-                        .map(|index| index.saturating_add(1))
-                })
-                .unwrap_or(0);
-            let arrival = arrivals
-                .get(written_after_the_conversation_as_it_was..)
-                .unwrap_or_default()
-                .iter()
-                .find(|(key, source)| {
-                    source.trim() == send.text.as_ref()
-                        && !send.preexisting_keys.contains(key)
-                        && !claimed.contains(key)
-                });
-            if let Some((key, _)) = arrival {
-                claimed.insert(key.clone());
-                paired.insert(send.id);
-            }
-        }
-
-        self.sends.retain(|send| !paired.contains(&send.id));
-    }
-
-    /// Whether one of these is the same message as `text`, which is how a queue entry
-    /// read from the log is recognised as one of these rather than a second message.
-    /// Only rows of `session_id` count: another session's pending send is not this
-    /// conversation's queue entry.
-    fn holds_text(&self, text: &str, session_id: Option<&str>) -> bool {
-        // The queue log holds the line the CLI was handed, and a message sent from Zed is
-        // handed over wrapped in its `<channel …>` envelope. A send knows only the words
-        // the reader typed, so the unwrapped form has to be recognised too — otherwise
-        // the one message is drawn twice, as a queue row beside its own pending row.
-        let unwrapped = queued_message_body(text);
-        self.sends.iter().any(|send| {
-            Some(send.session_id.as_str()) == session_id
-                && (send.text == text || send.text == unwrapped.as_str())
-        })
-    }
-
-    #[cfg(test)]
-    fn entries(&self) -> Vec<Entry> {
-        self.entries_matching(|_| true)
-    }
-
-    /// What the conversation draws for `selected`: rows of that session, or nothing
-    /// while none is selected. The backing collection is not filtered.
-    fn entries_for(&self, selected: Option<&str>) -> Vec<Entry> {
-        self.entries_matching(|send| Some(send.session_id.as_str()) == selected)
-    }
-
-    fn entries_matching(&self, belongs: impl Fn(&PendingSend) -> bool) -> Vec<Entry> {
-        let now_ms = now_millis();
-        self.sends
-            .iter()
-            .filter(|send| belongs(send))
-            .map(|send| Entry {
-                // Keyed outside the transcript's namespace: a record is keyed by its
-                // uuid, and nothing derived from a pending message may be cached under
-                // one.
-                key: SharedString::from(format!("pending-{}", send.id)),
-                kind: EntryKind::Pending {
-                    id: send.id,
-                    text: send.text.clone(),
-                    note: pending_send_note(send, now_ms),
-                    failed: send.error.is_some(),
-                },
-            })
-            .collect()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.sends.is_empty()
-    }
-
-    fn has_row_for(&self, session_id: Option<&str>) -> bool {
-        let Some(session_id) = session_id else {
-            return false;
-        };
-        self.sends.iter().any(|send| send.session_id == session_id)
-    }
-
-    fn send_is_finished(send: &PendingSend) -> bool {
-        send.error.is_some() || send.delivered_at_ms.is_some()
-    }
-
-    /// Marks in-flight rows whose session is neither live nor ended as failed, so the
-    /// finished bound can cover them. Finished rows, and rows of a session that is still
-    /// listed, are left alone.
-    fn fail_in_flight_of_unknown_sessions<'a>(
-        &mut self,
-        known_session_ids: impl IntoIterator<Item = &'a str>,
-    ) {
-        let known_session_ids: HashSet<&str> = known_session_ids.into_iter().collect();
-        for send in &mut self.sends {
-            if Self::send_is_finished(send) {
-                continue;
-            }
-            if !known_session_ids.contains(send.session_id.as_str()) {
-                send.error = Some(SharedString::from(SESSION_ENDED_BEFORE_ARRIVAL));
-            }
-        }
-    }
-
-    /// Drops the oldest delivered-or-failed rows until at most
-    /// [`FINISHED_PENDING_SEND_BOUND`] finished rows remain. In-flight rows are not
-    /// counted and are never chosen.
-    fn evict_finished_over_bound(&mut self) {
-        let finished = self
-            .sends
-            .iter()
-            .filter(|send| Self::send_is_finished(send))
-            .count();
-        let Some(overflow) = finished.checked_sub(FINISHED_PENDING_SEND_BOUND) else {
-            return;
-        };
-        if overflow == 0 {
-            return;
-        }
-        let mut remaining_to_drop = overflow;
-        self.sends.retain(|send| {
-            if remaining_to_drop == 0 || !Self::send_is_finished(send) {
-                return true;
-            }
-            remaining_to_drop -= 1;
-            false
-        });
-    }
-}
-
-/// The user's own messages in the conversation, keyed as the entries are and in the order
-/// they appear: what a pending message is waiting to be replaced by.
+/// A slash command is included because that is the entry a `/goal` record is drawn as,
+/// and a comparison of a path against the drawn conversation has to see it as the
+/// reader's message.
+#[cfg(test)]
 fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
     entries
         .iter()
@@ -8459,8 +8101,6 @@ fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
                 source,
                 ..
             } => Some((entry.key.clone(), source.clone())),
-            // A slash command is the user's message too, and it is what a send of
-            // `/compact` turns into.
             EntryKind::SlashCommand { text } => Some((entry.key.clone(), text.clone())),
             _ => None,
         })
@@ -8469,18 +8109,9 @@ fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
 
 /// The messages the CLI is holding behind the turn it is running, read from the queue
 /// log, as rows of the conversation.
-///
-/// A message sent from Zed is in that queue as well, and is already drawn as a pending
-/// send — the one the panel can take back when the send fails — so the queue entry
-/// matching it is left to that.
-fn queued_entries<'queue>(
-    queued: impl IntoIterator<Item = &'queue SharedString>,
-    pending_sends: &PendingSends,
-    selected: Option<&str>,
-) -> Vec<Entry> {
+fn queued_entries<'queue>(queued: impl IntoIterator<Item = &'queue SharedString>) -> Vec<Entry> {
     queued
         .into_iter()
-        .filter(|text| !pending_sends.holds_text(text, selected))
         // A background task reporting in is queued exactly as a message typed mid-turn
         // is, and its text is nothing but the block the CLI wrote to tell itself. Held to
         // the same rule as the conversation's own records — what is left once the
@@ -8500,30 +8131,16 @@ fn queued_entries<'queue>(
         .collect()
 }
 
-/// Whether the pending messages are drawn into the conversation on screen.
-///
-/// They belong to the session's own conversation: the reader sent them to the session,
-/// not to one of the agents it spawned, so nothing of theirs is drawn among an agent's
-/// records. A message that is not drawn is not taken down — it goes on waiting for the
-/// record it was sent as, and is drawn again as soon as the session's own conversation is
-/// back on screen.
-fn pending_is_drawn_in(target: &TranscriptTarget) -> bool {
-    match target {
-        TranscriptTarget::Main => true,
-        TranscriptTarget::Subagent { .. } => false,
-    }
-}
-
 /// The user's own messages in one conversation, as the entries [`build_entries`] would
 /// give the same records, and nothing else the records hold.
 ///
-/// This is all [`PendingSends`] reads of a conversation, and building that conversation
-/// whole to get it would decode every image the session has ever pasted — a screenshot is
-/// around a megabyte and a half of base64 — on each of the four rebuilds a second a
-/// streaming reply causes. The keys have to be the ones the drawn conversation carries,
-/// because that is what a pending message's bookkeeping is written in;
+/// Building that conversation whole to get them would decode every image the session
+/// has ever pasted — a screenshot is around a megabyte and a half of base64 — on each
+/// of the four rebuilds a second a streaming reply causes. The keys have to be the ones
+/// the drawn conversation carries;
 /// [`the_user_messages_read_off_a_path_are_the_ones_the_built_entries_carry`] holds the
 /// two together.
+#[cfg(test)]
 fn user_message_entries(path: &[&TranscriptRecord]) -> Vec<Entry> {
     let mut entries = Vec::new();
 
@@ -9220,57 +8837,6 @@ fn parse_tool_input(input: &str) -> Option<Value> {
 enum AgentState {
     Running,
     Finished,
-}
-
-/// How many commands the menu offers at once. Enough to choose from without the menu
-/// taking the room the conversation is in.
-const SLASH_COMMAND_ROWS: usize = 8;
-
-/// How many paths the `@` menu draws. The listing brings back more than this so that
-/// typing on narrows what is already here rather than waiting for another answer.
-const FILE_MENU_ROWS: usize = 8;
-
-/// The part of what has been typed that is a command being named, or `None` when what is
-/// typed is not naming one.
-///
-/// Only a message that is nothing but a command names one: `/` partway through a sentence
-/// is a path, a date, or a fraction, and a menu that opened on those would be in the way
-/// of ordinary typing. A command with its arguments already typed is no longer being
-/// named either — the reader has moved on to what it takes.
-fn slash_command_being_named(text: &str) -> Option<&str> {
-    let text = text.strip_prefix('/')?;
-    if text.starts_with('/') {
-        return None;
-    }
-    (!text.contains(char::is_whitespace)).then_some(text)
-}
-
-/// The commands worth offering for what has been typed, best first.
-///
-/// A command whose name starts with what was typed is what the reader is reaching for; one
-/// that merely contains it is offered behind those, because a name is usually typed from
-/// its beginning. Beyond that the order the machine listed them in stands, which puts the
-/// commands someone wrote before the built-in ones.
-fn matching_slash_commands<'commands>(
-    commands: &'commands [SlashCommand],
-    typed: &str,
-) -> Vec<&'commands SlashCommand> {
-    let typed = typed.to_lowercase();
-    let mut starting = Vec::new();
-    let mut containing = Vec::new();
-
-    for command in commands {
-        let name = command.name.to_lowercase();
-        if name.starts_with(&typed) {
-            starting.push(command);
-        } else if !typed.is_empty() && name.contains(&typed) {
-            containing.push(command);
-        }
-    }
-
-    starting.extend(containing);
-    starting.truncate(SLASH_COMMAND_ROWS);
-    starting
 }
 
 /// The conversation list, told to report where the reader is whenever they move.
@@ -10023,104 +9589,6 @@ fn announced_workflow_run_id(tool_use_id: &str, main_path: &[&TranscriptRecord])
     })
 }
 
-/// Why the input is disabled, or `None` when it is not.
-///
-/// An agent's conversation is named before the missing channel is, because it is the
-/// reason the reader can act on: the way back is one chip away.
-fn input_note(
-    can_send: bool,
-    is_reading_an_agent: bool,
-    has_selection: bool,
-) -> Option<&'static str> {
-    if can_send {
-        return None;
-    }
-    if is_reading_an_agent {
-        return Some(AGENT_READ_ONLY_NOTE);
-    }
-    if has_selection {
-        return Some(READ_ONLY_NOTE);
-    }
-    Some(SELECT_A_SESSION_TO_REPLY)
-}
-
-#[derive(Debug)]
-enum SlashSendDecision {
-    SendAsText,
-    OpenInTerminal,
-    NeedsArgument { example: String },
-}
-
-fn slash_command_name_and_argument(text: &str) -> Option<(&str, &str)> {
-    let trimmed = text.trim();
-    let rest = trimmed.strip_prefix('/')?;
-    if rest.is_empty() {
-        return None;
-    }
-    match rest.find(char::is_whitespace) {
-        Some(index) => Some((&rest[..index], rest[index..].trim())),
-        None => Some((rest, "")),
-    }
-}
-
-fn slash_send_decision(text: &str) -> SlashSendDecision {
-    let Some((name, argument)) = slash_command_name_and_argument(text) else {
-        return SlashSendDecision::SendAsText;
-    };
-    if CHANNEL_DIALOG_SLASH_COMMANDS.contains(&name) {
-        if name == "mcp" && !argument.is_empty() {
-            return SlashSendDecision::SendAsText;
-        }
-        return SlashSendDecision::OpenInTerminal;
-    }
-    if CHANNEL_ARGUMENT_SLASH_COMMANDS.contains(&name) && argument.is_empty() {
-        return SlashSendDecision::NeedsArgument {
-            example: format!("add an argument, e.g. /{name} opus"),
-        };
-    }
-    SlashSendDecision::SendAsText
-}
-
-fn slash_command_needs_terminal(name: &str) -> bool {
-    CHANNEL_DIALOG_SLASH_COMMANDS.contains(&name)
-}
-
-fn question_answer_title<'a>(header: &'a str, asked: &'a str) -> &'a str {
-    if header.is_empty() { asked } else { header }
-}
-
-fn compose_single_question_answer(header: &str, asked: &str, label: &str) -> String {
-    format!(
-        "Answer to \"{}\": {label}",
-        question_answer_title(header, asked)
-    )
-}
-
-fn compose_multi_question_answer(header: &str, labels: &[String]) -> String {
-    format!("Answers to \"{header}\": {}", labels.join("; "))
-}
-
-fn compose_type_something_prefix(header: &str, asked: &str) -> String {
-    format!("Answer to \"{}\": ", question_answer_title(header, asked))
-}
-
-fn pending_send_note(send: &PendingSend, now_ms: i64) -> SharedString {
-    if let Some(error) = send.error.as_ref() {
-        return error.clone();
-    }
-    match send.delivered_at_ms {
-        Some(delivered_at_ms) => {
-            let waiting_from = send.observed_at_ms.unwrap_or(delivered_at_ms);
-            if now_ms.saturating_sub(waiting_from) >= CHANNEL_WAIT_FOR_TRANSCRIPT_MS {
-                SharedString::from(CHANNEL_WAITING_NOTE)
-            } else {
-                SharedString::from(CHANNEL_DELIVERED_NOTE)
-            }
-        }
-        None => SharedString::from(SENDING_NOTE),
-    }
-}
-
 /// The line drawn above the input for an activity, or `None` for one that is not worth a
 /// line.
 #[cfg(test)]
@@ -10250,10 +9718,7 @@ fn build_entries(
     let mut last_user_index: Option<usize> = None;
 
     for (path_index, record) in path.iter().enumerate() {
-        let base_key = match record.uuid.as_ref() {
-            Some(uuid) => SharedString::from(uuid.clone()),
-            None => SharedString::from(format!("path-{path_index}")),
-        };
+        let base_key = record_base_key(record, path_index);
         let before = entries.len();
         append_record(
             record,
@@ -10283,6 +9748,15 @@ fn build_entries(
 
     flush_turn_attachments(&mut entries, &mut attachments, last_user_index);
     entries
+}
+
+/// The key every entry derived from one record is keyed under, alone or with the block's
+/// index appended. A record without a uuid is keyed by its position in the conversation.
+fn record_base_key(record: &TranscriptRecord, path_index: usize) -> SharedString {
+    match record.uuid.as_ref() {
+        Some(uuid) => SharedString::from(uuid.clone()),
+        None => SharedString::from(format!("path-{path_index}")),
+    }
 }
 
 fn entry_starts_a_turn(kind: &EntryKind) -> bool {
@@ -11018,10 +10492,13 @@ fn tool_result_kinds(
     tool_names: &HashMap<String, SharedString>,
     home_directory: Option<&Path>,
 ) -> Vec<EntryKind> {
-    let label = block
+    let tool_use_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
-        .and_then(|id| tool_names.get(id).cloned())
+        .map(|id| SharedString::from(id.to_string()));
+    let label = tool_use_id
+        .as_ref()
+        .and_then(|id| tool_names.get(id.as_ref()).cloned())
         .unwrap_or_else(|| SharedString::from("Tool result"));
     let is_error = block
         .get("is_error")
@@ -11058,6 +10535,7 @@ fn tool_result_kinds(
                         &mut text_parts,
                         &label,
                         is_error,
+                        tool_use_id.as_ref(),
                         structured_result,
                         home_directory,
                     );
@@ -11081,6 +10559,7 @@ fn tool_result_kinds(
                 &mut text_parts,
                 &label,
                 is_error,
+                tool_use_id.as_ref(),
                 structured_result,
                 home_directory,
             );
@@ -11118,6 +10597,7 @@ fn tool_result_kinds(
         label,
         is_error,
         body,
+        tool_use_id,
     }]
 }
 
@@ -11126,6 +10606,7 @@ fn flush_tool_result_text(
     text_parts: &mut Vec<String>,
     label: &SharedString,
     is_error: bool,
+    tool_use_id: Option<&SharedString>,
     structured_result: Option<&Value>,
     home_directory: Option<&Path>,
 ) {
@@ -11144,6 +10625,7 @@ fn flush_tool_result_text(
         label: label.clone(),
         is_error,
         body,
+        tool_use_id: tool_use_id.cloned(),
     });
 }
 
@@ -12001,6 +11483,161 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::session_registry::SlashCommand;
+
+    #[test]
+    fn a_main_pane_embeds_a_terminal_only_for_an_attachable_live_session() {
+        let wanted = wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@6.%8"))));
+        assert_eq!(
+            wanted,
+            Some(TerminalTarget {
+                pane: "%8".to_string(),
+                process_id: 42,
+            })
+        );
+        assert!(crate::session_registry::attach_arguments("zed:@6.%8").is_some());
+    }
+
+    #[test]
+    fn the_dock_does_not_embed_a_terminal() {
+        assert_eq!(
+            wanted_terminal(false, true, Some(("session-1", 42, Some("zed:@6.%8")))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_subagent_does_not_embed_a_terminal() {
+        assert_eq!(
+            wanted_terminal(true, false, Some(("session-1", 42, Some("zed:@6.%8")))),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ended_session_does_not_embed_a_terminal() {
+        assert_eq!(wanted_terminal(true, true, None), None);
+    }
+
+    #[test]
+    fn a_live_session_without_a_tmux_target_does_not_embed_a_terminal() {
+        assert_eq!(
+            wanted_terminal(true, true, Some(("session-1", 42, None))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tmux_target_embeds_a_terminal_only_when_attach_arguments_accepts_it() {
+        for tmux_target in [
+            "zed:@6.%8",
+            "zed:6.%8",
+            "my work:@1.%1",
+            "zed:@6.pane",
+            "",
+            "awp:@1",
+        ] {
+            let wanted = wanted_terminal(true, true, Some(("session-1", 7, Some(tmux_target))));
+            assert_eq!(
+                wanted.is_some(),
+                crate::session_registry::attach_arguments(tmux_target).is_some(),
+                "{tmux_target}"
+            );
+        }
+    }
+
+    /// `/clear` leaves the process and the tmux pane where they are and only rebinds the
+    /// conversation id. A terminal keyed on the conversation would be torn down — and a
+    /// second mirror minted — every time the reader cleared their context.
+    #[test]
+    fn clearing_the_conversation_keeps_the_terminal_that_is_already_attached() {
+        let before = wanted_terminal(true, true, Some(("before-clear", 42, Some("zed:@6.%8"))));
+        let after = wanted_terminal(true, true, Some(("after-clear", 42, Some("zed:@6.%8"))));
+        assert!(
+            before.is_some(),
+            "an attachable live session wants a terminal"
+        );
+        assert_eq!(
+            before, after,
+            "the same process on the same pane is the same terminal to attach to"
+        );
+    }
+
+    /// The identity that survives a `/clear` still has to notice a real move: another
+    /// process, or the same process registered on another pane.
+    #[test]
+    fn another_process_or_another_pane_is_another_terminal() {
+        let attached = wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@6.%8"))));
+        assert_ne!(
+            attached,
+            wanted_terminal(true, true, Some(("session-1", 43, Some("zed:@6.%8")))),
+            "another process holding the pane is another session to attach to"
+        );
+        assert_ne!(
+            attached,
+            wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@7.%9")))),
+            "the same process registered on another pane has to be attached again"
+        );
+    }
+
+    /// `/clear` keeps the client, so the attach that would mint another mirror does not
+    /// run. [`TerminalSync::Keep`] is the branch that returns before `attach_arguments`.
+    #[test]
+    fn clearing_the_conversation_does_not_read_attach_arguments() {
+        let before = wanted_terminal(true, true, Some(("before-clear", 42, Some("zed:@6.%8"))));
+        let after = wanted_terminal(true, true, Some(("after-clear", 42, Some("zed:@6.%8"))));
+        assert_eq!(
+            terminal_sync(before.as_ref(), after.as_ref()),
+            TerminalSync::Keep,
+            "the same pane and process must not re-read attach_arguments"
+        );
+    }
+
+    /// The client already on screen is not kept when the registry disagrees with it.
+    /// Another process re-attaches, and that is the only time `attach_arguments` is
+    /// read. An ended session drops the client and does not mint a mirror for it.
+    #[test]
+    fn a_changed_process_reattaches_and_an_ended_session_drops_the_terminal() {
+        let attached = wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@6.%8"))));
+        let replaced_process =
+            wanted_terminal(true, true, Some(("session-1", 43, Some("zed:@6.%8"))));
+        assert_eq!(
+            terminal_sync(attached.as_ref(), replaced_process.as_ref()),
+            TerminalSync::Attach,
+            "another process on the same pane has to read attach_arguments"
+        );
+        let ended = wanted_terminal(true, true, None);
+        assert_eq!(
+            terminal_sync(attached.as_ref(), ended.as_ref()),
+            TerminalSync::Drop,
+            "an ended session drops the client and does not read attach_arguments"
+        );
+    }
+
+    /// [`TerminalSync::Keep`] is the client that is already attached, and nothing else.
+    /// The first time a pane becomes attachable, and a move onto another pane, still
+    /// read `attach_arguments`. An idle panel with nothing selected must not attach.
+    #[test]
+    fn keep_does_not_swallow_the_first_attach_or_a_pane_move() {
+        let attached = wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@6.%8"))));
+        assert_eq!(
+            terminal_sync(None, attached.as_ref()),
+            TerminalSync::Attach,
+            "the first attach has to read attach_arguments"
+        );
+        let moved = wanted_terminal(true, true, Some(("session-1", 42, Some("zed:@7.%9"))));
+        assert_eq!(
+            terminal_sync(attached.as_ref(), moved.as_ref()),
+            TerminalSync::Attach,
+            "another pane is another attach"
+        );
+        assert_eq!(
+            terminal_sync(None, None),
+            TerminalSync::Keep,
+            "nothing selected does not mint a mirror"
+        );
+    }
+
     use super::*;
 
     use std::sync::{
@@ -12084,9 +11721,6 @@ mod tests {
                 label.contains("<channel") || raw.contains("<channel")
             }
             EntryKind::Queued { text } => text.contains("<channel"),
-            EntryKind::Pending { text, note, .. } => {
-                text.contains("<channel") || note.contains("<channel")
-            }
             EntryKind::LocalCommand { text } => text.contains("<channel"),
             EntryKind::SlashCommand { text } => text.contains("<channel"),
             EntryKind::Thinking { source } => source.contains("<channel"),
@@ -12243,173 +11877,6 @@ mod tests {
                 .any(|fact| fact.contains("in \u{b7}")),
             "got {:?}",
             session_facts(&spend)
-        );
-    }
-
-    fn history_of(messages: &[&str]) -> Vec<SharedString> {
-        messages
-            .iter()
-            .map(|message| SharedString::from(message.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn history_includes_pending_and_slash_commands_without_consecutive_duplicates() {
-        let lines = [
-            chained_line(
-                USER_RECORD_TYPE,
-                "u1",
-                None,
-                false,
-                serde_json::json!("first"),
-            ),
-            chained_line(
-                USER_RECORD_TYPE,
-                "u2",
-                Some("u1"),
-                false,
-                serde_json::json!("<command-name>/compact</command-name>"),
-            ),
-            chained_line(
-                USER_RECORD_TYPE,
-                "u3",
-                Some("u2"),
-                false,
-                serde_json::json!("<command-name>/compact</command-name>"),
-            ),
-        ];
-        let mut transcript = crate::Transcript::new();
-        transcript.absorb(lines.iter().map(|line| record(line)));
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session", "pending", &[]);
-
-        assert_eq!(
-            message_history(&pending_sends, &transcript),
-            history_of(&["pending", "/compact", "first"]),
-            "pending sends come first, slash commands are history, and consecutive repeats collapse"
-        );
-    }
-
-    /// A message still waiting in another conversation is not this one's history: those
-    /// rows are kept now that switching session hides them instead of dropping them, so
-    /// Up has to walk what was typed here and nothing else.
-    #[test]
-    fn history_leaves_out_messages_waiting_in_another_session() {
-        let lines = [chained_line(
-            USER_RECORD_TYPE,
-            "u1",
-            None,
-            false,
-            serde_json::json!("typed in this session"),
-        )];
-        let mut transcript = crate::Transcript::new();
-        transcript.absorb(lines.iter().map(|line| record(line)));
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("other-session", "sent to the other conversation", &[]);
-        pending_sends.remember("this-session", "waiting here", &[]);
-
-        assert_eq!(
-            message_history_for(&pending_sends, &transcript, Some("this-session")),
-            history_of(&["waiting here", "typed in this session"]),
-            "Up offers this conversation's messages, never another session's pending row"
-        );
-    }
-
-    /// The walk starts at the newest message and runs out at the oldest, rather than
-    /// wrapping round to the newest again: a reader holding Up would never know they
-    /// had reached the end.
-    #[test]
-    fn walking_back_stops_at_the_oldest_message() {
-        let history = history_of(&["newest", "middle", "oldest"]);
-
-        assert_eq!(
-            step_back_through_history(&history, None, ""),
-            HistoryStep::Recall {
-                index: 0,
-                message: "newest".into()
-            }
-        );
-        assert_eq!(
-            step_back_through_history(&history, Some(0), "newest"),
-            HistoryStep::Recall {
-                index: 1,
-                message: "middle".into()
-            }
-        );
-        assert_eq!(
-            step_back_through_history(&history, Some(2), "oldest"),
-            HistoryStep::Stay,
-            "there is nothing older, and the box must keep what it is holding"
-        );
-        assert_eq!(
-            step_back_through_history(&[], None, ""),
-            HistoryStep::Stay,
-            "a session with nothing sent to it has nothing to recall"
-        );
-    }
-
-    /// Walking forward ends at the empty box the walk started from, not at the newest
-    /// message: otherwise the reader can never get back to typing something new.
-    #[test]
-    fn walking_forward_ends_at_the_empty_box_the_walk_started_from() {
-        let history = history_of(&["newest", "middle", "oldest"]);
-
-        assert_eq!(
-            step_forward_through_history(&history, Some(2), "oldest"),
-            HistoryStep::Recall {
-                index: 1,
-                message: "middle".into()
-            }
-        );
-        assert_eq!(
-            step_forward_through_history(&history, Some(0), "newest"),
-            HistoryStep::Draft
-        );
-    }
-
-    /// The arrows belong to the cursor while the box holds something the reader wrote.
-    /// This is the property the whole design turns on: a half-written message must
-    /// never be thrown away by pressing Up.
-    #[test]
-    fn a_draft_in_the_box_keeps_the_arrow_keys_for_the_cursor() {
-        let history = history_of(&["newest", "middle"]);
-
-        assert_eq!(
-            step_back_through_history(&history, None, "half a thought"),
-            HistoryStep::MoveCursor(CursorDirection::Up)
-        );
-        assert_eq!(
-            step_forward_through_history(&history, None, "half a thought"),
-            HistoryStep::MoveCursor(CursorDirection::Down)
-        );
-        assert_eq!(
-            step_back_through_history(&history, Some(0), "newest, and then some"),
-            HistoryStep::MoveCursor(CursorDirection::Up),
-            "a recalled message the reader has edited is a draft of theirs"
-        );
-        assert_eq!(
-            step_forward_through_history(&history, Some(0), "newest, and then some"),
-            HistoryStep::MoveCursor(CursorDirection::Down)
-        );
-    }
-
-    /// A position recorded against a conversation that has since grown, or that the
-    /// reader has left, must not be read as standing somewhere in the new one.
-    #[test]
-    fn a_position_that_no_longer_matches_the_box_is_not_walked_from() {
-        let history = history_of(&["newest", "middle"]);
-
-        assert_eq!(
-            step_back_through_history(&history, Some(9), ""),
-            HistoryStep::Recall {
-                index: 0,
-                message: "newest".into()
-            },
-            "an empty box starts the walk again rather than trusting the position"
-        );
-        assert_eq!(
-            step_forward_through_history(&history, Some(9), ""),
-            HistoryStep::MoveCursor(CursorDirection::Down)
         );
     }
 
@@ -13092,34 +12559,6 @@ mod tests {
             Some("/clear"),
             "a channel queued_command must be the inner text; got {:?}",
             prompt.as_deref()
-        );
-    }
-
-    #[test]
-    fn a_pending_send_pairs_with_a_queued_channel_attachment() {
-        let typed = "/clear";
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session-a", typed, &[]);
-        let pending_before = pending_sends.entries();
-        assert_eq!(
-            pending_before.len(),
-            1,
-            "the send is drawn until the queued channel attachment arrives"
-        );
-        let pending_note_and_text = match &pending_before[0].kind {
-            EntryKind::Pending { note, text, .. } => format!("{note} / {text}"),
-            _ => "not a pending row".to_string(),
-        };
-
-        let after = user_message_entries_of(&[QUEUED_CHANNEL_CLEAR_ATTACHMENT]);
-        let compared = user_messages(&after);
-        pending_sends.pair_with(&after);
-
-        assert_eq!(
-            pending_sends.entries().len(),
-            0,
-            "the queued channel attachment is the send arriving; pending note and text: \
-             {pending_note_and_text}; compared against: {compared:?}"
         );
     }
 
@@ -13898,222 +13337,11 @@ mod tests {
         }
     }
 
-    fn command(name: &str, scope: SlashCommandScope) -> SlashCommand {
-        SlashCommand {
-            name: name.to_string(),
-            description: None,
-            argument_hint: None,
-            scope,
-        }
-    }
-
-    /// A slash partway through a sentence is a path, a date, or a fraction. A menu that
-    /// opened on those would be in the way of every message that mentions a file.
-    #[test]
-    fn only_a_message_that_is_nothing_but_a_command_is_naming_one() {
-        assert_eq!(slash_command_being_named("/comp"), Some("comp"));
-        assert_eq!(
-            slash_command_being_named("/"),
-            Some(""),
-            "a slash on its own is the whole menu, which is what it is for"
-        );
-
-        assert_eq!(slash_command_being_named("look at src/main.rs"), None);
-        assert_eq!(
-            slash_command_being_named("/compact now"),
-            None,
-            "once the arguments are being typed the name is settled"
-        );
-        assert_eq!(
-            slash_command_being_named("//"),
-            None,
-            "a doubled slash is not a command being named"
-        );
-        assert_eq!(slash_command_being_named(""), None);
-        assert_eq!(slash_command_being_named("compact"), None);
-    }
-
-    /// A name is usually typed from its beginning, so what starts with it is what the
-    /// reader is reaching for; what merely contains it is worth offering, but behind.
-    #[test]
-    fn commands_starting_with_what_was_typed_come_before_ones_merely_containing_it() {
-        let commands = vec![
-            command("review", SlashCommandScope::Project),
-            command("code-review", SlashCommandScope::User),
-            command("resume", SlashCommandScope::Builtin),
-            command("clear", SlashCommandScope::Builtin),
-        ];
-
-        let names: Vec<&str> = matching_slash_commands(&commands, "re")
-            .into_iter()
-            .map(|command| command.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["review", "resume", "code-review"]);
-
-        assert_eq!(
-            matching_slash_commands(&commands, "REV")
-                .into_iter()
-                .map(|command| command.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["review", "code-review"],
-            "what was typed is matched however it was capitalised"
-        );
-
-        assert_eq!(
-            matching_slash_commands(&commands, "").len(),
-            4,
-            "a slash on its own offers everything"
-        );
-        assert!(
-            matching_slash_commands(&commands, "nothing-by-this-name").is_empty(),
-            "a command this machine does not hold offers no rows, and an empty menu is \
-             not drawn at all"
-        );
-    }
-
-    /// The menu takes room the conversation is in, so it offers a screenful at most —
-    /// and must not go on drawing rows past that when everything matches.
-    #[test]
-    fn the_menu_offers_at_most_a_screenful() {
-        let commands: Vec<SlashCommand> = (0..SLASH_COMMAND_ROWS + 5)
-            .map(|index| command(&format!("command-{index}"), SlashCommandScope::User))
-            .collect();
-
-        assert_eq!(
-            matching_slash_commands(&commands, "").len(),
-            SLASH_COMMAND_ROWS
-        );
-    }
-
-    #[test]
-    fn file_menu_highlight_never_exceeds_the_rows_that_are_drawn() {
-        let files: Vec<SharedString> = (0..FILE_MENU_ROWS + 20)
-            .map(|index| SharedString::from(format!("src/file-{index}.rs")))
-            .collect();
-        let offered = matching_files(&files, "src");
-        let highlighted = step_through_menu(usize::MAX, offered.len(), MenuStep::Stay);
-
-        assert_eq!(offered.len(), FILE_MENU_ROWS);
-        assert!(highlighted < offered.len());
-    }
-
-    #[test]
-    fn file_menu_locally_narrows_previous_matches_and_bare_at_opens_nothing() {
-        let previous = vec![
-            SharedString::from("src/panel.rs"),
-            SharedString::from("src/session_store.rs"),
-            SharedString::from("tests/panel_test.rs"),
-        ];
-
-        assert_eq!(
-            matching_files(&previous, "panel"),
-            vec![
-                SharedString::from("src/panel.rs"),
-                SharedString::from("tests/panel_test.rs"),
-            ],
-            "the previous host result stays visible after being narrowed locally"
-        );
-        assert_eq!(file_being_named("@"), Some(""));
-        assert!(
-            matching_files(&previous, "").is_empty(),
-            "a bare @ draws no file menu"
-        );
-    }
-
-    #[test]
-    fn pasted_file_names_include_time_and_six_hex_hash_characters() {
-        let name = pasted_file_name(1_234, "png", b"same contents");
-        let hash = name
-            .strip_prefix("pasted-1234-")
-            .and_then(|name| name.strip_suffix(".png"))
-            .expect("the pasted-file name has the expected fixed parts");
-
-        assert_eq!(hash.len(), 6);
-        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
-        assert_eq!(name, pasted_file_name(1_234, "png", b"same contents"));
-        assert_ne!(name, pasted_file_name(1_234, "png", b"different contents"));
-        assert_eq!(
-            pasted_path_for_message(
-                Path::new("/work/project/images/pasted.png"),
-                Some(Path::new("/work/project")),
-            ),
-            "@images/pasted.png"
-        );
-        assert_eq!(
-            pasted_path_for_message(
-                Path::new("/home/user/.claude/zed-pasted/pasted.png"),
-                Some(Path::new("/work/project")),
-            ),
-            "/home/user/.claude/zed-pasted/pasted.png"
-        );
-    }
-
     #[test]
     fn successful_uninstall_reports_the_manual_mcp_cleanup_command() {
         let note = uninstall_hooks_note(Ok(()));
         assert!(note.contains("Hooks uninstalled"));
         assert!(note.contains("claude mcp remove zed-claude"));
-    }
-
-    #[test]
-    fn a_question_option_click_composes_the_exact_text() {
-        assert_eq!(
-            compose_single_question_answer("Shape", "Which shape?", "Circle"),
-            "Answer to \"Shape\": Circle"
-        );
-        assert_eq!(
-            compose_single_question_answer("", "Which extras?", "CodeGraph"),
-            "Answer to \"Which extras?\": CodeGraph"
-        );
-        assert_eq!(
-            compose_multi_question_answer(
-                "Extras",
-                &["CodeGraph".to_string(), "Tests".to_string()]
-            ),
-            "Answers to \"Extras\": CodeGraph; Tests"
-        );
-        assert_eq!(
-            compose_type_something_prefix("Shape", "Which shape?"),
-            "Answer to \"Shape\": "
-        );
-    }
-
-    #[test]
-    fn a_dialog_only_slash_command_is_not_sent() {
-        assert!(matches!(
-            slash_send_decision("/permissions"),
-            SlashSendDecision::OpenInTerminal
-        ));
-        assert!(matches!(
-            slash_send_decision("/login"),
-            SlashSendDecision::OpenInTerminal
-        ));
-        assert!(matches!(
-            slash_send_decision("/mcp"),
-            SlashSendDecision::OpenInTerminal
-        ));
-        assert!(matches!(
-            slash_send_decision("/mcp some-server"),
-            SlashSendDecision::SendAsText
-        ));
-    }
-
-    #[test]
-    fn an_argument_slash_command_without_an_argument_is_not_sent() {
-        match slash_send_decision("/model") {
-            SlashSendDecision::NeedsArgument { example } => {
-                assert_eq!(example, "add an argument, e.g. /model opus");
-            }
-            other => panic!("expected NeedsArgument, got a send decision of {other:?}"),
-        }
-        assert!(matches!(
-            slash_send_decision("/model opus"),
-            SlashSendDecision::SendAsText
-        ));
-        assert!(matches!(
-            slash_send_decision("hello"),
-            SlashSendDecision::SendAsText
-        ));
     }
 
     /// The status line under the input names channel liveness, not heartbeat age: clocks
@@ -14222,36 +13450,6 @@ mod tests {
         assert_eq!(
             agent_chip_tooltip(&full).as_ref(),
             "general-purpose\nopus\ndepth 2\nreview"
-        );
-    }
-
-    /// An agent's conversation is read-only, and the reader has to be told why the input
-    /// under it is dead — with the one reason they can act on first.
-    #[test]
-    fn reading_an_agent_disables_the_input_and_says_which_chip_to_go_back_to() {
-        assert_eq!(
-            input_note(false, true, true),
-            Some(AGENT_READ_ONLY_NOTE),
-            "the way back is one chip away, so that is the reason to give"
-        );
-        assert!(
-            AGENT_READ_ONLY_NOTE.contains("Main"),
-            "the note has to name the chip that takes the reader back, got {AGENT_READ_ONLY_NOTE:?}"
-        );
-
-        assert_eq!(
-            input_note(false, false, true),
-            Some(READ_ONLY_NOTE),
-            "a session outside tmux keeps its own reason"
-        );
-        assert_eq!(
-            input_note(false, false, false),
-            Some(SELECT_A_SESSION_TO_REPLY)
-        );
-        assert_eq!(
-            input_note(true, false, true),
-            None,
-            "a session that can be typed into is owed no explanation"
         );
     }
 
@@ -14979,34 +14177,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_send_stays_failed_with_its_text_and_can_be_retried() {
-        let mut pending_sends = PendingSends::default();
-        let id = pending_sends.remember("session", "the message", &[]);
-        pending_sends.resolve(id, &Err(anyhow::anyhow!("offline")));
-
-        assert_eq!(
-            pending_sends.text(id).map(SharedString::as_ref),
-            Some("the message")
-        );
-        assert!(
-            pending_sends
-                .sends
-                .first()
-                .is_some_and(|send| send.error.is_some())
-        );
-        assert_eq!(
-            pending_sends.retry(id, &[]),
-            Some(SharedString::from("the message")),
-        );
-        assert!(
-            pending_sends
-                .sends
-                .first()
-                .is_some_and(|send| send.error.is_none())
-        );
-    }
-
     fn activity_of(json_lines: &[&str]) -> Activity {
         let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
         let path: Vec<&TranscriptRecord> = records.iter().collect();
@@ -15334,220 +14504,6 @@ mod tests {
         );
     }
 
-    fn pending_texts(entries: &[Entry]) -> Vec<SharedString> {
-        entries
-            .iter()
-            .filter_map(|entry| match &entry.kind {
-                EntryKind::Pending { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn pending_ids(pending_sends: &PendingSends) -> Vec<u64> {
-        pending_sends.sends.iter().map(|send| send.id).collect()
-    }
-
-    /// The conversation as the panel draws it: what the transcript says, then what has
-    /// been sent to it and has not turned up yet.
-    fn shown(entries: &[Entry], pending_sends: &PendingSends) -> Vec<Entry> {
-        let mut shown = entries.to_vec();
-        shown.extend(pending_sends.entries());
-        shown
-    }
-
-    /// The bug this exists for: the CLI writes the user's record when it starts the turn,
-    /// so on a busy session there is nothing in the transcript to draw and the message
-    /// the user just sent looks like it went nowhere.
-    #[test]
-    fn a_sent_message_is_shown_before_the_transcript_has_it() {
-        let entries = entries_of(&[&user_message_line("a", "an earlier message")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "the message I just sent", &entries);
-
-        let shown = shown(&entries, &pending_sends);
-        assert_eq!(
-            pending_texts(&shown),
-            vec![SharedString::from("the message I just sent")],
-            "the message has to be somewhere the moment it is sent"
-        );
-        assert_eq!(
-            message_sources(&shown),
-            vec![SharedString::from("an earlier message")],
-            "and it must not be mixed into what the transcript itself said"
-        );
-    }
-
-    /// The records `pair_with` is matched against in the panel, which are not the ones
-    /// the conversation is drawn from — the bug below lived in the gap between the two.
-    fn user_message_entries_of(json_lines: &[&str]) -> Vec<Entry> {
-        let records: Vec<TranscriptRecord> = json_lines.iter().map(|line| record(line)).collect();
-        let path: Vec<&TranscriptRecord> = records.iter().collect();
-        user_message_entries(&path)
-    }
-
-    /// A message typed while the session was answering is recorded as an attachment and
-    /// never as a user record — that is the only place its text is ever written. Left out
-    /// of what a send is paired against, its `Sending…` message stays on screen for the
-    /// rest of the session while the conversation draws the very same words beside it.
-    #[test]
-    fn a_pending_message_goes_when_it_arrives_as_a_queued_message() {
-        let queued = serde_json::json!({
-            "type": "attachment",
-            "uuid": "b",
-            "parentUuid": "a",
-            "attachment": {
-                "type": "queued_command",
-                "prompt": "run the tests",
-            },
-        })
-        .to_string();
-
-        let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "run the tests", &before);
-
-        let after =
-            user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
-        pending_sends.pair_with(&after);
-
-        assert!(
-            pending_sends.is_empty(),
-            "the queued record is the message arriving, and it is the only record it \
-             will ever get"
-        );
-    }
-
-    /// The same for a message queued with an image in it, whose text is one block of
-    /// several rather than the whole of the field.
-    #[test]
-    fn a_pending_message_goes_when_it_arrives_as_a_queued_message_with_an_image() {
-        let queued = serde_json::json!({
-            "type": "attachment",
-            "uuid": "b",
-            "parentUuid": "a",
-            "attachment": {
-                "type": "queued_command",
-                "prompt": [
-                    {"type": "text", "text": "look at this"},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": "aGVsbG8=",
-                        },
-                    },
-                ],
-            },
-        })
-        .to_string();
-
-        let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "look at this", &before);
-
-        let after =
-            user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
-        pending_sends.pair_with(&after);
-
-        assert!(pending_sends.is_empty());
-    }
-
-    /// The key has to be the one the conversation draws that record under, or the entry
-    /// the send was paired with is not the entry on screen.
-    #[test]
-    fn a_queued_message_is_keyed_the_same_way_in_both_lists() {
-        let queued = serde_json::json!({
-            "type": "attachment",
-            "uuid": "b",
-            "parentUuid": "a",
-            "attachment": {"type": "queued_command", "prompt": "run the tests"},
-        })
-        .to_string();
-
-        let keys_of = |entries: Vec<Entry>| -> Vec<SharedString> {
-            entries
-                .into_iter()
-                .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
-                .map(|entry| entry.key)
-                .collect()
-        };
-
-        assert_eq!(
-            keys_of(user_message_entries_of(&[&queued])),
-            keys_of(entries_of(&[&queued])),
-        );
-    }
-
-    #[test]
-    fn a_pending_message_goes_when_its_record_arrives() {
-        let before = entries_of(&[&user_message_line("a", "an earlier message")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "run the tests", &before);
-        assert_eq!(
-            pending_texts(&shown(&before, &pending_sends)).len(),
-            1,
-            "the message is drawn while the transcript has nothing for it"
-        );
-
-        // The record the CLI writes carries the same text with its own context appended.
-        let after = entries_of(&[
-            &user_message_line("a", "an earlier message"),
-            &user_message_line(
-                "b",
-                "run the tests\n<system-reminder>The user opened a file.</system-reminder>",
-            ),
-        ]);
-        pending_sends.pair_with(&after);
-
-        let shown = shown(&after, &pending_sends);
-        assert_eq!(
-            pending_texts(&shown),
-            Vec::<SharedString>::new(),
-            "the record is the message now, and drawing both would show it twice"
-        );
-        assert_eq!(
-            message_sources(&shown),
-            vec![
-                SharedString::from("an earlier message"),
-                SharedString::from("run the tests"),
-            ],
-            "the message is shown once, by the record that arrived"
-        );
-    }
-
-    #[test]
-    fn a_pending_send_comes_down_when_its_channel_record_arrives() {
-        let typed = "可以了 channel connected";
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", typed, &[]);
-        let pending_before = pending_sends.entries();
-        assert_eq!(
-            pending_before.len(),
-            1,
-            "the send is drawn until the channel record arrives"
-        );
-        let pending_note_and_text = match &pending_before[0].kind {
-            EntryKind::Pending { note, text, .. } => format!("{note} / {text}"),
-            _ => "not a pending row".to_string(),
-        };
-
-        let after = user_message_entries_of(&[&channel_record_line(
-            "ff1c744b-channel",
-            &channel_envelope(typed),
-        )]);
-        let compared = user_messages(&after);
-        pending_sends.pair_with(&after);
-
-        assert_eq!(
-            pending_sends.entries().len(),
-            0,
-            "the channel record is the send arriving; pending note and text: \
-             {pending_note_and_text}; compared against: {compared:?}"
-        );
-    }
-
     fn queued_texts(entries: &[Entry]) -> Vec<SharedString> {
         entries
             .iter()
@@ -15565,7 +14521,7 @@ mod tests {
     fn a_queued_channel_message_is_drawn_as_its_inner_text() {
         let typed = "可以了 channel connected";
         let queued = vec![SharedString::from(channel_envelope(typed))];
-        let entries = queued_entries(&queued, &PendingSends::default(), Some("session-a"));
+        let entries = queued_entries(&queued);
 
         let texts = queued_texts(&entries);
         assert_eq!(
@@ -15576,51 +14532,6 @@ mod tests {
         assert!(
             !entries.iter().any(entry_holds_channel_open),
             "no <channel survives in a queue row; got {texts:?}"
-        );
-    }
-
-    /// A message sent from Zed is in the session's queue as well as in the panel's own
-    /// pending row. Compared raw, the queue entry never matched the send, so the one
-    /// message was drawn twice: a `Queued` row holding the envelope, and the pending row.
-    #[test]
-    fn a_queued_channel_message_the_panel_sent_is_not_drawn_twice() {
-        let typed = "可以了 channel connected";
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session-a", typed, &[]);
-        let queued = vec![SharedString::from(channel_envelope(typed))];
-
-        let entries = queued_entries(&queued, &pending_sends, Some("session-a"));
-        assert_eq!(
-            queued_texts(&entries),
-            Vec::<SharedString>::new(),
-            "the pending row already draws this message; pending rows: {:?}",
-            pending_texts(&pending_sends.entries())
-        );
-
-        // The same envelope while another session is selected is not this session's
-        // message, and the unwrapping must not start swallowing it.
-        assert_eq!(
-            queued_texts(&queued_entries(&queued, &pending_sends, Some("session-b"))),
-            vec![SharedString::from(typed)],
-            "another session's queue entry is still a row of its own"
-        );
-    }
-
-    /// The pairing the queue rows lean on predates the channel, and unwrapping must not
-    /// cost it: a plain queued message that matches a pending send is still left to it.
-    #[test]
-    fn a_queued_message_that_is_not_wrapped_still_matches_its_pending_send() {
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session-a", "run the tests", &[]);
-        let queued = vec![
-            SharedString::from("run the tests"),
-            SharedString::from("and then deploy"),
-        ];
-
-        assert_eq!(
-            queued_texts(&queued_entries(&queued, &pending_sends, Some("session-a"))),
-            vec![SharedString::from("and then deploy")],
-            "only the message that has no pending row of its own is drawn here"
         );
     }
 
@@ -15638,619 +14549,13 @@ mod tests {
         ];
 
         assert_eq!(
-            queued_texts(&queued_entries(
-                &queued,
-                &PendingSends::default(),
-                Some("7")
-            )),
+            queued_texts(&queued_entries(&queued)),
             vec![
                 SharedString::from(quoting),
                 SharedString::from(trailing),
                 SharedString::from("<channels> is not the tag"),
             ],
             "only a line that is nothing but an envelope is unwrapped"
-        );
-    }
-
-    /// One record is one message arriving, whichever wrapper it arrived in.
-    #[test]
-    fn one_channel_record_takes_only_the_older_of_two_equal_sends_down() {
-        let typed = "run the tests";
-        let mut pending_sends = PendingSends::default();
-        let older = pending_sends.remember("7", typed, &[]);
-        let newer = pending_sends.remember("7", typed, &[]);
-
-        let after = user_message_entries_of(&[&channel_record_line(
-            "ff1c744b-channel",
-            &channel_envelope(typed),
-        )]);
-        pending_sends.pair_with(&after);
-
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![newer],
-            "the older send ({older}) is the one that arrived; the newer ({newer}) is \
-             still waiting"
-        );
-    }
-
-    /// A send belongs to the session it was sent to: another session's conversation is
-    /// not where it arrives, however alike the two texts are.
-    #[test]
-    fn a_channel_record_of_another_session_leaves_this_rows_alone() {
-        let typed = "可以了 channel connected";
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session-a", typed, &[]);
-
-        let after = user_message_entries_of(&[&channel_record_line(
-            "ff1c744b-channel",
-            &channel_envelope(typed),
-        )]);
-        pending_sends.pair_with_session(&after, "session-b");
-
-        assert_eq!(
-            pending_texts(&pending_sends.entries()),
-            vec![SharedString::from(typed)],
-            "session-a's message is still waiting; a record read while session-b is \
-             selected says nothing about it"
-        );
-    }
-
-    #[test]
-    fn a_record_of_other_text_leaves_a_pending_message_alone() {
-        let before = entries_of(&[&user_message_line("a", "an earlier message")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "run the tests", &before);
-        assert_eq!(pending_texts(&shown(&before, &pending_sends)).len(), 1);
-
-        let after = entries_of(&[
-            &user_message_line("a", "an earlier message"),
-            &user_message_line("b", "something else entirely"),
-        ]);
-        pending_sends.pair_with(&after);
-
-        assert_eq!(
-            pending_texts(&shown(&after, &pending_sends)),
-            vec![SharedString::from("run the tests")],
-            "a record of other words is not this message arriving, and taking the \
-             message down for it would lose it"
-        );
-    }
-
-    /// A record the conversation was carrying before the send cannot be the send
-    /// arriving, whether or not the reader had it on screen at the time. Opening the
-    /// history behind a compaction reveals such records, and pairing with one takes the
-    /// message down having never delivered it — the one thing a pending message exists
-    /// to stop.
-    #[test]
-    fn opening_the_history_behind_a_compaction_leaves_a_pending_message_alone() {
-        let older = user_message_line("a", "keep going");
-        let newer = user_message_line("b", "and now this");
-
-        // What the reader is looking at with the history closed: the turn before the
-        // compaction is not in the active path.
-        let on_screen = entries_of(&[&newer]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "keep going", &on_screen);
-
-        // The same conversation with the compacted-away turn revealed.
-        let whole_history = entries_of(&[&older, &newer]);
-        pending_sends.pair_with(&whole_history);
-
-        assert_eq!(
-            pending_texts(&shown(&whole_history, &pending_sends)),
-            vec![SharedString::from("keep going")],
-            "the only record of this text was written before the send, so the message \
-             has not arrived and must still be shown"
-        );
-    }
-
-    /// What the guard above must not kill: the record a send was measured against can
-    /// itself leave the conversation before the send's own record turns up — compaction
-    /// runs as a turn starts, which is the same moment the user's record is written —
-    /// and the send still has to be paired with the record that did arrive.
-    #[test]
-    fn a_pending_message_is_paired_after_the_record_it_was_measured_against_is_compacted_away() {
-        let on_screen = entries_of(&[&user_message_line("a", "and now this")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "keep going", &on_screen);
-
-        let after_compaction = entries_of(&[&user_message_line("c", "keep going")]);
-        pending_sends.pair_with(&after_compaction);
-
-        assert!(
-            pending_sends.is_empty(),
-            "the send's own record has arrived and drawing both would show it twice, \
-             {:?} left",
-            pending_ids(&pending_sends)
-        );
-    }
-
-    /// The other input the guard must not kill: the first thing said in a conversation
-    /// has no record before it to be written after, and its record is still what the
-    /// send became.
-    #[test]
-    fn the_first_message_of_a_conversation_is_paired_with_the_record_that_arrives() {
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "the very first thing I said", &[]);
-
-        let arrived = entries_of(&[&user_message_line("a", "the very first thing I said")]);
-        pending_sends.pair_with(&arrived);
-
-        assert!(
-            pending_sends.is_empty(),
-            "the record of the first message is that message arriving, {:?} left",
-            pending_ids(&pending_sends)
-        );
-    }
-
-    #[test]
-    fn two_sends_of_the_same_text_are_paired_with_the_two_records_in_order() {
-        // A record already showing this text: it was there before either send, so it
-        // cannot be what either send became.
-        let before = entries_of(&[&user_message_line("a", "keep going")]);
-        let mut pending_sends = PendingSends::default();
-        let first = pending_sends.remember("7", "keep going", &before);
-        let second = pending_sends.remember("7", "keep going", &before);
-
-        pending_sends.pair_with(&before);
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![first, second],
-            "the record that was already there answers neither send"
-        );
-
-        let after_one = entries_of(&[
-            &user_message_line("a", "keep going"),
-            &user_message_line("b", "keep going"),
-        ]);
-        pending_sends.pair_with(&after_one);
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![second],
-            "the first record answers the first send, and the second send is still waiting"
-        );
-
-        let after_two = entries_of(&[
-            &user_message_line("a", "keep going"),
-            &user_message_line("b", "keep going"),
-            &user_message_line("c", "keep going"),
-        ]);
-        pending_sends.pair_with(&after_two);
-        assert!(
-            pending_sends.is_empty(),
-            "both sends have their record now, {:?} left",
-            pending_ids(&pending_sends)
-        );
-    }
-
-    #[test]
-    fn a_send_that_failed_keeps_its_pending_message_for_retry() {
-        let mut pending_sends = PendingSends::default();
-        let failed = pending_sends.remember("7", "the message that never arrived", &[]);
-        let arrived = pending_sends.remember("7", "the message that did", &[]);
-        assert_eq!(pending_ids(&pending_sends), vec![failed, arrived]);
-
-        pending_sends.resolve(arrived, &Ok("0000000000001-0001.json".to_string()));
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![failed, arrived],
-            "a send that arrived is waiting for its record to be written, not finished"
-        );
-
-        pending_sends.resolve(
-            failed,
-            &Err(anyhow::anyhow!("Zed channel is not loaded in this session")),
-        );
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![failed, arrived],
-            "a failed send remains visible so it can be retried or copied"
-        );
-        assert_eq!(
-            pending_sends.text(failed).map(SharedString::as_ref),
-            Some("the message that never arrived")
-        );
-        assert!(
-            pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == failed)
-                .is_some_and(|send| send.error.is_some())
-        );
-    }
-
-    /// Retry is the same message again, not a paraphrase of it: what Retry hands back is
-    /// what Copy yields and what the failed row shows, whichever alphabet it is in and
-    /// however many lines it has. A second failure leaves the row where it is.
-    #[test]
-    fn retry_hands_back_the_text_that_failed_and_a_second_failure_keeps_the_row() {
-        for original in [
-            "請把 tests 跑一遍 — and report back",
-            "first line\nsecond line\n  indented third",
-            "/compact keep the decisions",
-        ] {
-            let mut pending_sends = PendingSends::default();
-            let id = pending_sends.remember("7", original, &[]);
-            pending_sends.resolve(id, &Err(anyhow::anyhow!("Zed channel is not loaded")));
-
-            let retried = pending_sends.retry(id, &[]);
-            assert_eq!(
-                retried.as_ref().map(SharedString::as_ref),
-                Some(original),
-                "Retry must re-send the message that failed; expected {original:?}, got {:?}",
-                retried.as_ref().map(SharedString::as_ref)
-            );
-            assert!(
-                pending_sends
-                    .sends
-                    .iter()
-                    .find(|send| send.id == id)
-                    .is_some_and(|send| send.error.is_none()),
-                "a retried row is trying again, so it must not still read as failed"
-            );
-
-            pending_sends.resolve(id, &Err(anyhow::anyhow!("Zed channel is not loaded")));
-            assert_eq!(
-                pending_ids(&pending_sends),
-                vec![id],
-                "a second failure must leave the row to be retried again, not take it down"
-            );
-            assert_eq!(
-                pending_sends.text(id).map(SharedString::as_ref),
-                Some(original),
-                "the text survives every failure; expected {original:?}, got {:?}",
-                pending_sends.text(id).map(SharedString::as_ref)
-            );
-        }
-    }
-
-    #[test]
-    fn a_message_sent_inbox_event_marks_the_pending_send_delivered() {
-        let mut pending_sends = PendingSends::default();
-        let id = pending_sends.remember("7", "hello from zed", &[]);
-        pending_sends.resolve(id, &Ok("0000000000050-0001.json".to_string()));
-
-        let local_now = 1_700_000_000_000;
-        pending_sends.pair_with_channel(
-            &[ChannelInboxEvent::MessageSent {
-                at_ms: 50,
-                outbox_file: "0000000000050-0001.json".to_string(),
-                content_chars: 14,
-            }],
-            local_now,
-        );
-
-        let send = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == id)
-            .expect("the send is still waiting for its transcript record");
-        assert_eq!(send.delivered_at_ms, Some(50));
-        // Host at_ms is display-only. The 60 s wait is measured from the local time
-        // this inbox event was observed (here: a reader whose clock is far ahead of 50).
-        assert_eq!(
-            pending_send_note(send, local_now),
-            CHANNEL_DELIVERED_NOTE,
-            "a message the inbox has just reported delivered must read \"delivered to Claude\", \
-             got {:?}",
-            pending_send_note(send, local_now)
-        );
-        assert_eq!(
-            pending_send_note(send, local_now + CHANNEL_WAIT_FOR_TRANSCRIPT_MS),
-            CHANNEL_WAITING_NOTE,
-            "60 s after local observation, with no transcript record, says waiting; got {:?}",
-            pending_send_note(send, local_now + CHANNEL_WAIT_FOR_TRANSCRIPT_MS)
-        );
-    }
-
-    #[test]
-    fn pending_messages_are_hidden_not_dropped_when_the_reader_switches_session() {
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("7", "for the session I was reading", &[]);
-        let nine = pending_sends.remember("9", "for the session I am reading now", &[]);
-        assert_eq!(pending_ids(&pending_sends).len(), 2);
-
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("9"))),
-            vec![SharedString::from("for the session I am reading now")],
-            "the renderer shows only the selected session's rows"
-        );
-        assert_eq!(
-            pending_ids(&pending_sends).len(),
-            2,
-            "the backing collection still holds the other session's row"
-        );
-        assert!(
-            pending_ids(&pending_sends).contains(&nine),
-            "the selected session's row stays in the backing collection too"
-        );
-
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("7"))),
-            vec![SharedString::from("for the session I was reading")],
-            "switching back shows the hidden row again"
-        );
-        assert_eq!(pending_ids(&pending_sends).len(), 2);
-    }
-
-    #[test]
-    fn a_failed_row_hides_when_switching_session_and_reappears_with_its_text() {
-        let mut pending_sends = PendingSends::default();
-        let failed = pending_sends.remember("session-a", "keep this text", &[]);
-        pending_sends.resolve(failed, &Err(anyhow::anyhow!("offline")));
-        pending_sends.remember("session-b", "the other conversation", &[]);
-
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("session-b"))),
-            vec![SharedString::from("the other conversation")],
-            "a Failed row is not rendered under a different session"
-        );
-        assert_eq!(
-            pending_ids(&pending_sends).len(),
-            2,
-            "switching session must not drop the Failed row"
-        );
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("session-a"))),
-            vec![SharedString::from("keep this text")],
-            "switching back shows the Failed row with its text intact"
-        );
-    }
-
-    #[test]
-    fn dismiss_ended_hides_failed_rows_until_the_session_is_reselected() {
-        let mut pending_sends = PendingSends::default();
-        let failed = pending_sends.remember("session-a", "still mine", &[]);
-        pending_sends.resolve(failed, &Err(anyhow::anyhow!("offline")));
-
-        assert!(
-            pending_sends.entries_for(None).is_empty(),
-            "dismiss_ended leaves no session selected, so nothing is drawn"
-        );
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![failed],
-            "dismiss_ended must not drop the row"
-        );
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("session-a"))),
-            vec![SharedString::from("still mine")],
-            "reselecting the session shows the row again"
-        );
-    }
-
-    #[test]
-    fn closing_a_failed_row_removes_only_that_row() {
-        let mut pending_sends = PendingSends::default();
-        let first = pending_sends.remember("7", "first failed", &[]);
-        let second = pending_sends.remember("7", "second failed", &[]);
-        pending_sends.resolve(first, &Err(anyhow::anyhow!("offline")));
-        pending_sends.resolve(second, &Err(anyhow::anyhow!("offline")));
-
-        pending_sends.dismiss(first);
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![second],
-            "the close control takes down only the Failed row it sits on"
-        );
-        assert_eq!(
-            pending_texts(&pending_sends.entries_for(Some("7"))),
-            vec![SharedString::from("second failed")]
-        );
-    }
-
-    #[test]
-    fn pairing_only_considers_the_selected_sessions_rows() {
-        let echo = entries_of(&[&user_message_line("u", "hello from both")]);
-        let mut pending_sends = PendingSends::default();
-        pending_sends.remember("session-a", "hello from both", &[]);
-        let session_b = pending_sends.remember("session-b", "hello from both", &[]);
-
-        pending_sends.pair_with_session(&echo, "session-a");
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![session_b],
-            "a transcript echo in A must not take down B's in-flight row"
-        );
-        assert!(
-            pending_sends.holds_text("hello from both", Some("session-b")),
-            "B's in-flight text still occupies B's queue slot"
-        );
-        assert!(
-            !pending_sends.holds_text("hello from both", Some("session-a")),
-            "A's paired-away send must not hide A's queue entry"
-        );
-
-        pending_sends.resolve(session_b, &Ok("0000000000001-0001.json".to_string()));
-        pending_sends.pair_with_channel_for(
-            &[ChannelInboxEvent::MessageSent {
-                at_ms: 50,
-                outbox_file: "0000000000001-0001.json".to_string(),
-                content_chars: 14,
-            }],
-            1_700_000_000_000,
-            "session-a",
-        );
-        let send_b = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == session_b)
-            .expect("B's send is still waiting");
-        assert_eq!(
-            send_b.delivered_at_ms, None,
-            "A's inbox must not mark B's outbox file delivered"
-        );
-
-        pending_sends.pair_with_channel_for(
-            &[ChannelInboxEvent::MessageSent {
-                at_ms: 50,
-                outbox_file: "0000000000001-0001.json".to_string(),
-                content_chars: 14,
-            }],
-            1_700_000_000_000,
-            "session-b",
-        );
-        let send_b = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == session_b)
-            .expect("B's send is still waiting for its transcript record");
-        assert_eq!(send_b.delivered_at_ms, Some(50));
-    }
-
-    #[test]
-    fn the_finished_row_bound_evicts_oldest_finished_and_never_in_flight() {
-        let mut under_the_bound = PendingSends::default();
-        for session in ["session-a", "session-b", "session-c"] {
-            for index in 0..5 {
-                let id =
-                    under_the_bound.remember(session, &format!("{session}-failed-{index}"), &[]);
-                under_the_bound.resolve(id, &Err(anyhow::anyhow!("offline")));
-            }
-        }
-        assert_eq!(
-            under_the_bound.sends.len(),
-            15,
-            "3 sessions × 5 failed rows are under the bound and must lose nothing"
-        );
-
-        let mut in_flight_only = PendingSends::default();
-        for index in 0..51 {
-            in_flight_only.remember("session-a", &format!("in-flight-{index}"), &[]);
-        }
-        assert_eq!(
-            in_flight_only.sends.len(),
-            51,
-            "in-flight rows are not counted, so 51 of them coexist"
-        );
-
-        let mut pending_sends = PendingSends::default();
-        for index in 0..60 {
-            let id = pending_sends.remember("session-a", &format!("finished-{index}"), &[]);
-            pending_sends.resolve(id, &Err(anyhow::anyhow!("offline")));
-        }
-        let in_flight_ids: Vec<u64> = (0..3)
-            .map(|index| pending_sends.remember("session-a", &format!("in-flight-{index}"), &[]))
-            .collect();
-
-        let finished_texts: Vec<String> = pending_sends
-            .sends
-            .iter()
-            .filter(|send| send.error.is_some())
-            .map(|send| send.text.to_string())
-            .collect();
-        let in_flight_left: Vec<u64> = pending_sends
-            .sends
-            .iter()
-            .filter(|send| send.error.is_none())
-            .map(|send| send.id)
-            .collect();
-        assert_eq!(finished_texts.len(), 50);
-        assert_eq!(in_flight_left, in_flight_ids);
-        assert_eq!(
-            finished_texts.first().map(String::as_str),
-            Some("finished-10")
-        );
-        assert!(
-            !finished_texts.iter().any(|text| text == "finished-0"),
-            "the 10 evicted rows are the oldest finished; got {finished_texts:?}"
-        );
-        assert_eq!(
-            finished_texts.last().map(String::as_str),
-            Some("finished-59")
-        );
-    }
-
-    /// A row of a session that is still live or still in `ended` must not be failed by
-    /// the gone-session guard, even across many applications — that is the legal input
-    /// the guard could wrongly kill. A session that is neither is marked failed so the
-    /// finished bound covers it; a row that was already finished is left alone.
-    #[test]
-    fn in_flight_rows_of_a_gone_session_are_marked_failed_and_live_or_ended_ones_are_not() {
-        let mut pending_sends = PendingSends::default();
-        let live = pending_sends.remember("live-session", "hidden but live", &[]);
-        let ended = pending_sends.remember("ended-session", "still listed as ended", &[]);
-        let gone = pending_sends.remember("gone-session", "never coming back", &[]);
-        let already_failed = pending_sends.remember("gone-session", "already failed", &[]);
-        pending_sends.resolve(already_failed, &Err(anyhow::anyhow!("offline")));
-        let original_error = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == already_failed)
-            .expect("the already-failed row is there")
-            .error
-            .clone();
-
-        for _ in 0..10 {
-            pending_sends.fail_in_flight_of_unknown_sessions(["live-session", "ended-session"]);
-        }
-        pending_sends.evict_finished_over_bound();
-
-        let send_live = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == live)
-            .expect("the live session's in-flight row must survive");
-        assert_eq!(send_live.error, None, "a hidden-but-live session is legal");
-        let send_ended = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == ended)
-            .expect("the ended session's in-flight row must survive");
-        assert_eq!(send_ended.error, None, "a session still in ended is legal");
-        let send_gone = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == gone)
-            .expect("the gone session's row is kept as a finished row");
-        assert_eq!(
-            send_gone.error.as_deref(),
-            Some(SESSION_ENDED_BEFORE_ARRIVAL)
-        );
-        let send_already_failed = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == already_failed)
-            .expect("the already-failed row is left in place");
-        assert_eq!(
-            send_already_failed.error, original_error,
-            "finished rows are not rewritten by the gone-session guard"
-        );
-    }
-
-    /// Applying (A→B) then (B→C) in order takes rows keyed A all the way to C.
-    #[test]
-    fn rebind_applies_a_chain_of_clears_in_order() {
-        let mut pending_sends = PendingSends::default();
-        let id = pending_sends.remember("session-a", "follow the chain", &[]);
-        pending_sends.rebind("session-a", "session-b");
-        pending_sends.rebind("session-b", "session-c");
-        let send = pending_sends
-            .sends
-            .iter()
-            .find(|send| send.id == id)
-            .expect("the row is still there");
-        assert_eq!(
-            send.session_id.as_str(),
-            "session-c",
-            "rows keyed A must land on C after A→B then B→C"
-        );
-    }
-
-    #[test]
-    fn dismissing_one_pending_message_leaves_the_others() {
-        let mut pending_sends = PendingSends::default();
-        let first = pending_sends.remember("7", "same text", &[]);
-        let second = pending_sends.remember("7", "same text", &[]);
-        let third = pending_sends.remember("7", "another message", &[]);
-        assert_eq!(pending_ids(&pending_sends), vec![first, second, third]);
-
-        pending_sends.dismiss(second);
-        assert_eq!(
-            pending_ids(&pending_sends),
-            vec![first, third],
-            "the button takes down the message it sits on, not the one that reads the same"
         );
     }
 
@@ -16330,15 +14635,6 @@ mod tests {
                 slash_command_roots: Mutex::new(Vec::new()),
                 attachment_bytes: Vec::new(),
             }
-        }
-
-        fn with_sessions(self, sessions: Vec<RegisteredSession>) -> Self {
-            *self.sessions.lock().expect("setting scripted sessions") = sessions;
-            self
-        }
-
-        fn set_sessions(&self, sessions: Vec<RegisteredSession>) {
-            *self.sessions.lock().expect("replacing scripted sessions") = sessions;
         }
 
         fn with_attachment(mut self, bytes: Vec<u8>) -> Self {
@@ -16646,36 +14942,30 @@ mod tests {
 
         let window = cx.add_window(|_window, _cx| NoUi);
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, _window, cx| {
                 cx.new(|cx| {
                     let store = cx.new(|cx| ClaudeSessionStore::new(source.clone(), None, cx));
                     let store_subscription =
                         cx.observe(&store, |this: &mut ClaudeSessionsPanel, _, cx| {
                             this.rebuild_entries(cx);
-                            this.sync_input_availability(cx);
                             cx.notify();
                         });
-                    let message_editor = cx.new(|cx| {
-                        let mut editor = Editor::auto_height(1, 8, window, cx);
-                        editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
-                        editor.set_read_only(true);
-                        editor
-                    });
-                    let editor_subscription = cx.subscribe(
-                        &message_editor,
-                        |this: &mut ClaudeSessionsPanel, _, event, cx| {
-                            this.handle_message_editor_event(event, cx);
-                        },
-                    );
 
                     ClaudeSessionsPanel {
-                        history_index: None,
-                        question_ticks: HashSet::default(),
-                        ticked_question: None,
+                        workspace: WeakEntity::new_invalid(),
+                        focus_handle: cx.focus_handle(),
+                        fs: fs::FakeFs::new(cx.background_executor().clone()),
+                        store,
+                        source,
+                        project_root: None,
+                        in_pane: false,
+                        terminal: None,
+                        terminal_for: None,
+                        _terminal_attach: Task::ready(()),
+                        rail_expanded: true,
+                        rail_shows_everything: false,
                         permission_answered: false,
                         permission_answered_for: None,
-                        slash_send_note: None,
-                        opened_input_for_question: None,
                         live_message_scroll: ScrollHandle::new(),
                         live_message_length: 0,
                         live_message_markdown_key: None,
@@ -16687,35 +14977,13 @@ mod tests {
                         stop_armed_until_ms: None,
                         lifecycle_note: None,
                         _lifecycle_command: Task::ready(()),
-                        file_matches: Vec::new(),
-                        file_matches_for: None,
-                        file_query: None,
-                        file_highlight: 0,
-                        dismissed_file_menu_for: None,
-                        _listing_files: Task::ready(()),
-                        _pasting: Task::ready(()),
-                        paste_error: None,
-                        slash_highlight: 0,
-                        dismissed_slash_menu_for: None,
-                        slash_commands: Vec::new(),
-                        slash_commands_for: None,
-                        slash_commands_fresh: false,
-                        _listing_slash_commands: Task::ready(()),
                         hook_install_note: None,
                         _installing_hook: Task::ready(()),
-                        workspace: WeakEntity::new_invalid(),
-                        focus_handle: cx.focus_handle(),
-                        fs: fs::FakeFs::new(cx.background_executor().clone()),
-                        store,
-                        source,
-                        message_editor,
-                        project_root: None,
-                        in_pane: false,
-                        input_expanded: false,
                         entries: Vec::new(),
-                        pending_sends: PendingSends::default(),
                         activity: Activity::Idle,
                         agent_calls: HashMap::default(),
+                        billing: HashMap::default(),
+                        turn_bills: HashMap::default(),
                         list_state: ListState::new(0, ListAlignment::Bottom, px(1024.)),
                         session_list_expanded: true,
                         collapsed_session_agents: HashSet::default(),
@@ -16737,8 +15005,18 @@ mod tests {
                         dispatch_prompts: HashMap::default(),
                         patched_calls: HashSet::default(),
                         attachment_loads: HashMap::default(),
+                        entries_generation: 0,
+                        reachable_anchors: Vec::new(),
+                        anchor_cache: None,
+                        cached_scrolled_back: false,
+                        rail_width: px(RAIL_WIDTH_DEFAULT_PIXELS),
+                        rail_row_budget: None,
+                        rail_drag_position: None,
+                        zoomed_image: None,
+                        anchored_on_screen: HashSet::default(),
+                        hovered_anchor: None,
+                        followed_index: None,
                         _store_subscription: store_subscription,
-                        _editor_subscription: editor_subscription,
                     }
                 })
             })
@@ -16804,138 +15082,58 @@ mod tests {
         );
     }
 
+    /// `/clear` records an old→new session id on the store, and the store keeps every
+    /// pair until something takes it. The only reader was pending sends. With that gone,
+    /// the panel still has to take the pairs: the store lives as long as the panel does,
+    /// and nothing else will.
     #[gpui::test]
-    async fn switching_conversations_clears_the_answer_state_of_the_one_left(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let panel = scripted_panel(&[], &[], cx);
-        let actual = panel.update(cx, |panel, _cx| {
-            panel.history_index = Some(3);
-            panel.question_ticks.insert((0, 1));
-            panel.permission_answered = true;
-            panel.slash_send_note = Some(SharedString::from("note from the old conversation"));
-
-            panel.show_the_newest_of_another_conversation();
-            (
-                panel.history_index,
-                panel.question_ticks.is_empty(),
-                panel.permission_answered,
-                panel.slash_send_note.is_none(),
-            )
-        });
-
-        assert_eq!(
-            actual,
-            (None, true, false, true),
-            "all state aimed at the old conversation must be cleared; expected (None, true, false, true), got {actual:?}"
-        );
-    }
-
-    #[gpui::test]
-    async fn selection_change_clears_menu_state_and_lists_commands_in_the_new_cwd(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let mut first = scripted_registered_session();
-        first.session_id = "first-session".to_string();
-        first.process_id = 41;
-        first.working_directory = PathBuf::from("/work/first");
-        let mut second = scripted_registered_session();
-        second.session_id = "second-session".to_string();
-        second.process_id = 42;
-        second.working_directory = PathBuf::from("/work/second");
-        let source = Arc::new(
-            ScriptedSource::new(&[], &[]).with_sessions(vec![first.clone(), second.clone()]),
-        );
-        let panel = scripted_panel_over(source.clone(), cx);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.update(cx, |panel, cx| {
-            panel.select_session(first.session_id.clone(), cx)
-        });
-        cx.run_until_parked();
-
-        panel.update(cx, |panel, cx| {
-            panel.file_matches = vec![SharedString::from("old.rs")];
-            panel.file_matches_for = Some("old".to_string());
-            panel.dismissed_file_menu_for = Some("@old".to_string());
-            panel.dismissed_slash_menu_for = Some("/old".to_string());
-            panel.select_session(second.session_id.clone(), cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, _| {
-            assert!(panel.file_matches.is_empty());
-            assert_eq!(panel.file_matches_for, None);
-            assert_eq!(panel.dismissed_file_menu_for, None);
-            assert_eq!(panel.dismissed_slash_menu_for, None);
-        });
-        let roots = source
-            .slash_command_roots
-            .lock()
-            .expect("reading slash-command roots");
-        assert_eq!(
-            roots.last().and_then(Option::as_deref),
-            Some(second.working_directory.as_path()),
-            "the new session's cwd, not the Zed worktree, is the slash-command root"
-        );
-    }
-
-    #[gpui::test]
-    async fn file_listing_is_debounced_to_the_last_of_three_quick_queries(
+    async fn the_panel_drains_cleared_rebinds_so_they_do_not_accumulate(
         cx: &mut gpui::TestAppContext,
     ) {
         let source = Arc::new(ScriptedSource::new(&[], &[]));
         let panel = scripted_panel_over(source.clone(), cx);
-        read_the_scripted_session(&panel, cx);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
 
         panel.update(cx, |panel, cx| {
-            panel.file_matches = vec![
-                SharedString::from("src/session_store.rs"),
-                SharedString::from("src/session_source.rs"),
-            ];
-            assert_eq!(matching_files(&panel.file_matches, "session_s").len(), 2);
-            panel.list_files_for_query(Some("s".to_string()), cx);
-            panel.list_files_for_query(Some("se".to_string()), cx);
-            panel.list_files_for_query(Some("session_s".to_string()), cx);
+            panel.store.update(cx, |store, cx| {
+                assert_eq!(
+                    store.sessions().len(),
+                    1,
+                    "the first scan has to list the scripted session before it is cleared"
+                );
+                store.select(SCRIPTED_SESSION_ID, cx);
+            });
         });
-        cx.executor()
-            .advance_clock(FILE_LIST_DEBOUNCE.saturating_sub(Duration::from_millis(1)));
-        cx.run_until_parked();
-        assert!(
-            source
-                .file_list_requests
+
+        for session_id in ["after-clear-1", "after-clear-2"] {
+            let mut session = scripted_registered_session();
+            session.session_id = session_id.to_string();
+            *source
+                .sessions
                 .lock()
-                .expect("reading file-list requests")
-                .is_empty(),
-            "no host listing is issued before the debounce expires"
-        );
+                .expect("replacing the scripted session") = vec![session];
+            cx.executor().advance_clock(A_FEW_POLLS);
+            cx.run_until_parked();
+        }
 
-        cx.executor().advance_clock(Duration::from_millis(1));
-        cx.run_until_parked();
-        let requests = source
-            .file_list_requests
-            .lock()
-            .expect("reading file-list requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].1, "session_s");
-    }
-
-    #[gpui::test]
-    async fn paste_error_has_its_own_state_and_typing_clears_it(cx: &mut gpui::TestAppContext) {
-        let panel = scripted_panel(&[], &[], cx);
-        panel.update(cx, |panel, cx| {
-            panel.paste_error = Some(SharedString::from("Pasting the image: too large"));
-            assert!(
-                panel.paste_error.is_some(),
-                "the input has an error line to render"
-            );
-            assert_eq!(panel.hook_install_note, None);
-            panel.handle_message_editor_event(&EditorEvent::BufferEdited, cx);
-            assert_eq!(
-                panel.paste_error, None,
-                "typing clears only the paste error line"
-            );
+        let (selected, rebinds) = panel.update(cx, |panel, cx| {
+            panel.store.update(cx, |store, _cx| {
+                (
+                    store.selected().map(str::to_string),
+                    store.take_cleared_rebinds(),
+                )
+            })
         });
+        assert_eq!(
+            selected.as_deref(),
+            Some("after-clear-2"),
+            "both /clear scans have to move the selection, or an empty take is not evidence"
+        );
+        assert!(
+            rebinds.is_empty(),
+            "the panel has to take /clear pairs or the store keeps every one; left {rebinds:?}"
+        );
     }
 
     #[gpui::test]
@@ -17298,129 +15496,6 @@ mod tests {
                 Activity::Thinking,
                 "the line says what this session is doing, and it is thinking whichever \
                  conversation the reader has open"
-            );
-        });
-    }
-
-    /// A pending message was sent to the session, so it belongs to the session's own
-    /// conversation and is not drawn into an agent's records.
-    #[gpui::test]
-    async fn a_pending_message_is_not_drawn_into_an_agents_conversation(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let session_lines = [chained_line(
-            USER_RECORD_TYPE,
-            "m1",
-            None,
-            false,
-            serde_json::json!("an earlier message"),
-        )];
-        let agent_lines = [
-            chained_line(
-                USER_RECORD_TYPE,
-                "s1",
-                None,
-                true,
-                serde_json::json!("read the file"),
-            ),
-            chained_line(
-                ASSISTANT_RECORD_TYPE,
-                "s2",
-                Some("s1"),
-                true,
-                serde_json::json!([{ "type": "text", "text": "read it." }]),
-            ),
-        ];
-
-        let panel = scripted_panel(&session_lines, &agent_lines, cx);
-        read_the_scripted_session(&panel, cx);
-        panel.update(cx, |panel, cx| {
-            panel
-                .pending_sends
-                .remember(SCRIPTED_SESSION_ID, "and the lint", &panel.entries);
-            panel.rebuild_entries(cx);
-        });
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                pending_texts(&panel.entries),
-                vec![SharedString::from("and the lint")],
-                "the message is drawn in the conversation it was sent to"
-            );
-        });
-
-        read_the_conversation_of(scripted_agent(), &panel, cx);
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                pending_texts(&panel.entries),
-                Vec::<SharedString>::new(),
-                "nothing the reader sent to the session belongs in an agent's conversation"
-            );
-            assert_eq!(
-                pending_ids(&panel.pending_sends).len(),
-                1,
-                "the message is only undrawn, not taken down: it is still waiting for the \
-                 record it was sent as"
-            );
-        });
-
-        read_the_conversation_of(TranscriptTarget::Main, &panel, cx);
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                pending_texts(&panel.entries),
-                vec![SharedString::from("and the lint")],
-                "back in the session's own conversation the message is drawn again"
-            );
-        });
-    }
-
-    /// An agent is given its task as a user record of its own conversation, so an
-    /// agent's records hold the very text a send carries. Pairing against them takes
-    /// down a message that never arrived, and the reader is left with no sign of it at
-    /// all once they return to the session.
-    #[gpui::test]
-    async fn an_agents_own_prompt_does_not_pair_with_a_message_sent_to_the_session(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let session_lines = [chained_line(
-            USER_RECORD_TYPE,
-            "m1",
-            None,
-            false,
-            serde_json::json!("an earlier message"),
-        )];
-        let agent_lines = [chained_line(
-            USER_RECORD_TYPE,
-            "s1",
-            None,
-            true,
-            serde_json::json!("run the tests"),
-        )];
-
-        let panel = scripted_panel(&session_lines, &agent_lines, cx);
-        read_the_scripted_session(&panel, cx);
-        panel.update(cx, |panel, cx| {
-            panel
-                .pending_sends
-                .remember(SCRIPTED_SESSION_ID, "run the tests", &panel.entries);
-            panel.rebuild_entries(cx);
-        });
-
-        read_the_conversation_of(scripted_agent(), &panel, cx);
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                pending_ids(&panel.pending_sends).len(),
-                1,
-                "the session has written no record of this message; the agent's own \
-                 prompt reading the same is not it arriving"
-            );
-        });
-
-        read_the_conversation_of(TranscriptTarget::Main, &panel, cx);
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                pending_texts(&panel.entries),
-                vec![SharedString::from("run the tests")],
-                "a message that never arrived must still be shown as waiting"
             );
         });
     }
@@ -18698,10 +16773,6 @@ mod tests {
                 .expect("queueing the scripted inbox")
                 .extend_from_slice(inbox);
         }
-
-        fn replace_sessions(&self, sessions: Vec<RegisteredSession>) {
-            self.inner.set_sessions(sessions);
-        }
     }
 
     impl SessionSource for PromptSource {
@@ -18873,362 +16944,6 @@ mod tests {
         serde_json::json!({ "received_at_ms": received_at_ms, "event": event }).to_string()
     }
 
-    #[gpui::test]
-    async fn retrying_a_failed_pending_send_uses_the_store_and_the_same_text(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let source = Arc::new(PromptSource::new());
-        let panel = scripted_panel_over(source.clone(), cx);
-        read_the_scripted_session(&panel, cx);
-        let id = panel.update(cx, |panel, cx| {
-            let id = panel.pending_sends.remember(
-                SCRIPTED_SESSION_ID,
-                "send this exactly",
-                &panel.entries,
-            );
-            panel
-                .pending_sends
-                .resolve(id, &Err(anyhow::anyhow!("offline")));
-            assert!(panel.pending_sends.sends.first().is_some_and(|send| {
-                send.text.as_ref() == "send this exactly" && send.error.is_some()
-            }));
-            panel.retry_pending_send(id, cx);
-            id
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            source
-                .message_sends
-                .lock()
-                .expect("reading message sends")
-                .as_slice(),
-            ["send this exactly"],
-            "Retry goes through ClaudeSessionStore::send_message with the failed text"
-        );
-        panel.read_with(cx, |panel, _| {
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == id)
-                .expect("the retried send remains pending until its transcript record arrives");
-            assert_eq!(send.text.as_ref(), "send this exactly");
-            assert_eq!(send.error, None);
-            assert!(send.outbox_file.is_some());
-        });
-    }
-
-    #[gpui::test]
-    async fn clearing_the_session_rebinds_a_failed_row_and_retry_goes_to_the_new_id(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        const AFTER_CLEAR: &str = "after-clear-session";
-        let source = Arc::new(PromptSource::new());
-        let panel = scripted_panel_over(source.clone(), cx);
-        read_the_scripted_session(&panel, cx);
-        let failed = panel.update(cx, |panel, cx| {
-            let id = panel.pending_sends.remember(
-                SCRIPTED_SESSION_ID,
-                "keep sending this",
-                &panel.entries,
-            );
-            panel
-                .pending_sends
-                .resolve(id, &Err(anyhow::anyhow!("offline")));
-            panel.rebuild_entries(cx);
-            id
-        });
-
-        let mut cleared = scripted_registered_session();
-        cleared.session_id = AFTER_CLEAR.to_string();
-        source.replace_sessions(vec![cleared]);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, cx| {
-            assert_eq!(
-                panel.store.read(cx).selected(),
-                Some(AFTER_CLEAR),
-                "/clear must select the new sessionId"
-            );
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == failed)
-                .expect("the Failed row survives /clear");
-            assert_eq!(
-                send.session_id.as_str(),
-                AFTER_CLEAR,
-                "the Failed row is rebound to the new sessionId"
-            );
-            assert_eq!(send.text.as_ref(), "keep sending this");
-            assert!(send.error.is_some());
-            assert_eq!(
-                pending_texts(&panel.entries),
-                vec![SharedString::from("keep sending this")],
-                "the Failed row stays visible under the new sessionId"
-            );
-        });
-
-        panel.update(cx, |panel, cx| {
-            panel.retry_pending_send(failed, cx);
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            source
-                .message_sends
-                .lock()
-                .expect("reading message sends")
-                .as_slice(),
-            ["keep sending this"],
-            "Retry after /clear goes through send_message on the newly selected session"
-        );
-        panel.read_with(cx, |panel, cx| {
-            assert_eq!(panel.store.read(cx).selected(), Some(AFTER_CLEAR));
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == failed)
-                .expect("the retried send remains pending until its transcript record arrives");
-            assert_eq!(send.session_id.as_str(), AFTER_CLEAR);
-            assert_eq!(send.error, None);
-        });
-    }
-
-    /// The gone-session guard must not fail an in-flight row whose session is still live
-    /// (only hidden) or still in `ended`. After dismiss_ended drops it from both, the
-    /// same row is marked failed so the finished bound covers it.
-    #[gpui::test]
-    async fn in_flight_row_of_a_hidden_live_or_ended_session_survives_rebuilds(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let mut session_a = scripted_registered_session();
-        session_a.session_id = "session-a".to_string();
-        session_a.process_id = 41;
-        let mut session_b = scripted_registered_session();
-        session_b.session_id = "session-b".to_string();
-        session_b.process_id = 42;
-        let source = Arc::new(
-            ScriptedSource::new(&[], &[]).with_sessions(vec![session_a, session_b.clone()]),
-        );
-        let panel = scripted_panel_over(source.clone(), cx);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.update(cx, |panel, cx| {
-            panel.select_session("session-a".to_string(), cx)
-        });
-        cx.run_until_parked();
-
-        let waiting = panel.update(cx, |panel, cx| {
-            let id = panel
-                .pending_sends
-                .remember("session-a", "still waiting", &[]);
-            panel.select_session("session-b".to_string(), cx);
-            id
-        });
-        cx.run_until_parked();
-
-        panel.update(cx, |panel, cx| {
-            for _ in 0..10 {
-                panel.rebuild_entries(cx);
-            }
-        });
-        panel.read_with(cx, |panel, _| {
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == waiting)
-                .expect("the hidden session's in-flight row is still there");
-            assert_eq!(send.session_id.as_str(), "session-a");
-            assert_eq!(
-                send.error, None,
-                "a hidden-but-live session must survive 10 rebuilds"
-            );
-        });
-
-        source.set_sessions(vec![session_b]);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, cx| {
-            assert!(
-                panel
-                    .store
-                    .read(cx)
-                    .ended_sessions()
-                    .iter()
-                    .any(|ended| ended.session_id == "session-a"),
-                "session-a must be in ended after its process is gone"
-            );
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == waiting)
-                .expect("the ended session's in-flight row is still there");
-            assert_eq!(
-                send.error, None,
-                "a session still in ended must not be failed"
-            );
-        });
-
-        panel.update(cx, |panel, cx| {
-            panel
-                .store
-                .update(cx, |store, cx| store.dismiss_ended("session-a", cx));
-        });
-        cx.run_until_parked();
-        panel.read_with(cx, |panel, _| {
-            let send = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == waiting)
-                .expect("the orphan is kept as a finished row");
-            assert_eq!(
-                send.error.as_deref(),
-                Some(SESSION_ENDED_BEFORE_ARRIVAL),
-                "dismiss_ended leaves the session neither live nor ended"
-            );
-        });
-    }
-
-    /// A Failed row left in another session must not keep walking this conversation's
-    /// transcript on every rebuild. An in-flight row of the selected session still does.
-    #[gpui::test]
-    async fn a_failed_row_in_another_session_does_not_walk_the_selected_transcript(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let mut session_a = scripted_registered_session();
-        session_a.session_id = "session-a".to_string();
-        session_a.process_id = 41;
-        let mut session_b = scripted_registered_session();
-        session_b.session_id = "session-b".to_string();
-        session_b.process_id = 42;
-        let source =
-            Arc::new(ScriptedSource::new(&[], &[]).with_sessions(vec![session_a, session_b]));
-        let panel = scripted_panel_over(source, cx);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.update(cx, |panel, cx| {
-            panel.select_session("session-b".to_string(), cx)
-        });
-        cx.run_until_parked();
-
-        panel.update(cx, |panel, cx| {
-            let failed = panel
-                .pending_sends
-                .remember("session-a", "failed elsewhere", &[]);
-            panel
-                .pending_sends
-                .resolve(failed, &Err(anyhow::anyhow!("offline")));
-            panel.rebuild_entries(cx);
-        });
-        let walks_with_foreign_failed =
-            panel.read_with(cx, |panel, _| panel.pending_sends.session_transcript_walks);
-        panel.update(cx, |panel, cx| {
-            panel.rebuild_entries(cx);
-        });
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(
-                panel.pending_sends.session_transcript_walks, walks_with_foreign_failed,
-                "a Failed row in A must not walk B's transcript"
-            );
-        });
-
-        panel.update(cx, |panel, cx| {
-            panel
-                .pending_sends
-                .remember("session-b", "waiting here", &[]);
-            panel.rebuild_entries(cx);
-        });
-        panel.read_with(cx, |panel, _| {
-            assert!(
-                panel.pending_sends.session_transcript_walks > walks_with_foreign_failed,
-                "an in-flight row of the selected session must still walk the transcript"
-            );
-        });
-    }
-
-    /// A scan that replaces pid41 A→B and pid42 B→C records only the selected pid's
-    /// pair. The row keyed A follows pid41 to B; a row keyed B, sent to pid42, stays on
-    /// B because that pid was not selected.
-    #[gpui::test]
-    async fn a_row_follows_its_own_pid_through_clear_not_another_pids(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let mut session_a = scripted_registered_session();
-        session_a.session_id = "session-a".to_string();
-        session_a.process_id = 41;
-        let mut session_b = scripted_registered_session();
-        session_b.session_id = "session-b".to_string();
-        session_b.process_id = 42;
-        let source = Arc::new(
-            ScriptedSource::new(&[], &[]).with_sessions(vec![session_a.clone(), session_b.clone()]),
-        );
-        let panel = scripted_panel_over(source.clone(), cx);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.update(cx, |panel, cx| {
-            panel.select_session("session-a".to_string(), cx)
-        });
-        cx.run_until_parked();
-
-        let (row_for_pid41, row_for_pid42) = panel.update(cx, |panel, cx| {
-            let row_for_pid41 = panel.pending_sends.remember("session-a", "for pid41", &[]);
-            let row_for_pid42 = panel.pending_sends.remember("session-b", "for pid42", &[]);
-            panel.rebuild_entries(cx);
-            (row_for_pid41, row_for_pid42)
-        });
-
-        let mut rebound_b = session_a;
-        rebound_b.session_id = "session-b".to_string();
-        let mut session_c = session_b;
-        session_c.session_id = "session-c".to_string();
-        source.set_sessions(vec![rebound_b, session_c]);
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-
-        panel.read_with(cx, |panel, cx| {
-            assert_eq!(
-                panel.store.read(cx).selected(),
-                Some("session-b"),
-                "selection follows pid41, not pid42's /clear"
-            );
-            let send_for_pid41 = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == row_for_pid41)
-                .expect("the row keyed A survives /clear");
-            assert_eq!(
-                send_for_pid41.session_id.as_str(),
-                "session-b",
-                "the row keyed A follows pid41 to B"
-            );
-            assert_eq!(
-                send_for_pid41.error, None,
-                "the rebound row is still in flight, not failed"
-            );
-            let send_for_pid42 = panel
-                .pending_sends
-                .sends
-                .iter()
-                .find(|send| send.id == row_for_pid42)
-                .expect("the row keyed B survives the other pid's /clear");
-            assert_eq!(
-                send_for_pid42.session_id.as_str(),
-                "session-b",
-                "pid42 was not selected, so its clear is not recorded and the row stays on B"
-            );
-            assert_eq!(send_for_pid42.error, None);
-        });
-    }
-
     /// The two prompts of one turn can land in a single poll: the tool the reader allowed
     /// finishes and the next permission is asked for before the next read. The second
     /// prompt has not been answered by anyone, so it must draw its own buttons.
@@ -19330,103 +17045,6 @@ mod tests {
             !answered,
             "a prompt nobody has answered must draw Allow and Deny; expected \
              permission_answered false, got {answered}"
-        );
-    }
-
-    /// Ticks are keyed by position, so a question that arrives in the same poll that
-    /// takes the answered one away would come up with the last question's boxes ticked
-    /// and submit an answer the reader never made.
-    #[gpui::test]
-    async fn a_second_question_does_not_inherit_the_ticks_of_the_first(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let source = Arc::new(PromptSource::new());
-        let panel = scripted_panel_over(source.clone(), cx);
-        read_the_scripted_session(&panel, cx);
-        let asked_at_ms = now_millis();
-        source.deliver(
-            &[hook_event_line(
-                asked_at_ms,
-                "PreToolUse",
-                serde_json::json!({
-                    "tool_use_id": "toolu_question_one",
-                    "tool_name": "AskUserQuestion",
-                    "tool_input": {
-                        "questions": [{
-                            "header": "Extras",
-                            "question": "Which extras?",
-                            "multiSelect": true,
-                            "options": [{ "label": "CodeGraph" }, { "label": "Tests" }],
-                        }],
-                    },
-                }),
-            )],
-            &[],
-        );
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-        panel.update(cx, |panel, _| {
-            panel.question_ticks.insert((0, 1));
-        });
-
-        let second_at_ms = asked_at_ms + 200;
-        source.deliver(
-            &[
-                hook_event_line(
-                    second_at_ms,
-                    "PostToolUse",
-                    serde_json::json!({
-                        "tool_use_id": "toolu_question_one",
-                        "tool_name": "AskUserQuestion",
-                    }),
-                ),
-                hook_event_line(
-                    second_at_ms,
-                    "PreToolUse",
-                    serde_json::json!({
-                        "tool_use_id": "toolu_question_two",
-                        "tool_name": "AskUserQuestion",
-                        "tool_input": {
-                            "questions": [{
-                                "header": "Cleanup",
-                                "question": "Delete what?",
-                                "multiSelect": true,
-                                "options": [
-                                    { "label": "Nothing" },
-                                    { "label": "The whole branch" },
-                                ],
-                            }],
-                        },
-                    }),
-                ),
-            ],
-            &[],
-        );
-        cx.executor().advance_clock(A_FEW_POLLS);
-        cx.run_until_parked();
-
-        let (asking, ticks) = panel.update(cx, |panel, cx| {
-            (
-                panel
-                    .store
-                    .read(cx)
-                    .live()
-                    .pending_question
-                    .as_ref()
-                    .map(|question| question.tool_use_id.clone()),
-                panel.question_ticks.clone(),
-            )
-        });
-        assert_eq!(
-            asking.as_deref(),
-            Some("toolu_question_two"),
-            "the second question is the one waiting; expected \
-             Some(\"toolu_question_two\"), got {asking:?}"
-        );
-        assert!(
-            ticks.is_empty(),
-            "a tick belongs to the question it was made on; expected no ticks on the \
-             second question, got {ticks:?}"
         );
     }
 
@@ -19808,6 +17426,7 @@ mod tests {
                 label: SharedString::from("Write"),
                 is_error: false,
                 body: ToolResultBody::Inline(SharedString::from("ok")),
+                tool_use_id: None,
             },
         }
     }
@@ -20897,5 +18516,1898 @@ mod tests {
             Some(&diff),
             "a call whose block carried no id keeps the diff of its own input"
         );
+    }
+
+    fn usage_of(
+        input_tokens: u64,
+        cache_write_1h_tokens: u64,
+        cache_write_5m_tokens: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        thinking_tokens: u64,
+    ) -> Usage {
+        Usage {
+            input_tokens,
+            cache_write_1h_tokens,
+            cache_write_5m_tokens,
+            cache_read_tokens,
+            output_tokens,
+            thinking_tokens,
+        }
+    }
+
+    fn billed_message(key: &str, usage: Usage) -> Entry {
+        Entry {
+            key: SharedString::from(key),
+            kind: EntryKind::Message {
+                role: MessageRole::Assistant,
+                source: SharedString::from("answer"),
+                usage: Some(usage),
+                answered_at: None,
+            },
+        }
+    }
+
+    /// The turn's bill when nothing outside the entries is known about it, which is how
+    /// the tests that hand-build entries ask for it.
+    fn turn_usage(entries: &[Entry], turn_start: usize) -> (Vec<Usage>, Usage) {
+        turn_billing(entries, turn_start, &HashMap::default())
+    }
+
+    fn is_turn_cost_anchor(entries: &[Entry], index: usize) -> bool {
+        turn_cost_anchor(entries, index, &HashMap::default())
+    }
+
+    /// One turn's records the way Claude Code writes them, and everything the panel
+    /// derives from them.
+    fn turn_of(json_lines: &[String]) -> (Vec<Entry>, HashMap<SharedString, Billed>) {
+        let records: Vec<TranscriptRecord> = json_lines
+            .iter()
+            .map(|line| record(line.as_str()))
+            .collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let entries = build_entries(&path, None, &mut EntryCache::default());
+        let billing = billing_of_path(&path);
+        (entries, billing)
+    }
+
+    fn usage_json(input: u64, cache_read: u64, cache_write: u64, output: u64) -> Value {
+        serde_json::json!({
+            "input_tokens": input,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+            "output_tokens": output,
+        })
+    }
+
+    /// One assistant record: one content block, and a copy of the whole call's usage.
+    fn billed_block_line(
+        uuid: &str,
+        request_id: Option<&str>,
+        block: Value,
+        usage: &Value,
+    ) -> String {
+        let mut line = serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [block],
+                "usage": usage,
+            },
+        });
+        if let Some(request_id) = request_id
+            && let Some(object) = line.as_object_mut()
+        {
+            object.insert(
+                REQUEST_ID_FIELD.to_string(),
+                Value::String(request_id.to_string()),
+            );
+        }
+        line.to_string()
+    }
+
+    fn thinking_block() -> Value {
+        serde_json::json!({"type": "thinking", "thinking": "weighing it up"})
+    }
+
+    fn text_block(text: &str) -> Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
+    fn read_call_block(id: &str) -> Value {
+        serde_json::json!({"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": "/tmp/a.rs"}})
+    }
+
+    /// Claude Code writes one record per content block, and only a `text` block becomes
+    /// a message. An answer that thought and called a tool is billed for every token it
+    /// spent and writes no message at all, so a bill read off the messages misses it.
+    #[test]
+    fn a_turn_bills_the_calls_that_wrote_no_text() {
+        let first = usage_json(11, 2_200, 330, 44);
+        let second = usage_json(7, 1_100, 220, 33);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), thinking_block(), &first),
+            billed_block_line("a2", Some("req-1"), read_call_block("call-1"), &first),
+            billed_block_line("a3", Some("req-2"), text_block("done"), &second),
+        ]);
+
+        let expected_first = Usage::from_record(&serde_json::json!({"message": {"usage": first}}))
+            .expect("the fixture carries usage");
+        let expected_second =
+            Usage::from_record(&serde_json::json!({"message": {"usage": second}}))
+                .expect("the fixture carries usage");
+
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls,
+            vec![expected_first, expected_second],
+            "an answer that only thought and called a tool is still a billed call"
+        );
+        assert_eq!(
+            total.output_tokens, 77,
+            "output tokens of the whole turn; got {}, expected 44 + 33",
+            total.output_tokens
+        );
+        assert_eq!(
+            total.cache_read_tokens, 3_300,
+            "cache read of the whole turn; got {}, expected 2200 + 1100",
+            total.cache_read_tokens
+        );
+    }
+
+    /// The records of one call carry identical copies of its usage under different
+    /// uuids, so the uuid cannot be what tells one call from the next.
+    #[test]
+    fn one_call_written_as_several_records_is_billed_once() {
+        let once = usage_json(5, 500, 50, 25);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), text_block("first half"), &once),
+            billed_block_line("a2", Some("req-1"), text_block("second half"), &once),
+        ]);
+
+        let expected = Usage::from_record(&serde_json::json!({"message": {"usage": once}}))
+            .expect("the fixture carries usage");
+
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls,
+            vec![expected],
+            "one API call, however many records it was written as"
+        );
+        assert_eq!(
+            total.output_tokens, 25,
+            "one call's output tokens; got {}, expected 25 rather than 25 twice",
+            total.output_tokens
+        );
+    }
+
+    /// Two calls that happen to cost the same are two calls. This is what the call id
+    /// must not swallow, including on records written before `requestId` existed.
+    #[test]
+    fn two_calls_that_cost_the_same_are_billed_twice() {
+        let same = usage_json(5, 500, 50, 25);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), text_block("one"), &same),
+            billed_block_line("a2", Some("req-2"), text_block("two"), &same),
+        ]);
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(calls.len(), 2, "two calls, identical numbers");
+        assert_eq!(total.output_tokens, 50);
+
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", None, text_block("one"), &same),
+            billed_block_line("a2", None, text_block("two"), &same),
+        ]);
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls.len(),
+            2,
+            "without a requestId every record stands as its own call"
+        );
+        assert_eq!(total.output_tokens, 50);
+    }
+
+    /// Streaming writes the call several times. The earlier records carry a few output
+    /// tokens; the last record is the call that was actually billed.
+    #[test]
+    fn a_call_is_billed_from_its_last_record() {
+        let shared = (4, 100, 10);
+        let (input, cache_read, cache_write) = shared;
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line(
+                "a1",
+                Some("req-1"),
+                text_block("."),
+                &usage_json(input, cache_read, cache_write, 1),
+            ),
+            billed_block_line(
+                "a2",
+                Some("req-1"),
+                text_block(".."),
+                &usage_json(input, cache_read, cache_write, 5),
+            ),
+            billed_block_line(
+                "a3",
+                Some("req-1"),
+                text_block("done"),
+                &usage_json(input, cache_read, cache_write, 1403),
+            ),
+        ]);
+
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls.len(),
+            1,
+            "three records of one requestId are one call, got {calls:?}"
+        );
+        assert_eq!(
+            total.output_tokens, 1403,
+            "the last record's output; got {}, the first record only had 1",
+            total.output_tokens
+        );
+        assert_eq!(
+            total.input_tokens, input,
+            "input is copied onto every record and must not be summed; got {}",
+            total.input_tokens
+        );
+    }
+
+    /// Copies that do not differ are still one call, and the number is that copy's, not
+    /// zero and not the copy counted once per record.
+    #[test]
+    fn identical_copies_of_a_call_are_billed_once() {
+        let once = usage_json(4, 100, 10, 25);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), text_block("a"), &once),
+            billed_block_line("a2", Some("req-1"), text_block("b"), &once),
+            billed_block_line("a3", Some("req-1"), text_block("c"), &once),
+        ]);
+
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls.len(),
+            1,
+            "identical copies are one call, got {calls:?}"
+        );
+        assert_eq!(total.output_tokens, 25);
+        assert_eq!(total.input_tokens, 4);
+    }
+
+    /// A blank requestId is not an id. Two records that both omit one are two calls,
+    /// including when they cost the same.
+    #[test]
+    fn a_blank_request_id_does_not_merge_records() {
+        let same = usage_json(4, 100, 10, 25);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some(""), text_block("one"), &same),
+            billed_block_line("a2", Some(""), text_block("two"), &same),
+        ]);
+        let (calls, total) = turn_billing(&entries, 0, &billing);
+        assert_eq!(
+            calls.len(),
+            2,
+            "a blank requestId must not glue two records into one call, got {calls:?}"
+        );
+        assert_eq!(total.output_tokens, 50);
+    }
+
+    /// Replacing a call's usage with its later snapshot must not move that call past one
+    /// that started in between.
+    #[test]
+    fn a_later_snapshot_does_not_move_the_call() {
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line(
+                "a1",
+                Some("req-1"),
+                text_block("."),
+                &usage_json(4, 100, 10, 1),
+            ),
+            billed_block_line(
+                "b1",
+                Some("req-2"),
+                text_block("other"),
+                &usage_json(4, 100, 10, 9),
+            ),
+            billed_block_line(
+                "a2",
+                Some("req-1"),
+                text_block("done"),
+                &usage_json(4, 100, 10, 1403),
+            ),
+        ]);
+
+        let (calls, _) = turn_billing(&entries, 0, &billing);
+        let outputs: Vec<u64> = calls.iter().map(|usage| usage.output_tokens).collect();
+        assert_eq!(
+            outputs,
+            vec![1403, 9],
+            "req-1 started first, so its completed usage stays ahead of req-2; got {outputs:?}"
+        );
+    }
+
+    /// Collapse removes the tool entry, which is where a thinking|tool call's last record
+    /// sits. The card still has to bill that record, and the next turn's call stays there.
+    #[test]
+    fn a_collapsed_turn_bills_each_calls_last_record() {
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line(
+                "a1",
+                Some("req-1"),
+                thinking_block(),
+                &usage_json(4, 100, 10, 1),
+            ),
+            billed_block_line(
+                "a2",
+                Some("req-1"),
+                read_call_block("c1"),
+                &usage_json(4, 100, 10, 1403),
+            ),
+            billed_block_line(
+                "b1",
+                Some("req-2"),
+                text_block("noted"),
+                &usage_json(4, 100, 10, 9),
+            ),
+            user_message_line("u2", "next"),
+            billed_block_line(
+                "d1",
+                Some("req-3"),
+                text_block("later"),
+                &usage_json(4, 100, 10, 7),
+            ),
+        ]);
+        let bills = turn_bills(&entries, &billing);
+        let collapsed = collapse_turns(
+            entries,
+            &HashSet::default(),
+            false,
+            false,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        assert!(
+            collapsed
+                .iter()
+                .all(|entry| !matches!(entry.kind, EntryKind::ToolUse { .. })),
+            "the tool entry is still collapsed away"
+        );
+
+        let survivor: Vec<u64> = turn_billing(&collapsed, 0, &billing)
+            .0
+            .iter()
+            .map(|usage| usage.output_tokens)
+            .collect();
+        assert_eq!(
+            survivor,
+            vec![9],
+            "billing the entries collapse kept drops the tool-only call and keeps the text snapshot"
+        );
+
+        let summary = collapsed
+            .iter()
+            .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
+            .expect("the turn with a tool call collapses to a summary");
+        let (calls, _) = displayed_turn_usage(&collapsed, summary, &bills)
+            .expect("the collapsed turn still has a bill");
+        let outputs: Vec<u64> = calls.iter().map(|usage| usage.output_tokens).collect();
+        assert_eq!(
+            outputs.as_slice(),
+            [1403, 9].as_slice(),
+            "card billed {outputs:?}; the entries collapse kept would bill {survivor:?}"
+        );
+        assert!(
+            cost_anchor_at(&collapsed, summary, true, &billing),
+            "the summary is where the card hangs"
+        );
+
+        let second = collapsed
+            .iter()
+            .position(|entry| entry.key.as_ref() == "u2")
+            .expect("the next turn's user message survives collapse");
+        let (next_calls, _) = displayed_turn_usage(&collapsed, second, &bills)
+            .expect("the next turn has its own bill");
+        assert_eq!(
+            next_calls
+                .iter()
+                .map(|usage| usage.output_tokens)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "the next turn's call is not folded into the one before it"
+        );
+    }
+
+    /// A finished turn that never wrote text collapses to a summary and nothing billed.
+    /// The card still hangs on that summary, and the amount is the last record.
+    #[test]
+    fn a_collapsed_turn_with_no_text_still_shows_its_last_record() {
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line(
+                "a1",
+                Some("req-1"),
+                thinking_block(),
+                &usage_json(4, 100, 10, 1),
+            ),
+            billed_block_line(
+                "a2",
+                Some("req-1"),
+                read_call_block("c1"),
+                &usage_json(4, 100, 10, 1403),
+            ),
+        ]);
+        let bills = turn_bills(&entries, &billing);
+        let collapsed = collapse_turns(
+            entries,
+            &HashSet::default(),
+            false,
+            false,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        let summary = collapsed
+            .iter()
+            .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
+            .expect("a tool call collapses the turn");
+        assert!(
+            !turn_cost_anchor(&collapsed, summary, &billing),
+            "the collapsed entries themselves no longer contain a billed record"
+        );
+
+        let (_, total) = displayed_turn_usage(&collapsed, summary, &bills)
+            .expect("the bill was taken before those entries were dropped");
+        assert_eq!(
+            total.output_tokens, 1403,
+            "got {}, the last record of the call is 1403",
+            total.output_tokens
+        );
+        assert!(
+            cost_anchor_at(&collapsed, summary, true, &billing),
+            "with the pre-collapse bill, the summary carries the card"
+        );
+    }
+
+    /// The running turn is never collapsed, so it has no summary, and it can be several
+    /// calls deep before it says anything. The card has to hang somewhere.
+    #[test]
+    fn a_turn_that_wrote_no_text_still_has_a_cost_anchor() {
+        let usage = usage_json(11, 2_200, 330, 44);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), thinking_block(), &usage),
+            billed_block_line("a2", Some("req-1"), read_call_block("call-1"), &usage),
+        ]);
+        assert_eq!(entries.len(), 3, "user, thinking, tool call");
+
+        assert!(
+            turn_cost_anchor(&entries, 2, &billing),
+            "the last billed entry of the turn carries the card"
+        );
+        assert!(!turn_cost_anchor(&entries, 1, &billing));
+        assert!(!turn_cost_anchor(&entries, 0, &billing));
+    }
+
+    /// The reader opens the card to see each call on its own line; the rebuild that runs
+    /// four times a second while the session answers must not close it again.
+    #[test]
+    fn an_expanded_turn_cost_card_survives_the_next_rebuild() {
+        let usage = usage_json(11, 2_200, 330, 44);
+        let (entries, _) = turn_of(&[
+            user_message_line("u1", "go"),
+            billed_block_line("a1", Some("req-1"), text_block("done"), &usage),
+        ]);
+        let cost_key = turn_cost_key(&entries[0].key);
+
+        let mut expanded: HashSet<SharedString> = HashSet::default();
+        expanded.insert(cost_key.clone());
+        let live = live_cache_keys(&entries);
+        expanded.retain(|key| live.contains(key));
+
+        assert!(
+            expanded.contains(&cost_key),
+            "the cost card's expansion key {cost_key:?} was dropped by the rebuild; live keys were {:?}",
+            {
+                let mut keys: Vec<&str> = live.iter().map(SharedString::as_ref).collect();
+                keys.sort_unstable();
+                keys
+            }
+        );
+    }
+
+    fn summary_entry(turn_id: &str) -> Entry {
+        Entry {
+            key: turn_summary_key(&SharedString::from(turn_id)),
+            kind: EntryKind::TurnSummary {
+                turn_id: SharedString::from(turn_id),
+                calls: 1,
+                files_edited: Vec::new(),
+                agents: 0,
+                thinking_blocks: 0,
+                duration_ms: None,
+                pending_background_agents: 0,
+                is_expanded: false,
+            },
+        }
+    }
+
+    #[test]
+    fn rail_worth_keeps_only_what_the_terminal_cannot_show() {
+        let message = EntryKind::Message {
+            role: MessageRole::Assistant,
+            source: SharedString::from("hello"),
+            usage: Some(usage_of(1, 0, 0, 0, 1, 0)),
+            answered_at: None,
+        };
+        assert_eq!(
+            rail_worth(&message),
+            RailWorth::TerminalHasIt,
+            "a billed message's body is still the terminal's; the bill is a separate card"
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::Thinking {
+                source: SharedString::from("hmm"),
+            }),
+            RailWorth::TerminalHasIt
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::ToolUse {
+                name: SharedString::from("Read"),
+                input: SharedString::from("{}"),
+                id: None,
+                diff: None,
+            }),
+            RailWorth::TerminalHasIt
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::ToolUse {
+                name: SharedString::from("Edit"),
+                input: SharedString::from("{}"),
+                id: None,
+                diff: Some(SharedString::from("-old\n+new")),
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::ToolResult {
+                label: SharedString::from("Bash"),
+                is_error: false,
+                body: ToolResultBody::Inline(SharedString::from("ok")),
+                tool_use_id: None,
+            }),
+            RailWorth::TerminalHasIt
+        );
+        let truncated = SharedString::from("line\n".repeat(MAX_UNCLAMPED_OUTPUT_LINES + 1));
+        assert_eq!(
+            rail_worth(&EntryKind::ToolResult {
+                label: SharedString::from("Bash"),
+                is_error: false,
+                body: ToolResultBody::Inline(truncated),
+                tool_use_id: None,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::ToolResult {
+                label: SharedString::from("Bash"),
+                is_error: false,
+                body: ToolResultBody::Persisted(PersistedOutput {
+                    size: SharedString::from("80.6KB"),
+                    path: PathBuf::from("/tmp/out.txt"),
+                    preview: SharedString::from("ok"),
+                }),
+                tool_use_id: None,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::Image {
+                image: Arc::new(Image::empty()),
+                media_type: SharedString::from("image/png"),
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::SentFiles {
+                caption: None,
+                files: vec![SentFile {
+                    path: PathBuf::from("/tmp/a.png"),
+                    name: SharedString::from("a.png"),
+                    size: None,
+                    media_type: None,
+                    is_image: true,
+                }],
+                is_error: false,
+                result_text: None,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::LocalCommand {
+                text: SharedString::from("ls"),
+            }),
+            RailWorth::TerminalHasIt
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::SlashCommand {
+                text: SharedString::from("/cost"),
+            }),
+            RailWorth::TerminalHasIt
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::Queued {
+                text: SharedString::from("later"),
+            }),
+            RailWorth::TerminalHasIt
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::CompactBoundary {
+                trigger: SharedString::from("auto"),
+                pre_tokens: None,
+                post_tokens: None,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::Attachments { items: Vec::new() }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::SystemNote {
+                subtype: SharedString::from("away_summary"),
+                text: SharedString::from("back"),
+                url: None,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(
+            rail_worth(&EntryKind::TurnFooter {
+                duration_ms: 1,
+                message_count: 1,
+                pending_background_agents: 0,
+            }),
+            RailWorth::Draw
+        );
+        assert_eq!(rail_worth(&summary_entry("u1").kind), RailWorth::Draw);
+        assert_eq!(
+            rail_worth(&EntryKind::Unknown {
+                label: SharedString::from("x"),
+                raw: SharedString::from("{}"),
+            }),
+            RailWorth::Draw
+        );
+    }
+
+    #[test]
+    fn turn_usage_sums_one_turn_and_leaves_the_next_alone() {
+        let first = usage_of(1, 2, 3, 4, 5, 6);
+        let second = usage_of(10, 20, 30, 40, 50, 60);
+        let other = usage_of(100, 0, 0, 0, 7, 0);
+
+        let one_call = vec![user_turn_entry("u1", "go"), billed_message("a", first)];
+        let (calls, total) = turn_usage(&one_call, 0);
+        assert_eq!(calls, vec![first]);
+        assert_eq!(total, first);
+
+        let many = vec![
+            user_turn_entry("u1", "go"),
+            billed_message("a", first),
+            billed_message("b", second),
+            user_turn_entry("u2", "next"),
+            billed_message("c", other),
+        ];
+        let (calls, total) = turn_usage(&many, 0);
+        assert_eq!(calls, vec![first, second]);
+        assert_eq!(total, first.add(second));
+        assert_eq!(total.input_tokens, 11);
+        assert_eq!(total.cache_write_1h_tokens, 22);
+        assert_eq!(total.cache_write_5m_tokens, 33);
+        assert_eq!(total.cache_read_tokens, 44);
+        assert_eq!(total.output_tokens, 55);
+        assert_eq!(total.thinking_tokens, 66);
+        let (calls, total) = turn_usage(&many, 3);
+        assert_eq!(calls, vec![other]);
+        assert_eq!(total, other);
+
+        let none = vec![
+            user_turn_entry("u1", "go"),
+            tool_use_turn_entry("t", "Read", serde_json::json!({}), "id"),
+        ];
+        let (calls, total) = turn_usage(&none, 0);
+        assert!(calls.is_empty());
+        assert_eq!(total, Usage::default());
+
+        let (calls, total) = turn_usage(&[], 0);
+        assert!(calls.is_empty());
+        assert_eq!(total, Usage::default());
+    }
+
+    #[test]
+    fn two_text_blocks_of_one_record_are_one_billed_call() {
+        let once = usage_of(3, 0, 0, 0, 4, 0);
+        let entries = vec![
+            user_turn_entry("u1", "go"),
+            billed_message("rec#0", once),
+            billed_message("rec#1", once),
+        ];
+        let (calls, total) = turn_usage(&entries, 0);
+        assert_eq!(calls, vec![once]);
+        assert_eq!(total, once);
+    }
+
+    #[test]
+    fn work_area_fills_the_rail_when_there_is_no_terminal() {
+        assert_eq!(work_area(true, false), WorkArea::TerminalAndRail);
+        assert_eq!(work_area(false, false), WorkArea::TerminalOnly);
+        assert_eq!(work_area(true, true), WorkArea::RailOnly);
+        assert_eq!(
+            work_area(false, true),
+            WorkArea::RailOnly,
+            "a collapsed rail plus a subagent used to draw an empty pane"
+        );
+    }
+
+    #[test]
+    fn a_hidden_rail_entry_keeps_its_index() {
+        let entries = vec![
+            billed_message("message", usage_of(1, 0, 0, 0, 1, 0)),
+            Entry {
+                key: SharedString::from("image"),
+                kind: EntryKind::Image {
+                    image: Arc::new(Image::empty()),
+                    media_type: SharedString::from("image/png"),
+                },
+            },
+            Entry {
+                key: SharedString::from("thinking"),
+                kind: EntryKind::Thinking {
+                    source: SharedString::from("hmm"),
+                },
+            },
+        ];
+        let keys: Vec<SharedString> = entries.iter().map(|entry| entry.key.clone()).collect();
+        let slots = rail_draw_slots(&entries);
+        assert_eq!(
+            slots.len(),
+            entries.len(),
+            "hiding a body must not drop the slot the list is indexed by"
+        );
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(&entries[index].key, key);
+            assert_eq!(slots[index], rail_worth(&entries[index].kind));
+        }
+        assert_eq!(slots[0], RailWorth::TerminalHasIt);
+        assert_eq!(entries[0].key.as_ref(), "message");
+        assert_eq!(slots[1], RailWorth::Draw);
+        assert_eq!(entries[1].key.as_ref(), "image");
+        assert_eq!(slots[2], RailWorth::TerminalHasIt);
+        assert_eq!(entries[2].key.as_ref(), "thinking");
+    }
+
+    #[test]
+    fn the_turn_cost_anchor_is_the_summary_or_else_the_last_billed_message() {
+        let first = usage_of(1, 0, 0, 0, 1, 0);
+        let second = usage_of(2, 0, 0, 0, 2, 0);
+        let with_summary = vec![
+            user_turn_entry("u1", "go"),
+            summary_entry("u1"),
+            billed_message("a1", first),
+        ];
+        assert!(is_turn_cost_anchor(&with_summary, 1));
+        assert!(!is_turn_cost_anchor(&with_summary, 2));
+
+        let without_summary = vec![
+            user_turn_entry("u1", "go"),
+            billed_message("a1", first),
+            billed_message("a2", second),
+            user_turn_entry("u2", "next"),
+            billed_message("b1", first),
+        ];
+        assert!(!is_turn_cost_anchor(&without_summary, 1));
+        assert!(is_turn_cost_anchor(&without_summary, 2));
+        assert!(!is_turn_cost_anchor(&without_summary, 0));
+        assert!(is_turn_cost_anchor(&without_summary, 4));
+    }
+
+    #[test]
+    fn transcript_anchors_keep_the_first_line_and_name_tool_calls() {
+        let entries = vec![
+            user_turn_entry("u", "**Fix** the login\nmore"),
+            Entry {
+                key: SharedString::from("think"),
+                kind: EntryKind::Thinking {
+                    source: SharedString::from("secret"),
+                },
+            },
+            tool_use_turn_entry(
+                "t",
+                "Read",
+                serde_json::json!({"file_path": "auth.rs"}),
+                "call",
+            ),
+            tool_use_turn_entry("empty", "Bash", serde_json::json!({}), "call-2"),
+            assistant_turn_entry("a", "done"),
+            peer_turn_entry("p"),
+            Entry {
+                key: SharedString::from("blank"),
+                kind: EntryKind::Message {
+                    role: MessageRole::User,
+                    source: SharedString::from("\nsecond line"),
+                    usage: None,
+                    answered_at: None,
+                },
+            },
+            Entry {
+                key: SharedString::from("spaced"),
+                kind: EntryKind::Message {
+                    role: MessageRole::Assistant,
+                    source: SharedString::from("  hello"),
+                    usage: None,
+                    answered_at: None,
+                },
+            },
+        ];
+        let anchors = transcript_anchors(&entries);
+        assert_eq!(
+            anchors
+                .iter()
+                .map(|anchor| (anchor.key.as_str(), anchor.glyph, anchor.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "u",
+                    terminal_anchors::AnchorGlyph::UserPrompt,
+                    "**Fix** the login"
+                ),
+                (
+                    "t",
+                    terminal_anchors::AnchorGlyph::Assistant,
+                    "Read(auth.rs)"
+                ),
+                ("empty", terminal_anchors::AnchorGlyph::Assistant, "Bash()"),
+                ("a", terminal_anchors::AnchorGlyph::Assistant, "done"),
+                ("p", terminal_anchors::AnchorGlyph::Assistant, "from a peer"),
+                ("blank", terminal_anchors::AnchorGlyph::UserPrompt, ""),
+                (
+                    "spaced",
+                    terminal_anchors::AnchorGlyph::Assistant,
+                    "  hello"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn anchor_chips_mark_edit_diffs_images_and_truncated_output() {
+        let edit = EntryKind::ToolUse {
+            name: SharedString::from("Edit"),
+            input: SharedString::from("{}"),
+            id: None,
+            diff: Some(SharedString::from("+a\n")),
+        };
+        let edit_without_diff = EntryKind::ToolUse {
+            name: SharedString::from("Edit"),
+            input: SharedString::from("{}"),
+            id: None,
+            diff: None,
+        };
+        let write_with_diff = EntryKind::ToolUse {
+            name: SharedString::from("Write"),
+            input: SharedString::from("{}"),
+            id: None,
+            diff: Some(SharedString::from("+a\n")),
+        };
+        let image = EntryKind::Image {
+            image: Arc::new(gpui::Image::empty()),
+            media_type: SharedString::from("image/png"),
+        };
+        let twelve = "x\n".repeat(MAX_UNCLAMPED_OUTPUT_LINES);
+        let thirteen = "x\n".repeat(MAX_UNCLAMPED_OUTPUT_LINES + 1);
+        let short_output = EntryKind::ToolResult {
+            label: SharedString::from("Read"),
+            is_error: false,
+            body: ToolResultBody::Inline(SharedString::from(twelve)),
+            tool_use_id: None,
+        };
+        let long_output = EntryKind::ToolResult {
+            label: SharedString::from("Read"),
+            is_error: false,
+            body: ToolResultBody::Inline(SharedString::from(thirteen)),
+            tool_use_id: None,
+        };
+        let persisted = EntryKind::ToolResult {
+            label: SharedString::from("Read"),
+            is_error: false,
+            body: ToolResultBody::Persisted(PersistedOutput {
+                size: SharedString::from("1"),
+                path: PathBuf::from("/tmp/out"),
+                preview: SharedString::from("short"),
+            }),
+            tool_use_id: None,
+        };
+        let message = EntryKind::Message {
+            role: MessageRole::Assistant,
+            source: SharedString::from("hello"),
+            usage: None,
+            answered_at: None,
+        };
+
+        assert_eq!(anchor_chip(&edit), AnchorChip::EditDiff);
+        assert_eq!(anchor_chip(&edit_without_diff), AnchorChip::Other);
+        assert_eq!(anchor_chip(&write_with_diff), AnchorChip::Other);
+        assert_eq!(anchor_chip(&image), AnchorChip::Image);
+        assert_eq!(anchor_chip(&short_output), AnchorChip::Other);
+        assert_eq!(anchor_chip(&long_output), AnchorChip::ExpandOutput);
+        assert_eq!(anchor_chip(&persisted), AnchorChip::ExpandOutput);
+        assert_eq!(anchor_chip(&message), AnchorChip::Other);
+        assert_eq!(anchor_chip_icon(AnchorChip::EditDiff), IconName::FileDiff);
+        assert_eq!(anchor_chip_icon(AnchorChip::Image), IconName::Image);
+        assert_eq!(
+            anchor_chip_icon(AnchorChip::ExpandOutput),
+            IconName::ExpandVertical
+        );
+    }
+
+    fn tool_result_entry(key: &str, lines: usize) -> Entry {
+        Entry {
+            key: SharedString::from(key.to_string()),
+            kind: EntryKind::ToolResult {
+                label: SharedString::from("Read"),
+                is_error: false,
+                body: ToolResultBody::Inline(SharedString::from("x\n".repeat(lines))),
+                tool_use_id: None,
+            },
+        }
+    }
+
+    fn image_entry(key: &str) -> Entry {
+        Entry {
+            key: SharedString::from(key.to_string()),
+            kind: EntryKind::Image {
+                image: Arc::new(gpui::Image::empty()),
+                media_type: SharedString::from("image/png"),
+            },
+        }
+    }
+
+    #[test]
+    fn a_call_owns_the_run_of_results_and_images_that_follows_it() {
+        let entries = vec![
+            tool_use_turn_entry("call", "Bash", serde_json::json!({}), "id-1"),
+            tool_result_entry("result", 1),
+            image_entry("shot"),
+            assistant_turn_entry("said", "done"),
+            tool_use_turn_entry("running", "Bash", serde_json::json!({}), "id-2"),
+        ];
+
+        // The run stops at the answer that follows it.
+        assert_eq!(
+            call_results(&entries, 0)
+                .iter()
+                .map(|entry| entry.key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["result", "shot"],
+        );
+        // A call still running has produced nothing yet.
+        assert!(call_results(&entries, 4).is_empty());
+        assert!(call_results(&entries, 99).is_empty());
+
+        // Parallel calls: one assistant record asks for two tools and one user record
+        // answers both, so the results cannot be told apart by position. The first call
+        // draws nothing rather than borrowing the other's result. See T3R1-SG3.
+        let parallel = vec![
+            tool_use_turn_entry("first", "Read", serde_json::json!({}), "id-1"),
+            tool_use_turn_entry("second", "Read", serde_json::json!({}), "id-2"),
+            tool_result_entry("both", 1),
+        ];
+        assert!(call_results(&parallel, 0).is_empty());
+        assert_eq!(
+            call_results(&parallel, 1)
+                .iter()
+                .map(|entry| entry.key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["both"],
+        );
+    }
+
+    #[test]
+    fn a_call_row_draws_what_the_call_produced() {
+        let edit = EntryKind::ToolUse {
+            name: SharedString::from(EDIT_TOOL_NAME),
+            input: SharedString::from("{}"),
+            id: None,
+            diff: Some(SharedString::from("+a\n")),
+        };
+        let bash = EntryKind::ToolUse {
+            name: SharedString::from("Bash"),
+            input: SharedString::from("{}"),
+            id: None,
+            diff: None,
+        };
+        let message = EntryKind::Message {
+            role: MessageRole::Assistant,
+            source: SharedString::from("hello"),
+            usage: None,
+            answered_at: None,
+        };
+        let short = vec![tool_result_entry("short", MAX_UNCLAMPED_OUTPUT_LINES)];
+        let long = vec![tool_result_entry("long", MAX_UNCLAMPED_OUTPUT_LINES + 1)];
+        let shot = vec![image_entry("shot")];
+        let long_and_shot = vec![
+            tool_result_entry("long", MAX_UNCLAMPED_OUTPUT_LINES + 1),
+            image_entry("shot"),
+        ];
+
+        assert_eq!(anchored_chip(&bash, &shot), Some(AnchorChip::Image));
+        assert_eq!(anchored_chip(&bash, &long), Some(AnchorChip::ExpandOutput));
+        // diff > image > expand.
+        assert_eq!(
+            anchored_chip(&edit, &long_and_shot),
+            Some(AnchorChip::EditDiff)
+        );
+        assert_eq!(
+            anchored_chip(&bash, &long_and_shot),
+            Some(AnchorChip::Image)
+        );
+        // The two guards: a call with no result yet, and a call whose result is short
+        // and holds no image, draw nothing rather than an empty chevron.
+        assert_eq!(anchored_chip(&bash, &[]), None);
+        assert_eq!(anchored_chip(&bash, &short), None);
+        // A message keeps the row it always had.
+        assert_eq!(anchored_chip(&message, &[]), Some(AnchorChip::Other));
+    }
+
+    #[test]
+    fn parallel_tool_uses_keep_the_image_on_the_call_that_produced_it() {
+        // One assistant record emits two calls; the user record answers both.
+        // `call-a`'s result contains an image and `call-b`'s result is one short
+        // line. Position pairing gives both answers to `call-b`.
+        let entries = entries_of(&[
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"call-a","name":"Read","input":{"file_path":"a.rs"}},{"type":"tool_use","id":"call-b","name":"Bash","input":{"command":"true"}}]}}"#,
+            r#"{"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":[{"type":"text","text":"see this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBB"}}]},{"type":"tool_result","tool_use_id":"call-b","content":"ok"}]}}"#,
+        ]);
+        let index_of = |id: &str| {
+            entries.iter().position(|entry| {
+                matches!(
+                    &entry.kind,
+                    EntryKind::ToolUse { id: Some(tool_id), .. } if tool_id.as_ref() == id
+                )
+            })
+        };
+        let Some(index_a) = index_of("call-a") else {
+            panic!("expected the Read call");
+        };
+        let Some(index_b) = index_of("call-b") else {
+            panic!("expected the Bash call");
+        };
+        assert_eq!(
+            anchored_chip(&entries[index_a].kind, call_results(&entries, index_a)),
+            Some(AnchorChip::Image),
+            "the image belongs to call-a"
+        );
+        assert_eq!(
+            anchored_chip(&entries[index_b].kind, call_results(&entries, index_b)),
+            None,
+            "call-b's own result is a short line, so it draws no chip"
+        );
+    }
+
+    #[test]
+    fn a_call_does_not_borrow_a_result_that_names_another_call() {
+        let named = |key: &str, id: &str| Entry {
+            key: SharedString::from(key),
+            kind: EntryKind::ToolResult {
+                label: SharedString::from("Bash"),
+                is_error: false,
+                body: ToolResultBody::Inline(SharedString::from("ok")),
+                tool_use_id: Some(SharedString::from(id)),
+            },
+        };
+        let entries = vec![
+            tool_use_turn_entry("a", "Read", serde_json::json!({}), "id-a"),
+            named("b-out", "id-b"),
+            tool_use_turn_entry("b", "Bash", serde_json::json!({}), "id-b"),
+            tool_use_turn_entry("c", "Bash", serde_json::json!({}), "id-c"),
+            tool_result_entry("c-out", 1),
+        ];
+        assert!(
+            call_results(&entries, 0).is_empty(),
+            "a missing result must not take the next call's"
+        );
+        assert_eq!(
+            call_results(&entries, 2)
+                .iter()
+                .map(|entry| entry.key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["b-out"]
+        );
+        // A result that never named a call still belongs to the call in front of it.
+        assert_eq!(
+            call_results(&entries, 3)
+                .iter()
+                .map(|entry| entry.key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["c-out"]
+        );
+    }
+
+    #[test]
+    fn a_scrolled_back_screen_still_numbers_its_rows_from_the_top() {
+        // Scrolled back three rows: the top visible row reports line -3.
+        assert_eq!(visible_grid_line(-3, 3), 0);
+        assert_eq!(visible_grid_line(-1, 3), 2);
+        assert_eq!(visible_grid_line(46, 3), 49);
+        // Not scrolled: the grid line already is the screen row.
+        assert_eq!(visible_grid_line(0, 0), 0);
+        assert_eq!(visible_grid_line(49, 0), 49);
+        // Rows above what the terminal reports stay out of the screen.
+        assert_eq!(visible_grid_line(-4, 3), -1);
+        assert_eq!(visible_grid_line(1, usize::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn a_cache_miss_keeps_the_transcript_anchors_of_the_same_generation() {
+        let anchors = vec![terminal_anchors::TranscriptAnchor {
+            key: "u".to_string(),
+            glyph: terminal_anchors::AnchorGlyph::UserPrompt,
+            text: "fix the login".to_string(),
+        }];
+        let cache = |generation: u64| AnchorCache {
+            entries_generation: generation,
+            glyphs: Glyphs::default(),
+            columns: 80,
+            screen_lines: 24,
+            line_height: px(18.),
+            cell_width: px(8.),
+            rows: Vec::new(),
+            transcript: anchors.clone(),
+            anchorings: Vec::new(),
+        };
+
+        assert_eq!(reusable_anchors(Some(cache(7)), 7), Some(anchors.clone()));
+        // A rebuilt conversation is the one thing that can change them.
+        assert_eq!(reusable_anchors(Some(cache(7)), 8), None);
+        assert_eq!(reusable_anchors(None, 7), None);
+    }
+
+    #[test]
+    fn the_gutter_stays_for_a_terminal_and_not_for_a_subagent() {
+        assert!(anchor_gutter_shown(WorkArea::TerminalAndRail, true));
+        assert!(anchor_gutter_shown(WorkArea::TerminalOnly, true));
+        assert!(!anchor_gutter_shown(WorkArea::RailOnly, true));
+        assert!(!anchor_gutter_shown(WorkArea::TerminalAndRail, false));
+        assert!(!anchor_gutter_shown(WorkArea::TerminalOnly, false));
+        assert_eq!(anchor_chip_top(0, px(18.)), px(0.));
+        assert_eq!(anchor_chip_top(7, px(18.)), px(126.));
+    }
+
+    fn collapse_for(
+        entries: Vec<Entry>,
+        expand_all: bool,
+        current_turn_running: bool,
+    ) -> Vec<Entry> {
+        collapse_turns(
+            entries,
+            &HashSet::default(),
+            expand_all,
+            current_turn_running,
+            &HashMap::default(),
+            &HashMap::default(),
+        )
+    }
+
+    fn anchor_named<'a>(anchors: &'a [ReachableAnchor], key: &str) -> &'a ReachableAnchor {
+        anchors
+            .iter()
+            .find(|anchor| anchor.anchor.key == key)
+            .unwrap_or_else(|| panic!("missing anchor {key}"))
+    }
+
+    #[test]
+    fn a_surviving_entry_keeps_its_own_collapsed_index() {
+        // A non-anchor before the turn shifts every later index. The anchor list's
+        // own position is not the index in the collapsed list.
+        let before = vec![
+            image_entry("prefix"),
+            user_turn_entry("u", "go"),
+            assistant_turn_entry("a", "done"),
+        ];
+        let after = collapse_for(before.clone(), false, false);
+        let anchors = reachable_anchors(&before, &after);
+        let user = anchor_named(&anchors, "u");
+        let assistant = anchor_named(&anchors, "a");
+        assert_eq!(after[user.index].key.as_ref(), "u");
+        assert_eq!(after[assistant.index].key.as_ref(), "a");
+        assert!(
+            after
+                .iter()
+                .all(|entry| !matches!(entry.kind, EntryKind::TurnSummary { .. })),
+            "a turn with no tool call has no summary to point at"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_tool_points_at_its_turn_summary_and_keeps_its_chip() {
+        let before = vec![
+            user_turn_entry("u", "go"),
+            tool_use_turn_entry(
+                "first",
+                "Read",
+                serde_json::json!({"file_path": "a.rs"}),
+                "id-1",
+            ),
+            tool_result_entry("first-out", 1),
+            tool_use_turn_entry(
+                "second",
+                "Read",
+                serde_json::json!({"file_path": "b.rs"}),
+                "id-2",
+            ),
+            tool_result_entry("second-out", MAX_UNCLAMPED_OUTPUT_LINES + 1),
+        ];
+        let after = collapse_for(before.clone(), false, false);
+        let summary = after
+            .iter()
+            .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
+            .unwrap_or_else(|| panic!("expected a summary"));
+        let anchors = reachable_anchors(&before, &after);
+        let first = anchor_named(&anchors, "first");
+        let second = anchor_named(&anchors, "second");
+        let user = anchor_named(&anchors, "u");
+        assert_eq!(after[user.index].key.as_ref(), "u");
+        assert_ne!(user.index, summary);
+        assert_eq!(first.index, summary);
+        assert_eq!(second.index, summary);
+        assert!(
+            !after.iter().any(|entry| entry.key.as_ref() == "second"),
+            "the tool entry itself is gone"
+        );
+        // The long result is gone with the tool, but the chip was read before collapse.
+        assert_eq!(second.chip, Some(AnchorChip::ExpandOutput));
+        // A one-line result is not an expand chip. Collapsing must not invent one.
+        assert_eq!(first.chip, None);
+    }
+
+    #[test]
+    fn a_running_turn_has_no_summary_so_its_tool_stays_put() {
+        let before = vec![
+            user_turn_entry("u", "go"),
+            Entry {
+                key: SharedString::from("think"),
+                kind: EntryKind::Thinking {
+                    source: SharedString::from("hmm"),
+                },
+            },
+            tool_use_turn_entry(
+                "live",
+                "Read",
+                serde_json::json!({"file_path": "a.rs"}),
+                "id",
+            ),
+        ];
+        let after = collapse_for(before.clone(), false, true);
+        assert!(
+            after
+                .iter()
+                .all(|entry| !matches!(entry.kind, EntryKind::TurnSummary { .. }))
+        );
+        let anchors = reachable_anchors(&before, &after);
+        let live = anchor_named(&anchors, "live");
+        assert_eq!(after[live.index].key.as_ref(), "live");
+    }
+
+    #[test]
+    fn show_tool_calls_keeps_every_anchor_on_its_own_entry() {
+        let before = vec![
+            user_turn_entry("u", "go"),
+            tool_use_turn_entry(
+                "call",
+                "Read",
+                serde_json::json!({"file_path": "a.rs"}),
+                "id",
+            ),
+            tool_result_entry("out", 1),
+        ];
+        let after = collapse_for(before.clone(), true, false);
+        assert!(
+            after.iter().any(|entry| entry.key.as_ref() == "call"),
+            "expand-all leaves the tool in the list"
+        );
+        let anchors = reachable_anchors(&before, &after);
+        let call = anchor_named(&anchors, "call");
+        assert_eq!(after[call.index].key.as_ref(), "call");
+        assert!(
+            !matches!(after[call.index].kind, EntryKind::TurnSummary { .. }),
+            "the tool is still on screen, so the click must not land on the summary"
+        );
+    }
+
+    fn anchor_row(row: usize, text: &str) -> terminal_anchors::AnchorRow {
+        terminal_anchors::AnchorRow {
+            row,
+            glyph: terminal_anchors::AnchorGlyph::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    fn transcript_anchor_row(key: &str, text: &str) -> terminal_anchors::TranscriptAnchor {
+        terminal_anchors::TranscriptAnchor {
+            key: key.to_string(),
+            glyph: terminal_anchors::AnchorGlyph::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    fn tail_filled_transcript(
+        head: Vec<terminal_anchors::TranscriptAnchor>,
+    ) -> Vec<terminal_anchors::TranscriptAnchor> {
+        let mut transcript = head;
+        for index in 0..terminal_anchors::MAX_TRANSCRIPT_ANCHORS {
+            transcript.push(transcript_anchor_row(
+                &format!("fill-{index}"),
+                "othertextvalue",
+            ));
+        }
+        transcript
+    }
+
+    fn aligned_keys(
+        screen: &[terminal_anchors::AnchorRow],
+        transcript: &[terminal_anchors::TranscriptAnchor],
+        scrolled_back: bool,
+    ) -> Vec<String> {
+        let window = transcript_window_for_screen(screen, transcript, scrolled_back);
+        terminal_anchors::align(screen, window)
+            .into_iter()
+            .map(|anchoring| anchoring.key)
+            .collect()
+    }
+
+    #[test]
+    fn a_scrolled_back_screen_keeps_an_anchor_older_than_the_tail_window() {
+        let transcript =
+            tail_filled_transcript(vec![transcript_anchor_row("old", "uniqueoldanchortext")]);
+        let screen = [anchor_row(0, "uniqueoldanchortext")];
+        assert_eq!(
+            aligned_keys(&screen, &transcript, true),
+            vec!["old".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_scrolled_back_screen_pairs_a_repeated_line_with_the_copy_beside_the_old_one() {
+        let transcript = tail_filled_transcript(vec![
+            transcript_anchor_row("old", "uniqueoldanchortext"),
+            transcript_anchor_row("old-read", "Read(auth.rs)"),
+        ]);
+        // The filler window also contains this text, so the tail matches the wrong copy.
+        let transcript = {
+            let mut transcript = transcript;
+            let last = transcript.len().saturating_sub(1);
+            transcript[last] = transcript_anchor_row("new-read", "Read(auth.rs)");
+            transcript
+        };
+        let screen = [
+            anchor_row(0, "uniqueoldanchortext"),
+            anchor_row(1, "Read(auth.rs)"),
+        ];
+        assert_eq!(
+            aligned_keys(&screen, &transcript, true),
+            vec!["old".to_string(), "old-read".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_tail_window_stays_when_the_screen_is_not_scrolled_back() {
+        let transcript =
+            tail_filled_transcript(vec![transcript_anchor_row("old", "uniqueoldanchortext")]);
+        let screen = [anchor_row(0, "uniqueoldanchortext")];
+        assert!(aligned_keys(&screen, &transcript, false).is_empty());
+
+        let mut recent = tail_filled_transcript(Vec::new());
+        recent.push(transcript_anchor_row("newest", "uniqueoldanchortext"));
+        let screen = [anchor_row(4, "uniqueoldanchortext")];
+        assert_eq!(
+            aligned_keys(&screen, &recent, true),
+            vec!["newest".to_string()],
+            "a line that is already in the tail must not be dropped for an older window"
+        );
+
+        let short = vec![
+            transcript_anchor_row("only", "uniqueoldanchortext"),
+            transcript_anchor_row("next", "othertextvalue"),
+        ];
+        assert_eq!(
+            aligned_keys(&screen, &short, true),
+            vec!["only".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_scrolled_back_span_of_one_window_is_covered_in_full() {
+        let mut transcript = Vec::new();
+        let mut screen = Vec::new();
+        for index in 0..terminal_anchors::MAX_TRANSCRIPT_ANCHORS {
+            let text = format!("uniqueline{index:04}");
+            transcript.push(transcript_anchor_row(&format!("key-{index}"), &text));
+            screen.push(anchor_row(index, &text));
+        }
+        transcript.push(transcript_anchor_row("newer", "othertextvalue"));
+        assert_eq!(
+            aligned_keys(&screen, &transcript, true),
+            (0..terminal_anchors::MAX_TRANSCRIPT_ANCHORS)
+                .map(|index| format!("key-{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_scrolled_back_span_longer_than_one_window_keeps_the_newer_side() {
+        let count = terminal_anchors::MAX_TRANSCRIPT_ANCHORS + 1;
+        let mut transcript = Vec::new();
+        let mut screen = Vec::new();
+        for index in 0..count {
+            let text = format!("uniqueline{index:04}");
+            transcript.push(transcript_anchor_row(&format!("key-{index}"), &text));
+            screen.push(anchor_row(index, &text));
+        }
+        let keys = aligned_keys(&screen, &transcript, true);
+        assert_eq!(keys.len(), terminal_anchors::MAX_TRANSCRIPT_ANCHORS);
+        assert_eq!(keys.first().map(String::as_str), Some("key-1"));
+        assert_eq!(keys.last().map(String::as_str), Some("key-512"));
+        assert!(!keys.iter().any(|key| key == "key-0"));
+    }
+
+    #[test]
+    fn an_anchor_before_the_first_turn_is_not_sent_to_a_later_summary() {
+        let before = vec![
+            assistant_turn_entry("preface", "hello there friend"),
+            user_turn_entry("u", "go"),
+            tool_use_turn_entry("t", "Read", serde_json::json!({"file_path": "a.rs"}), "id"),
+            tool_result_entry("out", 1),
+        ];
+        let after = collapse_for(before.clone(), false, false);
+        let anchors = reachable_anchors(&before, &after);
+        let preface = anchor_named(&anchors, "preface");
+        assert_eq!(after[preface.index].key.as_ref(), "preface");
+    }
+
+    fn call_index_of(entries: &[Entry], wanted: &str) -> usize {
+        entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.kind,
+                    EntryKind::ToolUse { id: Some(id), .. } if id.as_ref() == wanted
+                )
+            })
+            .unwrap_or_else(|| panic!("missing call {wanted}"))
+    }
+
+    #[test]
+    fn a_result_that_leads_with_its_image_keeps_it_on_its_own_call() {
+        // The content blocks are walked in order and the pending text is flushed the
+        // moment an image is reached, so an image written before the text lands in
+        // front of the `ToolResult` that carries the id.
+        let entries = entries_of(&[
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"call-a","name":"Read","input":{"file_path":"shot.png"}}]}}"#,
+            r#"{"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBB"}},{"type":"text","text":"see this"}]}]}}"#,
+        ]);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Image { .. })),
+            "the record has to produce an image entry for this to be about anything"
+        );
+        let call = call_index_of(&entries, "call-a");
+        assert_eq!(
+            anchored_chip(&entries[call].kind, call_results(&entries, call)),
+            Some(AnchorChip::Image),
+            "the image is this call's output even though it was written before the text"
+        );
+    }
+
+    /// The boundary added for the test above reaches backwards, so it has to stop
+    /// before an image that a previous result left behind.
+    #[test]
+    fn a_call_does_not_take_the_image_the_previous_result_left_behind() {
+        let entries = entries_of(&[
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"call-a","name":"Read","input":{"file_path":"a.png"}},{"type":"tool_use","id":"call-b","name":"Bash","input":{"command":"true"}}]}}"#,
+            r#"{"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBB"}}]},{"type":"tool_result","tool_use_id":"call-b","content":"two"}]}}"#,
+        ]);
+        let first = call_index_of(&entries, "call-a");
+        let second = call_index_of(&entries, "call-b");
+        assert_eq!(
+            anchored_chip(&entries[first].kind, call_results(&entries, first)),
+            Some(AnchorChip::Image),
+            "the image was written after call-a's own text"
+        );
+        assert_eq!(
+            anchored_chip(&entries[second].kind, call_results(&entries, second)),
+            None,
+            "call-b's result is one short line; the image in front of it is call-a's"
+        );
+    }
+
+    fn identified_result_entry(key: &str, id: &str) -> Entry {
+        Entry {
+            key: SharedString::from(key.to_string()),
+            kind: EntryKind::ToolResult {
+                label: SharedString::from("Read"),
+                is_error: false,
+                body: ToolResultBody::Inline(SharedString::from("ok")),
+                tool_use_id: Some(SharedString::from(id.to_string())),
+            },
+        }
+    }
+
+    /// `reachable_anchors` runs on every rebuild, which is every 250 ms on the
+    /// foreground thread. Pairing a call with its result by scanning the whole
+    /// conversation for each call makes that pass quadratic in the session's length.
+    #[test]
+    fn the_anchor_pass_does_not_rescan_the_conversation_for_every_call() {
+        const CALLS: usize = 8000;
+        let mut before = Vec::with_capacity(CALLS * 3);
+        for index in 0..CALLS {
+            before.push(user_turn_entry(&format!("u{index}"), "go"));
+            before.push(tool_use_turn_entry(
+                &format!("t{index}"),
+                "Read",
+                serde_json::json!({}),
+                &format!("toolu_01A09q90qw90lq917835lq{index:06}"),
+            ));
+            before.push(identified_result_entry(
+                &format!("r{index}"),
+                &format!("toolu_01A09q90qw90lq917835lq{index:06}"),
+            ));
+        }
+        let after = before.clone();
+
+        let started = std::time::Instant::now();
+        let anchors = reachable_anchors(&before, &after);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            anchors.len(),
+            CALLS * 2,
+            "every message and call is an anchor"
+        );
+        let budget = std::time::Duration::from_millis(110);
+        assert!(
+            elapsed < budget,
+            "the anchor pass over {} entries took {elapsed:?}, budget {budget:?}",
+            before.len()
+        );
+    }
+
+    /// The window search runs on every frame the terminal spends scrolled back, so it
+    /// must not build a fresh skeleton for both sides of every comparison the way
+    /// `rows_match` does; `align` precomputes its skeletons for the same reason.
+    #[test]
+    fn choosing_a_window_skeletonises_each_row_once() {
+        const ANCHORS: usize = 20000;
+        let transcript = (0..ANCHORS)
+            .map(|index| {
+                transcript_anchor_row(
+                    &format!("key-{index}"),
+                    &format!("Read(src/module{index}/file{index}.rs)"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let screen = (0..20)
+            .map(|index| {
+                anchor_row(
+                    index,
+                    &format!("Read(src/module{}/file{}.rs)", index + 100, index + 100),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let window = transcript_window_for_screen(&screen, &transcript, true);
+        let elapsed = started.elapsed();
+
+        assert_eq!(window.len(), terminal_anchors::MAX_TRANSCRIPT_ANCHORS);
+        assert_eq!(
+            window.first().map(|anchor| anchor.key.as_str()),
+            Some("key-100"),
+            "the window starts at the oldest visible row"
+        );
+        let budget = std::time::Duration::from_millis(300);
+        assert!(
+            elapsed < budget,
+            "choosing a window over {ANCHORS} anchors took {elapsed:?}, budget {budget:?}"
+        );
+    }
+
+    fn anchoring(row: usize, key: &str) -> Anchoring {
+        Anchoring {
+            row,
+            key: key.to_string(),
+        }
+    }
+
+    fn reachable_anchor(key: &str, index: usize) -> ReachableAnchor {
+        ReachableAnchor {
+            anchor: terminal_anchors::TranscriptAnchor {
+                key: key.to_string(),
+                glyph: terminal_anchors::AnchorGlyph::Assistant,
+                text: String::new(),
+            },
+            index,
+            chip: None,
+        }
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_the_default_when_the_pane_is_wide() {
+        let available = unconstrained_rail_budget();
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_DEFAULT_PIXELS), available),
+            px(RAIL_WIDTH_DEFAULT_PIXELS)
+        );
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_both_ends_of_the_range() {
+        let available = unconstrained_rail_budget();
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MIN_PIXELS), available),
+            px(RAIL_WIDTH_MIN_PIXELS)
+        );
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MAX_PIXELS), available),
+            px(RAIL_WIDTH_MAX_PIXELS)
+        );
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_a_rail_that_leaves_the_terminal_exactly_320() {
+        // 900 + 320. The terminal floor is inclusive: 900 must not be pulled down.
+        let available = px(RAIL_WIDTH_MAX_PIXELS + TERMINAL_MIN_WIDTH_PIXELS);
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MAX_PIXELS), available),
+            px(RAIL_WIDTH_MAX_PIXELS)
+        );
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_240_when_that_leaves_the_terminal_exactly_320() {
+        let available = px(RAIL_WIDTH_MIN_PIXELS + TERMINAL_MIN_WIDTH_PIXELS);
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MIN_PIXELS), available),
+            px(RAIL_WIDTH_MIN_PIXELS)
+        );
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_a_subpixel_width() {
+        let available = unconstrained_rail_budget();
+        assert_eq!(clamped_rail_width(px(380.5), available), px(380.5));
+    }
+
+    #[test]
+    fn clamped_rail_width_pulls_an_out_of_range_request_onto_the_ends() {
+        let available = unconstrained_rail_budget();
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MIN_PIXELS - 1.), available),
+            px(RAIL_WIDTH_MIN_PIXELS)
+        );
+        assert_eq!(
+            clamped_rail_width(px(RAIL_WIDTH_MAX_PIXELS + 1.), available),
+            px(RAIL_WIDTH_MAX_PIXELS)
+        );
+    }
+
+    #[test]
+    fn clamped_rail_width_shrinks_the_rail_so_the_terminal_stays_at_least_320() {
+        // 1000 - 320 = 680, inside 240..=900, so 800 is the request that has to give way.
+        let available = px(1000.);
+        assert_eq!(clamped_rail_width(px(800.), available), px(680.));
+    }
+
+    #[test]
+    fn clamped_rail_width_lets_the_rail_go_below_240_when_both_floors_cannot_hold() {
+        // 500 - 320 = 180. Raising that to 240 would leave the terminal at 260.
+        let available = px(500.);
+        assert_eq!(clamped_rail_width(px(100.), available), px(180.));
+        assert_eq!(clamped_rail_width(px(200.), available), px(180.));
+    }
+
+    #[test]
+    fn clamped_rail_width_does_not_go_negative_when_the_row_cannot_hold_the_terminal() {
+        let available = px(100.);
+        assert_eq!(clamped_rail_width(px(380.), available), px(0.));
+        assert_eq!(clamped_rail_width(px(0.), px(0.)), px(0.));
+    }
+
+    #[test]
+    fn clamped_rail_width_keeps_one_pixel_above_the_rail_floor_when_the_terminal_allows_it() {
+        // 561 - 320 = 241. 241 is inside 240..=900 and must not snap to 240.
+        let available = px(RAIL_WIDTH_MIN_PIXELS + TERMINAL_MIN_WIDTH_PIXELS + 1.);
+        assert_eq!(clamped_rail_width(px(241.), available), px(241.));
+    }
+
+    #[test]
+    fn terminal_and_rail_budget_reserves_the_handle_and_the_gutter_only_when_it_is_shown() {
+        assert_eq!(
+            terminal_and_rail_budget(px(1000.), true),
+            px(1000. - RAIL_RESIZE_HANDLE_PIXELS - ANCHOR_GUTTER_WIDTH_PIXELS)
+        );
+        assert_eq!(
+            terminal_and_rail_budget(px(1000.), false),
+            px(1000. - RAIL_RESIZE_HANDLE_PIXELS)
+        );
+    }
+
+    #[test]
+    fn forgetting_the_handle_would_leave_the_terminal_under_320() {
+        // Row is 240 + 320 + 6. With the handle reserved, a request of 246 clamps to 240
+        // and the terminal stays at 320. Leaving the handle out of the budget would
+        // accept 246 and leave the terminal at 314.
+        let row = px(RAIL_WIDTH_MIN_PIXELS + TERMINAL_MIN_WIDTH_PIXELS + RAIL_RESIZE_HANDLE_PIXELS);
+        let budget = terminal_and_rail_budget(row, false);
+        assert_eq!(
+            budget,
+            px(RAIL_WIDTH_MIN_PIXELS + TERMINAL_MIN_WIDTH_PIXELS)
+        );
+        assert_eq!(
+            clamped_rail_width(px(246.), budget),
+            px(RAIL_WIDTH_MIN_PIXELS)
+        );
+    }
+
+    #[test]
+    fn reserving_a_missing_gutter_would_reject_a_legal_rail_width() {
+        // Row is 240 + 320 + 6 + 28. No gutter is drawn, so 268 must survive.
+        // Subtracting the gutter anyway would clamp 268 down to 240.
+        let row = px(RAIL_WIDTH_MIN_PIXELS
+            + TERMINAL_MIN_WIDTH_PIXELS
+            + RAIL_RESIZE_HANDLE_PIXELS
+            + ANCHOR_GUTTER_WIDTH_PIXELS);
+        let budget = terminal_and_rail_budget(row, false);
+        assert_eq!(clamped_rail_width(px(268.), budget), px(268.));
+    }
+
+    #[test]
+    fn anchored_on_screen_keys_is_empty_when_nothing_is_aligned() {
+        let keys = anchored_on_screen_keys(&[]);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn anchored_on_screen_keys_keeps_every_distinct_key_including_an_empty_one() {
+        let keys = anchored_on_screen_keys(&[
+            anchoring(0, "alpha"),
+            anchoring(2, "alpha"),
+            anchoring(3, ""),
+            anchoring(4, "beta"),
+        ]);
+        assert!(keys.contains("alpha"));
+        assert!(keys.contains(""));
+        assert!(keys.contains("beta"));
+        assert!(!keys.contains("absent"));
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn rail_follow_index_stays_none_while_the_terminal_is_live() {
+        let anchorings = [anchoring(0, "alpha")];
+        let reachable = [reachable_anchor("alpha", 0)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, false, 1), None);
+    }
+
+    #[test]
+    fn rail_follow_index_uses_the_top_row_even_when_it_is_not_first_or_index_zero() {
+        let anchorings = [
+            anchoring(5, "lower"),
+            anchoring(0, "top"),
+            anchoring(2, "mid"),
+        ];
+        let reachable = [
+            reachable_anchor("lower", 1),
+            reachable_anchor("top", 4),
+            reachable_anchor("mid", 2),
+        ];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 5), Some(4));
+    }
+
+    #[test]
+    fn rail_follow_index_keeps_index_zero_and_the_last_in_range_index() {
+        let anchorings = [anchoring(0, "first")];
+        let reachable = [reachable_anchor("first", 0)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 1), Some(0));
+
+        let anchorings = [anchoring(1, "last")];
+        let reachable = [reachable_anchor("last", 3)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 4), Some(3));
+    }
+
+    #[test]
+    fn rail_follow_index_rejects_an_index_past_the_entries() {
+        let anchorings = [anchoring(0, "past")];
+        let reachable = [reachable_anchor("past", 2)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 2), None);
+    }
+
+    #[test]
+    fn rail_follow_index_is_none_when_the_screen_has_no_anchors() {
+        let reachable = [reachable_anchor("alpha", 0)];
+        assert_eq!(rail_follow_index(&[], &reachable, true, 1), None);
+    }
+
+    #[test]
+    fn rail_follow_index_does_not_substitute_a_lower_row_when_the_top_key_is_missing() {
+        let anchorings = [anchoring(0, "missing"), anchoring(3, "present")];
+        let reachable = [reachable_anchor("present", 1)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 2), None);
+    }
+
+    #[test]
+    fn rail_follow_index_uses_a_later_anchor_on_the_same_top_row() {
+        let anchorings = [
+            anchoring(0, "missing"),
+            anchoring(0, "present"),
+            anchoring(4, "lower"),
+        ];
+        let reachable = [reachable_anchor("present", 2), reachable_anchor("lower", 0)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 3), Some(2));
+    }
+
+    #[test]
+    fn rail_follow_index_skips_an_out_of_range_duplicate_and_keeps_the_in_range_one() {
+        let anchorings = [anchoring(1, "same")];
+        let reachable = [reachable_anchor("same", 5), reachable_anchor("same", 1)];
+        assert_eq!(rail_follow_index(&anchorings, &reachable, true, 3), Some(1));
+        let both_in_range = [reachable_anchor("same", 1), reachable_anchor("same", 2)];
+        assert_eq!(
+            rail_follow_index(&anchorings, &both_in_range, true, 3),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rail_follow_scroll_reveals_a_new_index_and_index_zero() {
+        assert_eq!(rail_follow_scroll(None, Some(0), true), Some(0));
+        assert_eq!(rail_follow_scroll(Some(3), Some(4), true), Some(4));
+    }
+
+    #[test]
+    fn rail_follow_scroll_does_not_repeat_the_index_it_already_followed() {
+        assert_eq!(rail_follow_scroll(Some(0), Some(0), true), None);
+        assert_eq!(rail_follow_scroll(Some(4), Some(4), true), None);
+    }
+
+    #[test]
+    fn rail_follow_scroll_does_not_scroll_while_the_terminal_is_live() {
+        assert_eq!(rail_follow_scroll(None, Some(0), false), None);
+        assert_eq!(rail_follow_scroll(Some(4), Some(4), false), None);
+    }
+
+    #[test]
+    fn rail_follow_scroll_scrolls_again_after_the_followed_index_was_cleared() {
+        assert_eq!(rail_follow_scroll(Some(4), None, true), None);
+        assert_eq!(rail_follow_scroll(None, Some(4), true), Some(4));
+    }
+
+    #[test]
+    fn hover_anchor_changed_is_false_only_when_the_key_is_the_same() {
+        assert!(!hover_anchor_changed(None, None));
+        assert!(!hover_anchor_changed(Some("alpha"), Some("alpha")));
+        assert!(!hover_anchor_changed(Some(""), Some("")));
+        assert!(hover_anchor_changed(None, Some("")));
+        assert!(hover_anchor_changed(Some("alpha"), None));
+        assert!(hover_anchor_changed(None, Some("alpha")));
+        assert!(hover_anchor_changed(Some("alpha"), Some("beta")));
+        assert!(hover_anchor_changed(Some("ab"), Some("a")));
     }
 }

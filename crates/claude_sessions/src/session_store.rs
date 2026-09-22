@@ -996,6 +996,14 @@ impl ClaudeSessionStore {
         self.selected_live().map(|live| &live.session)
     }
 
+    /// The tmux invocation that shows the selected live session's window, or `None`
+    /// when nothing live is selected or its `tmux` field is not a pane tmux can attach.
+    pub fn attach_arguments(&self) -> Option<Vec<String>> {
+        let session = self.selected_session()?;
+        let tmux_target = session.tmux_target.as_deref()?;
+        crate::session_registry::attach_arguments(tmux_target)
+    }
+
     fn spawn_registry_poll(&self, cx: &mut Context<Self>) -> Task<()> {
         let source = self.source.clone();
         let project_root = self.project_root.clone();

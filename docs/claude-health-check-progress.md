@@ -141,3 +141,16 @@
 - 2026-09-18 19:33 WP7d 完成；大腦 gate 487+187 綠、clippy 乾淨；快照 `after-wp7d-*.patch`。19:35 派 Opus 窄審 WP7d diff（SG-1 情境重跑、重複 pid、DW-1 mutation 驗證）。窄審綠即凍結程式碼 → `cargo build -p zed` → 總結。
 - 2026-09-18 19:48 WP7d 窄審完成，程式碼凍結。大腦套用 DW-1 強斷言 patch，單測綠、整支 binary 10× 10 執行緒全綠。快照 `baseline/final-1948.patch` + `untracked-final.tgz`。最終驗收串跑中：fmt check → `cargo test` → clippy → `cargo build -p zed`（log `scratch/final-acceptance.log`）。channel assets 自 11:01 未動，node 34/34 仍有效。
 - 2026-09-18 19:53 **最終驗收全綠**：`cargo fmt --check`（claude_sessions／remote）0 差異；`cargo test -p claude_sessions -p remote` 487（含 130 盲測）+ 187；`./script/clippy -p claude_sessions -p remote -p remote_server` 乾淨；`cargo build -p zed` dev 增量 1 分 59 秒成功；channel server node 34/34（assets 自 11:01 未動）。log `scratch/final-acceptance.log`，最終 diff 快照 `scratch/baseline/final-1950.patch`。**未 commit**（使用者未要求）。刻意不動：`crates/remote_server/src/server.rs`、`crates/tmux_sessions/src/tmux_sessions_panel.rs` 在 HEAD 就未格式化，已還原成 HEAD 原樣。
+
+## 7. 後續（2026-09-22 起）
+
+這份檔到此為止是 2026-09-18 那一階段的紀錄，**不再更新**。2026-09-22 使用者拍板轉向：放棄面板的訊息輸入框，打字回到 terminal，面板改成「內嵌 tmux 鏡像 attach 的 TerminalView ＋ 右側 rail ＋ 中間 gutter」。新的規格、事實清單、工作包與裁決全部在 `docs/claude-terminal-rail.md`；對應的架構文件與使用者文件（`docs/claude-sessions-architecture.md`、`docs/claude-sessions-setup.md`）已改寫成新架構。
+
+上面那些 WP 裡，**下列部分作廢**（code 已刪，紀錄留著只為了追歷史）：
+
+- WP3b 的「送訊息」半邊：store `send_message` 的 UI 呼叫、問題卡以組成文字回答、slash 三分類（純文字／帶參數／terminal 專用）。channel server、`answer_permission`、interrupt 那一半**保留**。
+- WP7 的輸入框全套：`render_input`、`@` 檔案選單、`/` slash 選單、貼圖（`PasteIntoMessage`、`~/.claude/zed-pasted/`）、Up／Down 歷史、Esc `DismissMenus`、`SendMessage`／`PreviousMessage`／`NextMessage` actions 與三個平台的 keymap 綁定。
+- WP7b／WP7c／WP7d 的 `PendingSends`（待送列、`/clear` 改綁、50 列上限、Failed 列、Retry）與 §3.4 R2-G1 起的所有 PendingSends 裁決。store 的 `take_cleared_rebinds()` 留著但只被 drain。
+- §5「待使用者確認」兩條已由實測定案：dev-channel 確認框每次啟動都跳；`claude mcp add --scope user zed-claude -- node ~/.claude/zed-channel/server.mjs` 是正確做法。
+
+其餘（hook dispatcher、statusLine wrapper、`LiveState`、五個 poll、registry rebind／ended row、channel 檔案協定、權限卡、Stop、entries／EntryCache／各種工具卡、盲測）沿用，且是新架構的地基。

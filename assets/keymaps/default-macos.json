@@ -1751,25 +1751,4 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
-  {
-    "context": "ClaudeSessionsPanel",
-    "bindings": {
-      "escape": "claude_sessions::DismissMenus",
-    },
-  },
-  {
-    "context": "ClaudeSessionsInput > Editor",
-    "bindings": {
-      "enter": "claude_sessions::SendMessage",
-      "shift-enter": "editor::Newline",
-      "escape": "claude_sessions::DismissMenus",
-      // The terminal's own history keys. The handler moves the cursor instead whenever
-      // the box holds a draft, so these do not cost multi-line editing its arrows.
-      "up": "claude_sessions::PreviousMessage",
-      "down": "claude_sessions::NextMessage",
-      // An image cannot be sent through a terminal as itself, so a paste that carries
-      // one is written out as a file and named in the message by its path.
-      "cmd-v": "claude_sessions::PasteIntoMessage",
-    },
-  },
 ]

@@ -1658,21 +1658,4 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
-  {
-    "context": "ClaudeSessionsPanel",
-    "bindings": {
-      "escape": "claude_sessions::DismissMenus",
-    },
-  },
-  {
-    "context": "ClaudeSessionsInput > Editor",
-    "bindings": {
-      "enter": "claude_sessions::SendMessage",
-      "shift-enter": "editor::Newline",
-      "escape": "claude_sessions::DismissMenus",
-      "up": "claude_sessions::PreviousMessage",
-      "down": "claude_sessions::NextMessage",
-      "ctrl-v": "claude_sessions::PasteIntoMessage",
-    },
-  },
 ]
