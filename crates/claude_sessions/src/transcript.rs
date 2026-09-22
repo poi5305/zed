@@ -26,6 +26,9 @@ const QUEUE_OPERATION_RECORD_TYPE: &str = "queue-operation";
 /// Claude Code's own accounting of what the session has cost.
 const COST_STATE_RECORD_TYPE: &str = "cost-state";
 
+/// Names the API call a record was written from. One call is several records.
+const REQUEST_ID_FIELD: &str = "requestId";
+
 const PERMISSION_MODE_RECORD_TYPE: &str = "permission-mode";
 const AI_TITLE_RECORD_TYPE: &str = "ai-title";
 const BRIDGE_SESSION_RECORD_TYPE: &str = "bridge-session";
@@ -244,8 +247,28 @@ impl Transcript {
     /// answer's record is rewritten as it streams — adding each one as it arrived would
     /// count the same answer many times.
     pub fn spend(&self) -> Spend {
+        // One API call is several records sharing a requestId. Earlier ones are snapshots
+        // taken while the answer was still streaming: only output_tokens grows, and the
+        // last record is what the call cost. A record with no requestId, or a blank one,
+        // predates that field or does not name a call, and stands as its own call.
+        let mut last_of_call: HashMap<String, usize> = HashMap::default();
+        for (index, record) in self.records.iter().enumerate() {
+            if Usage::from_record(&record.raw).is_none() {
+                continue;
+            }
+            let Some(request_id) = record
+                .raw
+                .get(REQUEST_ID_FIELD)
+                .and_then(Value::as_str)
+                .filter(|request_id| !request_id.is_empty())
+            else {
+                continue;
+            };
+            last_of_call.insert(request_id.to_string(), index);
+        }
+
         let mut spend = Spend::default();
-        for record in &self.records {
+        for (index, record) in self.records.iter().enumerate() {
             // Claude Code's own accounting, written as a snapshot of the whole session,
             // so the newest one is the answer and the ones before it are history. It is
             // preferred over the total derived from token counts: it is the CLI's own
@@ -276,6 +299,15 @@ impl Transcript {
             let Some(usage) = Usage::from_record(&record.raw) else {
                 continue;
             };
+            if let Some(request_id) = record
+                .raw
+                .get(REQUEST_ID_FIELD)
+                .and_then(Value::as_str)
+                .filter(|request_id| !request_id.is_empty())
+                && last_of_call.get(request_id) != Some(&index)
+            {
+                continue;
+            }
             spend.usage = spend.usage.add(usage);
             spend.answers = spend.answers.saturating_add(1);
             // The newest answer's own numbers, which say how the session is running now
@@ -1278,6 +1310,209 @@ mod tests {
             None,
             "a count must come from a total_tokens_reminder, got {:?}",
             transcript.tokens_left()
+        );
+    }
+
+    fn billed_answer(
+        uuid: &str,
+        request_id: Option<&str>,
+        output: u64,
+        cache_read: u64,
+        model: &str,
+    ) -> String {
+        let mut line = serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": 2,
+                    "cache_read_input_tokens": cache_read,
+                    "output_tokens": output,
+                },
+            },
+        });
+        if let Some(request_id) = request_id
+            && let Some(object) = line.as_object_mut()
+        {
+            object.insert(
+                REQUEST_ID_FIELD.to_string(),
+                Value::String(request_id.to_string()),
+            );
+        }
+        line.to_string()
+    }
+
+    /// The records of one call share a requestId and only the last one's output is complete.
+    #[test]
+    fn a_call_is_spent_from_its_last_record() {
+        let spent = transcript(&[
+            billed_answer("a1", Some("req-1"), 1, 100, "claude-opus-5"),
+            billed_answer("a2", Some("req-1"), 5, 100, "claude-opus-5"),
+            billed_answer("a3", Some("req-1"), 1403, 100, "claude-opus-5"),
+        ])
+        .spend();
+
+        assert_eq!(
+            spent.usage.output_tokens, 1403,
+            "the last record's output; got {}, which is the snapshots added together",
+            spent.usage.output_tokens
+        );
+        assert_eq!(
+            spent.answers, 1,
+            "answers count calls, got {} records",
+            spent.answers
+        );
+        assert_eq!(
+            spent.usage.input_tokens, 2,
+            "input is the same on every copy and must not be summed; got {}",
+            spent.usage.input_tokens
+        );
+        assert_eq!(
+            spent.context_tokens, 102,
+            "context is the last record's input plus cache read, not a sum of the copies"
+        );
+        assert_eq!(spent.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// Three identical copies are one call. Deduping them must not drop the call or zero it.
+    #[test]
+    fn identical_copies_of_a_call_are_spent_once() {
+        let spent = transcript(&[
+            billed_answer("a1", Some("req-1"), 25, 100, "claude-opus-5"),
+            billed_answer("a2", Some("req-1"), 25, 100, "claude-opus-5"),
+            billed_answer("a3", Some("req-1"), 25, 100, "claude-opus-5"),
+        ])
+        .spend();
+
+        assert_eq!(spent.answers, 1);
+        assert_eq!(spent.usage.output_tokens, 25);
+        assert_eq!(spent.usage.cache_read_tokens, 100);
+    }
+
+    /// The same numbers under two request ids are two calls. Deduping by amount would eat one.
+    #[test]
+    fn two_calls_that_cost_the_same_are_spent_twice() {
+        let spent = transcript(&[
+            billed_answer("a1", Some("req-1"), 25, 100, "claude-opus-5"),
+            billed_answer("b1", Some("req-2"), 25, 100, "claude-haiku-4-5"),
+        ])
+        .spend();
+
+        assert_eq!(
+            spent.answers, 2,
+            "two request ids, even with the same token counts"
+        );
+        assert_eq!(spent.usage.output_tokens, 50);
+        assert_eq!(
+            spent.model.as_deref(),
+            Some("claude-haiku-4-5"),
+            "the model is whatever the last record of the file named"
+        );
+    }
+
+    /// A record written before requestId existed is its own call, including when two of
+    /// them happen to cost the same.
+    #[test]
+    fn a_record_without_a_request_id_is_spent_on_its_own() {
+        let spent = transcript(&[
+            billed_answer("a1", None, 25, 100, "claude-opus-5"),
+            billed_answer("a2", None, 25, 100, "claude-opus-5"),
+            billed_answer("a3", Some(""), 25, 100, "claude-opus-5"),
+            billed_answer("a4", Some(""), 25, 100, "claude-opus-5"),
+        ])
+        .spend();
+
+        assert_eq!(
+            spent.answers, 4,
+            "a missing id and a blank id are each their own call"
+        );
+        assert_eq!(spent.usage.output_tokens, 100);
+    }
+
+    /// A snapshot that arrives after another call must not erase that call, and the
+    /// context the file ends on is still the last record's.
+    #[test]
+    fn a_later_snapshot_does_not_drop_the_call_between_it() {
+        let mut last = serde_json::from_str::<Value>(&billed_answer(
+            "a2",
+            Some("req-1"),
+            1403,
+            100,
+            "claude-opus-5",
+        ))
+        .expect("the fixture is json");
+        if let Some(object) = last.as_object_mut() {
+            object.insert("effort".to_string(), Value::String("high".to_string()));
+        }
+
+        let spent = transcript(&[
+            billed_answer("a1", Some("req-1"), 1, 100, "claude-opus-5"),
+            billed_answer("b1", Some("req-2"), 9, 50, "claude-haiku-4-5"),
+            last.to_string(),
+        ])
+        .spend();
+
+        assert_eq!(
+            spent.usage.output_tokens, 1412,
+            "req-1's last output plus req-2; got {}",
+            spent.usage.output_tokens
+        );
+        assert_eq!(spent.answers, 2);
+        assert_eq!(
+            spent.context_tokens, 102,
+            "the file's last record is req-1's completed snapshot (input 2 + cache read 100), not req-2's"
+        );
+        assert_eq!(spent.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(spent.effort.as_deref(), Some("high"));
+    }
+
+    /// The dedup skip is only allowed to judge records that carry usage of their own.
+    /// A `cost-state` record naming a requestId that belongs to some answer is not a
+    /// stale snapshot of that answer, and skipping it loses the session's whole bill.
+    #[test]
+    fn a_cost_state_sharing_a_request_id_with_an_answer_is_still_read() {
+        let spent = transcript(&[
+            r#"{"type":"cost-state","requestId":"req-1","totalCostUSD":2.25,"totalLinesAdded":7}"#
+                .to_string(),
+            billed_answer("a1", Some("req-1"), 40, 100, "claude-opus-5"),
+        ])
+        .spend();
+
+        let total = spent.reported.as_ref().map(|reported| reported.total_usd);
+        assert_eq!(
+            total,
+            Some(2.25),
+            "got {total:?}, the cost-state says 2.25; None means the requestId dedup ate it"
+        );
+        let lines_added = spent.reported.as_ref().map(|reported| reported.lines_added);
+        assert_eq!(lines_added, Some(7), "got {lines_added:?}, want Some(7)");
+        assert_eq!(
+            spent.answers, 1,
+            "the answer is still one call, got {}",
+            spent.answers
+        );
+    }
+
+    /// Same rule for a compact boundary: it carries no usage, so the dedup must not
+    /// reach it, or the context left after a compaction is lost.
+    #[test]
+    fn a_compact_boundary_sharing_a_request_id_with_an_answer_is_still_read() {
+        let spent = transcript(&[
+            billed_answer("a1", Some("req-1"), 40, 680_000, "claude-opus-5"),
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"b1","parentUuid":"a1","requestId":"req-1","compactMetadata":{"trigger":"auto","preTokens":792090,"postTokens":16995}}"#
+                .to_string(),
+        ])
+        .spend();
+
+        assert_eq!(
+            spent.context_tokens, 16995,
+            "got {}, the boundary kept 16995 and 680002 is the answer it superseded",
+            spent.context_tokens
+        );
+        assert!(
+            spent.context_is_post_compaction,
+            "the figure on screen came from the compaction, so it must be marked as one"
         );
     }
 

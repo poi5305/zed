@@ -13,7 +13,7 @@ use std::{
     process::Stdio,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -3397,19 +3397,141 @@ fn workflow_run_id(candidate: &str) -> Option<&str> {
 ///
 /// The field is shaped `session:@window.%pane`, and `:` is tmux's own separator between
 /// a session and the window inside it, so a session name can never contain one and
-/// everything before the first is the name. Only read for display.
+/// everything before the first is the name. Only read for display — sends and captures
+/// address the pane by its id; see [`pane_target`].
 pub fn tmux_session_name(tmux_field: &str) -> Option<&str> {
     let name = tmux_field.split(':').next()?;
     (!name.is_empty()).then_some(name)
 }
 
-/// Names the sessions Zed used to group with a user's own to hold one window of it.
-/// The prefix is what keeps Zed's own bookkeeping out of the session list the user is shown.
+/// The pane a registration's `tmux` field names, as a target `tmux` accepts.
+///
+/// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. Only the pane id
+/// is kept: it is unique across the whole tmux server, so the session name — which may
+/// contain spaces, quotes or semicolons — never has to be quoted or reasoned about.
+/// Anything that is not `%` followed by decimal digits is rejected outright, so a value
+/// out of this JSON file can never reach tmux as a flag or as a second command.
+pub fn pane_target(tmux_field: &str) -> Option<String> {
+    let pane_identifier = tmux_field.rsplit('.').next()?;
+    let digits = pane_identifier.strip_prefix('%')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("%{digits}"))
+}
+
+/// The window a registration's `tmux` field names, as a target `tmux` accepts.
+///
+/// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. As in
+/// [`pane_target`], only the id is kept — it is unique across the whole tmux server — and
+/// anything that is not `@` followed by decimal digits is rejected outright, so a value
+/// out of this JSON file can never reach tmux as a flag or as a second command.
+pub fn window_target(tmux_field: &str) -> Option<String> {
+    let after_session_name = tmux_field.split_once(':')?.1;
+    let window_identifier = after_session_name.split('.').next()?;
+    let digits = window_identifier.strip_prefix('@')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("@{digits}"))
+}
+
+/// Names the sessions Zed groups with a user's own to hold one window of it; see
+/// [`attach_arguments`]. The prefix is what keeps Zed's own bookkeeping out of the
+/// session list the user is shown.
 const MIRROR_SESSION_PREFIX: &str = "zed-claude-mirror-";
 
 /// Whether a tmux session is one of Zed's mirrors rather than one the user started.
 pub fn is_zed_mirror_session(session_name: &str) -> bool {
     session_name.starts_with(MIRROR_SESSION_PREFIX)
+}
+
+/// Distinguishes the mirror sessions of concurrent attaches, so that an attach can never
+/// fail on the name of a mirror whose client is still going away.
+static MIRROR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The arguments of the one tmux invocation that shows a registration's window in a
+/// terminal of its own.
+///
+/// Attaching to the pane's own session is what does not work: a session has one current
+/// window and every client of it is shown that window, so two Claude Code sessions living
+/// in two windows of one tmux session are both shown whichever window the user happens to
+/// be on — never the window each of them is running in. A session grouped with theirs
+/// (`new-session -t`) shares its windows but keeps a current window of its own, so the
+/// terminal can sit on this registration's window while the user's own client stays where
+/// it is.
+///
+/// A field with no window id is attached the way it was before there were mirrors, which
+/// is still right for a session that has only the one window.
+pub fn attach_arguments(tmux_field: &str) -> Option<Vec<String>> {
+    let pane_target = pane_target(tmux_field)?;
+    let (Some(session_name), Some(window_target)) =
+        (tmux_session_name(tmux_field), window_target(tmux_field))
+    else {
+        return Some(vec!["attach".to_string(), "-t".to_string(), pane_target]);
+    };
+
+    let mirror_name = format!(
+        "{MIRROR_SESSION_PREFIX}{}-{}",
+        std::process::id(),
+        MIRROR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    Some(mirror_arguments(session_name, &window_target, &mirror_name))
+}
+
+/// tmux ends a command and starts the next one at any argument that ends in a semicolon,
+/// and a session name is allowed to end in one (`tmux rename-session 'done\;'` makes such
+/// a name). Passed as it stands, `=done;` would cut the mirror's command list in two and
+/// leave `-s <mirror> …` to be read as a command of its own, which tmux rejects with
+/// `unknown command: -s` and then abandons the rest of the list — no mirror, and no
+/// terminal for the reader. A backslash in front of that last semicolon is how tmux is
+/// told it belongs to the name. Only the last one matters: a semicolon anywhere else in
+/// the argument is an ordinary character to tmux.
+fn with_any_trailing_semicolon_escaped(session_name: &str) -> String {
+    match session_name.strip_suffix(';') {
+        Some(rest) => format!("{rest}\\;"),
+        None => session_name.to_string(),
+    }
+}
+
+/// The order of this list is what makes it safe, and each step is load-bearing:
+///
+/// * `new-session -d` creates the mirror without attaching, because a `new-session` that
+///   attaches leaves the commands after it addressing the session the client came from.
+/// * `=` in front of the session name asks tmux for that name exactly, rather than
+///   letting a name that reads as a pattern group the terminal with another session.
+/// * `select-window` comes before there is a client, so that the terminal opens on the
+///   right window instead of visibly jumping to it.
+/// * `destroy-unattached` comes last, because a session carrying it while nothing is
+///   attached is destroyed on the spot. Set here, the mirror goes away with the terminal
+///   rather than being left behind on the user's tmux server.
+///
+/// The name carries a sequence number because a command that fails makes tmux abandon the
+/// rest of the list: reusing the name of a mirror whose client has not finished detaching
+/// would fail the `new-session` and leave the reader with no terminal at all.
+fn mirror_arguments(session_name: &str, window_target: &str, mirror_name: &str) -> Vec<String> {
+    vec![
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-t".to_string(),
+        format!("={}", with_any_trailing_semicolon_escaped(session_name)),
+        "-s".to_string(),
+        mirror_name.to_string(),
+        ";".to_string(),
+        "select-window".to_string(),
+        "-t".to_string(),
+        format!("{mirror_name}:{window_target}"),
+        ";".to_string(),
+        "attach-session".to_string(),
+        "-t".to_string(),
+        mirror_name.to_string(),
+        ";".to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        mirror_name.to_string(),
+        "destroy-unattached".to_string(),
+        "on".to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -3563,18 +3685,194 @@ mod tests {
         assert_eq!(tmux_session_name(""), None);
     }
 
+    #[test]
+    fn the_window_target_is_the_id_between_the_two_separators() {
+        assert_eq!(window_target("zed:@6.%8"), Some("@6".to_string()));
+        assert_eq!(window_target("my work:@1.%1"), Some("@1".to_string()));
+        assert_eq!(
+            window_target("zed:6.%8"),
+            None,
+            "a window index is not a window id, and only an id is unique across the server"
+        );
+        assert_eq!(
+            window_target("zed:@.%8"),
+            None,
+            "an id of no digits is not an id"
+        );
+        assert_eq!(
+            window_target("zed:@6x.%8"),
+            None,
+            "anything but digits could reach tmux as a flag or a second command"
+        );
+        assert_eq!(window_target("%8"), None, "a field with no session part");
+        assert_eq!(window_target(""), None);
+    }
+
+    #[test]
+    fn test_pane_target_accepts_the_pane_id_of_a_registration() {
+        assert_eq!(pane_target("awp:@1.%1").as_deref(), Some("%1"));
+        assert_eq!(pane_target("a:b:@10.%234").as_deref(), Some("%234"));
+    }
+
+    #[test]
+    fn test_pane_target_rejects_everything_that_is_not_a_pane_id() {
+        for rejected in ["awp:@1", "awp:@1.%", "awp:@1.%x", "-t", "", "%1 ; rm -rf /"] {
+            assert_eq!(
+                pane_target(rejected),
+                None,
+                "`{rejected}` is not a pane id and must never reach tmux"
+            );
+        }
+    }
+
     /// The mirror is grouped with the user's session and so is listed beside it. A name
     /// the user chose must never be mistaken for one, or their own session disappears
     /// from the tmux panel.
     #[test]
     fn only_zeds_own_mirrors_are_recognized_as_mirrors() {
-        assert!(is_zed_mirror_session("zed-claude-mirror-1-0"));
+        let mirror = attach_arguments("zed:@6.%8").expect("a pane field attaches");
+        let index = mirror
+            .iter()
+            .position(|argument| argument == "-s")
+            .expect("the mirror is created with a name of its own");
+        assert!(is_zed_mirror_session(&mirror[index + 1]));
+
         assert!(!is_zed_mirror_session("zed"));
         assert!(!is_zed_mirror_session("my work"));
         assert!(
             !is_zed_mirror_session("mirror-zed-claude-mirror-1-0"),
             "the prefix is a prefix, not a substring"
         );
+    }
+
+    /// Two sessions in two windows of one tmux session used to be shown the same window:
+    /// `attach` is per session, and a session has one current window that every client of
+    /// it is shown. Each has to be attached through a mirror of its own for the terminal
+    /// under a conversation to be the terminal that conversation is running in.
+    #[test]
+    fn attaching_goes_through_a_mirror_that_holds_this_window() {
+        let first = attach_arguments("zed:@6.%8").expect("a pane field attaches");
+        let second = attach_arguments("zed:@7.%9").expect("a pane field attaches");
+
+        let mirror_of = |arguments: &[String]| {
+            let index = arguments
+                .iter()
+                .position(|argument| argument == "-s")
+                .expect("the mirror is created with a name of its own");
+            arguments[index + 1].clone()
+        };
+        let first_mirror = mirror_of(&first);
+        let second_mirror = mirror_of(&second);
+        assert_ne!(
+            first_mirror, second_mirror,
+            "two attaches must not race for one name: a failed command abandons the rest \
+             of a tmux command list, leaving the reader with no terminal"
+        );
+
+        assert_eq!(
+            first,
+            mirror_arguments("zed", "@6", &first_mirror),
+            "the first session's terminal must hold window @6"
+        );
+        assert_eq!(
+            second,
+            mirror_arguments("zed", "@7", &second_mirror),
+            "the second session's terminal must hold window @7, not the window the first \
+             one is on"
+        );
+    }
+
+    #[test]
+    fn the_mirror_is_grouped_selected_attached_and_then_made_temporary() {
+        assert_eq!(
+            mirror_arguments("my work", "@6", "zed-claude-mirror-1-0"),
+            vec![
+                "new-session",
+                "-d",
+                "-t",
+                // Exactly this session, not whatever a name that reads as a pattern matches.
+                "=my work",
+                "-s",
+                "zed-claude-mirror-1-0",
+                ";",
+                // Before the client exists, so that the terminal opens on the window
+                // rather than visibly jumping to it.
+                "select-window",
+                "-t",
+                "zed-claude-mirror-1-0:@6",
+                ";",
+                "attach-session",
+                "-t",
+                "zed-claude-mirror-1-0",
+                ";",
+                // After it, because a session carrying this while nothing is attached is
+                // destroyed on the spot.
+                "set-option",
+                "-t",
+                "zed-claude-mirror-1-0",
+                "destroy-unattached",
+                "on",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+        );
+    }
+
+    /// A tmux session name is free to end in a semicolon — `tmux rename-session 'done\;'`
+    /// makes one — and tmux splits an argument list at any argument that ends in one. The
+    /// name unescaped turns this list into `new-session -d -t =done` followed by a second
+    /// command starting `-s`, which tmux rejects with `unknown command: -s` and abandons
+    /// the rest of the list, leaving the reader with no terminal at all.
+    #[test]
+    fn a_session_name_ending_in_a_semicolon_does_not_end_the_command_list() {
+        let arguments = mirror_arguments("done;", "@6", "zed-claude-mirror-1-0");
+        assert_eq!(
+            arguments.get(3).map(String::as_str),
+            Some("=done\\;"),
+            "the trailing semicolon has to reach tmux escaped, or it separates commands"
+        );
+    }
+
+    /// The escape must only touch a name that ends in a semicolon: one anywhere else is a
+    /// legal name tmux takes as it stands (`tmux rename-session 'wo;rk'` keeps it whole),
+    /// and escaping it would group the terminal with the wrong session or with none.
+    #[test]
+    fn a_semicolon_anywhere_but_the_end_of_a_name_is_left_alone() {
+        for (session_name, expected) in [
+            ("zed", "=zed"),
+            ("my work", "=my work"),
+            ("wo;rk", "=wo;rk"),
+            (";lead", "=;lead"),
+            ("", "="),
+        ] {
+            let arguments = mirror_arguments(session_name, "@6", "zed-claude-mirror-1-0");
+            assert_eq!(
+                arguments.get(3).map(String::as_str),
+                Some(expected),
+                "`{session_name}` reaches tmux as it stands"
+            );
+        }
+    }
+
+    /// The mirror exists to pick a window out of a session; a field that names no window
+    /// has none to pick, and attaching to the pane's own session is what it did before.
+    #[test]
+    fn a_field_without_a_window_attaches_the_way_it_did_before() {
+        assert_eq!(
+            attach_arguments("zed:6.%8"),
+            Some(vec![
+                "attach".to_string(),
+                "-t".to_string(),
+                "%8".to_string()
+            ])
+        );
+        assert_eq!(
+            attach_arguments("zed:@6.pane"),
+            None,
+            "a field with no pane is not a session Zed can show at all"
+        );
+        assert_eq!(attach_arguments(""), None);
     }
 
     fn write_channel_server_json(home: &Path, claude_pid: u32, contents: &str) -> PathBuf {

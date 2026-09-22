@@ -1,36 +1,37 @@
 # Claude Sessions 面板：設定與使用
 
-- 日期：2026-09-18
-- 對象：在 Zed 裡用 Claude Sessions 面板看、控制正在跑的 Claude Code session 的人（本機或 remote host 都適用）
-- 技術細節在 `docs/claude-sessions-architecture.md`；為什麼要這樣改在 `docs/claude-health-check.md`
+- 日期：2026-09-22
+- 對象：在 Zed 裡看、控制正在跑的 Claude Code session 的人（本機或 remote host 都適用）
+- 技術細節在 `docs/claude-sessions-architecture.md`；這次改版的規格與裁決在 `docs/claude-terminal-rail.md`
 
-## 這次改了什麼（一段話）
+## 一句話
 
-面板不再讀 tmux 畫面、也不再對 tmux 送按鍵。**讀**的部分靠三個檔：session 的 transcript、一支 hook 腳本把 Claude Code 每個 hook 事件 append 進 `~/.claude/zed-events/<session_id>.jsonl`、一支 statusLine 包裝腳本把 CLI 的狀態 JSON 寫進 `~/.claude/zed-status/<session_id>.json`。**寫**的部分靠一個 Zed 自己的 channel MCP server（`~/.claude/zed-channel/server.mjs`）：你在面板送出的訊息、Allow／Deny、Stop，都是寫成檔案丟進 `~/.claude/zed-channel/<claude pid>/outbox/`，由 server 轉成 Claude Code 的 channel 通知。terminal 本身完全不會被碰到，所以之前「Zed 一開就把 CLI 壓成 20 列」「Saying 卡住不消失」「auto mode 顯示不同步」這類問題的根因已經不存在了。
+**打字在 terminal，看在面板。** 面板開成 editor tab 之後，左邊是你那個 Claude Code 的 tmux pane（面板自己 attach 上去的 terminal，可以直接在裡面打字），右邊一條 rail 只畫 terminal 顯示不了的東西：圖片、被截斷的工具輸出、Edit 的 diff、附件、每輪摘要、每輪一張費用卡。中間一條窄窄的 gutter，把 rail 裡的東西對齊到 terminal 畫面上那一行。頂端是 context／模型／費用／rate limit 的工具列，底端是狀態列和 Stop 按鈕。
+
+面板本身只會做三件「寫」的事：Stop（中斷這一輪）、權限 Allow／Deny、裝／解除 hooks。其他一切輸入都在 terminal 做。
 
 ## 三步設定
 
 ### 1. 在面板按 Install hooks
 
-打開 Claude Sessions 面板（dock），session 列表上方會有 **Install hooks** 按鈕（hooks 裝好之後按鈕就不會再出現）。按下去會做這些事：
+打開 Claude Sessions 面板（dock），session 列表的標題列有 **Install hooks**（裝好之後這顆會變成 **Uninstall hooks**）。按下去會：
 
 - 寫三個檔：
-  - `~/.claude/hooks/zed-claude-events.sh` — hook 事件分派器
-  - `~/.claude/hooks/zed-claude-status.sh` — statusLine 包裝
-  - `~/.claude/zed-channel/server.mjs` — channel server
-- 改 `~/.claude/settings.json` 的兩個地方：
-  - `hooks`：13 個事件各加一條指向 `zed-claude-events.sh` 的 entry — `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PermissionRequest`、`PermissionDenied`、`Notification`、`Stop`、`SubagentStop`、`PreCompact`、`PostCompact`、`PostModelSwitch`、`MessageDisplay`、`SessionEnd`。你自己原本的 hook 不會被動；舊版 Zed 裝的 `record-pending-question.sh`／`record-live-message.sh`（兩種引號寫法都算）會被移掉。
-  - `statusLine`：改成跑 `zed-claude-status.sh`。如果你原本就有自己的 statusLine 指令，它會被存進 `~/.claude/zed-status/chained-command.txt`，包裝腳本每次都會接著執行它、把它的輸出原樣印回去，所以你的狀態列長相不變。
-- 改 settings 之前先把原檔複製一份到 `~/.claude/settings.json.zed-backup`（只留一份，每次真的有改才覆蓋）。
-- settings.json 若解析不了，什麼都不寫，直接報錯。
+  - `~/.claude/hooks/zed-claude-events.sh` — hook 事件分派器，把每個事件 append 進 `~/.claude/zed-events/<session_id>.jsonl`
+  - `~/.claude/hooks/zed-claude-status.sh` — statusLine 包裝，把 CLI 的狀態 JSON 寫進 `~/.claude/zed-status/<session_id>.json`
+  - `~/.claude/zed-channel/server.mjs` — channel MCP server
+- 改 `~/.claude/settings.json` 兩個地方：
+  - `hooks`：13 個事件各加一條指向 `zed-claude-events.sh` 的 entry — `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PermissionRequest`、`PermissionDenied`、`Notification`、`Stop`、`SubagentStop`、`PreCompact`、`PostCompact`、`PostModelSwitch`、`MessageDisplay`、`SessionEnd`。你自己的 hook 不會被動；舊版 Zed 裝的 `record-pending-question.sh`／`record-live-message.sh` 會被移掉。
+  - `statusLine`：改成跑 `zed-claude-status.sh`。你原本的 statusLine 指令會存進 `~/.claude/zed-status/chained-command.txt`，包裝腳本每次都接著執行它、把輸出原樣印回去，狀態列長相不變。
+- 改 settings 之前先複製一份到 `~/.claude/settings.json.zed-backup`（只留一份，真的有改才覆蓋）。settings.json 解析不了就什麼都不寫，直接報錯。
 
-按完會在輸入框上方看到結果之一：
+結果會顯示在 session 列表下方，三種之一：
 
 - `Hooks installed (settings backed up to …); restart Claude to pick them up`
 - `Hook scripts updated; restart Claude to pick them up`
 - `Hooks are up to date`
 
-remote 專案也一樣按這顆，只是檔案會寫在遠端主機的家目錄。
+remote 專案也是同一顆按鈕，只是檔案寫在遠端主機的家目錄。
 
 ### 2. 註冊 MCP server（每台機器一次）
 
@@ -38,7 +39,7 @@ remote 專案也一樣按這顆，只是檔案會寫在遠端主機的家目錄�
 claude mcp add --scope user zed-claude -- node "$HOME/.claude/zed-channel/server.mjs"
 ```
 
-面板在 channel 還沒接上時會顯示 `Zed channel not loaded — click Setup`，旁邊的 **Copy setup commands** 會把這條指令和下一步的 `export` 一起複製到剪貼簿，路徑已經替你填好（remote 專案填的是遠端的路徑）。
+remote 主機就在那台主機上跑同一條，路徑換成該主機的家目錄。（以前面板有一顆「Copy setup commands」幫你填路徑，現在沒有了，自己打。）
 
 ### 3. 每個 session 啟動時帶旗標，然後重啟
 
@@ -46,117 +47,144 @@ claude mcp add --scope user zed-claude -- node "$HOME/.claude/zed-channel/server
 export CLAUDE_EXTRA_ARGS='--dangerously-load-development-channels server:zed-claude'
 ```
 
-- 放進 `~/.zshrc` 就好：你的 `claude()` zsh function 會自動把 `CLAUDE_EXTRA_ARGS` 帶進每個 session。沒用那個 function 的話就直接在 `claude` 後面加那個旗標。
-- 設好之後**把正在跑的 Claude session 重啟**：hooks 和 channel 都是啟動時載入的，舊的 process 看不到。
-- **每次互動式啟動都會跳一次** `WARNING: Loading development channels` 確認框（選 `I am using this for local development` 就繼續，選 `Exit` 就結束）。沒有辦法預先同意：對照 claude 2.1.276 的 `DevChannelsDialog`，`onAccept` 只是註冊 channel 並往下走，不會寫任何設定，也沒有類似 `bypassPermissionsModeAccepted` 的持久化鍵。唯一不跳的情況是 channel 功能本身被關掉（非 first-party provider、或組織政策沒開 `channelsEnabled`），那時 channel 也不會真的能用。
-- 不能改用 `--channels zed-claude`：那個旗標只吃 Anthropic 核可清單上的 channel server，我們自己裝的 `server.mjs` 會被擋，訊息是 `… is not on the approved channels allowlist (use --dangerously-load-development-channels for local dev)`。
-- 面板下方狀態列出現 `channel: connected` 就代表接通了。
+- 放進 `~/.zshrc`：你的 `claude()` zsh function 會把 `CLAUDE_EXTRA_ARGS` 帶進每個 session。沒用那個 function 就直接在 `claude` 後面加那個旗標。
+- 設好之後**把正在跑的 Claude session 重啟**：hooks 和 channel 都是啟動時載入的。
+- 每次互動式啟動都會跳一次 `WARNING: Loading development channels` 確認框，選 `I am using this for local development` 繼續。沒有辦法預先同意。
+- 不能改用 `--channels zed-claude`：那個旗標只吃 Anthropic 核可清單上的 channel，自己裝的 `server.mjs` 會被擋。
+- 面板底端狀態列出現 `channel: connected` 就是接通了。**channel 只影響 Stop 與 Allow／Deny**；沒接通，面板照樣能看、terminal 照樣能打字。
 
-## 面板怎麼讀
+## 怎麼打開、怎麼用
 
-### 標題與工具列
+1. dock 裡的 Claude Sessions 面板列出這台主機上正在跑的 session（本機或 remote）。點一列選它。
+2. 按列表旁邊的箭頭（tooltip「Open in Editor」）或跑 `claude_sessions::OpenInEditor`，會在 editor 區開一個 tab，標題是 `[tmux session 名] 對話名稱`。
+3. tab 左邊的 terminal 就是那個 session 的 tmux pane。**直接在裡面打字**：回答 Claude 的問題、跑 `/context`、`/model`、`/compact`、`/clear` 這些 slash 指令、貼路徑、Ctrl+C，全部照 Claude Code CLI 原本的方式。面板不會替你送任何文字。
+4. 右邊 rail 和中間 gutter 是拿來看的（點 chip 或卡片會捲動、展開），不是拿來輸入的。
 
-- 標題用 Claude 自己取的 session 名稱（transcript 裡的 `ai-title`），沒有就退回 registry 的名字。
-- context 進度條：用 statusLine 給的 `used_percentage`；60% 以上轉黃、85% 以上轉紅；compact 過會在 tooltip 註明；沒有 statusLine 時只顯示數字不畫條。
-- facts：模型、effort、費用、`15.0M tokens left`、5h／7d 的 rate limit（tooltip 有重置時間）、`+x −y` 行數、還在跑的 agent 數。面板太窄時收成「…」。
-- 按鈕：**Open in claude.ai**、**Expand all tool calls**、**Show full history**、**Show costs**。
+**只能在 terminal 做的事**：打訊息、回答 AskUserQuestion、所有 slash 指令（含 `/context` 這類 CLI 本地指令）、貼圖或貼檔。
 
-### now row（現在在跑什麼）
+## 面板長什麼樣
 
-- 對話最底下釘一列：工具圖示、名稱、目標（檔名／指令／查詢字）、已跑秒數、脈動點。
-- 來源是 hook 的 `PreToolUse`，所以在 turn 進行中就會動，不用等 transcript。
-- 沒有工具在跑但 turn 還沒結束會顯示 thinking；idle 時整列消失。
-- 點一下可以展開那個工具的完整卡片（結果已經有的話一起展開）。
+### 工具列（最上面）
 
-### 每輪摘要
+- 標題是 Claude 自己取的 session 名稱（transcript 的 `ai-title`），沒有就用 registry 的名字。
+- context 進度條用 statusLine 的 `used_percentage`；60% 轉黃、85% 轉紅；compact 過會在 tooltip 註明；沒有 statusLine 只顯示數字。
+- facts：模型、effort、累計費用、`15.0M tokens left`、5h／7d rate limit（tooltip 有重置時間）、`+x −y` 行數、還在跑的 agent 數。太窄收成「…」。模型費率不認識時多一個 `unpriced models`。
+- 右側按鈕：
+  - **收合／展開 rail**（側欄圖示，tooltip「Show/Hide details」）：收起來 terminal 就拿到整個寬度。
+  - **rail 範圍**（i 圖示）：預設「只畫 terminal 顯示不了的」；按下去變「Show everything」，rail 就是完整對話（含純文字訊息、thinking、每則訊息底下的費用行）。
+  - **Open in claude.ai**、**Expand all tool calls**、**Show full history**、**Show costs**（預設開）。
 
-- 已經結束的 turn 預設摺成一行 `▸ 12 tool calls · 3 files edited · 2 agents · 41s`，tooltip 列出改過的檔名。
-- 點開才看到工具卡、結果、thinking；再點一次收回。
-- 正在進行的 turn 永遠展開，工具卡會邊跑邊長出來。
-- **Expand all tool calls** 是「預設全部展開」的開關。
+### terminal（左）
 
-### Saying 框（串流中的字）
+- 面板選到一個活著、而且 registry 裡有 tmux pane 的 session，就會自動 attach。attach 中顯示 `Attaching…`。
+- 沒有 tmux pane 的 session（例如用 `claude --bg` 起的）顯示 `This session is not running in a tmux pane. Attach from the sessions list.`，這時只能在 dock 用 **Attach** 開一個一般 terminal。
+- `/clear` 之後 session id 會換，但 terminal **不會**重新 attach，捲動歷史留著。
+- 切到 subagent 的對話時 terminal 會拆掉（那不是 tmux pane 裡的東西），切回主對話會重新 attach，捲動歷史從頭來。這是刻意的，見架構文件。
+- 面板拿到焦點時焦點落在 terminal 上，直接打字就行。
 
-- 標題 `Saying…`；訊息說完但 transcript 還沒追上時變 `Said`。
-- 用 markdown 畫；上緣可以拖曳調高度（3 rem 到面板 60% 之間），高度會記住。
-- `Stop` hook 到、或 transcript 出現同一則訊息就自動收起；超過 30 秒沒更新且 session 已 idle 也會收。
+### gutter（中間那條）
 
-### 權限卡
+- 28 px 寬。rail 裡有東西可看的那一輪，會在 terminal 畫面上對應那一行的旁邊畫一個小 chip：
+  - diff 圖示：這次是 Edit，rail 有 diff
+  - 圖片圖示：工具結果裡有圖片
+  - 展開圖示：工具輸出在 terminal 被截成 `ctrl+o to expand`，rail 有完整的
+  - 箭頭：一般訊息行
+- 點 chip，rail 捲到那一筆並展開。
+- 對齊靠 terminal 行首的 `>`（你的輸入）和 `⏺`（Claude 的每段文字／每個工具呼叫）跟 transcript 做順序保留的比對。捲回歷史時也會跟著算；對不上就不畫，不會畫錯位置。
+- 你的 Claude Code 主題如果換了行首符號，在 Zed settings 加：
 
-- Claude Code 問權限時卡片會列工具名、目標、`input_preview`；channel 接通時有 **Allow**／**Deny**。
-- 按了之後顯示 `answered — waiting for the session`，等 hook 說這個 prompt 結束才消失。
-- terminal 的對話框同時也開著，誰先答誰算。
-- channel 沒接通時卡片寫 `Approve in the terminal or on claude.ai (channel not loaded)`，沒有按鈕。
+```json
+"claude_sessions": {
+  "user_prompt_glyph": "❯",
+  "assistant_glyph": "●"
+}
+```
+
+一個字元；空字串或多字元會退回預設。
+
+### rail（右）
+
+預設模式下只畫這些：
+
+- **每輪一張費用卡**：一行 `$0.42 · 1.2K in · 85K cache read · 3.1K cache write (5m) · 900 out · (400 thinking)`（為 0 的欄位不顯示；thinking 括號裡是 out 的一部分，不另外算錢），點一下展開成這輪每一次 API 呼叫各一行。已經收合的輪掛在那一行 `▸ 12 tool calls · 3 files edited · 41s` 摘要底下；正在跑的輪掛在最後一筆有計費的 record 底下。模型費率不認識就不畫。
+- **圖片**、**SendUserFile 送檔卡**（失敗標紅；4 MiB 以上改成 **Load anyway (N MB)**；mp4 或其他檔案的路徑是按鈕，本機用系統程式開、remote 先下載）、**附件**。
+- **Edit 的 diff**。
+- **被截斷的工具輸出**（超過 12 行、或被 Claude Code 存成檔案的那種），點開看全部。
+- **每輪摘要**、compact 邊界、系統註記。
+- 純文字訊息、thinking、短的工具輸出、沒有 diff 的工具呼叫：terminal 已經有了，rail 留一個零高度的位子，不重畫。
+
+按工具列的 i 圖示切到「Show everything」就是以前那個完整對話畫面。
+
+rail 底部還有：**now row**（正在跑哪個工具、跑了幾秒；來自 hook，點一下展開那張卡）、**Saying 框**（串流中的字，可拖高度；說完自動收）、以及「N new below」（你捲上去看舊東西時，下面又長出來的筆數）。
+
+### 權限卡（rail 下面、狀態列上面）
+
+- Claude Code 問權限時出現 `Permission requested: <工具> <目標>`，channel 有給的話多兩行 description 與 `input_preview`。
+- channel 接通：有 **Allow**／**Deny**。按了之後顯示 `answered — waiting for the session`，等 Claude Code 說這個 prompt 結束才消失。terminal 的對話框同時也開著，誰先答誰算。
+- channel 沒接通：`Approve in the terminal or on claude.ai (channel not loaded)`，沒有按鈕，去 terminal 按。
 
 ### 問題卡（AskUserQuestion）
 
-- 一次顯示這個 call 的所有問題和選項，不追游標。
-- 單選直接點選項；多選勾完按 **Submit**；**Type something** 會把 `Answer to "<問題>": ` 填進輸入框讓你接著打。
-- 全部都是**組成一則文字訊息送出去**（例如 `Answer to "Which DB?": Postgres`），因為 Claude Code 不會把問題 relay 給 channel；卡片下方有一行小字提醒這件事。
+只顯示，不能答：列出每個問題的 header、題目、選項，最後一行 `Answer in the terminal.`。到 terminal 用方向鍵選。
 
-### 輸入框、slash 選單、狀態列
+### 狀態列與 Stop（最下面）
 
-- Enter 送出、Shift+Enter 換行、Esc 只關選單（不再是中斷）。
-- `/` 選單分三類：
-  - 純文字（skills、`/compact`、`/clear`…）直接送。
-  - 帶參數的（`/model`、`/effort`、`/config`、`/autocompact`、`/output-style`、`/advisor`）要有參數才送，沒有會提示 `add an argument, e.g. /model opus`。
-  - 只能在 terminal 用的（`/permissions`、`/login`、`/resume`、`/agents`、`/plugin`、`/hooks`、`/memory`、`/theme`、`/export`、`/bug`、沒帶參數的 `/mcp`…）掛著 `terminal` 標記，Enter 不會送。
-- 送出的訊息在進 transcript 前顯示 `delivered to Claude`；60 秒還沒被 session 拿走會變 `sent, waiting for the session to pick it up`。
-- 狀態列一行：`● idle` 或 `● running 1:24` · `mode: auto`（tooltip 有 auto-mode 旗標） · `channel: connected` 或 `channel: not loaded — Setup`。
-- 工具列偶爾會出現 `stale: transcript 12 s`，表示那個來源太久沒回；registry 掃描沒回來時也會亮，不會重複發送。
+- 一行 `● idle` 或 `● running 1:24` · `mode: auto`（tooltip 有 auto-mode 旗標） · `channel: connected` 或 `channel: not loaded — Setup`（後者代表你還沒做第 2、3 步）。
+- 右邊 **Stop**：只在 channel 接通、server 支援 interrupt、而且這一輪正在跑時能按。按一下送一次 SIGINT（等同 terminal 按一次 Ctrl+C），按鈕變 `interrupt sent` 五秒或直到這一輪結束；期間再按無效。idle 時停用，tooltip 說原因。
+- 讀 subagent 時沒有狀態列。
 
-### Stop 按鈕（中斷）
+### dock 裡的列表
 
-- 只有在 channel 接通、server 支援 interrupt、而且 turn 正在跑的時候才能按。
-- 按一下送一次 SIGINT（等同 terminal 的 Ctrl+C 一次），顯示 `interrupt sent` 直到 turn 結束或 5 秒過去；期間再按無效。
-- idle 時停用，tooltip 會說原因（例如 `Interrupt: session is idle`），避免 idle 時的單次 Ctrl+C 變成「再按一次就退出」。
+- **活著的 session**：名字、目錄、狀態；`claude --bg` 起的也會列（每 3 秒跑一次 `claude agents --json`），動作 **Attach**（開一般 terminal 跑 `claude attach <id>`）、**Respawn**、**Stop**（按第一下變 **Confirm stop**，5 秒內再按才真的 `claude stop`）。
+- **ended（process 不見了）**：CLI 自動更新、`exit`、crash、`/clear` 之後舊對話留在列表，還能讀；動作 **Resume**（原 cwd 跑 `claude --bg --resume <id>`，registry 掃到就綁回來）、**Open in claude.ai**、**Open in tmux**（原本有 tmux target 才有；開一個你看得到的 terminal）、**Dismiss**。最多留 20 筆。
+- **Install hooks／Uninstall hooks** 在列表標題列。
+- **agent chips**：這個 session 派出去的 subagent，點一下讀它的對話（terminal 會拆掉，見上）。
 
-### ended row（process 不見了）
+## 已經拿掉的功能（舊文件教過，別找了）
 
-- CLI 自動更新、`exit`、crash 之後 transcript 不會被清掉，那一列變成 ended：內容照樣可讀可展開，但不能送。
-- 動作：
-  - **Resume in background** — 在原 cwd 跑 `claude --bg --resume <sessionId>`，registry 再掃到同一個 sessionId 就自動重新綁回這個 tab。
-  - **Open in claude.ai** — 開 `https://claude.ai/code/<bridgeSessionId>`。
-  - **Open in tmux** — session 原本有 tmux target 才會出現；這是開一個你看得到的 terminal 去 attach，不是隱藏 client。
-  - **Dismiss** — 從列表移除。
-- `/clear` 過的舊對話也會以 ended 形式留著。最多保留 20 筆。
+2026-09-22 起，面板**不再有任何輸入框**。以下全部沒有了：
 
-### 背景 session
+- 面板底部的訊息輸入框、Enter 送出、Shift+Enter 換行、`delivered to Claude` 那類送出狀態、待送佇列（PendingSends）、Retry。
+- `/` slash 選單（含「哪些指令只能在 terminal」的分類）——現在所有指令都在 terminal 打，Claude Code 自己處理。
+- `@` 檔案選單、貼圖（`~/.claude/zed-pasted/`）、Cmd+V 貼進訊息。
+- Up／Down 叫出歷史訊息。
+- 問題卡的可點選項、**Submit**、**Type something**——問題卡只剩顯示。
+- Esc 關選單（`claude_sessions::DismissMenus`）。
+- keymap 裡 `claude_sessions::SendMessage`／`DismissMenus`／`PreviousMessage`／`NextMessage`／`PasteIntoMessage` 五個 action 與它們在 macOS／Linux／Windows 的綁定。剩下的 action 只有 `ToggleFocus` 與 `OpenInEditor`。
+- 「Copy setup commands」按鈕。
 
-- 面板每 3 秒跑一次 `claude agents --json`，`claude --bg` 起的 session 也會列出來，並把 `waiting: permission prompt` 這類狀態貼到對應的列上。
-- 動作：**Attach**（開 terminal 跑 `claude attach <id>`）、**Respawn**（`claude respawn <id>`）、**Stop**（按第一下變 **Confirm stop**，5 秒內再按一下才真的 `claude stop`，過了自動解除）。
-- 找不到 `claude` 指令時只會顯示一次淡淡的提示，不會跳錯誤。
+保留的：Stop、權限 Allow／Deny、Install／Uninstall hooks、dock 的 Attach／Respawn／Stop／Resume／Open in tmux／Dismiss。
 
-### shell 小弟卡
+## 疑難排解
 
-- Bash 工具若是用 `agent … --model …`、`agy … -p …`、`codex exec -m …` 派工，卡片會顯示模型、prompt 檔第一行、log 路徑。
-- prompt 裡有寫 report 路徑的話會多一列 `Report · <檔名>` 和 **Load**，載入後以 markdown 顯示（超過 40 行摺疊）。
+**terminal 區顯示 `This session is not running in a tmux pane.`**
+registry（`~/.claude/sessions/<pid>.json`）的 `tmux` 欄位沒有 `%pane` id。這個 session 不是在 tmux 裡起的（例如 `claude --bg`），面板沒有東西可以 attach。用 dock 的 **Attach** 開一般 terminal，或在 tmux 裡重開 session。
 
-### 送檔卡（SendUserFile）
+**terminal 區一直 `Attaching…` 或顯示 `Attaching to the session: …`**
+tmux 命令沒成功。最常見：Zed 跟 tmux server 不是同一個 user、或 tmux 不在 PATH。錯誤文字會直接顯示在那一區。
 
-- 失敗的送檔會標紅並附結果文字。
-- 圖片直接顯示，4 MiB 以上改成 **Load anyway (N MB)** 按鈕（上限 64 MiB）。
-- mp4 或其他檔案的路徑列是按鈕：本機用系統預設程式開，remote 會先下載再開。
-- 只有 session 工作目錄底下或 `/tmp` 的檔才會給你開。
+**多出來的 `zed-claude-mirror-*` tmux session**
+那是面板 attach 用的鏡像 session（和你的 session 同一個 group、共用 window），關掉 tab 就會自己銷毀。殘留的話 `tmux kill-session -t zed-claude-mirror-…` 無害。列表會把它們過濾掉。
 
-## 已知限制
+**狀態列 `channel: not loaded — Setup`，權限卡沒有 Allow／Deny，Stop 按不下去**
+第 2、3 步沒做完，或 session 沒重啟。確認 `claude mcp list` 有 `zed-claude`、啟動時有跳 `Loading development channels` 確認框、`~/.claude/zed-channel/<claude pid>/server.json` 存在且 5 秒更新一次。
 
-- **AskUserQuestion 只能用文字回答**：Claude Code 的 channel 不 relay 問題，面板組出來的答案是一般訊息，模型要自己讀懂。官方補 relay 之前這是永久做法。
-- **Interrupt 就是一次 SIGINT**：只在 turn 進行中可按，server 端 3 秒內只送一次；連按不會變 Ctrl+C 兩下。
-- **channel 是 research preview**：`--dangerously-load-development-channels` 的語法和確認提示都可能改。
-- **同一 turn 內 5 秒內兩個同名工具的權限提示**只能靠先後順序配對（channel 的 `permission_request` 沒帶 `tool_use_id`）。不同工具名或相隔超過 5 秒的不會配錯。
-- **remote host 必須用和 `claude` 相同的 POSIX user** 跑 Zed 的 remote server：channel 目錄是 0700。
-- **遠端主機時鐘偏差**會讓 Saying 框的 30 秒守衛提早收起、費用顯示偏向較舊的 statusLine 值。
-- `claude agents --json` 找不到 `claude` 時會顯示一次提示；背景 session 就列不出來。
-- 兩個 Zed 視窗同時對同一個 session 送訊息，極端情況下仍可能撞名（機率極低，協定不允許獨占鎖）。
+**工具列沒有 context 進度條、沒有模型／費用、rail 沒有 now row**
+hooks 或 statusLine 沒裝，或 session 沒重啟。dock 若還看得到 **Install hooks** 就是沒裝；裝了看 `~/.claude/zed-events/<session_id>.jsonl` 與 `~/.claude/zed-status/<session_id>.json` 有沒有在長。
+
+**gutter 一個 chip 都沒有**
+gutter 只在 terminal 有 attach 上、而且畫面上有 `>`／`⏺` 行首能對上 transcript 時畫。你的 Claude Code 主題如果換了符號，照上面設 `user_prompt_glyph`／`assistant_glyph`。純符號的行（`⏺ ✅`）刻意不對齊。
+
+**rail「N new below」的數字比看到的多**
+那個數字算的是 transcript 筆數，包括 terminal 已經顯示、rail 沒重畫的那些。切到「Show everything」數字就對得上。已知取捨。
 
 ## 解除安裝
 
-hooks 已裝好時，面板會在 Install hooks 旁邊多一顆 **Uninstall hooks**。按下去會：
+面板 **Uninstall hooks** 會：
 
-1. 從 `~/.claude/settings.json` 拿掉 13 個事件裡指向 `zed-claude-events.sh` 的 entry，並把 `statusLine` 還原成 Zed 串接前的指令（原本沒有就整個拿掉）。
-2. 刪掉 `~/.claude/hooks/zed-claude-events.sh`、`zed-claude-status.sh` 與 `~/.claude/zed-channel/server.mjs`。
+1. 從 `~/.claude/settings.json` 拿掉 13 個事件裡指向 `zed-claude-events.sh` 的 entry，`statusLine` 還原成串接前的指令（原本沒有就整個拿掉）。
+2. 刪 `~/.claude/hooks/zed-claude-events.sh`、`zed-claude-status.sh`、`~/.claude/zed-channel/server.mjs`。
 
-它**不會**碰 `~/.claude.json`，所以 MCP 那條要自己收：`claude mcp remove zed-claude`，並從 `~/.zshrc` 拿掉 `CLAUDE_EXTRA_ARGS` 那行。資料目錄 `~/.claude/zed-events/`、`~/.claude/zed-status/`、`~/.claude/zed-channel/`、`~/.claude/zed-pasted/` 想清就清，留著也無害。最後重啟 Claude session。
+它**不會**碰 `~/.claude.json`，MCP 那條自己收：`claude mcp remove zed-claude`，再從 `~/.zshrc` 拿掉 `CLAUDE_EXTRA_ARGS`。資料目錄 `~/.claude/zed-events/`、`~/.claude/zed-status/`、`~/.claude/zed-channel/` 想清就清。最後重啟 Claude session。
 
-面板進不去時的手動版：`cp ~/.claude/settings.json.zed-backup ~/.claude/settings.json` 還原 settings（那是 Zed 最後一次改 settings 之前的版本），再照上面第 2 步刪檔。
+面板進不去時的手動版：`cp ~/.claude/settings.json.zed-backup ~/.claude/settings.json`（那是 Zed 最後一次改 settings 之前的版本），再照第 2 點刪檔。

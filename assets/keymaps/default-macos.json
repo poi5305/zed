@@ -1801,4 +1801,7 @@
       "cmd-v": "claude_sessions::PasteIntoMessage",
     },
   },
+    },
+  },
+  {
 ]

@@ -1703,4 +1703,7 @@
       "ctrl-v": "claude_sessions::PasteIntoMessage",
     },
   },
+    },
+  },
+  {
 ]
