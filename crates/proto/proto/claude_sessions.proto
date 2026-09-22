@@ -17,6 +17,8 @@ message ClaudeSession {
   uint64 context_tokens = 10;
   // Claude Code's own total for the session, when it has written one.
   optional double total_cost_usd = 11;
+  // The id of the session on claude.ai, when the registry recorded one.
+  optional string bridge_session_id = 12;
 }
 
 // Request to list Claude Code sessions on the remote host.
@@ -33,6 +35,7 @@ message ListClaudeSessionsResponse {
   // client checks against a boundary under the home directory has to be checked
   // against this one.
   string home_directory = 2;
+  optional string liveness_unavailable_reason = 3;
 }
 
 // One subagent conversation of a session, as the machine it runs on describes it.
@@ -71,42 +74,64 @@ message ListClaudeSubagentsResponse {
   repeated ClaudeSubagent subagents = 1;
 }
 
-// One option of a question a session is waiting on.
-message ClaudeQuestionOption {
-  string label = 1;
-  optional string description = 2;
+// One request for every listed session's agents, so the host walks
+// ~/.claude/projects once rather than once per session.
+message ListClaudeSubagentsForSessions {
+  uint64 project_id = 1;
+  repeated string session_ids = 2;
 }
 
-// One question of a call a session is waiting on.
-message ClaudeQuestion {
-  // The short name the terminal shows in its tab strip, and what a reader picks one of
-  // several questions by.
-  string header = 1;
-  string question = 2;
-  repeated ClaudeQuestionOption options = 3;
-  bool multi_select = 4;
+message ClaudeSubagentsOfSession {
+  string session_id = 1;
+  repeated ClaudeSubagent subagents = 2;
 }
 
-// Request the question a session is waiting on. The CLI writes nothing about a question
-// into its transcript until the question has been answered, so this is read from what a
-// PreToolUse hook recorded on the machine the session runs on.
-message GetClaudePendingQuestion {
+message ListClaudeSubagentsForSessionsResponse {
+  repeated ClaudeSubagentsOfSession by_session = 1;
+}
+
+// One row of `claude agents --json`.
+message ClaudeAgent {
+  optional string id = 1;
+  string kind = 2;
+  optional string state = 3;
+  optional string status = 4;
+  optional string waiting_for = 5;
+  optional uint32 pid = 6;
+  optional string session_id = 7;
+  optional string name = 8;
+  optional string cwd = 9;
+  optional string started_at = 10;
+}
+
+message ListClaudeAgents {
+  uint64 project_id = 1;
+}
+
+message ListClaudeAgentsResponse {
+  repeated ClaudeAgent agents = 1;
+}
+
+// Continue an ended session in the background: `claude --bg --resume <session_id>`.
+message ResumeClaudeSession {
   uint64 project_id = 1;
   string session_id = 2;
+  string cwd = 3;
 }
 
-message GetClaudePendingQuestionResponse {
-  // What the session is saying right now, assembled from what the terminal has drawn.
-  // The transcript does not hold an assistant message until the turn is over, so on a
-  // long turn this is the only place the words exist.
-  optional string live_message = 4;
-  // Absent when the hook has recorded no question for this session, including when the
-  // hook is not installed at all.
-  optional string tool_use_id = 1;
-  repeated ClaudeQuestion questions = 2;
-  // Whether the hook that records questions is installed on that machine, so that a
-  // reader can offer to install it rather than silently showing nothing.
-  bool hook_installed = 3;
+message ResumeClaudeSessionResponse {
+  string output = 1;
+}
+
+// `claude respawn <id>` or `claude stop <id>` on the machine the session lived on.
+message RunClaudeAgentCommand {
+  uint64 project_id = 1;
+  repeated string args = 2;
+  string cwd = 3;
+}
+
+message RunClaudeAgentCommandResponse {
+  string output = 1;
 }
 
 // One slash command a session answers to.
@@ -126,22 +151,68 @@ message ClaudeSlashCommand {
 message ListClaudeSlashCommands {
   uint64 project_id = 1;
   optional string project_root = 2;
+  // When set, `project_root` must be that session's working directory or inside it.
+  optional string session_id = 3;
 }
 
 message ListClaudeSlashCommandsResponse {
   repeated ClaudeSlashCommand commands = 1;
 }
 
-// Request to install the hook that records waiting questions on the machine the sessions
-// run on. Installing twice changes nothing.
-message InstallClaudeQuestionHook {
+enum ClaudeHookInstallOutcome {
+  AlreadyCurrent = 0;
+  ScriptsRefreshed = 1;
+  Installed = 2;
+}
+
+// Request to incrementally read ~/.claude/zed-events/<session_id>.jsonl.
+message TailClaudeEvents {
+  uint64 project_id = 1;
+  string session_id = 2;
+  uint64 offset = 3;
+  bytes pending = 4;
+}
+
+message TailClaudeEventsResponse {
+  optional string path = 1;
+  uint64 start_offset = 2;
+  uint64 offset = 3;
+  bytes pending = 4;
+  repeated string lines = 5;
+  bool restarted = 6;
+}
+
+// Request the raw statusLine JSON for a session.
+message ReadClaudeStatus {
+  uint64 project_id = 1;
+  string session_id = 2;
+}
+
+message ReadClaudeStatusResponse {
+  optional string status_json = 1;
+}
+
+message InstallClaudeHooks {
   uint64 project_id = 1;
 }
 
-message InstallClaudeQuestionHookResponse {
-  // Where the settings that were there were copied to, absent when there were none to
-  // copy or when the hook was already installed.
-  optional string backup_path = 1;
+message InstallClaudeHooksResponse {
+  ClaudeHookInstallOutcome outcome = 1;
+  optional string backup_path = 2;
+}
+
+message UninstallClaudeHooks {
+  uint64 project_id = 1;
+}
+
+message UninstallClaudeHooksResponse {}
+
+message ClaudeHooksInstalled {
+  uint64 project_id = 1;
+}
+
+message ClaudeHooksInstalledResponse {
+  bool installed = 1;
 }
 
 // Request to incrementally read the transcript of a Claude Code session.
@@ -168,11 +239,17 @@ message TailClaudeTranscriptResponse {
   bool restarted = 6;
 }
 
-// Request to read the head of an offloaded tool output file.
+// Request to read the head of an offloaded tool output file, or of a file a session
+// delivered to the user with `SendUserFile`.
 message ReadClaudeFile {
   uint64 project_id = 1;
   string path = 2;
   uint64 max_bytes = 3;
+  // Set only for an attachment, and it is what the far end judges the path against: the
+  // file sits wherever the session wrote it rather than under `~/.claude/projects`, so
+  // the boundary is that session's own working directory. Absent for an offloaded tool
+  // output, which is judged against `~/.claude/projects` as before.
+  optional string session_id = 4;
 }
 
 // Response containing file contents up to max_bytes and whether it was truncated.
@@ -181,35 +258,77 @@ message ReadClaudeFileResponse {
   bool truncated = 2;
 }
 
-// Request the visible contents of a Claude Code session's tmux pane. The CLI draws
-// several things there that it never writes to the transcript: a prompt waiting to be
-// answered, the messages queued behind the turn it is running, and its status line.
-message CaptureClaudePane {
+// Whether the Zed channel server is live for a Claude Code process.
+message ClaudeChannelStatus {
   uint64 project_id = 1;
-  string pane_target = 2;
+  uint32 claude_pid = 2;
 }
 
-message CaptureClaudePaneResponse {
-  string contents = 1;
+message ClaudeChannelStatusResponse {
+  bool live = 1;
+  optional int64 heartbeat_at_ms = 2;
+  optional uint32 server_pid = 3;
+  repeated string features = 4;
 }
 
-// Request to send text or an Escape keypress to a Claude Code session's tmux pane.
-message SendClaudeInput {
+// Write a message to the session's channel outbox.
+message ClaudeChannelSend {
   uint64 project_id = 1;
-  string pane_target = 2;
-  oneof input {
-    string text = 3;
-    bool escape = 4;
-    // One of the key names `PaneKey` writes; anything else is refused by the host.
-    string key = 5;
-  }
+  uint32 claude_pid = 2;
+  string content = 3;
+}
+
+message ClaudeChannelSendResponse {
+  string outbox_file = 1;
+}
+
+// Answer a permission prompt through the channel outbox.
+message ClaudeChannelAnswerPermission {
+  uint64 project_id = 1;
+  uint32 claude_pid = 2;
+  string request_id = 3;
+  bool allow = 4;
+}
+
+message ClaudeChannelAnswerPermissionResponse {
+  string outbox_file = 1;
+}
+
+// Incrementally read ~/.claude/zed-channel/<claude_pid>/inbox.jsonl.
+message TailClaudeChannelInbox {
+  uint64 project_id = 1;
+  uint32 claude_pid = 2;
+  uint64 offset = 3;
+  bytes pending = 4;
+}
+
+message TailClaudeChannelInboxResponse {
+  optional string path = 1;
+  uint64 start_offset = 2;
+  uint64 offset = 3;
+  bytes pending = 4;
+  repeated string lines = 5;
+  bool restarted = 6;
+}
+
+// Write an interrupt to the session's channel outbox.
+message ClaudeChannelInterrupt {
+  uint64 project_id = 1;
+  uint32 claude_pid = 2;
+  string reason = 3;
+}
+
+message ClaudeChannelInterruptResponse {
+  string outbox_file = 1;
 }
 
 // Request the paths under a session's working directory that a partly typed `@` names.
 message ListClaudeSessionFiles {
   uint64 project_id = 1;
+  // Optional sub-path under the session's working directory. Empty means that directory.
   string directory = 2;
   string query = 3;
+  string session_id = 4;
 }
 
 message ListClaudeSessionFilesResponse {

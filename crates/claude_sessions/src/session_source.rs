@@ -2,9 +2,9 @@
 //!
 //! Everything the panel needs from the machine the sessions run on goes through this
 //! trait: listing the sessions, following a transcript, reading a persisted output file
-//! back, and typing into a session's pane. A remote project's sessions live on the far
-//! end of a connection, and a second implementation of these four methods is the whole
-//! difference between reading them and reading this machine's.
+//! back, and talking to a session through the Zed channel. A remote project's sessions
+//! live on the far end of a connection, and a second implementation of these methods is
+//! the whole difference between reading them and reading this machine's.
 //!
 //! Every method hands back a [`Task`] and does its IO on the background executor, so a
 //! `ps` invocation or a multi-megabyte read cannot stall the frame the panel is drawing.
@@ -19,36 +19,14 @@ use anyhow::{Context as _, Result};
 use collections::HashMap;
 use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
-use util::ResultExt as _;
 
 use crate::session_registry::{
-    self, PaneKey, PendingQuestion, Question, QuestionOption, RegisteredSession, SessionSummary,
+    self, AgentListing, ChannelStatus, HookInstallOutcome, RegisteredSession, SessionSummary,
     SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress, TailState,
-    TranscriptSpend, read_subagent_transcript_tail, read_transcript_tail,
+    TranscriptSpend, channel_answer_permission, channel_interrupt, channel_send_message,
+    channel_status, now_millis, read_channel_inbox_tail, read_events_tail, read_session_status,
+    read_subagent_transcript_tail, read_transcript_tail,
 };
-
-/// What the machine a session runs on can say about questions.
-///
-/// `hook_installed` is carried beside the question because their meanings differ: a
-/// machine that records nothing has no question to report whether or not one is waiting,
-/// and a reader told only `None` would draw a session that is blocked on its user as one
-/// with nothing to answer.
-pub struct QuestionState {
-    pub question: Option<PendingQuestion>,
-    pub hook_installed: bool,
-    /// What the session is saying right now, which the transcript will not hold until the
-    /// turn it belongs to is over.
-    pub live_message: Option<String>,
-}
-
-/// What the user asked to send to a session. `Escape` carries no text because it is an
-/// interrupt, not a message.
-pub enum SessionInput {
-    Text(String),
-    Escape,
-    /// Answers a prompt the CLI has drawn in the pane. See [`PaneKey`].
-    Key(PaneKey),
-}
 
 /// The prefix of a file that was read, and whether the file went on past it.
 pub struct FileContents {
@@ -66,6 +44,7 @@ pub struct FileContents {
 pub struct SessionListing {
     pub sessions: Vec<SessionSummary>,
     pub home_directory: PathBuf,
+    pub liveness_unavailable_reason: Option<String>,
 }
 
 pub trait SessionSource: Send + Sync + 'static {
@@ -90,16 +69,17 @@ pub trait SessionSource: Send + Sync + 'static {
         session_ids: Vec<String>,
     ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>>;
 
-    /// The question the session is waiting on, and whether the machine it runs on records
-    /// questions at all. A question that is waiting is written nowhere the conversation
-    /// can be read from, so a machine without the hook has nothing to answer with and the
-    /// reader is told so rather than shown an empty panel.
-    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>>;
+    fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>>;
 
-    /// Installs the hook that records waiting questions on the machine the sessions run
-    /// on, reporting where the settings that were there were copied to. Installing twice
-    /// changes nothing.
-    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>>;
+    fn read_status(&self, session_id: String) -> Task<Result<Option<String>>>;
+
+    fn install_hooks(&self) -> Task<Result<HookInstallOutcome>>;
+
+    fn uninstall_hooks(&self) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!("uninstalling hooks is not available")))
+    }
+
+    fn hooks_installed(&self) -> Task<Result<bool>>;
 
     /// The slash commands a session in this project answers to.
     fn list_slash_commands(&self, project_root: Option<PathBuf>)
@@ -131,11 +111,82 @@ pub trait SessionSource: Send + Sync + 'static {
     /// them.
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>>;
 
-    fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>>;
+    /// Reads at most `max_bytes` of a file the session named as a `SendUserFile`
+    /// attachment. Separate from [`Self::read_file`] because the two are allowed to read
+    /// different things: an attachment is judged against the session's own working
+    /// directory, and the machine the session runs on is the one that decides, from that
+    /// session's registration rather than from anything sent here.
+    fn read_attachment(
+        &self,
+        session_id: String,
+        path: PathBuf,
+        max_bytes: u64,
+    ) -> Task<Result<FileContents>>;
 
-    /// The visible contents of the session's tmux pane, which is where Claude Code draws
-    /// what it never writes to the transcript.
-    fn capture_pane(&self, pane_target: String) -> Task<Result<String>>;
+    fn channel_status(&self, claude_pid: u32) -> Task<Result<ChannelStatus>>;
+
+    fn channel_send_message(&self, claude_pid: u32, content: String) -> Task<Result<String>>;
+
+    fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>>;
+
+    fn channel_answer_permission(
+        &self,
+        claude_pid: u32,
+        request_id: String,
+        allow: bool,
+    ) -> Task<Result<String>>;
+
+    fn tail_channel_inbox(&self, claude_pid: u32, state: TailState) -> Task<Result<TailProgress>>;
+
+    /// Whether this source reads a machine other than the one Zed is running on.
+    /// A sent file that exists under the same path locally is still that other
+    /// machine's file, so opening one always fetches rather than using the local name.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    /// `claude agents --json` on the machine the sessions run on.
+    fn list_agents(&self) -> Task<Result<Vec<AgentListing>>> {
+        Task::ready(Ok(Vec::new()))
+    }
+
+    /// `claude --bg --resume <session_id>` in `cwd`.
+    fn resume_session_in_background(
+        &self,
+        _session_id: String,
+        _cwd: PathBuf,
+    ) -> Task<Result<String>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "resuming a session in the background is not available"
+        )))
+    }
+
+    /// `claude respawn <id>` or `claude stop <id>` in `cwd`.
+    fn run_claude_agent_command(&self, _args: Vec<String>, _cwd: PathBuf) -> Task<Result<String>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this Claude agent command is not available"
+        )))
+    }
+
+    /// Like [`Self::list_session_files`], naming the session whose working directory
+    /// bounds the walk. Sources that do not know a session still answer from `directory`.
+    fn list_session_files_in(
+        &self,
+        _session_id: String,
+        directory: PathBuf,
+        query: String,
+    ) -> Task<Result<Vec<String>>> {
+        self.list_session_files(directory, query)
+    }
+
+    /// Like [`Self::list_slash_commands`], naming the session `project_root` must sit in.
+    fn list_slash_commands_for(
+        &self,
+        project_root: Option<PathBuf>,
+        _session_id: Option<String>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        self.list_slash_commands(project_root)
+    }
 }
 
 /// The sessions running on the machine Zed itself is running on.
@@ -162,6 +213,8 @@ impl SessionSource for LocalSource {
             Ok(SessionListing {
                 sessions,
                 home_directory,
+                liveness_unavailable_reason: session_registry::liveness_unavailable_reason()
+                    .map(str::to_string),
             })
         })
     }
@@ -189,21 +242,34 @@ impl SessionSource for LocalSource {
         })
     }
 
-    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
-        let home_directory = self.home_directory.clone();
-        self.executor.spawn(async move {
-            Ok(QuestionState {
-                question: session_registry::read_pending_question(&home_directory, &session_id)?,
-                hook_installed: session_registry::question_hook_is_installed(&home_directory),
-                live_message: session_registry::read_live_message(&home_directory, &session_id)?,
-            })
-        })
-    }
-
-    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
+    fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
         let home_directory = self.home_directory.clone();
         self.executor
-            .spawn(async move { session_registry::install_question_hook(&home_directory) })
+            .spawn(async move { read_events_tail(&home_directory, &session_id, state) })
+    }
+
+    fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { read_session_status(&home_directory, &session_id) })
+    }
+
+    fn install_hooks(&self) -> Task<Result<HookInstallOutcome>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { session_registry::install_zed_hooks(&home_directory) })
+    }
+
+    fn uninstall_hooks(&self) -> Task<Result<()>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { session_registry::uninstall_zed_hooks(&home_directory) })
+    }
+
+    fn hooks_installed(&self) -> Task<Result<bool>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { Ok(session_registry::zed_hooks_installed(&home_directory)) })
     }
 
     fn list_slash_commands(
@@ -255,19 +321,122 @@ impl SessionSource for LocalSource {
             .spawn(async move { read_file_prefix(&path, max_bytes) })
     }
 
-    fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>> {
+    fn read_attachment(
+        &self,
+        session_id: String,
+        path: PathBuf,
+        max_bytes: u64,
+    ) -> Task<Result<FileContents>> {
+        let home_directory = self.home_directory.clone();
         self.executor.spawn(async move {
-            match input {
-                SessionInput::Text(text) => session_registry::send_text(&pane_target, &text).await,
-                SessionInput::Escape => session_registry::send_escape(&pane_target).await,
-                SessionInput::Key(key) => session_registry::send_key(&pane_target, key).await,
-            }
+            // Checked here even though the sessions are this machine's, so that the rule
+            // is applied on the machine the file is on however the session was reached.
+            let working_directory =
+                session_registry::session_working_directory(&home_directory, &session_id)
+                    .with_context(|| format!("no session is registered as {session_id}"))?;
+            anyhow::ensure!(
+                session_registry::attachment_is_readable(&path, &working_directory),
+                "{} is outside the working directory of session {session_id}",
+                path.display(),
+            );
+            read_file_prefix(&path, max_bytes)
         })
     }
 
-    fn capture_pane(&self, pane_target: String) -> Task<Result<String>> {
+    fn channel_status(&self, claude_pid: u32) -> Task<Result<ChannelStatus>> {
+        let home_directory = self.home_directory.clone();
         self.executor
-            .spawn(async move { session_registry::capture_pane(&pane_target).await })
+            .spawn(async move { Ok(channel_status(&home_directory, claude_pid, now_millis())) })
+    }
+
+    fn channel_send_message(&self, claude_pid: u32, content: String) -> Task<Result<String>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { channel_send_message(&home_directory, claude_pid, &content) })
+    }
+
+    fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { channel_interrupt(&home_directory, claude_pid, &reason) })
+    }
+
+    fn channel_answer_permission(
+        &self,
+        claude_pid: u32,
+        request_id: String,
+        allow: bool,
+    ) -> Task<Result<String>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            channel_answer_permission(&home_directory, claude_pid, &request_id, allow)
+        })
+    }
+
+    fn tail_channel_inbox(&self, claude_pid: u32, state: TailState) -> Task<Result<TailProgress>> {
+        let home_directory = self.home_directory.clone();
+        self.executor
+            .spawn(async move { read_channel_inbox_tail(&home_directory, claude_pid, state) })
+    }
+
+    fn list_agents(&self) -> Task<Result<Vec<AgentListing>>> {
+        let executor = self.executor.clone();
+        self.executor
+            .spawn(async move { session_registry::list_claude_agents(&executor).await })
+    }
+
+    fn resume_session_in_background(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+    ) -> Task<Result<String>> {
+        let executor = self.executor.clone();
+        self.executor.spawn(async move {
+            session_registry::resume_session_in_background(&session_id, &cwd, &executor).await
+        })
+    }
+
+    fn run_claude_agent_command(&self, args: Vec<String>, cwd: PathBuf) -> Task<Result<String>> {
+        let executor = self.executor.clone();
+        self.executor.spawn(async move {
+            session_registry::run_claude_agent_command(&args, &cwd, &executor).await
+        })
+    }
+
+    fn list_session_files_in(
+        &self,
+        session_id: String,
+        directory: PathBuf,
+        query: String,
+    ) -> Task<Result<Vec<String>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            let directory = session_registry::session_files_directory(
+                &home_directory,
+                &session_id,
+                &directory,
+            )?;
+            Ok(session_registry::list_files_under(&directory, &query))
+        })
+    }
+
+    fn list_slash_commands_for(
+        &self,
+        project_root: Option<PathBuf>,
+        session_id: Option<String>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            let project_root = session_registry::slash_command_project_root(
+                &home_directory,
+                session_id.as_deref(),
+                project_root.as_deref(),
+            )?;
+            Ok(session_registry::list_slash_commands(
+                &home_directory,
+                project_root.as_deref(),
+            ))
+        })
     }
 }
 
@@ -332,69 +501,86 @@ impl SessionSource for RemoteSource {
         })
     }
 
-    /// One request per session rather than one that names them all: the far end already
-    /// answers [`proto::ListClaudeSubagents`], and the scan this saves is the local one
-    /// over the projects directory, which the remote machine does per request anyway.
-    /// The requests are all issued before any is awaited, so they are in flight together.
+    /// One request for every listed session's agents, so the host walks
+    /// `~/.claude/projects` once rather than once per session.
     fn list_subagents_for_sessions(
         &self,
         session_ids: Vec<String>,
     ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
-        let requests = session_ids
-            .into_iter()
-            .map(|session_id| {
-                let request = self.client.request(proto::ListClaudeSubagents {
-                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
-                    session_id: session_id.clone(),
-                });
-                (session_id, request)
-            })
-            .collect::<Vec<_>>();
+        let request = self.client.request(proto::ListClaudeSubagentsForSessions {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_ids: session_ids.clone(),
+        });
 
         self.executor.spawn(async move {
-            let mut subagents_by_session = HashMap::default();
-            for (session_id, request) in requests {
-                // One session the far end cannot list must not hide every other
-                // session's agents: the dock draws them all, and an empty list for the
-                // one that failed is the same answer the local scan gives for a
-                // directory it could not read.
-                let subagents = match request.await.log_err() {
-                    Some(response) => response
+            let response = request.await?;
+            let mut subagents_by_session = session_ids
+                .into_iter()
+                .map(|session_id| (session_id, Vec::new()))
+                .collect::<HashMap<_, _>>();
+            for of_session in response.by_session {
+                subagents_by_session.insert(
+                    of_session.session_id,
+                    of_session
                         .subagents
                         .into_iter()
                         .map(subagent_summary_from_proto)
                         .collect(),
-                    None => Vec::new(),
-                };
-                subagents_by_session.insert(session_id, subagents);
+                );
             }
             Ok(subagents_by_session)
         })
     }
 
-    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
-        let request = self.client.request(proto::GetClaudePendingQuestion {
+    fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
+        let request = self.client.request(proto::TailClaudeEvents {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+            offset: state.offset,
+            pending: state.pending,
+        });
+
+        self.executor
+            .spawn(async move { Ok(events_progress_from_proto(request.await?)) })
+    }
+
+    fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
+        let request = self.client.request(proto::ReadClaudeStatus {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
             session_id,
         });
 
-        self.executor.spawn(async move {
-            let response = request.await?;
-            Ok(QuestionState {
-                question: pending_question_from_proto(&response),
-                hook_installed: response.hook_installed,
-                live_message: response.live_message.clone(),
-            })
-        })
+        self.executor
+            .spawn(async move { Ok(request.await?.status_json) })
     }
 
-    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
-        let request = self.client.request(proto::InstallClaudeQuestionHook {
+    fn install_hooks(&self) -> Task<Result<HookInstallOutcome>> {
+        let request = self.client.request(proto::InstallClaudeHooks {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
         });
 
         self.executor
-            .spawn(async move { Ok(request.await?.backup_path.map(PathBuf::from)) })
+            .spawn(async move { Ok(hook_install_outcome_from_proto(request.await?)) })
+    }
+
+    fn uninstall_hooks(&self) -> Task<Result<()>> {
+        let request = self.client.request(proto::UninstallClaudeHooks {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        });
+
+        self.executor.spawn(async move {
+            request.await?;
+            Ok(())
+        })
+    }
+
+    fn hooks_installed(&self) -> Task<Result<bool>> {
+        let request = self.client.request(proto::ClaudeHooksInstalled {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        });
+
+        self.executor
+            .spawn(async move { Ok(request.await?.installed) })
     }
 
     fn list_slash_commands(
@@ -404,6 +590,7 @@ impl SessionSource for RemoteSource {
         let request = self.client.request(proto::ListClaudeSlashCommands {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
             project_root: project_root.map(|root| root.to_string_lossy().into_owned()),
+            session_id: None,
         });
 
         self.executor.spawn(async move {
@@ -428,10 +615,20 @@ impl SessionSource for RemoteSource {
     }
 
     fn list_session_files(&self, directory: PathBuf, query: String) -> Task<Result<Vec<String>>> {
+        self.list_session_files_in(String::new(), directory, query)
+    }
+
+    fn list_session_files_in(
+        &self,
+        session_id: String,
+        directory: PathBuf,
+        query: String,
+    ) -> Task<Result<Vec<String>>> {
         let request = self.client.request(proto::ListClaudeSessionFiles {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
             directory: directory.to_string_lossy().into_owned(),
             query,
+            session_id,
         });
 
         self.executor.spawn(async move { Ok(request.await?.paths) })
@@ -470,11 +667,17 @@ impl SessionSource for RemoteSource {
             .spawn(async move { Ok(tail_progress_from_proto(request.await?)) })
     }
 
-    fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
+    fn read_attachment(
+        &self,
+        session_id: String,
+        path: PathBuf,
+        max_bytes: u64,
+    ) -> Task<Result<FileContents>> {
         let request = self.client.request(proto::ReadClaudeFile {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
             path: path_to_wire(&path),
             max_bytes,
+            session_id: Some(session_id),
         });
 
         self.executor.spawn(async move {
@@ -486,34 +689,155 @@ impl SessionSource for RemoteSource {
         })
     }
 
-    fn capture_pane(&self, pane_target: String) -> Task<Result<String>> {
-        let request = self.client.request(proto::CaptureClaudePane {
+    fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
+        let request = self.client.request(proto::ReadClaudeFile {
             project_id: proto::REMOTE_SERVER_PROJECT_ID,
-            pane_target,
-        });
-
-        self.executor
-            .spawn(async move { Ok(request.await?.contents) })
-    }
-
-    fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>> {
-        let request = self.client.request(proto::SendClaudeInput {
-            project_id: proto::REMOTE_SERVER_PROJECT_ID,
-            pane_target,
-            input: Some(match input {
-                SessionInput::Text(text) => proto::send_claude_input::Input::Text(text),
-                // The variant is the whole message; the boolean it carries only exists
-                // because a protobuf `oneof` arm must have a type.
-                SessionInput::Escape => proto::send_claude_input::Input::Escape(true),
-                SessionInput::Key(key) => {
-                    proto::send_claude_input::Input::Key(key.tmux_name().to_string())
-                }
-            }),
+            path: path_to_wire(&path),
+            max_bytes,
+            session_id: None,
         });
 
         self.executor.spawn(async move {
-            request.await?;
-            Ok(())
+            let response = request.await?;
+            Ok(FileContents {
+                bytes: response.contents,
+                truncated: response.truncated,
+            })
+        })
+    }
+
+    fn channel_status(&self, claude_pid: u32) -> Task<Result<ChannelStatus>> {
+        let request = self.client.request(proto::ClaudeChannelStatus {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            claude_pid,
+        });
+        self.executor.spawn(async move {
+            let response = request.await?;
+            Ok(ChannelStatus {
+                live: response.live,
+                heartbeat_at_ms: response.heartbeat_at_ms,
+                server_pid: response.server_pid,
+                features: response.features,
+            })
+        })
+    }
+
+    fn channel_send_message(&self, claude_pid: u32, content: String) -> Task<Result<String>> {
+        let request = self.client.request(proto::ClaudeChannelSend {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            claude_pid,
+            content,
+        });
+        self.executor
+            .spawn(async move { Ok(request.await?.outbox_file) })
+    }
+
+    fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>> {
+        let request = self.client.request(proto::ClaudeChannelInterrupt {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            claude_pid,
+            reason,
+        });
+        self.executor
+            .spawn(async move { Ok(request.await?.outbox_file) })
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn channel_answer_permission(
+        &self,
+        claude_pid: u32,
+        request_id: String,
+        allow: bool,
+    ) -> Task<Result<String>> {
+        let request = self.client.request(proto::ClaudeChannelAnswerPermission {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            claude_pid,
+            request_id,
+            allow,
+        });
+        self.executor
+            .spawn(async move { Ok(request.await?.outbox_file) })
+    }
+
+    fn tail_channel_inbox(&self, claude_pid: u32, state: TailState) -> Task<Result<TailProgress>> {
+        let request = self.client.request(proto::TailClaudeChannelInbox {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            claude_pid,
+            offset: state.offset,
+            pending: state.pending,
+        });
+        self.executor
+            .spawn(async move { Ok(channel_inbox_progress_from_proto(request.await?)) })
+    }
+
+    fn list_agents(&self) -> Task<Result<Vec<AgentListing>>> {
+        let request = self.client.request(proto::ListClaudeAgents {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        });
+        self.executor.spawn(async move {
+            Ok(request
+                .await?
+                .agents
+                .into_iter()
+                .map(agent_listing_from_proto)
+                .collect())
+        })
+    }
+
+    fn resume_session_in_background(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+    ) -> Task<Result<String>> {
+        let request = self.client.request(proto::ResumeClaudeSession {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+            cwd: cwd.to_string_lossy().into_owned(),
+        });
+        self.executor
+            .spawn(async move { Ok(request.await?.output) })
+    }
+
+    fn run_claude_agent_command(&self, args: Vec<String>, cwd: PathBuf) -> Task<Result<String>> {
+        let request = self.client.request(proto::RunClaudeAgentCommand {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            args,
+            cwd: cwd.to_string_lossy().into_owned(),
+        });
+        self.executor
+            .spawn(async move { Ok(request.await?.output) })
+    }
+
+    fn list_slash_commands_for(
+        &self,
+        project_root: Option<PathBuf>,
+        session_id: Option<String>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        let request = self.client.request(proto::ListClaudeSlashCommands {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            project_root: project_root.map(|root| root.to_string_lossy().into_owned()),
+            session_id,
+        });
+
+        self.executor.spawn(async move {
+            Ok(request
+                .await?
+                .commands
+                .into_iter()
+                .map(|command| SlashCommand {
+                    name: command.name,
+                    description: command.description,
+                    argument_hint: command.argument_hint,
+                    scope: match command.scope {
+                        1 => SlashCommandScope::Project,
+                        2 => SlashCommandScope::User,
+                        _ => SlashCommandScope::Builtin,
+                    },
+                })
+                .collect())
         })
     }
 }
@@ -541,17 +865,21 @@ fn session_listing_from_proto(response: proto::ListClaudeSessionsResponse) -> Se
             .map(session_summary_from_proto)
             .collect(),
         home_directory: PathBuf::from(response.home_directory),
+        // The panel draws this as a row of its own, so a reason with nothing in it would
+        // be a blank row saying nothing at all.
+        liveness_unavailable_reason: response
+            .liveness_unavailable_reason
+            .filter(|reason| !reason.trim().is_empty()),
     }
 }
 
 /// Rebuilds a listed session from what the far end sent.
 ///
-/// Three fields of [`RegisteredSession`] are deliberately absent from the wire message.
+/// Two fields of [`RegisteredSession`] are deliberately absent from the wire message.
 /// `process_start` and `kind` exist to decide whether a registration is live and
 /// interactive, and that decision has already been made on the machine the process runs
 /// on — this side has no pid table to check it against, so a second answer here could
-/// only be a worse one. `bridge_session_id` names a resource on that machine that
-/// nothing here can reach. Sending them would widen what the protocol exposes to no
+/// only be a worse one. Sending them would widen what the protocol exposes to no
 /// reader, so they are filled with what the scan on the far end has already proven:
 /// the kind it filtered for, and no process start of our own to claim.
 fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
@@ -567,7 +895,7 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
             status: session.status,
             updated_at: session.updated_at,
             tmux_target: session.tmux_target,
-            bridge_session_id: None,
+            bridge_session_id: session.bridge_session_id,
         },
         transcript_path: session.transcript_path.map(PathBuf::from),
         // Zero context means the far end found no answer to read, which is the same
@@ -578,6 +906,21 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
                 total_cost_usd: session.total_cost_usd,
             },
         ),
+    }
+}
+
+fn agent_listing_from_proto(agent: proto::ClaudeAgent) -> AgentListing {
+    AgentListing {
+        id: agent.id,
+        kind: agent.kind,
+        state: agent.state,
+        status: agent.status,
+        waiting_for: agent.waiting_for,
+        process_id: agent.pid,
+        session_id: agent.session_id,
+        name: agent.name,
+        working_directory: agent.cwd.map(PathBuf::from),
+        started_at: agent.started_at,
     }
 }
 
@@ -614,44 +957,42 @@ fn subagent_summary_from_proto(subagent: proto::ClaudeSubagent) -> SubagentSumma
     }
 }
 
-/// The question a response carries, or `None` when it carries none.
-///
-/// A response naming no call is not a question this side can draw: whether a question is
-/// still waiting is answered by looking for the tool result that answers its id, and
-/// without one there is nothing to look for. A question with no options left is dropped
-/// for the same reason the far end drops it — there would be nothing to pick.
-fn pending_question_from_proto(
-    response: &proto::GetClaudePendingQuestionResponse,
-) -> Option<PendingQuestion> {
-    let tool_use_id = response
-        .tool_use_id
-        .as_deref()
-        .filter(|id| !id.is_empty())?
-        .to_string();
+fn events_progress_from_proto(response: proto::TailClaudeEventsResponse) -> TailProgress {
+    TailProgress {
+        path: response.path.map(PathBuf::from),
+        start_offset: response.start_offset,
+        offset: response.offset,
+        pending: response.pending,
+        lines: response.lines,
+        restarted: response.restarted,
+    }
+}
 
-    let questions: Vec<Question> = response
-        .questions
-        .iter()
-        .filter(|question| !question.options.is_empty())
-        .map(|question| Question {
-            header: question.header.clone(),
-            question: question.question.clone(),
-            options: question
-                .options
-                .iter()
-                .map(|option| QuestionOption {
-                    label: option.label.clone(),
-                    description: option.description.clone(),
-                })
-                .collect(),
-            multi_select: question.multi_select,
-        })
-        .collect();
+fn channel_inbox_progress_from_proto(
+    response: proto::TailClaudeChannelInboxResponse,
+) -> TailProgress {
+    TailProgress {
+        path: response.path.map(PathBuf::from),
+        start_offset: response.start_offset,
+        offset: response.offset,
+        pending: response.pending,
+        lines: response.lines,
+        restarted: response.restarted,
+    }
+}
 
-    (!questions.is_empty()).then_some(PendingQuestion {
-        tool_use_id,
-        questions,
-    })
+fn hook_install_outcome_from_proto(
+    response: proto::InstallClaudeHooksResponse,
+) -> HookInstallOutcome {
+    if response.outcome == proto::ClaudeHookInstallOutcome::ScriptsRefreshed as i32 {
+        HookInstallOutcome::ScriptsRefreshed
+    } else if response.outcome == proto::ClaudeHookInstallOutcome::Installed as i32 {
+        HookInstallOutcome::Installed {
+            backup_path: response.backup_path.map(PathBuf::from),
+        }
+    } else {
+        HookInstallOutcome::AlreadyCurrent
+    }
 }
 
 fn tail_progress_from_proto(response: proto::TailClaudeTranscriptResponse) -> TailProgress {
@@ -698,6 +1039,7 @@ mod tests {
             transcript_path: Some("/home/user/.claude/projects/p/abc-123.jsonl".to_string()),
             context_tokens: 0,
             total_cost_usd: None,
+            bridge_session_id: Some("bridge-abc".to_string()),
         }
     }
 
@@ -731,7 +1073,10 @@ mod tests {
             summary.session.kind, "interactive",
             "the far end lists interactive sessions only"
         );
-        assert_eq!(summary.session.bridge_session_id, None);
+        assert_eq!(
+            summary.session.bridge_session_id.as_deref(),
+            Some("bridge-abc")
+        );
     }
 
     #[test]
@@ -742,6 +1087,7 @@ mod tests {
             updated_at: None,
             tmux_target: None,
             transcript_path: None,
+            bridge_session_id: None,
             ..wire_session()
         });
 
@@ -753,6 +1099,7 @@ mod tests {
             "a session with no pane must not come out looking like one Zed can type into"
         );
         assert_eq!(summary.transcript_path, None);
+        assert_eq!(summary.session.bridge_session_id, None);
         // The fields that are always present still arrive.
         assert_eq!(summary.session.process_id, 4321);
         assert_eq!(summary.session.session_id, "abc-123");
@@ -763,6 +1110,7 @@ mod tests {
         let listing = session_listing_from_proto(proto::ListClaudeSessionsResponse {
             sessions: vec![wire_session()],
             home_directory: "/home/deploy".to_string(),
+            liveness_unavailable_reason: None,
         });
 
         assert_eq!(
@@ -779,6 +1127,7 @@ mod tests {
         let listing = session_listing_from_proto(proto::ListClaudeSessionsResponse {
             sessions: Vec::new(),
             home_directory: String::new(),
+            liveness_unavailable_reason: None,
         });
 
         assert_eq!(
@@ -787,6 +1136,40 @@ mod tests {
             "an unset home directory must stay empty rather than become this machine's"
         );
         assert!(listing.sessions.is_empty());
+    }
+
+    #[test]
+    fn a_remote_liveness_unavailable_reason_surfaces_from_the_proto() {
+        let listing = session_listing_from_proto(proto::ListClaudeSessionsResponse {
+            sessions: Vec::new(),
+            home_directory: "C:\\Users\\remote".to_string(),
+            liveness_unavailable_reason: Some(
+                "Claude session liveness checks are unavailable on this host.".to_string(),
+            ),
+        });
+
+        assert_eq!(
+            listing.liveness_unavailable_reason.as_deref(),
+            Some("Claude session liveness checks are unavailable on this host."),
+        );
+    }
+
+    /// A note with nothing in it is not a note: the panel draws whatever arrives here as
+    /// a muted row under the session list, so an empty reason would be an empty row.
+    #[test]
+    fn a_liveness_unavailable_reason_with_nothing_in_it_is_no_reason() {
+        for sent in ["", "   ", "\n"] {
+            let listing = session_listing_from_proto(proto::ListClaudeSessionsResponse {
+                sessions: Vec::new(),
+                home_directory: "C:\\Users\\remote".to_string(),
+                liveness_unavailable_reason: Some(sent.to_string()),
+            });
+
+            assert_eq!(
+                listing.liveness_unavailable_reason, None,
+                "{sent:?} says nothing and must arrive as no reason at all, not as a blank note"
+            );
+        }
     }
 
     fn wire_subagent() -> proto::ClaudeSubagent {

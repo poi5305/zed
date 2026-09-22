@@ -8,20 +8,23 @@
 
 use std::{
     fs,
-    io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
+    io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet};
+use futures::future::try_join;
+use gpui::BackgroundExecutor;
 use serde::Deserialize;
-use smol::io::AsyncWriteExt as _;
-use util::{ResultExt as _, command::Stdio};
+use smol::io::AsyncReadExt as _;
+use util::ResultExt as _;
 
 /// No cutoff is applied to `updatedAt`, because it is not a heartbeat: on this machine
 /// every registration carries `updatedAt == statusUpdatedAt`, so it only moves when the
@@ -58,6 +61,222 @@ pub struct RegisteredSession {
 pub fn parse_registered_session(contents: &str) -> anyhow::Result<RegisteredSession> {
     let session = serde_json::from_str(contents)?;
     Ok(session)
+}
+
+/// One row of `claude agents --json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentListing {
+    pub id: Option<String>,
+    pub kind: String,
+    pub state: Option<String>,
+    pub status: Option<String>,
+    pub waiting_for: Option<String>,
+    pub process_id: Option<u32>,
+    pub session_id: Option<String>,
+    pub name: Option<String>,
+    pub working_directory: Option<PathBuf>,
+    pub started_at: Option<String>,
+}
+
+/// Parses the JSON array `claude agents --json` prints. Unknown fields are ignored,
+/// missing optional fields stay `None`, and a non-array is an error.
+pub fn parse_claude_agents_json(contents: &str) -> Result<Vec<AgentListing>> {
+    anyhow::ensure!(
+        contents.len() <= MAX_COMMAND_OUTPUT_BYTES,
+        "claude agents --json is {} bytes, and the limit is {MAX_COMMAND_OUTPUT_BYTES}",
+        contents.len()
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(contents).with_context(|| "parsing claude agents --json")?;
+    let Some(array) = value.as_array() else {
+        bail!("claude agents --json did not print an array");
+    };
+    Ok(array.iter().filter_map(agent_listing_from_json).collect())
+}
+
+fn agent_listing_from_json(value: &serde_json::Value) -> Option<AgentListing> {
+    let kind = value.get("kind")?.as_str()?.to_string();
+    Some(AgentListing {
+        id: json_opt_string(value, "id"),
+        kind,
+        state: json_opt_string(value, "state"),
+        status: json_opt_string(value, "status"),
+        waiting_for: json_opt_string(value, "waitingFor"),
+        process_id: value
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|process_id| u32::try_from(process_id).ok()),
+        session_id: json_opt_string(value, "sessionId"),
+        name: json_opt_string(value, "name"),
+        working_directory: json_opt_string(value, "cwd").map(PathBuf::from),
+        started_at: json_opt_string(value, "startedAt"),
+    })
+}
+
+fn json_opt_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+pub const RESUME_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LIST_AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs `command`, refusing when it has not finished within `timeout`.
+///
+/// The child is spawned when this function is entered rather than when the wait is first
+/// polled, so a bound that only stops waiting would leave the process running with
+/// nothing left watching it, and every retry would leave another. `kill_on_drop` is what
+/// makes dropping the future end the process instead. Stdout and stderr are read up to
+/// [`MAX_COMMAND_OUTPUT_BYTES`] each; past that the child is dropped (and so killed)
+/// rather than held as a growing buffer.
+async fn output_within(
+    command: &mut smol::process::Command,
+    what: &str,
+    timeout: Duration,
+    executor: &BackgroundExecutor,
+) -> Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(anyhow::Error::from)?;
+    let stdout = child.stdout.take().context("stdout pipe")?;
+    let stderr = child.stderr.take().context("stderr pipe")?;
+    let collect = async {
+        let (stdout, stderr) = try_join(
+            read_capped_output(stdout, MAX_COMMAND_OUTPUT_BYTES),
+            read_capped_output(stderr, MAX_COMMAND_OUTPUT_BYTES),
+        )
+        .await?;
+        let status = child.status().await.map_err(anyhow::Error::from)?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    let timeout_wait = async {
+        executor.timer(timeout).await;
+        bail!("{what} has not answered in {} s", timeout.as_secs())
+    };
+    smol::future::or(Box::pin(collect), Box::pin(timeout_wait)).await
+}
+
+async fn read_capped_output(
+    mut reader: impl smol::io::AsyncRead + Unpin,
+    cap: usize,
+) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(buffer);
+        }
+        anyhow::ensure!(
+            buffer.len().saturating_add(read) <= cap,
+            "the command printed more than {cap} bytes"
+        );
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Runs `claude` with `args` in `working_directory`, which must be an absolute
+/// existing directory with no NUL.
+pub async fn run_claude_command(
+    args: &[String],
+    working_directory: &Path,
+    timeout: Duration,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
+    anyhow::ensure!(
+        claude_command_working_directory(working_directory).is_some(),
+        "{} is not an absolute existing directory",
+        working_directory.display()
+    );
+    let mut command = smol::process::Command::new("claude");
+    command.args(args).current_dir(working_directory);
+    let output = output_within(
+        &mut command,
+        &format!("claude {}", args.join(" ")),
+        timeout,
+        executor,
+    )
+    .await
+    .with_context(|| "running claude")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "claude {} exited with {}: {stderr}",
+            args.join(" "),
+            output.status
+        );
+    }
+    Ok(stdout)
+}
+
+/// `claude --bg --resume <session_id>` in `cwd`. `session_id` must be a single path component.
+pub async fn resume_session_in_background(
+    session_id: &str,
+    cwd: &Path,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
+    let session_id = claude_command_operand(session_id)
+        .with_context(|| "session_id is not a value this may hand to claude")?;
+    run_claude_command(
+        &[
+            "--bg".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ],
+        cwd,
+        RESUME_SESSION_TIMEOUT,
+        executor,
+    )
+    .await
+}
+
+/// `claude respawn <id>` or `claude stop <id>`. The id must be a single path component.
+pub async fn run_claude_agent_command(
+    args: &[String],
+    cwd: &Path,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
+    anyhow::ensure!(
+        args.len() == 2 && (args[0] == "respawn" || args[0] == "stop"),
+        "expected respawn or stop and an id"
+    );
+    claude_command_operand(&args[1])
+        .with_context(|| "the id is not a value this may hand to claude")?;
+    run_claude_command(args, cwd, RESUME_SESSION_TIMEOUT, executor).await
+}
+
+pub async fn list_claude_agents(executor: &BackgroundExecutor) -> Result<Vec<AgentListing>> {
+    let mut command = smol::process::Command::new("claude");
+    command.args(["agents", "--json"]);
+    let output = output_within(
+        &mut command,
+        "claude agents --json",
+        LIST_AGENTS_TIMEOUT,
+        executor,
+    )
+    .await
+    .with_context(|| "running claude agents --json")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "claude agents --json exited with {}: {stderr}",
+            output.status
+        );
+    }
+    parse_claude_agents_json(&stdout)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -280,6 +499,16 @@ pub async fn process_start_times(_process_ids: Vec<u32>) -> HashMap<u32, String>
     HashMap::default()
 }
 
+#[cfg(unix)]
+pub fn liveness_unavailable_reason() -> Option<&'static str> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn liveness_unavailable_reason() -> Option<&'static str> {
+    Some("Claude session liveness checks are unavailable on this host.")
+}
+
 pub fn normalize_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -323,7 +552,7 @@ pub fn find_transcript(home_directory: &Path, session_id: &str) -> Option<PathBu
 /// a separator or a parent component names something outside the projects directory, and
 /// what this module opens is handed back to its caller line by line — the sibling
 /// `<home>/.claude/sessions` holds the credentials for the sessions' messaging sockets.
-fn single_path_component(name: &str) -> Option<&str> {
+pub fn single_path_component(name: &str) -> Option<&str> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(std::path::Component::Normal(only_component)), None)
@@ -335,12 +564,180 @@ fn single_path_component(name: &str) -> Option<&str> {
     }
 }
 
+/// Longer than any id Claude Code writes — a session id is a 36 character uuid — and
+/// short enough that nothing of substance can be smuggled through as one.
+const MAX_COMMAND_OPERAND_BYTES: usize = 64;
+
+/// Status files in this module refuse to load more than 1 MiB; a spawned `claude` is held
+/// to the channel-message cap so a host that prints without bound cannot grow the process
+/// with it. Larger than any agents listing or resume line Claude Code writes.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The directory `claude` may be started in: an absolute path that already exists as a
+/// directory and that does not contain a NUL. A relative path is the process's, not the
+/// session's, and on a remote project the path is the far end's answer.
+pub fn claude_command_working_directory(path: &Path) -> Option<&Path> {
+    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+        return None;
+    }
+    path.is_dir().then_some(path)
+}
+
+/// The value an id may take when it is handed to `claude` as an operand, or to a shell
+/// as one word of a command line.
+///
+/// Stricter than [`single_path_component`], which is all a file name has to satisfy: an
+/// id also has to be unable to be read as an option or to close the word it sits in, and
+/// on a remote project it is the far end that chose it. Every id Claude Code writes — the
+/// short one an agents listing gives, and a session id — is alphanumeric with hyphens, so
+/// refusing the rest turns nothing legal away.
+pub fn claude_command_operand(value: &str) -> Option<&str> {
+    let value = single_path_component(value)?;
+    let is_plain =
+        |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '_';
+    (value.len() <= MAX_COMMAND_OPERAND_BYTES
+        && !value.starts_with('-')
+        && value.chars().all(is_plain))
+    .then_some(value)
+}
+
 /// The name a session's transcript file has, or `None` when the session id could name
 /// something other than a file inside one project's directory.
 fn transcript_file_name(session_id: &str) -> Option<String> {
     // Appending a suffix to a lone normal component cannot introduce a component of its
     // own, so the composed name stays inside one project's directory.
     Some(format!("{}.jsonl", single_path_component(session_id)?))
+}
+
+/// The directories a session's scratch files live in, which are not under its working
+/// directory and are named as absolutely as the working directory is. `/private/tmp` is
+/// the same directory as `/tmp` on macOS, and it is the spelling the paths are recorded
+/// with there, so both are listed rather than resolved.
+const TEMPORARY_DIRECTORIES: [&str; 2] = ["/tmp", "/private/tmp"];
+
+/// The directory a session was started in, as its own registration records it, or `None`
+/// when no registration names that session.
+///
+/// This is the same value the panel lists the session under, and it is read here rather
+/// than accepted from the caller because it is what a request to read a file is judged
+/// against: a working directory the requester supplies is no boundary at all.
+pub fn session_working_directory(home_directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let registry_directory = home_directory.join(".claude").join("sessions");
+    read_registrations(&registry_directory)
+        .log_err()?
+        .into_iter()
+        .find(|registration| registration.session_id == session_id)
+        .map(|registration| registration.working_directory)
+}
+
+/// Whether `path` stays inside `directory`: absolute, no `..`, and a prefix of `directory`.
+///
+/// The same shape [`attachment_is_readable`] uses, without the `/tmp` exception — a
+/// listing or slash-command walk is not an attachment.
+pub fn path_stays_inside(path: &Path, directory: &Path) -> bool {
+    if !path.is_absolute()
+        || !directory.is_absolute()
+        || directory.parent().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    path.starts_with(directory)
+}
+
+/// The directory `list_session_files` may walk for `session_id`: the session's working
+/// directory, or a sub-path of it named by `requested`.
+pub fn session_files_directory(
+    home_directory: &Path,
+    session_id: &str,
+    requested: &Path,
+) -> Result<PathBuf> {
+    let working_directory = session_working_directory(home_directory, session_id)
+        .with_context(|| format!("no session is registered as {session_id}"))?;
+    let directory = if requested.as_os_str().is_empty() {
+        working_directory.clone()
+    } else if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        working_directory.join(requested)
+    };
+    anyhow::ensure!(
+        path_stays_inside(&directory, &working_directory),
+        "{} is outside the working directory of session {session_id}",
+        directory.display(),
+    );
+    Ok(directory)
+}
+
+/// Whether `project_root` is the named session's working directory or inside it.
+///
+/// When `session_id` is absent, any live registration whose working directory contains
+/// `project_root` is enough: slash commands are listed for the project, not a pid.
+pub fn slash_command_project_root(
+    home_directory: &Path,
+    session_id: Option<&str>,
+    project_root: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let Some(project_root) = project_root else {
+        return Ok(None);
+    };
+    let working_directory = match session_id {
+        Some(session_id) => session_working_directory(home_directory, session_id)
+            .with_context(|| format!("no session is registered as {session_id}"))?,
+        None => {
+            let registry_directory = home_directory.join(".claude").join("sessions");
+            read_registrations(&registry_directory)?
+                .into_iter()
+                .map(|registration| registration.working_directory)
+                .find(|working_directory| path_stays_inside(project_root, working_directory))
+                .with_context(|| {
+                    format!(
+                        "{} is not inside any session's working directory",
+                        project_root.display()
+                    )
+                })?
+        }
+    };
+    anyhow::ensure!(
+        path_stays_inside(project_root, &working_directory),
+        "{} is outside the working directory of the session",
+        project_root.display(),
+    );
+    Ok(Some(project_root.to_path_buf()))
+}
+
+/// Whether a file a session recorded as a `SendUserFile` attachment may be read back.
+///
+/// The attachment sits wherever the session wrote it — under the project it is working
+/// on, or in the temporary directory its scratch files go to — so the boundary that
+/// guards offloaded tool outputs, `~/.claude/projects`, refuses every one of them. The
+/// boundary here is the session's own working directory instead, which is the same
+/// subtree the session can already read and write on its user's behalf, plus the
+/// temporary directories.
+///
+/// Requiring an absolute path with no parent component ("..") is what makes the prefix
+/// check mean what it says: without it, a path under the working directory could climb
+/// out of it and name a key file.
+pub fn attachment_is_readable(path: &Path, working_directory: &Path) -> bool {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+
+    // A working directory that is the filesystem root is not a boundary, and a relative
+    // one cannot be compared against an absolute path at all.
+    let working_directory_bounds =
+        working_directory.is_absolute() && working_directory.parent().is_some();
+
+    (working_directory_bounds && path.starts_with(working_directory))
+        || TEMPORARY_DIRECTORIES
+            .iter()
+            .any(|directory| path.starts_with(directory))
 }
 
 #[derive(Clone)]
@@ -463,6 +860,7 @@ fn read_appended_lines(
         state.offset = state.offset.saturating_add(appended.len() as u64);
         state.pending.extend_from_slice(&appended);
         lines = split_complete_lines(&mut state.pending);
+        cap_pending_buffer(&mut state.pending);
     }
 
     Ok(TailProgress {
@@ -473,6 +871,343 @@ fn read_appended_lines(
         lines,
         restarted,
     })
+}
+
+/// Follows `~/.claude/zed-events/<session_id>.jsonl`. No file yet is progress with no
+/// lines and path None, the same answer a transcript that has not been written yet gives.
+pub fn read_events_tail(
+    home_directory: &Path,
+    session_id: &str,
+    mut state: TailState,
+) -> Result<TailProgress> {
+    let start_offset = state.offset;
+    let Some(path) = events_file_path(home_directory, session_id) else {
+        return Ok(tail_of_no_file(&state));
+    };
+    if !path.is_file() {
+        return Ok(tail_of_no_file(&state));
+    }
+
+    // A remote tail does not send the path back: the file is always this one, named by
+    // session id. Restart only when a previously followed path disagrees, not when the
+    // path is still unknown.
+    let mut restarted = false;
+    if let Some(followed) = state.path.as_ref()
+        && followed != &path
+    {
+        restarted = state.offset > 0 || !state.pending.is_empty();
+        state.offset = 0;
+        state.pending.clear();
+    }
+
+    read_appended_lines(path, state, start_offset, restarted)
+}
+
+/// The ceiling on the statusLine snapshot, which is read whole on every poll and framed
+/// onto the wire behind it. The CLI's own status JSON is a couple of kilobytes, so
+/// anything past this is not a status line and is refused rather than carried.
+const MAX_STATUS_FILE_BYTES: u64 = 1024 * 1024;
+
+pub fn read_session_status(home_directory: &Path, session_id: &str) -> Result<Option<String>> {
+    let Some(path) = status_file_path(home_directory, session_id) else {
+        return Ok(None);
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.len() <= MAX_STATUS_FILE_BYTES,
+            "{} is {} bytes, past the {} a status line may be",
+            path.display(),
+            metadata.len(),
+            MAX_STATUS_FILE_BYTES,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading metadata of {}", path.display()));
+        }
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn events_file_path(home_directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let session_id = single_path_component(session_id)?;
+    Some(
+        home_directory
+            .join(".claude")
+            .join(EVENTS_DIRECTORY)
+            .join(format!("{session_id}.jsonl")),
+    )
+}
+
+fn status_file_path(home_directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let session_id = single_path_component(session_id)?;
+    Some(
+        home_directory
+            .join(".claude")
+            .join(STATUS_DIRECTORY)
+            .join(format!("{session_id}.json")),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelStatus {
+    pub live: bool,
+    pub heartbeat_at_ms: Option<i64>,
+    pub server_pid: Option<u32>,
+    pub features: Vec<String>,
+}
+
+fn channel_root(home_directory: &Path) -> PathBuf {
+    home_directory.join(".claude").join(CHANNEL_DIRECTORY)
+}
+
+pub fn channel_server_path(home_directory: &Path) -> PathBuf {
+    channel_root(home_directory).join(CHANNEL_SERVER_FILE)
+}
+
+fn channel_session_directory(home_directory: &Path, claude_pid: u32) -> Result<PathBuf> {
+    ensure_nonzero_claude_pid(claude_pid)?;
+    Ok(channel_root(home_directory).join(claude_pid.to_string()))
+}
+
+fn ensure_nonzero_claude_pid(claude_pid: u32) -> Result<()> {
+    if claude_pid == 0 {
+        bail!("claude_pid must not be 0");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ChannelServerFile {
+    pid: Option<u32>,
+    heartbeat_at_ms: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_channel_features")]
+    features: Vec<String>,
+}
+
+/// Missing → empty (serde default). Null, a string, or any non-array → empty so a
+/// live heartbeat is not thrown away with the rest of server.json. Array elements
+/// that are not strings are skipped so `["interrupt", 1]` still advertises interrupt.
+fn deserialize_channel_features<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(feature) => Some(feature),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Whether the Zed channel server for `claude_pid` is live: `server.json` exists as a
+/// regular file (never a symlink) and its heartbeat is no older than 20 seconds.
+pub fn channel_status(home: &Path, claude_pid: u32, now_ms: i64) -> ChannelStatus {
+    let absent = ChannelStatus {
+        live: false,
+        heartbeat_at_ms: None,
+        server_pid: None,
+        features: Vec::new(),
+    };
+    if claude_pid == 0 {
+        return absent;
+    }
+    let Ok(session_directory) = channel_session_directory(home, claude_pid) else {
+        return absent;
+    };
+    let path = session_directory.join("server.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) => return absent,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return absent;
+    }
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return absent;
+    };
+    let Ok(file) = serde_json::from_str::<ChannelServerFile>(&contents) else {
+        return absent;
+    };
+    let heartbeat_at_ms = file.heartbeat_at_ms;
+    let live = heartbeat_at_ms.is_some_and(|heartbeat_at_ms| {
+        now_ms.saturating_sub(heartbeat_at_ms) <= CHANNEL_HEARTBEAT_STALE_MS
+    });
+    ChannelStatus {
+        live,
+        heartbeat_at_ms,
+        server_pid: file.pid,
+        features: file.features,
+    }
+}
+
+static CHANNEL_OUTBOX_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+fn next_outbox_sequence() -> u32 {
+    CHANNEL_OUTBOX_SEQUENCE.fetch_add(1, Ordering::Relaxed) % CHANNEL_OUTBOX_SEQ_MODULUS
+}
+
+/// Publishes one outbox payload under a name the server reads in lexical order.
+///
+/// The sequence that makes those names unique is this process's own and starts over in
+/// every Zed, so a second Zed sending to the same session in the same millisecond reaches
+/// for the very same name. A name something already holds is left alone and the next one
+/// taken instead, and the temporary file is named after this process, so neither writer
+/// renames over the other's message or writes through the other's temporary file. What is
+/// left is the instant between the two, which nothing this side of the protocol can close:
+/// only the server, which deletes a name within a poll of it appearing, ever sees both.
+fn publish_outbox_file(
+    outbox: &Path,
+    now_ms: i64,
+    encoded: &[u8],
+    next_sequence: &mut dyn FnMut() -> u32,
+) -> Result<String> {
+    for _ in 0..CHANNEL_OUTBOX_NAME_ATTEMPTS {
+        let name = format!("{now_ms:013}-{:04}.json", next_sequence());
+        let destination = outbox.join(&name);
+        if fs::symlink_metadata(&destination).is_ok() {
+            continue;
+        }
+        let temporary = outbox.join(format!("{name}.{}.tmp", std::process::id()));
+        fs::write(&temporary, encoded)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        fs::rename(&temporary, &destination)
+            .with_context(|| format!("publishing {}", destination.display()))?;
+        return Ok(name);
+    }
+    bail!(
+        "no free channel outbox name in {} after {CHANNEL_OUTBOX_NAME_ATTEMPTS} tries",
+        outbox.display()
+    );
+}
+
+fn write_outbox_json(home: &Path, claude_pid: u32, payload: &serde_json::Value) -> Result<String> {
+    let session_directory = channel_session_directory(home, claude_pid)?;
+    let outbox = session_directory.join("outbox");
+    fs::create_dir_all(&outbox).with_context(|| format!("creating {}", outbox.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&session_directory, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("locking down {}", session_directory.display()))?;
+    }
+
+    let encoded = serde_json::to_vec(payload).context("encoding a channel outbox payload")?;
+    if encoded.len() > CHANNEL_MESSAGE_MAX_BYTES {
+        bail!("channel outbox file exceeds 4 MiB");
+    }
+    publish_outbox_file(&outbox, now_millis(), &encoded, &mut next_outbox_sequence)
+}
+
+pub fn channel_send_message(home: &Path, claude_pid: u32, content: &str) -> Result<String> {
+    ensure_nonzero_claude_pid(claude_pid)?;
+    if content.trim().is_empty() {
+        bail!("message content must not be empty");
+    }
+    if content.len() > CHANNEL_MESSAGE_MAX_BYTES {
+        bail!("message content exceeds 4 MiB");
+    }
+    write_outbox_json(
+        home,
+        claude_pid,
+        &serde_json::json!({
+            "kind": "message",
+            "content": content,
+            "meta": { "from": "zed" },
+        }),
+    )
+}
+
+/// How long an interrupt reason may be. Counted in Unicode scalar values, matching the
+/// bound the channel server applies before it will send SIGINT.
+pub const CHANNEL_INTERRUPT_REASON_MAX_CHARS: usize = 200;
+
+pub fn channel_interrupt(home: &Path, claude_pid: u32, reason: &str) -> Result<String> {
+    ensure_nonzero_claude_pid(claude_pid)?;
+    if reason.chars().count() > CHANNEL_INTERRUPT_REASON_MAX_CHARS {
+        bail!("interrupt reason exceeds {CHANNEL_INTERRUPT_REASON_MAX_CHARS} characters");
+    }
+    write_outbox_json(
+        home,
+        claude_pid,
+        &serde_json::json!({
+            "kind": "interrupt",
+            "reason": reason,
+        }),
+    )
+}
+
+fn request_id_is_valid(request_id: &str) -> bool {
+    let length = request_id.len();
+    (1..=16).contains(&length)
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+pub fn channel_answer_permission(
+    home: &Path,
+    claude_pid: u32,
+    request_id: &str,
+    allow: bool,
+) -> Result<String> {
+    ensure_nonzero_claude_pid(claude_pid)?;
+    if !request_id_is_valid(request_id) {
+        bail!("invalid permission request_id");
+    }
+    let behavior = if allow { "allow" } else { "deny" };
+    write_outbox_json(
+        home,
+        claude_pid,
+        &serde_json::json!({
+            "kind": "permission",
+            "request_id": request_id,
+            "behavior": behavior,
+        }),
+    )
+}
+
+/// Follows `~/.claude/zed-channel/<claude_pid>/inbox.jsonl`. Same semantics as
+/// [`read_events_tail`]: no file is empty progress, a shrink restarts.
+pub fn read_channel_inbox_tail(
+    home: &Path,
+    claude_pid: u32,
+    mut state: TailState,
+) -> Result<TailProgress> {
+    ensure_nonzero_claude_pid(claude_pid)?;
+    let start_offset = state.offset;
+    let path = channel_session_directory(home, claude_pid)?.join("inbox.jsonl");
+    if !path.is_file() {
+        return Ok(tail_of_no_file(&state));
+    }
+
+    let mut restarted = false;
+    if let Some(followed) = state.path.as_ref()
+        && followed != &path
+    {
+        restarted = state.offset > 0 || !state.pending.is_empty();
+        state.offset = 0;
+        state.pending.clear();
+    }
+
+    read_appended_lines(path, state, start_offset, restarted)
+}
+
+pub fn channel_setup_commands(home: &Path) -> String {
+    let server = channel_server_path(home);
+    format!(
+        "claude mcp add --scope user zed-claude -- node '{}'\nexport CLAUDE_EXTRA_ARGS='--dangerously-load-development-channels server:zed-claude'",
+        server.display()
+    )
 }
 
 /// The record Claude Code writes when it compacts a conversation, which says how much
@@ -587,6 +1322,12 @@ fn spend_in_lines<'a>(lines: impl Iterator<Item = &'a str>) -> TranscriptSpend {
 
 /// Splits every complete line out of `buffer`, leaving any trailing partial line behind.
 ///
+/// How large the unfinished line of a tail may grow before it is dropped. A line that
+/// never ends would otherwise be held forever on both sides of the wire.
+pub const TAIL_PENDING_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+static PENDING_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// The buffer holds bytes rather than text because a read can stop in the middle of a
 /// multi-byte character; only a run of bytes terminated by a newline is known to be a
 /// whole line, and only then is it interpreted as text.
@@ -605,7 +1346,22 @@ pub fn split_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     }
 
     buffer.drain(..consumed);
+    cap_pending_buffer(buffer);
     lines
+}
+
+/// Drops a partial line that has grown past [`TAIL_PENDING_CAP_BYTES`]. The next newline
+/// is what resynchronises the tail; nothing of the dropped bytes is emitted.
+fn cap_pending_buffer(buffer: &mut Vec<u8>) {
+    if buffer.len() <= TAIL_PENDING_CAP_BYTES {
+        return;
+    }
+    if !PENDING_CAP_LOGGED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "dropping a tailed line past {TAIL_PENDING_CAP_BYTES} bytes; resyncing at the next newline"
+        );
+    }
+    buffer.clear();
 }
 
 /// A session as the machine it runs on sees it: the registration, plus where its
@@ -680,12 +1436,41 @@ const WORKFLOW_RUN_ID_LABEL: &str = "Run ID:";
 const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
 const WORKFLOW_JOURNAL_RESULT_TYPE: &str = "result";
 const WORKFLOW_JOURNAL_STARTED_TYPE: &str = "started";
-const PENDING_QUESTIONS_DIRECTORY: &str = "pending-questions";
-const QUESTION_HOOK_SCRIPT: &str = "hooks/record-pending-question.sh";
-const QUESTION_HOOK_TOOL: &str = "AskUserQuestion";
-const LIVE_MESSAGES_DIRECTORY: &str = "live-messages";
-const LIVE_MESSAGE_HOOK_SCRIPT: &str = "hooks/record-live-message.sh";
-const LIVE_MESSAGE_HOOK_EVENT: &str = "MessageDisplay";
+const EVENTS_DIRECTORY: &str = "zed-events";
+const STATUS_DIRECTORY: &str = "zed-status";
+const CHANNEL_DIRECTORY: &str = "zed-channel";
+const CHANNEL_SERVER_FILE: &str = "server.mjs";
+/// How old a heartbeat may be and still count as live. The same bound dates the age
+/// the panel draws beside it.
+pub const CHANNEL_HEARTBEAT_STALE_MS: i64 = 20_000;
+pub const CHANNEL_MESSAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const CHANNEL_OUTBOX_SEQ_MODULUS: u32 = 10_000;
+/// How many names one send may reach for before giving up. The name space for one
+/// millisecond is [`CHANNEL_OUTBOX_SEQ_MODULUS`] wide; stopping earlier would refuse a
+/// send while free names of that millisecond were still unused.
+const CHANNEL_OUTBOX_NAME_ATTEMPTS: usize = CHANNEL_OUTBOX_SEQ_MODULUS as usize;
+const EVENTS_HOOK_SCRIPT: &str = "hooks/zed-claude-events.sh";
+const STATUS_HOOK_SCRIPT: &str = "hooks/zed-claude-status.sh";
+const CHAINED_STATUS_COMMAND_FILE: &str = "chained-command.txt";
+const LEGACY_QUESTION_HOOK_SCRIPT: &str = "hooks/record-pending-question.sh";
+const LEGACY_LIVE_MESSAGE_HOOK_SCRIPT: &str = "hooks/record-live-message.sh";
+const LEGACY_QUESTION_HOOK_NAME: &str = "record-pending-question.sh";
+const LEGACY_LIVE_MESSAGE_HOOK_NAME: &str = "record-live-message.sh";
+const HOOK_EVENTS: [&str; 13] = [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Notification",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "PostModelSwitch",
+    "MessageDisplay",
+    "SessionEnd",
+];
 
 /// The `agent-<agentId>.meta.json` sidecar written beside a subagent's transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -921,6 +1706,36 @@ const BUILTIN_SLASH_COMMANDS: [(&str, &str); 14] = [
     ("help", "List every command"),
 ];
 
+/// Slash commands that open a terminal dialog. Sent as text only when they take an
+/// argument (`/mcp …`); otherwise the panel tells the reader to use the terminal.
+pub const CHANNEL_DIALOG_SLASH_COMMANDS: &[&str] = &[
+    "permissions",
+    "login",
+    "logout",
+    "resume",
+    "agents",
+    "plugin",
+    "hooks",
+    "memory",
+    "theme",
+    "export",
+    "bug",
+    "vim",
+    "ide",
+    "doctor",
+    "mcp",
+];
+
+/// Slash commands that are sent as text only when an argument is present.
+pub const CHANNEL_ARGUMENT_SLASH_COMMANDS: &[&str] = &[
+    "model",
+    "effort",
+    "config",
+    "autocompact",
+    "output-style",
+    "advisor",
+];
+
 /// Every slash command a session in `project_root` would answer to.
 ///
 /// Ordered so that rows do not move between reads — directory enumeration is in no
@@ -1093,6 +1908,8 @@ fn walk_for_mentions(
 /// still has somewhere to put one.
 const PASTED_FILE_DIRECTORY: &str = "zed-pasted";
 
+const PASTED_FILE_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Larger than any screenshot, and small enough that a paste cannot fill a disk.
 const MAX_PASTED_FILE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -1116,12 +1933,89 @@ pub fn write_pasted_file(home_directory: &Path, name: &str, contents: &[u8]) -> 
     let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
     fs::create_dir_all(&directory).with_context(|| format!("creating {}", directory.display()))?;
 
+    let directory_metadata = fs::symlink_metadata(&directory)
+        .with_context(|| format!("reading metadata for {}", directory.display()))?;
+    anyhow::ensure!(
+        directory_metadata.is_dir() && !directory_metadata.file_type().is_symlink(),
+        "{} must be a real directory",
+        directory.display()
+    );
+    // Housekeeping, not part of the paste: a directory this user cannot read or unlink
+    // from is a reason to leave the old files alone, not a reason to lose the new one.
+    if let Err(error) = prune_pasted_files(&directory, now_millis()) {
+        log::warn!("pruning {}: {error:#}", directory.display());
+    }
+
     let path = directory.join(name);
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "{} must be a regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("writing {}", path.display()))?;
 
     path.to_str()
         .map(str::to_string)
         .context("the path this was written to cannot be spelled for the session")
+}
+
+fn prune_pasted_files(directory: &Path, now_ms: i64) -> Result<()> {
+    let cutoff_ms =
+        now_ms.saturating_sub(i64::try_from(PASTED_FILE_KEEP.as_millis()).unwrap_or(i64::MAX));
+    let entries =
+        fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?;
+    // One entry is never allowed to decide the fate of the others, or of the paste that
+    // asked for this: a second window removing a file between this `read_dir` and the
+    // look at it is ordinary, and a file left by another user is not this one's to fix.
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("reading an entry in {}: {error}", directory.display());
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                log::warn!("reading metadata for {}: {error}", path.display());
+                continue;
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(written_at_ms) = pasted_file_timestamp_ms(&entry.file_name()) else {
+            continue;
+        };
+        if written_at_ms < cutoff_ms
+            && let Err(error) = fs::remove_file(&path)
+        {
+            log::warn!("removing {}: {error}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn pasted_file_timestamp_ms(name: &std::ffi::OsStr) -> Option<i64> {
+    let name = name.to_str()?.strip_prefix("pasted-")?;
+    let timestamp = name
+        .split_once('-')
+        .map(|(timestamp, _)| timestamp)
+        .or_else(|| name.split_once('.').map(|(timestamp, _)| timestamp))?;
+    timestamp.parse().ok()
 }
 
 /// The file a skill's directory is a skill by virtue of holding.
@@ -1292,368 +2186,568 @@ fn slash_command_front_matter(contents: &str) -> (Option<String>, Option<String>
     (description, argument_hint)
 }
 
-/// One piece of a message as the terminal drew it.
-#[derive(Deserialize)]
-struct LiveMessagePiece {
-    #[serde(default)]
-    message_id: Option<String>,
-    #[serde(default)]
-    index: u64,
-    #[serde(default)]
-    delta: String,
-}
-
-/// What the session is saying right now, assembled from the pieces the terminal drew.
+/// Appends every Claude Code hook event to `~/.claude/zed-events/<session_id>.jsonl`.
 ///
-/// `None` when nothing has been recorded, which includes a machine without the hook and a
-/// session that has not said anything since it was installed.
-pub fn read_live_message(home_directory: &Path, session_id: &str) -> Result<Option<String>> {
-    let Some(session_id) = single_path_component(session_id) else {
-        return Ok(None);
-    };
-    let path = home_directory
-        .join(".claude")
-        .join(LIVE_MESSAGES_DIRECTORY)
-        .join(format!("{session_id}.jsonl"));
-
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    };
-
-    Ok(assemble_live_message(&contents))
-}
-
-/// Puts one message back together from the pieces recorded for it.
-///
-/// Only the newest message in the file is assembled: the file is truncated when a message
-/// begins, but a truncation that did not happen — the hook could not write, or a message
-/// began while the file was being read — would otherwise show two messages run together.
-///
-/// Pieces are ordered by the index they carry rather than by the order they were written,
-/// and a piece that is unreadable or repeats an index already seen is skipped: a line is
-/// appended while this is being read, so the last one is regularly half-written.
-fn assemble_live_message(contents: &str) -> Option<String> {
-    let mut pieces: Vec<LiveMessagePiece> = Vec::new();
-    for line in contents.lines() {
-        let Ok(piece) = serde_json::from_str::<LiveMessagePiece>(line) else {
-            continue;
-        };
-        pieces.push(piece);
-    }
-
-    let newest_message = pieces.last()?.message_id.clone();
-    if newest_message.is_some() {
-        pieces.retain(|piece| piece.message_id == newest_message);
-    } else {
-        // Nothing names which message these belong to, so the only boundary left is a
-        // message starting over. Taken as the last such start rather than by clearing as
-        // they are read, because the pieces are not in the order they are numbered.
-        let last_start = pieces
-            .iter()
-            .rposition(|piece| piece.index == 0)
-            .unwrap_or(0);
-        pieces.drain(..last_start);
-    }
-
-    pieces.sort_by_key(|piece| piece.index);
-    pieces.dedup_by_key(|piece| piece.index);
-
-    let message: String = pieces.into_iter().map(|piece| piece.delta).collect();
-    (!message.trim().is_empty()).then_some(message)
-}
-
-/// The question the hook last recorded for this session, if it recorded one.
-///
-/// A file left behind by a question that has since been answered is not filtered here:
-/// only the session's conversation says whether the call was answered, and this function
-/// is the one place that does not have it. The caller checks; see [`PendingQuestion`].
-pub fn read_pending_question(
-    home_directory: &Path,
-    session_id: &str,
-) -> Result<Option<PendingQuestion>> {
-    let Some(session_id) = single_path_component(session_id) else {
-        return Ok(None);
-    };
-    let path = home_directory
-        .join(".claude")
-        .join(PENDING_QUESTIONS_DIRECTORY)
-        .join(format!("{session_id}.json"));
-
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        // A session that has never asked anything leaves no file, which is the ordinary
-        // case rather than a failure.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    };
-
-    parse_pending_question(&contents)
-        .with_context(|| format!("parsing {}", path.display()))
-        .or_else(|error| {
-            // The hook writes this file whole, but a reader that refused to draw anything
-            // because one payload was unreadable would lose the terminal mirror as well.
-            log::warn!("{error:#}");
-            Ok(None)
-        })
-}
-
-/// The shell script the hook runs. It records the call and decides nothing about it:
-/// anything on stdout would be read by the CLI as a ruling on the tool call it is
-/// watching, so this prints nothing and always succeeds.
-const QUESTION_HOOK_SOURCE: &str = r#"#!/bin/sh
-# Written by Zed. Records the question a session is waiting on, so that a reader outside
-# the terminal can draw it as something to click. The CLI writes nothing about a question
-# into its transcript until the question has been answered, so this is the only place the
-# structure of a waiting question can be read from.
-#
-# Nothing is printed and the exit status is always 0: this hook rules on nothing.
+/// Nothing is printed and the exit status is always 0: this hook rules on nothing.
+const EVENTS_HOOK_SOURCE: &str = r#"#!/bin/sh
+# Written by Zed. Appends every hook event so a reader outside the terminal can
+# follow the session without reading the screen.
 payload=$(cat)
 hook_directory=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || exit 0
 case "$hook_directory" in
   */.claude/hooks) claude_directory=${hook_directory%/hooks} ;;
   *) [ -n "${HOME:-}" ] || exit 0; claude_directory="$HOME/.claude" ;;
 esac
-directory="$claude_directory/pending-questions"
-mkdir -p "$directory" || exit 0
-session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
-# Not every machine a session runs on has python3, and a hook that silently recorded
-# nothing there would look exactly like a session that has never asked anything.
+session=$(printf '%s' "$payload" | python3 -c 'import json,sys; found=json.load(sys.stdin).get("session_id"); print(found if isinstance(found, str) else "")' 2>/dev/null)
 if [ -z "$session" ]; then
   session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
 fi
 [ -n "$session" ] || exit 0
 case "$session" in */*|.|..) exit 0 ;; esac
-printf '%s' "$payload" > "$directory/$session.json.tmp" 2>/dev/null || exit 0
-mv "$directory/$session.json.tmp" "$directory/$session.json" 2>/dev/null || exit 0
-exit 0
-"#;
-
-/// The shell script that records what a session is saying as it says it.
-///
-/// The CLI does not write an assistant message into its transcript until the turn holding
-/// it is over, which on a long turn is tens of seconds after the words were on screen.
-/// This event carries them as they are drawn.
-///
-/// Each message starts again at index 0, which is the only thing keeping this file to one
-/// message: the first piece of a message truncates it and the rest are appended.
-const LIVE_MESSAGE_HOOK_SOURCE: &str = r#"#!/bin/sh
-# Written by Zed. Records what a session is saying while it says it, because the
-# transcript does not get the words until the turn is over.
-#
-# Nothing is printed and the exit status is always 0: this hook rules on nothing.
-payload=$(cat)
-hook_directory=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || exit 0
-case "$hook_directory" in
-  */.claude/hooks) claude_directory=${hook_directory%/hooks} ;;
-  *) [ -n "${HOME:-}" ] || exit 0; claude_directory="$HOME/.claude" ;;
-esac
-directory="$claude_directory/live-messages"
+payload=$(printf '%s' "$payload" | tr -d '\n\r')
+directory="$claude_directory/zed-events"
 mkdir -p "$directory" || exit 0
-session=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
-if [ -z "$session" ]; then
-  session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-fi
-[ -n "$session" ] || exit 0
-case "$session" in */*|.|..) exit 0 ;; esac
-
 file="$directory/$session.jsonl"
-# A message begins again at index 0, so its first piece is what clears the one before it.
-# Without this the file is every message the session has ever drawn.
-index=$(printf '%s' "$payload" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("index"); print(value if type(value) is int else "")' 2>/dev/null)
-if [ -z "$index" ]; then
-  index=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"index"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
-fi
-if [ -n "$index" ] && [ "$index" -eq 0 ] 2>/dev/null; then
-  : > "$file" 2>/dev/null || exit 0
-fi
-# A message that somehow never starts over must not grow without limit.
 if [ -f "$file" ]; then
   size=$(wc -c < "$file" 2>/dev/null || echo 0)
-  [ "$size" -lt 262144 ] || : > "$file" 2>/dev/null
+  [ "$size" -le 8388608 ] || : > "$file" 2>/dev/null
 fi
-printf '%s\n' "$payload" >> "$file" 2>/dev/null || exit 0
+received_at_ms=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null)
+if [ -n "$received_at_ms" ]; then have_python=yes; else have_python=; received_at_ms=$(date +%s)000; fi
+line="{\"received_at_ms\":${received_at_ms},\"event\":${payload}}"
+# Appended in one write(2) where that is possible. A shell redirect writes a long
+# payload in several chunks, and hooks are not serialized with one another: parallel
+# tool calls answer their PostToolUse together, so two chunked appends interleave and
+# destroy both lines.
+if [ -n "$have_python" ]; then
+  printf '%s\n' "$line" | python3 -c 'import os,sys
+data = sys.stdin.buffer.read()
+handle = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+while data:
+    data = data[os.write(handle, data):]' "$file" 2>/dev/null
+else
+  printf '%s\n' "$line" >> "$file" 2>/dev/null
+fi
 exit 0
 "#;
 
-/// The hooks Zed installs, as the event they answer and the script that answers it.
-///
-/// Both exist for the same reason — the CLI writes neither a waiting question nor the
-/// words of a turn in progress anywhere a reader can see them — so they are installed
-/// together and reported together. A machine with one and not the other is a machine
-/// where installing was interrupted, and is offered the install again.
-const INSTALLED_HOOKS: [(&str, &str, &str); 2] = [
-    (
-        "PreToolUse",
-        QUESTION_HOOK_SCRIPT,
-        QUESTION_HOOK_SOURCE_PLACEHOLDER,
-    ),
-    (
-        LIVE_MESSAGE_HOOK_EVENT,
-        LIVE_MESSAGE_HOOK_SCRIPT,
-        LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER,
-    ),
-];
+/// Writes the CLI's status JSON for a session, and chains the user's own statusLine
+/// command when one was displaced.
+const STATUS_HOOK_SOURCE: &str = r#"#!/bin/sh
+# Written by Zed. Records the CLI's status JSON and optionally chains the user's
+# own statusLine command so its stdout still reaches the CLI.
+payload=$(cat)
+hook_directory=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || exit 0
+case "$hook_directory" in
+  */.claude/hooks) claude_directory=${hook_directory%/hooks} ;;
+  *) [ -n "${HOME:-}" ] || exit 0; claude_directory="$HOME/.claude" ;;
+esac
+session=$(printf '%s' "$payload" | python3 -c 'import json,sys; found=json.load(sys.stdin).get("session_id"); print(found if isinstance(found, str) else "")' 2>/dev/null)
+if [ -z "$session" ]; then
+  session=$(printf '%s' "$payload" | tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+fi
+directory="$claude_directory/zed-status"
+if [ -n "$session" ]; then
+  case "$session" in */*|.|..) session= ;; esac
+fi
+if [ -n "$session" ]; then
+  mkdir -p "$directory" || exit 0
+  file="$directory/$session.json"
+  printf '%s' "$payload" > "$file.tmp" 2>/dev/null || exit 0
+  mv "$file.tmp" "$file" 2>/dev/null || exit 0
+fi
+chained="$claude_directory/zed-status/chained-command.txt"
+if [ -f "$chained" ]; then
+  command=$(cat "$chained" 2>/dev/null)
+  if [ -n "$command" ]; then
+    printf '%s' "$payload" | sh -c "$command" || true
+  fi
+fi
+exit 0
+"#;
 
-/// The two sources, kept out of [`INSTALLED_HOOKS`] because a `const` array cannot hold
-/// them by reference and repeating them would be two copies to keep in step.
-const QUESTION_HOOK_SOURCE_PLACEHOLDER: &str = "question";
-const LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER: &str = "live-message";
+const CHANNEL_SERVER_SOURCE: &str = include_str!("../assets/zed-claude-channel/server.mjs");
 
-fn hook_source(placeholder: &str) -> &'static str {
-    match placeholder {
-        LIVE_MESSAGE_HOOK_SOURCE_PLACEHOLDER => LIVE_MESSAGE_HOOK_SOURCE,
-        _ => QUESTION_HOOK_SOURCE,
-    }
-}
-
-/// Only the question hook is matched to a tool; the message hook answers every message
-/// its event is raised for.
-fn hook_matcher(event: &str) -> Option<&'static str> {
-    (event == "PreToolUse").then_some(QUESTION_HOOK_TOOL)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookInstallOutcome {
+    AlreadyCurrent,
+    ScriptsRefreshed,
+    Installed { backup_path: Option<PathBuf> },
 }
 
 fn shell_quote(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
-/// Whether the hooks Zed installs are in place on this machine.
-pub fn question_hook_is_installed(home_directory: &Path) -> bool {
-    let Some(settings) = read_claude_settings(home_directory).log_err().flatten() else {
-        return false;
-    };
-
-    INSTALLED_HOOKS.iter().all(|(event, script, placeholder)| {
-        let script = home_directory.join(".claude").join(script);
-        let command = shell_quote(script.to_string_lossy().as_ref());
-        // The contents rather than the file's existence: these scripts are Zed's own,
-        // and a fix to one of them reaches a machine only by being written there again.
-        // A machine that installed an earlier version would otherwise be stuck on it
-        // for good, which is every machine a fix is written for.
-        let is_current = fs::read_to_string(&script)
-            .is_ok_and(|installed| installed == hook_source(placeholder));
-        is_current && settings_name_the_hook(&settings, event, &command)
-    })
+fn claude_directory(home_directory: &Path) -> PathBuf {
+    home_directory.join(".claude")
 }
 
-fn read_claude_settings(home_directory: &Path) -> Result<Option<serde_json::Value>> {
-    let path = home_directory.join(".claude").join("settings.json");
+fn settings_path(home_directory: &Path) -> PathBuf {
+    claude_directory(home_directory).join("settings.json")
+}
+
+fn settings_backup_path(home_directory: &Path) -> PathBuf {
+    claude_directory(home_directory).join("settings.json.zed-backup")
+}
+
+fn events_hook_path(home_directory: &Path) -> PathBuf {
+    claude_directory(home_directory).join(EVENTS_HOOK_SCRIPT)
+}
+
+fn status_hook_path(home_directory: &Path) -> PathBuf {
+    claude_directory(home_directory).join(STATUS_HOOK_SCRIPT)
+}
+
+fn command_refers_to(command: &str, script_name: &str) -> bool {
+    command.contains(script_name)
+}
+
+fn read_claude_settings(home_directory: &Path) -> Result<serde_json::Value> {
+    let path = settings_path(home_directory);
     match fs::read_to_string(&path) {
-        Ok(contents) => {
-            let settings = serde_json::from_str(&contents)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            Ok(Some(settings))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("{} could not be parsed", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
 
-fn settings_name_the_hook(settings: &serde_json::Value, event: &str, command: &str) -> bool {
-    let matcher = hook_matcher(event);
-    settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get(event))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry.get("matcher").and_then(serde_json::Value::as_str) == matcher
-                    && entry
-                        .get("hooks")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|hooks| {
-                            hooks.iter().any(|hook| {
-                                hook.get("command").and_then(serde_json::Value::as_str)
-                                    == Some(command)
-                            })
-                        })
-            })
-        })
+fn write_script_if_changed(path: &Path, source: &str) -> Result<bool> {
+    let current = fs::read_to_string(path).ok();
+    if current.as_deref() == Some(source) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, source).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", path.display()))?;
+    }
+    Ok(true)
 }
 
-/// Installs the hook that records waiting questions, and reports the path the previous
-/// settings were copied to when there were settings to copy.
-///
-/// The settings file belongs to its user and holds everything else they have configured,
-/// so it is read, added to, and written back rather than replaced, and a copy of what was
-/// there is kept first. Installing twice changes nothing.
-pub fn install_question_hook(home_directory: &Path) -> Result<Option<PathBuf>> {
-    let claude_directory = home_directory.join(".claude");
-    let settings_path = claude_directory.join("settings.json");
-
-    // Written before the settings are touched: a settings file naming a script that is
-    // not there yet would have the CLI reporting a broken hook until this finished.
-    let mut commands = Vec::new();
-    for (event, script, source) in INSTALLED_HOOKS {
-        let script = claude_directory.join(script);
-        if let Some(parent) = script.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&script, hook_source(source))
-            .with_context(|| format!("writing {}", script.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("making {} executable", script.display()))?;
-        }
-        commands.push((event, shell_quote(script.to_string_lossy().as_ref())));
+fn write_regular_file_if_changed(
+    path: &Path,
+    source: &str,
+    #[cfg_attr(not(unix), allow(unused_variables))] unix_mode: u32,
+) -> Result<bool> {
+    let current = fs::read_to_string(path).ok();
+    if current.as_deref() == Some(source) {
+        return Ok(false);
     }
-
-    let existing = read_claude_settings(home_directory)?;
-    let missing: Vec<&(&str, String)> = commands
-        .iter()
-        .filter(|(event, command)| match &existing {
-            Some(settings) => !settings_name_the_hook(settings, event, command),
-            None => true,
-        })
-        .collect();
-    if missing.is_empty() {
-        return Ok(None);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
+    fs::write(path, source).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(unix_mode))
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    Ok(true)
+}
 
-    let backup = match &existing {
-        Some(_) => {
-            let backup = settings_path.with_extension(format!("json.bak.{}", now_millis()));
-            fs::copy(&settings_path, &backup)
-                .with_context(|| format!("copying {} aside", settings_path.display()))?;
-            Some(backup)
-        }
-        None => None,
-    };
+fn remove_path_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(inner) if inner.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(error).with_context(|| format!("removing {}", path.display())),
+        },
+    }
+}
 
-    let mut settings = existing.unwrap_or_else(|| serde_json::json!({}));
+fn hook_entries_mut<'a>(
+    settings: &'a mut serde_json::Value,
+    event: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
     let settings_object = settings
         .as_object_mut()
-        .with_context(|| format!("{} does not hold a JSON object", settings_path.display()))?;
+        .context("settings.json does not hold a JSON object")?;
     let hooks = settings_object
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .context("`hooks` does not hold a JSON object")?;
+    hooks
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| format!("`hooks.{event}` does not hold a JSON array"))
+}
 
-    for (event, command) in missing {
-        let mut hook = serde_json::json!({
-            "hooks": [{ "type": "command", "command": command }],
+fn entry_command_strings(entry: &serde_json::Value) -> Vec<String> {
+    entry
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .map(|hooks| {
+            hooks
+                .iter()
+                .filter_map(|hook| {
+                    hook.get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remove_legacy_hook_entries(settings: &mut serde_json::Value) -> Result<bool> {
+    let Some(hooks) = settings
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for event in hooks.values_mut() {
+        let Some(entries) = event.as_array_mut() else {
+            continue;
+        };
+        let before = entries.len();
+        entries.retain(|entry| {
+            !entry_command_strings(entry).iter().any(|command| {
+                command_refers_to(command, LEGACY_QUESTION_HOOK_NAME)
+                    || command_refers_to(command, LEGACY_LIVE_MESSAGE_HOOK_NAME)
+            })
         });
-        if let Some(matcher) = hook_matcher(event)
-            && let Some(hook) = hook.as_object_mut()
-        {
-            hook.insert("matcher".to_string(), serde_json::json!(matcher));
+        changed |= entries.len() != before;
+    }
+    Ok(changed)
+}
+
+fn ensure_events_hook_entries(
+    settings: &mut serde_json::Value,
+    events_command: &str,
+) -> Result<bool> {
+    let mut changed = false;
+    for event in HOOK_EVENTS {
+        let entries = hook_entries_mut(settings, event)?;
+        let mut ours: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry_command_strings(entry)
+                    .iter()
+                    .any(|command| command_refers_to(command, "zed-claude-events.sh"))
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        let canonical = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": events_command,
+                "timeout": 5
+            }]
+        });
+
+        if ours.is_empty() {
+            entries.push(canonical);
+            changed = true;
+            continue;
         }
-        hooks
-            .entry(*event)
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .with_context(|| format!("`hooks.{event}` does not hold a JSON array"))?
-            .push(hook);
+
+        let keep = ours.remove(0);
+        if entries.get(keep) != Some(&canonical) {
+            entries[keep] = canonical;
+            changed = true;
+        }
+        for index in ours.into_iter().rev() {
+            entries.remove(index);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn event_names_our_script(settings: &serde_json::Value, script_name: &str) -> bool {
+    HOOK_EVENTS.iter().all(|event| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(*event))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry_command_strings(entry)
+                        .iter()
+                        .any(|command| command_refers_to(command, script_name))
+                })
+            })
+    })
+}
+
+fn status_line_command(settings: &serde_json::Value) -> Option<&str> {
+    settings
+        .get("statusLine")
+        .and_then(|status_line| status_line.get("command"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn ensure_status_line(
+    settings: &mut serde_json::Value,
+    home_directory: &Path,
+    status_command: &str,
+) -> Result<bool> {
+    let chained_path = claude_directory(home_directory)
+        .join(STATUS_DIRECTORY)
+        .join(CHAINED_STATUS_COMMAND_FILE);
+
+    match status_line_command(settings) {
+        None => {
+            let settings_object = settings
+                .as_object_mut()
+                .context("settings.json does not hold a JSON object")?;
+            settings_object.insert(
+                "statusLine".to_string(),
+                serde_json::json!({
+                    "type": "command",
+                    "command": status_command,
+                }),
+            );
+            remove_path_if_present(&chained_path)?;
+            Ok(true)
+        }
+        Some(existing) if command_refers_to(existing, "zed-claude-status.sh") => Ok(false),
+        Some(existing) => {
+            let existing = existing.to_string();
+            if let Some(parent) = chained_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            fs::write(&chained_path, existing)
+                .with_context(|| format!("writing {}", chained_path.display()))?;
+            let settings_object = settings
+                .as_object_mut()
+                .context("settings.json does not hold a JSON object")?;
+            settings_object.insert(
+                "statusLine".to_string(),
+                serde_json::json!({
+                    "type": "command",
+                    "command": status_command,
+                }),
+            );
+            Ok(true)
+        }
+    }
+}
+
+fn restore_or_remove_status_line(
+    settings: &mut serde_json::Value,
+    home_directory: &Path,
+) -> Result<bool> {
+    let chained_path = claude_directory(home_directory)
+        .join(STATUS_DIRECTORY)
+        .join(CHAINED_STATUS_COMMAND_FILE);
+    match fs::read_to_string(&chained_path) {
+        Ok(command) => {
+            let command = command.trim().to_string();
+            let names_ours = status_line_command(settings)
+                .is_some_and(|current| command_refers_to(current, "zed-claude-status.sh"));
+            if names_ours {
+                let settings_object = settings
+                    .as_object_mut()
+                    .context("settings.json does not hold a JSON object")?;
+                if command.is_empty() {
+                    settings_object.remove("statusLine");
+                } else {
+                    let status_line = settings_object
+                        .entry("statusLine")
+                        .or_insert_with(|| serde_json::json!({"type": "command"}));
+                    if let Some(status_object) = status_line.as_object_mut() {
+                        status_object.insert("command".to_string(), serde_json::json!(command));
+                    }
+                }
+            }
+            remove_path_if_present(&chained_path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if status_line_command(settings)
+                .is_some_and(|command| command_refers_to(command, "zed-claude-status.sh"))
+            {
+                settings
+                    .as_object_mut()
+                    .context("settings.json does not hold a JSON object")?
+                    .remove("statusLine");
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", chained_path.display())),
+    }
+}
+
+fn remove_our_hook_entries(settings: &mut serde_json::Value) -> Result<bool> {
+    let Some(hooks) = settings
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for event in HOOK_EVENTS {
+        let Some(entries) = hooks
+            .get_mut(event)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let mut index = 0;
+        while index < entries.len() {
+            let should_remove_matcher = {
+                let Some(entry) = entries.get_mut(index) else {
+                    break;
+                };
+                match entry
+                    .get_mut("hooks")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    Some(hook_objects) => {
+                        let hook_count = hook_objects.len();
+                        hook_objects.retain(|hook| {
+                            !hook
+                                .get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|command| {
+                                    command_refers_to(command, "zed-claude-events.sh")
+                                })
+                        });
+                        if hook_objects.len() != hook_count {
+                            changed = true;
+                            hook_objects.is_empty()
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            };
+            if should_remove_matcher {
+                entries.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn scripts_are_current(home_directory: &Path) -> bool {
+    let events = events_hook_path(home_directory);
+    let status = status_hook_path(home_directory);
+    let server = channel_server_path(home_directory);
+    fs::read_to_string(&events).is_ok_and(|installed| installed == EVENTS_HOOK_SOURCE)
+        && fs::read_to_string(&status).is_ok_and(|installed| installed == STATUS_HOOK_SOURCE)
+        && fs::read_to_string(&server).is_ok_and(|installed| installed == CHANNEL_SERVER_SOURCE)
+}
+
+/// Whether the hooks Zed installs are in place on this machine.
+pub fn zed_hooks_installed(home_directory: &Path) -> bool {
+    if !scripts_are_current(home_directory) {
+        return false;
+    }
+    let Ok(settings) = read_claude_settings(home_directory) else {
+        return false;
+    };
+    event_names_our_script(&settings, "zed-claude-events.sh")
+        && status_line_command(&settings)
+            .is_some_and(|command| command_refers_to(command, "zed-claude-status.sh"))
+}
+
+/// Installs the event dispatcher and statusLine wrapper. Settings are parsed before
+/// anything is written; installing twice changes nothing.
+pub fn install_zed_hooks(home_directory: &Path) -> Result<HookInstallOutcome> {
+    let mut settings = read_claude_settings(home_directory)?;
+    let original = settings.clone();
+    let events_path = events_hook_path(home_directory);
+    let status_path = status_hook_path(home_directory);
+    let events_command = shell_quote(events_path.to_string_lossy().as_ref());
+    let status_command = shell_quote(status_path.to_string_lossy().as_ref());
+
+    let mut scripts_changed = write_script_if_changed(&events_path, EVENTS_HOOK_SOURCE)?;
+    scripts_changed |= write_script_if_changed(&status_path, STATUS_HOOK_SOURCE)?;
+    scripts_changed |= write_regular_file_if_changed(
+        &channel_server_path(home_directory),
+        CHANNEL_SERVER_SOURCE,
+        0o644,
+    )?;
+
+    let claude_directory = claude_directory(home_directory);
+    remove_path_if_present(&claude_directory.join(LEGACY_QUESTION_HOOK_SCRIPT))?;
+    remove_path_if_present(&claude_directory.join(LEGACY_LIVE_MESSAGE_HOOK_SCRIPT))?;
+    remove_path_if_present(&claude_directory.join("pending-questions"))?;
+    remove_path_if_present(&claude_directory.join("live-messages"))?;
+
+    let mut settings_changed = remove_legacy_hook_entries(&mut settings)?;
+    settings_changed |= ensure_events_hook_entries(&mut settings, &events_command)?;
+    settings_changed |= ensure_status_line(&mut settings, home_directory, &status_command)?;
+    settings_changed |= settings != original;
+
+    if !settings_changed {
+        return Ok(if scripts_changed {
+            HookInstallOutcome::ScriptsRefreshed
+        } else {
+            HookInstallOutcome::AlreadyCurrent
+        });
     }
 
-    fs::write(&settings_path, format!("{:#}\n", settings))
-        .with_context(|| format!("writing {}", settings_path.display()))?;
+    let settings_file = settings_path(home_directory);
+    let backup_path = if settings_file.is_file() {
+        let backup = settings_backup_path(home_directory);
+        fs::copy(&settings_file, &backup)
+            .with_context(|| format!("copying {} aside", settings_file.display()))?;
+        Some(backup)
+    } else {
+        None
+    };
 
-    Ok(backup)
+    if let Some(parent) = settings_file.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(&settings_file, format!("{:#}\n", settings))
+        .with_context(|| format!("writing {}", settings_file.display()))?;
+
+    Ok(HookInstallOutcome::Installed { backup_path })
+}
+
+pub fn uninstall_zed_hooks(home_directory: &Path) -> Result<()> {
+    let settings_file = settings_path(home_directory);
+    let mut settings = match fs::read_to_string(&settings_file) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("{} could not be parsed", settings_file.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", settings_file.display()));
+        }
+    };
+    let original = settings.clone();
+
+    remove_our_hook_entries(&mut settings)?;
+    restore_or_remove_status_line(&mut settings, home_directory)?;
+    remove_path_if_present(&events_hook_path(home_directory))?;
+    remove_path_if_present(&status_hook_path(home_directory))?;
+    remove_path_if_present(&channel_server_path(home_directory))?;
+
+    if settings != original {
+        if let Some(parent) = settings_file.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&settings_file, format!("{:#}\n", settings))
+            .with_context(|| format!("writing {}", settings_file.display()))?;
+    }
+
+    Ok(())
 }
 
 /// Which agents of one workflow run that run's journal says have returned.
@@ -1825,10 +2919,7 @@ pub async fn list_subagents_for_sessions(
                 // `subagents` path cannot be listed must not hide every other session
                 // this walk already found, or has yet to find.
                 read_subagents_for_session(&session_entry.path(), subagents).log_err();
-                resolve_task_agents(
-                    &session_transcript_path(&session_entry.path()),
-                    subagents,
-                );
+                resolve_task_agents(&session_transcript_path(&session_entry.path()), subagents);
             }
         }
     }
@@ -1836,6 +2927,8 @@ pub async fn list_subagents_for_sessions(
     for subagents in subagents_by_session.values_mut() {
         sort_subagents(subagents);
     }
+
+    prune_read_conversations();
 
     Ok(subagents_by_session)
 }
@@ -1893,82 +2986,147 @@ struct SessionConversation {
     notified_agents: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct CachedConversation {
+    offset_scanned: u64,
+    length: u64,
+    modified: Option<SystemTime>,
+    conversation: SessionConversation,
+}
+
 /// What the last read of a conversation found, kept so that the poll behind this does not
 /// read a multi-megabyte file every second for a session nothing has appended to.
 ///
-/// Trusted only while the file's length and modification time are still what they were
-/// when it was read: a conversation that has grown has to be read again, and its own
-/// metadata is the cheapest thing there is to notice that with. One entry per session
-/// read.
-static READ_CONVERSATIONS: Mutex<
-    Option<HashMap<PathBuf, (u64, Option<SystemTime>, SessionConversation)>>,
-> = Mutex::new(None);
+/// Keyed by path. On growth, only the appended bytes are folded in. On shrink or replace
+/// the entry is rebuilt. Entries whose session was not listed in the last scan are dropped.
+static READ_CONVERSATIONS: Mutex<Option<HashMap<PathBuf, CachedConversation>>> = Mutex::new(None);
+static SCANNED_CONVERSATION_PATHS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+fn note_conversation_path(path: &Path) {
+    if let Ok(mut paths) = SCANNED_CONVERSATION_PATHS.lock() {
+        paths
+            .get_or_insert_with(HashSet::default)
+            .insert(path.to_path_buf());
+    }
+}
+
+fn prune_read_conversations() {
+    let keep = match SCANNED_CONVERSATION_PATHS.lock() {
+        Ok(mut paths) => paths.take().unwrap_or_default(),
+        Err(_) => return,
+    };
+    if let Ok(mut cache) = READ_CONVERSATIONS.lock()
+        && let Some(cache) = cache.as_mut()
+    {
+        cache.retain(|path, _| keep.contains(path));
+    }
+}
 
 /// Reads the conversation at `transcript_path` for what it says about its own agents.
 fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversation> {
+    note_conversation_path(transcript_path);
     let metadata = fs::metadata(transcript_path)
         .with_context(|| format!("reading {}", transcript_path.display()))?;
-    let stamp = (metadata.len(), metadata.modified().ok());
+    let length = metadata.len();
+    let modified = metadata.modified().ok();
 
-    // Poisoning would mean a panic while one of these was held, which is a panic in the
-    // few lines below; the cache is then dropped rather than taking the scan with it.
     if let Ok(cache) = READ_CONVERSATIONS.lock()
         && let Some(cache) = cache.as_ref()
-        && let Some((length, modified, conversation)) = cache.get(transcript_path)
-        && (*length, *modified) == stamp
+        && let Some(cached) = cache.get(transcript_path)
+        && cached.length == length
+        && cached.modified == modified
     {
-        return Ok(conversation.clone());
+        return Ok(cached.conversation.clone());
     }
 
-    let file = fs::File::open(transcript_path)
+    let cached = READ_CONVERSATIONS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(transcript_path).cloned());
+
+    let (mut conversation, mut offset_scanned) = match cached {
+        Some(cached) if length >= cached.length && cached.offset_scanned <= cached.length => {
+            (cached.conversation, cached.offset_scanned)
+        }
+        _ => (SessionConversation::default(), 0),
+    };
+
+    let mut file = fs::File::open(transcript_path)
         .with_context(|| format!("reading {}", transcript_path.display()))?;
-    let mut conversation = SessionConversation::default();
-    for line in BufReader::new(file).lines() {
-        // A conversation being appended to while it is read, or one holding a record
-        // that is not valid UTF-8, still answers for every line that did read.
-        let Some(line) = line.log_err() else {
-            break;
-        };
-        // A notification is text inside whichever record is carrying it — a queued
-        // command, an attachment, the message it finally arrives as — so it is read out
-        // of the line rather than out of any one field.
-        read_task_notification_ids(&line, &mut conversation.notified_agents);
-        // Cheaper than parsing every record of a file this size, and no less exact: a
-        // record holding no `tool_result` at all cannot answer anything.
-        if !line.contains(TOOL_RESULT_BLOCK_TYPE) {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let Some(blocks) = record
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(serde_json::Value::as_str) != Some(TOOL_RESULT_BLOCK_TYPE)
-            {
-                continue;
-            }
-            if let Some(tool_use_id) = block
-                .get("tool_use_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                conversation.answered_calls.insert(tool_use_id.to_string());
-            }
-        }
+    if offset_scanned > 0 {
+        file.seek(SeekFrom::Start(offset_scanned))
+            .with_context(|| format!("seeking in {}", transcript_path.display()))?;
     }
+    let scanned = absorb_conversation_lines(&mut file, &mut conversation)?;
+    offset_scanned = offset_scanned.saturating_add(scanned);
 
     if let Ok(mut cache) = READ_CONVERSATIONS.lock() {
         cache.get_or_insert_with(HashMap::default).insert(
             transcript_path.to_path_buf(),
-            (stamp.0, stamp.1, conversation.clone()),
+            CachedConversation {
+                offset_scanned,
+                length,
+                modified,
+                conversation: conversation.clone(),
+            },
         );
     }
     Ok(conversation)
+}
+
+/// Absorbs every whole line from where the file is positioned, reporting how many bytes
+/// those lines took.
+///
+/// Only lines that ended are counted, because a scan can land in the middle of a line the
+/// session is still writing: were those bytes counted as read, the next scan would begin
+/// inside the line, neither half would parse, and the record they carry would be lost for
+/// good. Undecodable bytes are replaced rather than refused for the same reason — stopping
+/// at them would hide every record after them behind an offset that never goes back.
+fn absorb_conversation_lines(
+    file: &mut fs::File,
+    conversation: &mut SessionConversation,
+) -> Result<u64> {
+    let mut reader = BufReader::new(file);
+    let mut scanned = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| "reading a line of a session's conversation")?;
+        if read == 0 || !line.ends_with(b"\n") {
+            break;
+        }
+        scanned = scanned.saturating_add(read as u64);
+        let text = String::from_utf8_lossy(&line);
+        absorb_conversation_line(text.trim_end_matches(['\n', '\r']), conversation);
+    }
+    Ok(scanned)
+}
+
+fn absorb_conversation_line(line: &str, conversation: &mut SessionConversation) {
+    read_task_notification_ids(line, &mut conversation.notified_agents);
+    if !line.contains(TOOL_RESULT_BLOCK_TYPE) {
+        return;
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(blocks) = record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some(TOOL_RESULT_BLOCK_TYPE) {
+            continue;
+        }
+        if let Some(tool_use_id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) {
+            conversation.answered_calls.insert(tool_use_id.to_string());
+        }
+    }
 }
 
 /// Every agent a task notification in `line` names.
@@ -2023,11 +3181,7 @@ fn read_subagents_for_session(
                 let Some(workflow_run_id) = single_path_component(&run_directory_name) else {
                     continue;
                 };
-                read_subagents_in(
-                    &directory_entry.path(),
-                    Some(workflow_run_id),
-                    subagents,
-                )?;
+                read_subagents_in(&directory_entry.path(), Some(workflow_run_id), subagents)?;
             }
         }
         // Most sessions run no workflows at all, so a missing directory is the common
@@ -2243,48 +3397,14 @@ fn workflow_run_id(candidate: &str) -> Option<&str> {
 ///
 /// The field is shaped `session:@window.%pane`, and `:` is tmux's own separator between
 /// a session and the window inside it, so a session name can never contain one and
-/// everything before the first is the name. Only read for display — sends and captures
-/// address the pane by its id; see [`pane_target`].
+/// everything before the first is the name. Only read for display.
 pub fn tmux_session_name(tmux_field: &str) -> Option<&str> {
     let name = tmux_field.split(':').next()?;
     (!name.is_empty()).then_some(name)
 }
 
-/// The pane a registration's `tmux` field names, as a target `tmux` accepts.
-///
-/// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. Only the pane id
-/// is kept: it is unique across the whole tmux server, so the session name — which may
-/// contain spaces, quotes or semicolons — never has to be quoted or reasoned about.
-/// Anything that is not `%` followed by decimal digits is rejected outright, so a value
-/// out of this JSON file can never reach tmux as a flag or as a second command.
-pub fn pane_target(tmux_field: &str) -> Option<String> {
-    let pane_identifier = tmux_field.rsplit('.').next()?;
-    let digits = pane_identifier.strip_prefix('%')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("%{digits}"))
-}
-
-/// The window a registration's `tmux` field names, as a target `tmux` accepts.
-///
-/// The field is shaped `session:@window.%pane`, for example `awp:@1.%1`. As in
-/// [`pane_target`], only the id is kept — it is unique across the whole tmux server — and
-/// anything that is not `@` followed by decimal digits is rejected outright, so a value
-/// out of this JSON file can never reach tmux as a flag or as a second command.
-pub fn window_target(tmux_field: &str) -> Option<String> {
-    let after_session_name = tmux_field.split_once(':')?.1;
-    let window_identifier = after_session_name.split('.').next()?;
-    let digits = window_identifier.strip_prefix('@')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("@{digits}"))
-}
-
-/// Names the sessions Zed groups with a user's own to hold one window of it; see
-/// [`attach_arguments`]. The prefix is what keeps Zed's own bookkeeping out of the
-/// session list the user is shown.
+/// Names the sessions Zed used to group with a user's own to hold one window of it.
+/// The prefix is what keeps Zed's own bookkeeping out of the session list the user is shown.
 const MIRROR_SESSION_PREFIX: &str = "zed-claude-mirror-";
 
 /// Whether a tmux session is one of Zed's mirrors rather than one the user started.
@@ -2292,426 +3412,12 @@ pub fn is_zed_mirror_session(session_name: &str) -> bool {
     session_name.starts_with(MIRROR_SESSION_PREFIX)
 }
 
-/// Distinguishes the mirror sessions of concurrent attaches, so that an attach can never
-/// fail on the name of a mirror whose client is still going away.
-static MIRROR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// The arguments of the one tmux invocation that shows a registration's window in a
-/// terminal of its own.
-///
-/// Attaching to the pane's own session is what does not work: a session has one current
-/// window and every client of it is shown that window, so two Claude Code sessions living
-/// in two windows of one tmux session are both shown whichever window the user happens to
-/// be on — never the window each of them is running in. A session grouped with theirs
-/// (`new-session -t`) shares its windows but keeps a current window of its own, so the
-/// terminal can sit on this registration's window while the user's own client stays where
-/// it is.
-///
-/// A field with no window id is attached the way it was before there were mirrors, which
-/// is still right for a session that has only the one window.
-pub fn attach_arguments(tmux_field: &str) -> Option<Vec<String>> {
-    let pane_target = pane_target(tmux_field)?;
-    let (Some(session_name), Some(window_target)) =
-        (tmux_session_name(tmux_field), window_target(tmux_field))
-    else {
-        return Some(vec!["attach".to_string(), "-t".to_string(), pane_target]);
-    };
-
-    let mirror_name = format!(
-        "{MIRROR_SESSION_PREFIX}{}-{}",
-        std::process::id(),
-        MIRROR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    Some(mirror_arguments(session_name, &window_target, &mirror_name))
-}
-
-/// The order of this list is what makes it safe, and each step is load-bearing:
-///
-/// * `new-session -d` creates the mirror without attaching, because a `new-session` that
-///   attaches leaves the commands after it addressing the session the client came from.
-/// * `=` in front of the session name asks tmux for that name exactly, rather than
-///   letting a name that reads as a pattern group the terminal with another session.
-/// * `select-window` comes before there is a client, so that the terminal opens on the
-///   right window instead of visibly jumping to it.
-/// * `destroy-unattached` comes last, because a session carrying it while nothing is
-///   attached is destroyed on the spot. Set here, the mirror goes away with the terminal
-///   rather than being left behind on the user's tmux server.
-///
-/// The name carries a sequence number because a command that fails makes tmux abandon the
-/// rest of the list: reusing the name of a mirror whose client has not finished detaching
-/// would fail the `new-session` and leave the reader with no terminal at all.
-fn mirror_arguments(session_name: &str, window_target: &str, mirror_name: &str) -> Vec<String> {
-    vec![
-        "new-session".to_string(),
-        "-d".to_string(),
-        "-t".to_string(),
-        format!("={session_name}"),
-        "-s".to_string(),
-        mirror_name.to_string(),
-        ";".to_string(),
-        "select-window".to_string(),
-        "-t".to_string(),
-        format!("{mirror_name}:{window_target}"),
-        ";".to_string(),
-        "attach-session".to_string(),
-        "-t".to_string(),
-        mirror_name.to_string(),
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        mirror_name.to_string(),
-        "destroy-unattached".to_string(),
-        "on".to_string(),
-    ]
-}
-
-/// Distinguishes the buffers of concurrent sends, so that one send cannot paste the text
-/// of another that is still in flight.
-static PASTE_BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Every send travels as a bracketed paste, whatever it holds.
-///
-/// This used to be asked only for a multi-line message, on the grounds that bracketed
-/// paste exists to keep newlines from being read as submissions. That is one of two
-/// things it does. The other is telling the pane's TUI where the pasted content ends —
-/// and without that, a TUI that tells typing from pasting by how fast the bytes arrive
-/// has to guess. Claude Code guesses, and it reads the `Enter` this send makes to submit
-/// the message as one more byte of the burst that carried the message: the message stays
-/// in the input box with a newline on the end, waiting for a submission that already
-/// happened, and joins whatever the user types next as one prompt.
-///
-/// Guessing is only wrong for a burst long enough to look pasted, which a single-line
-/// message can easily be, so there is no line to draw here that a real message will not
-/// cross. What that argued against — a pane left in paste mode, swallowing what its user
-/// types next — needs tmux to die between the opening sequence and the closing one, which
-/// it writes as one paste, and is the same exposure every multi-line send already has.
-fn needs_bracketed_paste(_text: &str) -> bool {
-    true
-}
-
-/// The arguments of the one tmux invocation a send performs.
-///
-/// Loading the buffer, pasting it and submitting it travel as a single tmux command list,
-/// separated by the literal `;` arguments, because the tmux server is one event loop that
-/// runs a client's whole command list before it takes the next client's commands. As
-/// three invocations there is a gap between them for a concurrent send to slip into:
-/// load, paste, load, paste, Enter, Enter submits both messages as one and then submits
-/// an empty line.
-///
-/// `bracketed` adds the `-p` that pastes as a bracketed paste; see
-/// [`needs_bracketed_paste`] for why only a multi-line message asks for it.
-fn send_text_arguments(buffer_name: &str, pane_target: &str, bracketed: bool) -> Vec<String> {
-    let mut arguments = vec![
-        // `-` is where load-buffer reads the buffer from, and it means standard input.
-        "load-buffer",
-        "-b",
-        buffer_name,
-        "-",
-        ";",
-        // `-d` deletes the buffer once it has been pasted, so that the text is not left
-        // behind for the next paste to pick up.
-        "paste-buffer",
-        "-d",
-    ];
-    if bracketed {
-        arguments.push("-p");
-    }
-    arguments.extend([
-        "-b",
-        buffer_name,
-        "-t",
-        pane_target,
-        ";",
-        "send-keys",
-        "-t",
-        pane_target,
-        "Enter",
-    ]);
-
-    arguments.into_iter().map(str::to_string).collect()
-}
-
-/// Types `text` into the pane and submits it.
-///
-/// The text travels through a tmux paste buffer rather than as `send-keys` arguments:
-/// bracketed paste is what makes a multi-line message arrive as one message, where
-/// `send-keys` would submit at every newline. The buffer is loaded from stdin so that the
-/// text never appears on a command line.
-pub async fn send_text(pane_target: &str, text: &str) -> Result<()> {
-    if pane_target.is_empty() {
-        anyhow::bail!("no tmux pane to send to");
-    }
-
-    let buffer_name = format!(
-        "zed-claude-{}-{}",
-        std::process::id(),
-        PASTE_BUFFER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-
-    let arguments = send_text_arguments(&buffer_name, pane_target, needs_bracketed_paste(text));
-    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    // A command that fails makes tmux abandon the rest of the command list, so a paste
-    // that fails — the pane is gone, most likely — never reaches the deletion that
-    // `paste-buffer -d` would have done, while the `load-buffer` before it has already
-    // succeeded. The message would stay on top of the buffer stack for the user's next
-    // manual paste to pick up, so it is removed here instead. The paste's own failure is
-    // what gets reported: this cleanup is not the news.
-    match run_with_stdin("tmux", &arguments, text.as_bytes()).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            run_tmux(&["delete-buffer", "-b", &buffer_name])
-                .await
-                .log_err();
-            Err(error)
-        }
-    }
-}
-
-/// Interrupts whatever the session is doing, which is what Escape means to Claude Code.
-/// The keys a prompt drawn in a session's pane can be answered with.
-///
-/// An enum rather than a key name, so that nothing but these three can reach
-/// `tmux send-keys`: the caller is a UI button, and a pane that accepts arbitrary key
-/// names from one would accept whatever a registration could be made to carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaneKey {
-    Up,
-    Down,
-    Enter,
-    /// The digit that picks a numbered option outright, without walking to it first.
-    Choice(Digit),
-    /// Shift+Tab, which the CLI cycles its permission mode on. tmux calls it back-tab.
-    CyclePermissionMode,
-    /// Ctrl+C: takes back what has been typed into the CLI, and stops a turn it is
-    /// running.
-    Cancel,
-    /// Ctrl+D: quits the CLI, taking the session with it.
-    Quit,
-}
-
-/// The digits a numbered menu answers to.
-///
-/// A closed set rather than a number, for the same reason the rest of [`PaneKey`] is one:
-/// what this becomes is a key sent to a terminal, and a value that could be anything
-/// could be sent as something other than a choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Digit {
-    One,
-    Two,
-    Three,
-    Four,
-    Five,
-    Six,
-    Seven,
-    Eight,
-    Nine,
-}
-
-impl Digit {
-    /// The digit that picks the option at `index`, counting from zero as the options
-    /// themselves are. `None` past the ninth, which a menu does not number.
-    pub fn for_option(index: usize) -> Option<Self> {
-        Some(match index {
-            0 => Digit::One,
-            1 => Digit::Two,
-            2 => Digit::Three,
-            3 => Digit::Four,
-            4 => Digit::Five,
-            5 => Digit::Six,
-            6 => Digit::Seven,
-            7 => Digit::Eight,
-            8 => Digit::Nine,
-            _ => return None,
-        })
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Digit::One => "1",
-            Digit::Two => "2",
-            Digit::Three => "3",
-            Digit::Four => "4",
-            Digit::Five => "5",
-            Digit::Six => "6",
-            Digit::Seven => "7",
-            Digit::Eight => "8",
-            Digit::Nine => "9",
-        }
-    }
-}
-
-impl PaneKey {
-    /// The name tmux knows the key by.
-    pub fn tmux_name(self) -> &'static str {
-        match self {
-            PaneKey::Up => "Up",
-            PaneKey::Down => "Down",
-            PaneKey::Enter => "Enter",
-            PaneKey::Choice(digit) => digit.as_str(),
-            PaneKey::CyclePermissionMode => "BTab",
-            PaneKey::Cancel => "C-c",
-            PaneKey::Quit => "C-d",
-        }
-    }
-
-    /// Reads back what [`Self::tmux_name`] wrote. `None` for anything else, which is what
-    /// keeps the set closed when the name has crossed a connection.
-    pub fn from_tmux_name(name: &str) -> Option<Self> {
-        match name {
-            "Up" => Some(PaneKey::Up),
-            "Down" => Some(PaneKey::Down),
-            "Enter" => Some(PaneKey::Enter),
-            "1" => Some(PaneKey::Choice(Digit::One)),
-            "2" => Some(PaneKey::Choice(Digit::Two)),
-            "3" => Some(PaneKey::Choice(Digit::Three)),
-            "4" => Some(PaneKey::Choice(Digit::Four)),
-            "5" => Some(PaneKey::Choice(Digit::Five)),
-            "6" => Some(PaneKey::Choice(Digit::Six)),
-            "7" => Some(PaneKey::Choice(Digit::Seven)),
-            "8" => Some(PaneKey::Choice(Digit::Eight)),
-            "9" => Some(PaneKey::Choice(Digit::Nine)),
-            "BTab" => Some(PaneKey::CyclePermissionMode),
-            "C-c" => Some(PaneKey::Cancel),
-            "C-d" => Some(PaneKey::Quit),
-            _ => None,
-        }
-    }
-}
-
-/// Answers a prompt drawn in the pane, by sending it one of the keys it is waiting for.
-pub async fn send_key(pane_target: &str, key: PaneKey) -> Result<()> {
-    if pane_target.is_empty() {
-        anyhow::bail!("no tmux pane to send to");
-    }
-
-    run_tmux(&["send-keys", "-t", pane_target, key.tmux_name()]).await
-}
-
-/// The visible contents of a session's tmux pane, top line first.
-///
-/// This is the only way to read what Claude Code draws but never records: a prompt
-/// waiting for an answer, the messages queued behind the running turn, and the status
-/// line. `-p` writes the pane to stdout; only the visible screen is taken, because the
-/// scrollback behind it is the conversation, which is read from the transcript instead.
-pub async fn capture_pane(pane_target: &str) -> Result<String> {
-    if pane_target.is_empty() {
-        anyhow::bail!("no tmux pane to capture");
-    }
-
-    let output = capture_tmux(&["capture-pane", "-p", "-t", pane_target]).await?;
-    Ok(output)
-}
-
-pub async fn send_escape(pane_target: &str) -> Result<()> {
-    if pane_target.is_empty() {
-        anyhow::bail!("no tmux pane to send to");
-    }
-
-    run_tmux(&["send-keys", "-t", pane_target, "Escape"]).await
-}
-
-/// Like [`run_tmux`], but hands back what tmux wrote rather than only whether it
-/// succeeded.
-async fn capture_tmux(arguments: &[&str]) -> Result<String> {
-    let mut command = util::command::new_command("tmux");
-    command.args(arguments);
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("running tmux {}", arguments.join(" ")))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux {} failed: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Every argument is passed as its own `argv` entry, never through a shell, so that no
-/// value taken from a registration can be read as anything but one argument.
-async fn run_tmux(arguments: &[&str]) -> Result<()> {
-    let mut command = util::command::new_command("tmux");
-    command.args(arguments);
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("running tmux {}", arguments.join(" ")))?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux {} failed: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
-/// Runs a command with `stdin_contents` on its standard input.
-///
-/// The text to send reaches tmux this way rather than as an argument, so that nothing a
-/// session's user typed can be read as part of the command line.
-async fn run_with_stdin(program: &str, arguments: &[&str], stdin_contents: &[u8]) -> Result<()> {
-    let described = || format!("{program} {}", arguments.join(" "));
-
-    let mut command = util::command::new_command(program);
-    command.args(arguments);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("running {}", described()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .with_context(|| format!("{} was spawned without a stdin to write to", described()))?;
-    // A command that fails before it has read its input closes the pipe, which makes this
-    // write fail with a broken pipe. Reporting that would hide the command's own error, so
-    // the outcome is kept and only looked at once the exit status has been seen.
-    let mut write_result = stdin
-        .write_all(stdin_contents)
-        .await
-        .with_context(|| format!("writing to the stdin of {}", described()));
-    if write_result.is_ok() {
-        // Closed before waiting, because a command that reads until end of input never
-        // exits while this end of the pipe is still open.
-        write_result = stdin
-            .close()
-            .await
-            .with_context(|| format!("closing the stdin of {}", described()));
-    }
-    drop(stdin);
-
-    let output = child
-        .output()
-        .await
-        .with_context(|| format!("waiting for {}", described()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{} failed: {}",
-            described(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    // The command reported success, so nothing it did can explain a failed write and the
-    // write error is the real one.
-    write_result?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    const EVENTS_FILE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
     /// On Linux, `procStart` is field 22 of `/proc/<pid>/stat`. Counting that field from
     /// the left is what a reader of the format gets wrong: field 2 is the executable's
@@ -2857,41 +3563,12 @@ mod tests {
         assert_eq!(tmux_session_name(""), None);
     }
 
-    #[test]
-    fn the_window_target_is_the_id_between_the_two_separators() {
-        assert_eq!(window_target("zed:@6.%8"), Some("@6".to_string()));
-        assert_eq!(window_target("my work:@1.%1"), Some("@1".to_string()));
-        assert_eq!(
-            window_target("zed:6.%8"),
-            None,
-            "a window index is not a window id, and only an id is unique across the server"
-        );
-        assert_eq!(
-            window_target("zed:@.%8"),
-            None,
-            "an id of no digits is not an id"
-        );
-        assert_eq!(
-            window_target("zed:@6x.%8"),
-            None,
-            "anything but digits could reach tmux as a flag or a second command"
-        );
-        assert_eq!(window_target("%8"), None, "a field with no session part");
-        assert_eq!(window_target(""), None);
-    }
-
     /// The mirror is grouped with the user's session and so is listed beside it. A name
     /// the user chose must never be mistaken for one, or their own session disappears
     /// from the tmux panel.
     #[test]
     fn only_zeds_own_mirrors_are_recognized_as_mirrors() {
-        let mirror = attach_arguments("zed:@6.%8").expect("a pane field attaches");
-        let index = mirror
-            .iter()
-            .position(|argument| argument == "-s")
-            .expect("the mirror is created with a name of its own");
-        assert!(is_zed_mirror_session(&mirror[index + 1]));
-
+        assert!(is_zed_mirror_session("zed-claude-mirror-1-0"));
         assert!(!is_zed_mirror_session("zed"));
         assert!(!is_zed_mirror_session("my work"));
         assert!(
@@ -2900,98 +3577,418 @@ mod tests {
         );
     }
 
-    /// Two sessions in two windows of one tmux session used to be shown the same window:
-    /// `attach` is per session, and a session has one current window that every client of
-    /// it is shown. Each has to be attached through a mirror of its own for the terminal
-    /// under a conversation to be the terminal that conversation is running in.
-    #[test]
-    fn attaching_goes_through_a_mirror_that_holds_this_window() {
-        let first = attach_arguments("zed:@6.%8").expect("a pane field attaches");
-        let second = attach_arguments("zed:@7.%9").expect("a pane field attaches");
+    fn write_channel_server_json(home: &Path, claude_pid: u32, contents: &str) -> PathBuf {
+        let path = home
+            .join(".claude")
+            .join("zed-channel")
+            .join(claude_pid.to_string())
+            .join("server.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("creating the channel session directory");
+        }
+        fs::write(&path, contents).expect("writing server.json");
+        path
+    }
 
-        let mirror_of = |arguments: &[String]| {
-            let index = arguments
-                .iter()
-                .position(|argument| argument == "-s")
-                .expect("the mirror is created with a name of its own");
-            arguments[index + 1].clone()
-        };
-        let first_mirror = mirror_of(&first);
-        let second_mirror = mirror_of(&second);
+    #[test]
+    fn channel_status_is_live_stale_missing_or_a_symlink() {
+        let home_directory = temporary_directory("channel-status");
+        let now_ms = 1_000_000;
+        assert!(
+            !channel_status(&home_directory, 0, now_ms).live,
+            "pid 0 is never live"
+        );
+        assert!(
+            !channel_status(&home_directory, 42, now_ms).live,
+            "a missing server.json is not live"
+        );
+
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"claude_pid":42,"started_at_ms":1,"heartbeat_at_ms":999000,"protocol":1}"#,
+        );
+        let live = channel_status(&home_directory, 42, now_ms);
+        assert!(live.live, "a heartbeat within 20s is live");
+        assert_eq!(live.heartbeat_at_ms, Some(999_000));
+        assert_eq!(live.server_pid, Some(7));
+
+        let stale = channel_status(&home_directory, 42, now_ms + 21_000);
+        assert!(!stale.live, "a heartbeat older than 20s is not live");
+        assert_eq!(stale.heartbeat_at_ms, Some(999_000));
+
+        #[cfg(unix)]
+        {
+            let session_directory = home_directory
+                .join(".claude")
+                .join("zed-channel")
+                .join("43");
+            fs::create_dir_all(&session_directory).expect("creating the symlink fixture");
+            let target = session_directory.join("real.json");
+            fs::write(
+                &target,
+                r#"{"pid":8,"heartbeat_at_ms":999000,"protocol":1}"#,
+            )
+            .expect("writing the symlink target");
+            std::os::unix::fs::symlink(&target, session_directory.join("server.json"))
+                .expect("creating a server.json symlink");
+            assert!(
+                !channel_status(&home_directory, 43, now_ms).live,
+                "a symlink must not be followed"
+            );
+        }
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_status_reads_features_and_defaults_them_to_empty() {
+        let home_directory = temporary_directory("channel-status-features");
+        let now_ms = 1_000_000;
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"heartbeat_at_ms":999000,"protocol":1}"#,
+        );
+        assert!(
+            channel_status(&home_directory, 42, now_ms)
+                .features
+                .is_empty(),
+            "a server.json with no features field is an empty list, not a missing status"
+        );
+
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"heartbeat_at_ms":999000,"features":["message","permission","interrupt"]}"#,
+        );
+        assert_eq!(
+            channel_status(&home_directory, 42, now_ms).features,
+            vec!["message", "permission", "interrupt"]
+        );
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_status_treats_a_non_array_features_field_as_empty_without_killing_live() {
+        let home_directory = temporary_directory("channel-status-features-lenient");
+        let now_ms = 1_000_000;
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"heartbeat_at_ms":999000,"protocol":1,"features":null}"#,
+        );
+        let null_features = channel_status(&home_directory, 42, now_ms);
+        assert!(
+            null_features.live,
+            "a live heartbeat with features:null must stay live, not fail the whole parse; got {null_features:?}"
+        );
+        assert!(
+            null_features.features.is_empty(),
+            "features:null must parse as empty, got {:?}",
+            null_features.features
+        );
+
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"heartbeat_at_ms":999000,"protocol":1,"features":"interrupt"}"#,
+        );
+        let string_features = channel_status(&home_directory, 42, now_ms);
+        assert!(
+            string_features.live,
+            "a live heartbeat with features as a string must stay live; got {string_features:?}"
+        );
+        assert!(
+            string_features.features.is_empty(),
+            "a non-array features field must parse as empty, not as a single feature, got {:?}",
+            string_features.features
+        );
+
+        write_channel_server_json(
+            &home_directory,
+            42,
+            r#"{"pid":7,"heartbeat_at_ms":999000,"protocol":1,"features":["interrupt",1]}"#,
+        );
+        let mixed = channel_status(&home_directory, 42, now_ms);
+        assert!(mixed.live, "mixed feature elements must not fail the parse");
+        assert_eq!(
+            mixed.features,
+            vec!["interrupt"],
+            "string features in a mixed array must be kept; legal [\"interrupt\"] must not be rejected"
+        );
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_interrupt_refuses_pid_zero_and_an_overlong_reason() {
+        let home_directory = temporary_directory("channel-interrupt-refuse");
+        match channel_interrupt(&home_directory, 0, "stop") {
+            Ok(name) => panic!("pid 0 must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("claude_pid"), "got {error:#}"),
+        }
+        let too_long: String = "x".repeat(CHANNEL_INTERRUPT_REASON_MAX_CHARS + 1);
+        match channel_interrupt(&home_directory, 11, &too_long) {
+            Ok(name) => panic!("a 201-char reason must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("200"), "got {error:#}"),
+        }
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_send_message_refuses_empty_and_oversize_content() {
+        let home_directory = temporary_directory("channel-send-refuse");
+        match channel_send_message(&home_directory, 0, "hello") {
+            Ok(name) => panic!("pid 0 must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("claude_pid"), "got {error:#}"),
+        }
+        match channel_send_message(&home_directory, 11, "   ") {
+            Ok(name) => panic!("whitespace-only content must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("empty"), "got {error:#}"),
+        }
+        let too_large = "x".repeat(CHANNEL_MESSAGE_MAX_BYTES + 1);
+        match channel_send_message(&home_directory, 11, &too_large) {
+            Ok(name) => panic!("oversize content must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("4 MiB"), "got {error:#}"),
+        }
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_outbox_names_order_across_two_sends() -> Result<()> {
+        let home_directory = temporary_directory("channel-outbox-order");
+        let first = channel_send_message(&home_directory, 12, "one")?;
+        let second = channel_send_message(&home_directory, 12, "two")?;
+        assert_ne!(first, second);
+        assert!(
+            first < second,
+            "outbox names must sort in send order, got {first} then {second}"
+        );
+        let outbox = home_directory
+            .join(".claude")
+            .join("zed-channel")
+            .join("12")
+            .join("outbox");
+        assert!(outbox.join(&first).is_file());
+        assert!(outbox.join(&second).is_file());
+        assert!(!outbox.join(format!("{first}.tmp")).exists());
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    /// The sequence that makes outbox names unique is this process's own and starts at
+    /// zero in every Zed, so a second Zed on the same machine reaches for the same name
+    /// in the same millisecond: it must neither rename over a message that is already
+    /// published nor write through a temporary file it does not own.
+    #[test]
+    fn a_second_writer_neither_takes_a_published_name_nor_shares_its_temporary_file() -> Result<()>
+    {
+        let home_directory = temporary_directory("channel-outbox-collision");
+        let outbox = home_directory
+            .join(".claude")
+            .join("zed-channel")
+            .join("15")
+            .join("outbox");
+        fs::create_dir_all(&outbox)?;
+        let now_ms = 1_700_000_000_000;
+
+        let mine = publish_outbox_file(&outbox, now_ms, b"{\"content\":\"mine\"}", &mut || 7)?;
+
+        let mut theirs_sequence = [7u32, 8].into_iter();
+        let theirs =
+            match publish_outbox_file(&outbox, now_ms, b"{\"content\":\"theirs\"}", &mut || {
+                theirs_sequence.next().unwrap_or(9)
+            }) {
+                Ok(name) => name,
+                Err(error) => panic!("a second writer must find a free name, got error {error:#}"),
+            };
         assert_ne!(
-            first_mirror, second_mirror,
-            "two attaches must not race for one name: a failed command abandons the rest \
-             of a tmux command list, leaving the reader with no terminal"
+            theirs, mine,
+            "two messages must not be published under one name; expected a name other \
+             than {mine}, got {theirs}"
+        );
+        let published = fs::read_to_string(outbox.join(&mine))?;
+        assert_eq!(
+            published, "{\"content\":\"mine\"}",
+            "the message already published must survive the second writer; expected \
+             {{\"content\":\"mine\"}}, got {published}"
         );
 
+        // The other process is part-way through its own write under the name it took, so
+        // the temporary file at the shared path is not this process's to write.
+        let theirs_temporary = outbox.join(format!("{now_ms:013}-0009.json.tmp"));
+        fs::create_dir_all(&theirs_temporary)?;
+        let third =
+            match publish_outbox_file(&outbox, now_ms, b"{\"content\":\"third\"}", &mut || 9) {
+                Ok(name) => name,
+                Err(error) => panic!(
+                    "a temporary file another process owns must not stop this one, got error \
+                 {error:#}"
+                ),
+            };
         assert_eq!(
-            first,
-            mirror_arguments("zed", "@6", &first_mirror),
-            "the first session's terminal must hold window @6"
+            third,
+            format!("{now_ms:013}-0009.json"),
+            "the third message must be published under the free name it took"
         );
-        assert_eq!(
-            second,
-            mirror_arguments("zed", "@7", &second_mirror),
-            "the second session's terminal must hold window @7, not the window the first \
-             one is on"
-        );
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
     }
 
     #[test]
-    fn the_mirror_is_grouped_selected_attached_and_then_made_temporary() {
+    fn publish_outbox_file_walks_the_whole_name_space_when_the_first_names_are_taken() -> Result<()>
+    {
+        let home_directory = temporary_directory("channel-outbox-full-window");
+        let outbox = home_directory
+            .join(".claude")
+            .join("zed-channel")
+            .join("16")
+            .join("outbox");
+        fs::create_dir_all(&outbox)?;
+        let now_ms = 1_700_000_000_001i64;
+        for sequence in 0..16u32 {
+            fs::write(
+                outbox.join(format!("{now_ms:013}-{sequence:04}.json")),
+                b"{}",
+            )?;
+        }
+
+        let mut sequence = 0u32;
+        let published = match publish_outbox_file(
+            &outbox,
+            now_ms,
+            b"{\"content\":\"after-the-occupied-window\"}",
+            &mut || {
+                let next = sequence;
+                sequence += 1;
+                next
+            },
+        ) {
+            Ok(name) => name,
+            Err(error) => panic!(
+                "a free name past the first 16 of this millisecond must still be taken, \
+                 got error {error:#}"
+            ),
+        };
         assert_eq!(
-            mirror_arguments("my work", "@6", "zed-claude-mirror-1-0"),
-            vec![
-                "new-session",
-                "-d",
-                "-t",
-                // Exactly this session, not whatever a name that reads as a pattern matches.
-                "=my work",
-                "-s",
-                "zed-claude-mirror-1-0",
-                ";",
-                // Before the client exists, so that the terminal opens on the window
-                // rather than visibly jumping to it.
-                "select-window",
-                "-t",
-                "zed-claude-mirror-1-0:@6",
-                ";",
-                "attach-session",
-                "-t",
-                "zed-claude-mirror-1-0",
-                ";",
-                // After it, because a session carrying this while nothing is attached is
-                // destroyed on the spot.
-                "set-option",
-                "-t",
-                "zed-claude-mirror-1-0",
-                "destroy-unattached",
-                "on",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<String>>()
+            published,
+            format!("{now_ms:013}-0016.json"),
+            "expected the 17th name of this millisecond, got {published}"
         );
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
     }
 
-    /// The mirror exists to pick a window out of a session; a field that names no window
-    /// has none to pick, and attaching to the pane's own session is what it did before.
     #[test]
-    fn a_field_without_a_window_attaches_the_way_it_did_before() {
-        assert_eq!(
-            attach_arguments("zed:6.%8"),
-            Some(vec![
-                "attach".to_string(),
-                "-t".to_string(),
-                "%8".to_string()
-            ])
+    fn channel_answer_permission_validates_request_id() {
+        let home_directory = temporary_directory("channel-answer-id");
+        match channel_answer_permission(&home_directory, 13, "", true) {
+            Ok(name) => panic!("an empty request_id must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("request_id"), "got {error:#}"),
+        }
+        match channel_answer_permission(&home_directory, 13, "ABCDE", true) {
+            Ok(name) => panic!("uppercase must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("request_id"), "got {error:#}"),
+        }
+        match channel_answer_permission(&home_directory, 13, "abcdefghijklmnopq", false) {
+            Ok(name) => panic!("more than 16 chars must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("request_id"), "got {error:#}"),
+        }
+        let name = channel_answer_permission(&home_directory, 13, "abcde", true)
+            .expect("a 5-letter id is valid");
+        let written = fs::read_to_string(
+            home_directory
+                .join(".claude")
+                .join("zed-channel")
+                .join("13")
+                .join("outbox")
+                .join(&name),
+        )
+        .expect("reading the outbox file");
+        assert!(written.contains("\"allow\""), "got {written}");
+        assert!(written.contains("\"abcde\""), "got {written}");
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    #[test]
+    fn channel_inbox_tail_restarts_when_the_file_shrinks() -> Result<()> {
+        let home_directory = temporary_directory("channel-inbox-shrink");
+        let inbox = home_directory
+            .join(".claude")
+            .join("zed-channel")
+            .join("14")
+            .join("inbox.jsonl");
+        fs::create_dir_all(inbox.parent().expect("inbox parent"))?;
+        fs::write(
+            &inbox,
+            "{\"kind\":\"ready\",\"at_ms\":1}\n{\"kind\":\"ready\",\"at_ms\":2}\n",
+        )?;
+
+        let first = read_channel_inbox_tail(
+            &home_directory,
+            14,
+            TailState {
+                path: None,
+                offset: 0,
+                pending: Vec::new(),
+            },
+        )?;
+        assert_eq!(first.lines.len(), 2);
+
+        fs::write(
+            &inbox,
+            "{\"kind\":\"closed\",\"at_ms\":9,\"reason\":\"signal\"}\n",
+        )?;
+
+        let second = read_channel_inbox_tail(
+            &home_directory,
+            14,
+            TailState {
+                path: first.path,
+                offset: first.offset,
+                pending: first.pending,
+            },
+        )?;
+        assert!(
+            second.restarted,
+            "a shorter inbox must restart, got offset {} for a file of {} bytes",
+            first.offset,
+            fs::metadata(&inbox)?.len()
         );
         assert_eq!(
-            attach_arguments("zed:@6.pane"),
-            None,
-            "a field with no pane is not a session Zed can show at all"
+            second.lines,
+            vec![r#"{"kind":"closed","at_ms":9,"reason":"signal"}"#]
         );
-        assert_eq!(attach_arguments(""), None);
+
+        let missing = read_channel_inbox_tail(
+            &home_directory,
+            99,
+            TailState {
+                path: None,
+                offset: 0,
+                pending: Vec::new(),
+            },
+        )?;
+        assert!(missing.lines.is_empty());
+        assert!(missing.path.is_none());
+
+        match read_channel_inbox_tail(
+            &home_directory,
+            0,
+            TailState {
+                path: None,
+                offset: 0,
+                pending: Vec::new(),
+            },
+        ) {
+            Ok(_) => panic!("pid 0 must be refused"),
+            Err(error) => assert!(error.to_string().contains("claude_pid"), "got {error:#}"),
+        }
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
     }
 
     const SAMPLE_ONE_JSON: &str = r#"{"pid":10064,"sessionId":"4e2e3600-89c0-4cd5-9994-525c708559ab",
@@ -3569,24 +4566,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pane_target_accepts_the_pane_id_of_a_registration() {
-        assert_eq!(pane_target("awp:@1.%1").as_deref(), Some("%1"));
-        assert_eq!(pane_target("a:b:@10.%234").as_deref(), Some("%234"));
-    }
-
-    #[test]
-    fn test_pane_target_rejects_everything_that_is_not_a_pane_id() {
-        for rejected in ["awp:@1", "awp:@1.%", "awp:@1.%x", "-t", "", "%1 ; rm -rf /"] {
-            assert_eq!(
-                pane_target(rejected),
-                None,
-                "`{rejected}` is not a pane id and must never reach tmux"
-            );
-        }
-    }
-
     #[cfg(unix)]
-    #[test]
     fn test_list_sessions_reports_sessions_with_and_without_a_transcript() -> Result<()> {
         smol::block_on(async {
             let home_directory = temporary_directory("list-sessions");
@@ -3668,454 +4648,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_send_text_and_send_escape_reject_an_empty_pane_target() {
-        smol::block_on(async {
-            let send_text_error = send_text("", "hello")
-                .await
-                .expect_err("an empty pane target must not be sent to");
-            assert!(
-                send_text_error.to_string().contains("no tmux pane"),
-                "the failure has to name what went wrong, got `{send_text_error:#}`"
-            );
-
-            let send_escape_error = send_escape("")
-                .await
-                .expect_err("an empty pane target must not be sent to");
-            assert!(
-                send_escape_error.to_string().contains("no tmux pane"),
-                "the failure has to name what went wrong, got `{send_escape_error:#}`"
-            );
-        });
-    }
-
-    /// `send_text` sends the message through this, and it is the part that cannot be
-    /// exercised against tmux without pasting into a live pane. `cat` stands in for
-    /// `tmux load-buffer`: both read until end of input, so a write that is never closed
-    /// or a wait that happens too early hangs here exactly as it would there.
-    #[cfg(unix)]
-    #[test]
-    fn test_run_with_stdin_writes_the_whole_input_and_waits_for_the_command() {
-        smol::block_on(async {
-            // Larger than a pipe buffer, so that the write cannot complete until the
-            // command has started draining it.
-            let long_message = "line of a multi-line message\n".repeat(4096);
-            run_with_stdin("/bin/cat", &[], long_message.as_bytes())
-                .await
-                .expect("cat reads its stdin to the end and exits successfully");
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_run_with_stdin_reports_the_stderr_of_a_command_that_fails() {
-        smol::block_on(async {
-            let error =
-                match run_with_stdin("/bin/cat", &["/this/path/does/not/exist"], b"unused input")
-                    .await
-                {
-                    Ok(()) => panic!("reading a path that does not exist must fail"),
-                    Err(error) => format!("{error:#}"),
-                };
-            assert!(
-                error.contains("/this/path/does/not/exist") && error.contains("failed"),
-                "the failure must carry what the command printed on stderr, got `{error}`"
-            );
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_send_escape_reports_the_stderr_of_a_pane_that_does_not_exist() {
-        smol::block_on(async {
-            // A pane id far above anything a real tmux server has handed out, so this
-            // cannot reach a live pane. A machine without tmux fails just as usefully.
-            let error = match send_escape("%99999999").await {
-                Ok(()) => panic!("sending to a pane that does not exist must fail"),
-                Err(error) => format!("{error:#}"),
-            };
-            assert!(
-                error.contains("send-keys") || error.contains("running tmux"),
-                "the failure must say which tmux command failed, got `{error}`"
-            );
-        });
-    }
-
-    #[test]
-    fn a_session_id_cannot_lead_the_transcript_search_out_of_the_projects_directory() -> Result<()>
-    {
-        let home_directory = temporary_directory("session-id-boundary");
-        let session_id = "4e2e3600-89c0-4cd5-9994-525c708559ab";
-        let transcript = write_transcript(&home_directory, session_id, "{\"type\":\"user\"}\n");
-
-        assert_eq!(
-            find_transcript(&home_directory, session_id),
-            Some(transcript),
-            "the shape a real session id has must still resolve, or the boundary has \
-             eaten the only thing it exists to let through"
-        );
-
-        // `<home>/.claude/projects/-some-slug` is three levels below the home directory,
-        // so three parent components reach a file the tail has no business reading.
-        let outside = home_directory.join("outside.jsonl");
-        write_file(outside.clone(), "{\"secret\":\"not a transcript\"}\n");
-
-        for escaping_session_id in [
-            "../../../outside",
-            "./../../../outside",
-            "-some-slug/../../../outside",
-            "../../../../../../../../../../../../etc/hosts",
-        ] {
-            let found = find_transcript(&home_directory, escaping_session_id);
-            assert_eq!(
-                found, None,
-                "a session id of {escaping_session_id:?} must not resolve to a path \
-                 outside the projects directory, but it resolved to {found:?}"
-            );
-        }
-
-        let progress = read_transcript_tail(
-            &home_directory,
-            "../../../outside",
-            TailState {
-                path: None,
-                offset: 0,
-                pending: Vec::new(),
-            },
-        )?;
-        assert_eq!(
-            progress.path, None,
-            "a tail must not follow a path a session id climbed out to"
-        );
-        assert!(
-            progress.lines.is_empty(),
-            "a tail must not hand back the contents of {}, but it returned {:?}",
-            outside.display(),
-            progress.lines
-        );
-
-        Ok(())
-    }
-
-    /// Serializes the tests that touch the machine's tmux server. One of them asserts
-    /// that this process leaves no paste buffer behind while the other holds a paste
-    /// buffer for as long as its send takes, and there is only one buffer stack for both
-    /// of them to be right about.
-    static TMUX_SERVER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A test that panicked while holding the lock says nothing about whether the next
-    /// test may run, so the poison is stepped over rather than turned into a second
-    /// failure that hides the first.
-    fn tmux_server_lock() -> std::sync::MutexGuard<'static, ()> {
-        TMUX_SERVER_TESTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_send_that_cannot_reach_its_pane_leaves_no_paste_buffer_behind() {
-        let _tmux_server = tmux_server_lock();
-        smol::block_on(async {
-            // A pane id far above anything a real tmux server has handed out, so the
-            // paste cannot reach a live pane; `load-buffer` names no pane at all.
-            let error = match send_text("%99999999", "text that must not stay in tmux").await {
-                Ok(()) => panic!("sending to a pane that does not exist must fail"),
-                Err(error) => format!("{error:#}"),
-            };
-
-            let buffer_prefix = format!("zed-claude-{}-", std::process::id());
-            let mut list_buffers = util::command::new_command("tmux");
-            list_buffers.args(["list-buffers", "-F", "#{buffer_name}"]);
-            // A machine with no tmux server has no buffer stack to leak into.
-            let leftover_buffers: Vec<String> = match list_buffers.output().await {
-                Err(_) => Vec::new(),
-                Ok(output) => String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter(|buffer_name| buffer_name.starts_with(&buffer_prefix))
-                    .map(str::to_string)
-                    .collect(),
-            };
-
-            // Removed before the assertion, so that a failing run does not leave behind
-            // the very text it is complaining about.
-            for buffer_name in &leftover_buffers {
-                let mut delete_buffer = util::command::new_command("tmux");
-                delete_buffer.args(["delete-buffer", "-b", buffer_name]);
-                delete_buffer.output().await.log_err();
-            }
-
-            assert!(
-                leftover_buffers.is_empty(),
-                "a send that failed with `{error}` must leave no paste buffer behind, \
-                 but tmux still held {leftover_buffers:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn a_send_runs_one_tmux_command_list_so_two_sends_cannot_interleave() {
-        let arguments = send_text_arguments("zed-claude-1-0", "%12", true);
-
-        let separators = arguments
-            .iter()
-            .filter(|argument| argument.as_str() == ";")
-            .count();
-        assert_eq!(
-            separators, 2,
-            "loading, pasting and submitting have to travel as one tmux command list, \
-             separated by two `;` arguments, but the send runs {arguments:?}"
-        );
-        assert_eq!(
-            arguments,
-            vec![
-                "load-buffer",
-                "-b",
-                "zed-claude-1-0",
-                "-",
-                ";",
-                "paste-buffer",
-                "-d",
-                "-p",
-                "-b",
-                "zed-claude-1-0",
-                "-t",
-                "%12",
-                ";",
-                "send-keys",
-                "-t",
-                "%12",
-                "Enter",
-            ],
-            "the three steps have to stay in this order within the one command list"
-        );
-    }
-
-    /// Captured from a send that did not arrive: Claude Code tells typing from pasting by
-    /// how fast the bytes reach it, so an unbracketed burst long enough to look pasted
-    /// swallowed the `Enter` that follows it as one more byte of the paste. The message
-    /// sat in the input box with a newline on the end and went out joined to whatever the
-    /// user typed next, as one prompt — the session's own `last-prompt` record held both
-    /// messages with a \r between them.
-    #[test]
-    fn every_send_asks_tmux_for_a_bracketed_paste() {
-        let asked_for: Vec<(&str, bool)> = ["one line", "line one\nline two", "trailing\n"]
-            .into_iter()
-            .map(|text| (text, needs_bracketed_paste(text)))
-            .collect();
-        assert_eq!(
-            asked_for,
-            vec![
-                // The one that used to go without, and the one that was reported.
-                ("one line", true),
-                ("line one\nline two", true),
-                ("trailing\n", true),
-            ],
-            "a single line can be a burst long enough to be read as a paste, so there is \
-             no length at which guessing is safe"
-        );
-
-        let single_line = send_text_arguments("zed-claude-1-0", "%12", needs_bracketed_paste("one line"));
-        assert_eq!(
-            single_line,
-            vec![
-                "load-buffer",
-                "-b",
-                "zed-claude-1-0",
-                "-",
-                ";",
-                "paste-buffer",
-                "-d",
-                "-p",
-                "-b",
-                "zed-claude-1-0",
-                "-t",
-                "%12",
-                ";",
-                "send-keys",
-                "-t",
-                "%12",
-                "Enter",
-            ],
-            "`-p` is the whole difference, and the `Enter` still rides the same command \
-             list so that a concurrent send cannot slip between the paste and it"
-        );
-    }
-
-    /// Sends into a pane this test creates and kills, never into a pane a real Claude
-    /// Code session is running in. `cat` has not asked for bracketed paste, so tmux
-    /// leaves the paste sequences out either way and what lands in the file is the
-    /// message itself: this is about the text and its newlines arriving intact, while
-    /// [`only_a_multi_line_send_asks_tmux_for_a_bracketed_paste`] is what pins the flag.
-    #[cfg(unix)]
-    #[test]
-    fn a_single_line_and_a_multi_line_send_both_arrive_verbatim() {
-        let _tmux_server = tmux_server_lock();
-        smol::block_on(async {
-            let session_name = format!("zed-claude-send-shapes-test-{}", std::process::id());
-            let output_path = std::env::temp_dir().join(format!("{session_name}.out"));
-            std::fs::remove_file(&output_path).ok();
-
-            let mut new_session = util::command::new_command("tmux");
-            new_session.args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                &format!("cat >> '{}'", output_path.display()),
-            ]);
-            // A machine with no tmux binary, or one that cannot start a server, has no
-            // pane for this to send into.
-            match new_session.output().await {
-                Err(_) => return,
-                Ok(output) if !output.status.success() => return,
-                Ok(_) => {}
-            }
-
-            let received = async {
-                let mut list_panes = util::command::new_command("tmux");
-                list_panes.args(["list-panes", "-t", &session_name, "-F", "#{pane_id}"]);
-                let panes = list_panes
-                    .output()
-                    .await
-                    .context("listing the panes of the test session")?;
-                let pane_target = String::from_utf8_lossy(&panes.stdout).trim().to_string();
-                anyhow::ensure!(
-                    !pane_target.is_empty(),
-                    "the test session reported no pane to send to"
-                );
-
-                // The pane's `cat` appends, so the file accumulates both sends and the
-                // tail of it is what says the send being waited on has arrived.
-                let await_tail = |tail: &'static str| {
-                    let output_path = output_path.clone();
-                    async move {
-                        for _ in 0..100 {
-                            let received =
-                                std::fs::read_to_string(&output_path).unwrap_or_default();
-                            if received.ends_with(tail) {
-                                return anyhow::Ok(received);
-                            }
-                            // Sleeping the thread rather than awaiting a timer, because
-                            // what this waits for is another process writing a file.
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        anyhow::bail!(
-                            "the pane never received a line ending in {tail:?}, only `{}`",
-                            std::fs::read_to_string(&output_path).unwrap_or_default()
-                        )
-                    }
-                };
-
-                send_text(&pane_target, "a single line").await?;
-                let after_single_line = await_tail("a single line\n").await?;
-
-                send_text(&pane_target, "line one\nline two").await?;
-                let after_multi_line = await_tail("line two\n").await?;
-
-                anyhow::Ok((after_single_line, after_multi_line))
-            }
-            .await;
-
-            // Killed before the assertions, so that a failing run leaves no session and
-            // no file behind.
-            let mut kill_session = util::command::new_command("tmux");
-            kill_session.args(["kill-session", "-t", &session_name]);
-            kill_session.output().await.log_err();
-            std::fs::remove_file(&output_path).ok();
-
-            let (after_single_line, after_multi_line) =
-                received.expect("the sends into the test's own pane must succeed");
-            assert_eq!(
-                after_single_line, "a single line\n",
-                "a single-line send has to arrive as that line, submitted once"
-            );
-            assert_eq!(
-                after_multi_line, "a single line\nline one\nline two\n",
-                "the multi-line send that follows it has to arrive whole, submitted once"
-            );
-        });
-    }
-
-    /// Sends into a pane this test creates and kills, never into a pane a real Claude
-    /// Code session is running in.
-    #[cfg(unix)]
-    #[test]
-    fn a_multi_line_send_arrives_in_the_pane_as_one_message() {
-        let _tmux_server = tmux_server_lock();
-        smol::block_on(async {
-            let session_name = format!("zed-claude-send-text-test-{}", std::process::id());
-            let output_path = std::env::temp_dir().join(format!("{session_name}.out"));
-            std::fs::remove_file(&output_path).ok();
-
-            let mut new_session = util::command::new_command("tmux");
-            new_session.args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                &format!("cat >> '{}'", output_path.display()),
-            ]);
-            // A machine with no tmux binary, or one that cannot start a server, has no
-            // pane for this to send into; the rest of the suite still covers the
-            // arguments and the failure path.
-            match new_session.output().await {
-                Err(_) => return,
-                Ok(output) if !output.status.success() => return,
-                Ok(_) => {}
-            }
-
-            let received = async {
-                let mut list_panes = util::command::new_command("tmux");
-                list_panes.args(["list-panes", "-t", &session_name, "-F", "#{pane_id}"]);
-                let panes = list_panes
-                    .output()
-                    .await
-                    .context("listing the panes of the test session")?;
-                let pane_target = String::from_utf8_lossy(&panes.stdout).trim().to_string();
-                anyhow::ensure!(
-                    !pane_target.is_empty(),
-                    "the test session reported no pane to send to"
-                );
-
-                send_text(&pane_target, "line one\nline two").await?;
-
-                // tmux accepts the paste and the Enter before the pane's `cat` has seen
-                // them, and the second line only reaches the file once Enter has been
-                // typed, so the trailing newline is what says the whole send arrived.
-                // A missing file is what "nothing has arrived yet" looks like here.
-                for _ in 0..100 {
-                    let received = std::fs::read_to_string(&output_path).unwrap_or_default();
-                    if received.ends_with('\n') {
-                        return anyhow::Ok(received);
-                    }
-                    // Sleeping the thread rather than awaiting a timer, because what
-                    // this waits for is another process writing a file, and nothing
-                    // else is queued on this test's executor to be starved by it.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                anyhow::bail!(
-                    "the pane never received a submitted line, only `{}`",
-                    std::fs::read_to_string(&output_path).unwrap_or_default()
-                )
-            }
-            .await;
-
-            // Killed before the assertion, so that a failing run leaves no session and
-            // no file behind.
-            let mut kill_session = util::command::new_command("tmux");
-            kill_session.args(["kill-session", "-t", &session_name]);
-            kill_session.output().await.log_err();
-            std::fs::remove_file(&output_path).ok();
-
-            let received = received.expect("the send into the test's own pane must succeed");
-            assert_eq!(
-                received, "line one\nline two\n",
-                "both lines have to arrive as one message, submitted once"
-            );
-        });
-    }
-
     /// Both sidecars are verbatim rows from this machine's `subagents` directories.
     const SUBAGENT_META_GENERAL_PURPOSE: &str = r#"{"agentType":"general-purpose",
  "description":"Phase B adversarial review round 2",
@@ -4581,246 +5113,330 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_live_message_hook_truncates_when_index_zero_has_no_trailing_comma() -> Result<()> {
-        let temp_dir = temporary_directory("hook-truncate-test");
-        let session_id = "test-session";
-        let live_dir = temp_dir.join(".claude").join("live-messages");
-        fs::create_dir_all(&live_dir)?;
-        let message_file = live_dir.join(format!("{session_id}.jsonl"));
-        write_file(
-            message_file.clone(),
-            "stale content from previous message\n",
-        );
+    fn run_script(script: &Path, home: &Path, payload: &str) -> Result<std::process::Output> {
+        Ok(smol::block_on(
+            smol::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
+                .arg("--")
+                .arg(payload)
+                .arg(script)
+                .env("HOME", home)
+                .output(),
+        )?)
+    }
 
-        let hook_path = temp_dir.join("hook.sh");
-        fs::write(&hook_path, LIVE_MESSAGE_HOOK_SOURCE)?;
+    fn write_script(path: &Path, source: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, source)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))?;
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn events_hook_writes_nothing_without_a_session_id() -> Result<()> {
+        let home_directory = temporary_directory("events-no-session");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+        let output = run_script(&script, &home_directory, r#"{"hook_event_name":"Stop"}"#)?;
+        assert!(output.status.success(), "the hook must always exit 0");
+        assert!(output.stdout.is_empty(), "the hook prints nothing");
+        let events = home_directory.join(".claude").join("zed-events");
+        assert!(
+            !events.exists() || fs::read_dir(&events)?.next().is_none(),
+            "a payload without a session id must not create an events file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn events_hook_appends_a_wrapped_line_for_each_payload() -> Result<()> {
+        let home_directory = temporary_directory("events-append");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+        let first = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+        let second = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+        assert!(
+            run_script(&script, &home_directory, first)?
+                .status
+                .success()
+        );
+        assert!(
+            run_script(&script, &home_directory, second)?
+                .status
+                .success()
+        );
+        let contents = fs::read_to_string(
+            home_directory
+                .join(".claude")
+                .join("zed-events")
+                .join("s1.jsonl"),
+        )?;
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "each payload is one line, got {contents:?}");
+        for (line, expected) in lines.iter().zip([first, second]) {
+            let wrapper: serde_json::Value = serde_json::from_str(line)?;
+            assert!(
+                wrapper
+                    .get("received_at_ms")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some()
+            );
+            let event = serde_json::to_string(wrapper.get("event").context("event wrapper")?)?;
+            let expected: serde_json::Value = serde_json::from_str(expected)?;
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&event)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn events_hook_truncates_a_file_over_the_cap() -> Result<()> {
+        let home_directory = temporary_directory("events-cap");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+        let events_file = home_directory
+            .join(".claude")
+            .join("zed-events")
+            .join("s1.jsonl");
+        fs::create_dir_all(events_file.parent().context("events parent")?)?;
+        fs::write(
+            &events_file,
+            vec![b'x'; (EVENTS_FILE_CAP_BYTES as usize) + 1],
+        )?;
+        let payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+        assert!(
+            run_script(&script, &home_directory, payload)?
+                .status
+                .success()
+        );
+        let contents = fs::read_to_string(&events_file)?;
+        assert!(
+            contents.len() < EVENTS_FILE_CAP_BYTES as usize,
+            "the oversized file is truncated before the new line is appended; got {} bytes",
+            contents.len()
+        );
+        assert_eq!(contents.lines().count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn status_hook_writes_the_payload_and_chains() -> Result<()> {
+        let home_directory = temporary_directory("status-chain");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-status.sh");
+        write_script(&script, STATUS_HOOK_SOURCE)?;
+        let chained = home_directory
+            .join(".claude")
+            .join("zed-status")
+            .join("chained-command.txt");
+        fs::create_dir_all(chained.parent().context("status parent")?)?;
+        fs::write(&chained, "printf 'from-chain'")?;
+        let payload = r#"{"session_id":"s1","model":{"id":"opus"}}"#;
+        let output = run_script(&script, &home_directory, payload)?;
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "from-chain",
+            "the displaced status line command still prints"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                home_directory
+                    .join(".claude")
+                    .join("zed-status")
+                    .join("s1.json")
+            )?,
+            payload
+        );
+        Ok(())
+    }
+
+    /// Hooks are not serialized with one another: two tool calls that run in parallel
+    /// answer their PostToolUse at the same moment, and MessageDisplay fires beside them
+    /// continuously. An append that is more than one `write` interleaves with theirs and
+    /// destroys both lines, and a destroyed PostToolUse leaves its tool on the activity
+    /// line until the transcript catches up.
+    #[test]
+    fn events_hook_appends_whole_lines_under_concurrency() -> Result<()> {
+        let home_directory = temporary_directory("events-race");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+
+        const WRITERS: usize = 12;
+        let payload = format!(
+            r#"{{"session_id":"race","hook_event_name":"PostToolUse","tool_use_id":"t1","tool_response":"{}"}}"#,
+            "x".repeat(200_000)
+        );
+
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let script = script.clone();
+            let home_directory = home_directory.clone();
+            let payload = payload.clone();
+            writers.push(std::thread::spawn(move || {
+                run_script(&script, &home_directory, &payload).map(|output| output.status.success())
+            }));
+        }
+        for writer in writers {
+            let finished = writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("a writer panicked"))??;
+            assert!(finished, "every invocation of the hook exits 0");
         }
 
-        let payload = r#"{"type":"content_block_start","session_id":"test-session","index":0}"#;
-
-        // The hook reads its payload from stdin, and the shell is what feeds it: the
-        // pattern under test is the shell's own `case` glob, so running it any other way
-        // would be testing a reimplementation of it rather than the hook that ships.
-        let status = smol::block_on(
-            smol::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
-                .arg("--")
-                .arg(payload)
-                .arg(&hook_path)
-                .env("HOME", &temp_dir)
-                .status(),
+        let contents = fs::read_to_string(
+            home_directory
+                .join(".claude")
+                .join("zed-events")
+                .join("race.jsonl"),
         )?;
-        assert!(status.success(), "the hook must always exit 0");
-
-        let contents = fs::read_to_string(&message_file)?;
+        let whole: Vec<&str> = contents
+            .lines()
+            .filter(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+            .collect();
         assert_eq!(
-            contents.lines().next(),
-            Some(payload),
-            "hook must truncate file on index:0 even when object ends without a comma"
+            whole.len(),
+            WRITERS,
+            "every concurrent hook must leave one whole line; expected {} parseable lines, got {} of {} written",
+            WRITERS,
+            whole.len(),
+            contents.lines().count()
         );
         Ok(())
     }
 
+    /// The default only covers a key that is absent. A key that is present and null is a
+    /// payload that names no session, and the rule for those is to write nothing.
     #[test]
-    fn live_message_hook_reads_index_zero_as_json_not_as_one_textual_spelling() -> Result<()> {
-        let home_directory = temporary_directory("hook-index-json");
-        let session_id = "index-spacing";
-        let live_directory = home_directory.join(".claude").join(LIVE_MESSAGES_DIRECTORY);
-        fs::create_dir_all(&live_directory)?;
-        let message_file = live_directory.join(format!("{session_id}.jsonl"));
-        write_file(
-            message_file.clone(),
-            "stale content from previous message\n",
-        );
-
-        let hook_path = home_directory.join("hook.sh");
-        fs::write(&hook_path, LIVE_MESSAGE_HOOK_SOURCE)?;
-        let payload = r#"{"type":"content_block_start","session_id":"index-spacing","index" : 0}"#;
-        let status = smol::block_on(
-            smol::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
-                .arg("--")
-                .arg(payload)
-                .arg(&hook_path)
-                .env("HOME", &home_directory)
-                .status(),
-        )?;
-        assert!(status.success(), "the hook must always exit 0");
-
-        let contents = fs::read_to_string(&message_file)?;
-        let actual = contents.lines().next();
-        assert_eq!(
-            actual,
-            Some(payload),
-            "numeric index zero starts a new message regardless of JSON whitespace; expected first line {payload:?}, got {actual:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn question_hook_accepts_a_single_component_session_id_with_special_characters() -> Result<()> {
-        let home_directory = temporary_directory("hook-special-session");
-        let hook_path = home_directory.join("hook.sh");
-        fs::write(&hook_path, QUESTION_HOOK_SOURCE)?;
-        let session_id = "session..candidate '$()[]";
-        let payload = serde_json::json!({
-            "session_id": session_id,
-            "tool_use_id": "call-1",
-            "tool_input": {"questions": []},
-        })
-        .to_string();
-        let status = smol::block_on(
-            smol::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
-                .arg("--")
-                .arg(&payload)
-                .arg(&hook_path)
-                .env("HOME", &home_directory)
-                .status(),
-        )?;
-        assert!(status.success(), "the hook must always exit 0");
-
-        let expected_path = home_directory
+    fn events_hook_writes_nothing_for_a_null_session_id() -> Result<()> {
+        let home_directory = temporary_directory("events-null-session");
+        let script = home_directory
             .join(".claude")
-            .join(PENDING_QUESTIONS_DIRECTORY)
-            .join(format!("{session_id}.json"));
-        let actual = expected_path.is_file();
-        assert_eq!(
-            actual,
-            true,
-            "the Rust reader accepts this one path component; expected {} to exist, got exists={actual}",
-            expected_path.display()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn installed_question_hook_finds_its_home_when_home_is_unset() -> Result<()> {
-        let home_directory = temporary_directory("hook-without-home");
-        install_question_hook(&home_directory)?;
-        let hook_path = home_directory.join(".claude").join(QUESTION_HOOK_SCRIPT);
-        let session_id = "home-fallback";
-        let payload = serde_json::json!({
-            "session_id": session_id,
-            "tool_use_id": "call-1",
-            "tool_input": {"questions": []},
-        })
-        .to_string();
-        let status = smol::block_on(
-            smol::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(r#"printf '%s' "$1" | /bin/sh "$2""#)
-                .arg("--")
-                .arg(&payload)
-                .arg(&hook_path)
-                .env_remove("HOME")
-                .status(),
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+        let output = run_script(
+            &script,
+            &home_directory,
+            r#"{"session_id":null,"hook_event_name":"Stop"}"#,
         )?;
-        assert!(status.success(), "the hook must always exit 0");
+        assert!(output.status.success(), "the hook must always exit 0");
 
-        let expected_path = home_directory
-            .join(".claude")
-            .join(PENDING_QUESTIONS_DIRECTORY)
-            .join(format!("{session_id}.json"));
-        let actual = expected_path.is_file();
-        assert_eq!(
-            actual,
-            true,
-            "the installed script's location identifies its Claude directory; expected {} to exist, got exists={actual}",
-            expected_path.display()
+        let events = home_directory.join(".claude").join("zed-events");
+        let written: Vec<String> = match fs::read_dir(&events) {
+            Ok(entries) => entries
+                .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            written.is_empty(),
+            "a null session id names no session; expected no events file, got {written:?}"
         );
         Ok(())
     }
 
-    /// The pieces of a message arrive in the order the terminal drew them, but the file
-    /// is appended to while it is read, so the order is not what this reads them by.
+    /// What the guard above must not reject: an ordinary payload, and one whose session id
+    /// only the sed fallback can reach.
     #[test]
-    fn a_message_is_put_back_together_in_the_order_its_pieces_are_numbered() {
-        let out_of_order = concat!(
-            r#"{"message_id":"m1","index":1,"final":false,"delta":" world"}"#,
-            "\n",
-            r#"{"message_id":"m1","index":0,"final":false,"delta":"hello"}"#,
-            "\n",
-            r#"{"message_id":"m1","index":2,"final":true,"delta":"!"}"#,
-            "\n",
+    fn events_hook_still_writes_for_an_ordinary_session_id() -> Result<()> {
+        let home_directory = temporary_directory("events-ordinary-session");
+        let script = home_directory
+            .join(".claude")
+            .join("hooks")
+            .join("zed-claude-events.sh");
+        write_script(&script, EVENTS_HOOK_SOURCE)?;
+        assert!(
+            run_script(
+                &script,
+                &home_directory,
+                r#"{"session_id":"s-ordinary","hook_event_name":"Stop"}"#,
+            )?
+            .status
+            .success()
         );
+        let contents = fs::read_to_string(
+            home_directory
+                .join(".claude")
+                .join("zed-events")
+                .join("s-ordinary.jsonl"),
+        )?;
         assert_eq!(
-            assemble_live_message(out_of_order).as_deref(),
-            Some("hello world!")
+            contents.lines().count(),
+            1,
+            "an ordinary payload is still one appended line, got {contents:?}"
         );
+        Ok(())
     }
 
-    /// A message beginning is what clears the one before it, and the hook truncates on
-    /// the same signal. When that truncation did not happen — the file could not be
-    /// written, or a message began while it was being read — two messages would otherwise
-    /// be shown run together as one.
+    /// The status file is read whole on every poll and framed onto the wire behind it, so
+    /// it needs the ceiling `ReadClaudeFile` already has. Nothing the status line writes
+    /// comes anywhere near it.
     #[test]
-    fn only_the_newest_message_in_the_file_is_assembled() {
-        let two_messages = concat!(
-            r#"{"message_id":"m1","index":0,"final":true,"delta":"the older one"}"#,
-            "\n",
-            r#"{"message_id":"m2","index":0,"final":false,"delta":"the newer"}"#,
-            "\n",
-            r#"{"message_id":"m2","index":1,"final":true,"delta":" one"}"#,
-            "\n",
+    fn a_status_file_over_the_cap_is_refused() -> Result<()> {
+        let home_directory = temporary_directory("status-cap");
+        let status_file = home_directory
+            .join(".claude")
+            .join("zed-status")
+            .join("s1.json");
+        fs::create_dir_all(status_file.parent().context("status parent")?)?;
+        fs::write(
+            &status_file,
+            vec![b'x'; (MAX_STATUS_FILE_BYTES as usize) + 1],
+        )?;
+
+        let read = read_session_status(&home_directory, "s1");
+        assert!(
+            read.is_err(),
+            "a status file past the cap must be refused rather than read whole; expected Err, got Ok({:?})",
+            read.map(|status| status.map(|status| status.len()))
         );
-        assert_eq!(
-            assemble_live_message(two_messages).as_deref(),
-            Some("the newer one")
-        );
+        Ok(())
     }
 
-    /// The last line is regularly half-written, because it is appended to while it is
-    /// being read. Losing the piece being written is right; losing the message is not.
+    /// What the cap must not reject: a status payload far larger than the CLI writes.
     #[test]
-    fn a_half_written_piece_costs_only_itself() {
-        let half_written = concat!(
-            r#"{"message_id":"m1","index":0,"final":false,"delta":"what is here"}"#,
-            "\n",
-            r#"{"message_id":"m1","index":1,"final":fal"#,
+    fn a_large_but_legal_status_file_is_still_read() -> Result<()> {
+        let home_directory = temporary_directory("status-under-cap");
+        let status_file = home_directory
+            .join(".claude")
+            .join("zed-status")
+            .join("s1.json");
+        fs::create_dir_all(status_file.parent().context("status parent")?)?;
+        let status = format!(
+            r#"{{"session_id":"s1","model":{{"id":"opus","display_name":"{}"}}}}"#,
+            "n".repeat(100 * 1024)
         );
-        assert_eq!(
-            assemble_live_message(half_written).as_deref(),
-            Some("what is here")
-        );
-    }
+        fs::write(&status_file, &status)?;
 
-    /// Nothing recorded, and nothing but whitespace recorded, are both a session that has
-    /// nothing to show — and a blank block under the conversation is worse than none.
-    #[test]
-    fn a_message_of_nothing_is_not_a_message() {
-        assert_eq!(assemble_live_message(""), None);
+        let read = read_session_status(&home_directory, "s1")?;
         assert_eq!(
-            assemble_live_message(r#"{"message_id":"m1","index":0,"delta":"   \n "}"#),
-            None
+            read.as_deref().map(str::len),
+            Some(status.len()),
+            "a {} byte status file is well under the cap and must still be read whole",
+            status.len()
         );
-        assert_eq!(assemble_live_message("not json at all\n"), None);
-    }
-
-    /// A piece repeated — the hook ran twice for it, or a read caught a rewrite — must not
-    /// double the words it carries.
-    #[test]
-    fn a_piece_recorded_twice_is_only_said_once() {
-        let repeated = concat!(
-            r#"{"message_id":"m1","index":0,"final":false,"delta":"once"}"#,
-            "\n",
-            r#"{"message_id":"m1","index":1,"final":false,"delta":" only"}"#,
-            "\n",
-            r#"{"message_id":"m1","index":1,"final":false,"delta":" only"}"#,
-            "\n",
-        );
-        assert_eq!(
-            assemble_live_message(repeated).as_deref(),
-            Some("once only")
-        );
+        Ok(())
     }
 
     /// Captured from a real session that was waiting on this call, so that the shape the
@@ -4947,184 +5563,349 @@ mod tests {
         Ok(())
     }
 
-    /// The settings file is the user's and holds everything else they have configured, so
-    /// installing has to add to it rather than write over it, and has to leave a copy of
-    /// what was there.
     #[test]
-    fn installing_the_hook_keeps_the_rest_of_the_settings_and_copies_them_aside() -> Result<()> {
-        let home_directory = temporary_directory("question-hook-install");
+    fn installing_zed_hooks_on_a_fresh_home_is_idempotent() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-fresh");
+        match install_zed_hooks(&home_directory)? {
+            HookInstallOutcome::Installed { .. } => {}
+            other => panic!("fresh install writes settings, got {other:?}"),
+        }
+        assert!(zed_hooks_installed(&home_directory));
+        let installed_server = fs::read_to_string(channel_server_path(&home_directory))?;
+        assert_eq!(
+            installed_server, CHANNEL_SERVER_SOURCE,
+            "installing must copy the channel server"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(channel_server_path(&home_directory))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "the channel server is not executable, got {mode:o}"
+            );
+        }
+        match install_zed_hooks(&home_directory)? {
+            HookInstallOutcome::AlreadyCurrent => {}
+            other => panic!("installing twice must change nothing, got {other:?}"),
+        }
+        uninstall_zed_hooks(&home_directory)?;
+        assert!(
+            !channel_server_path(&home_directory).exists(),
+            "uninstall must remove the channel server"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_removes_zed_entries_and_server_but_keeps_claude_json() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-uninstall");
+        let claude_json = home_directory.join(".claude.json");
+        write_file(claude_json.clone(), r#"{"mcpServers":{"zed-claude":{}}}"#);
+        install_zed_hooks(&home_directory)?;
+
+        uninstall_zed_hooks(&home_directory)?;
+
+        let settings = read_claude_settings(&home_directory)?;
+        assert!(!event_names_our_script(&settings, "zed-claude-events.sh"));
+        assert!(!channel_server_path(&home_directory).exists());
+        assert_eq!(
+            fs::read_to_string(&claude_json)?,
+            r#"{"mcpServers":{"zed-claude":{}}}"#,
+            "uninstall leaves ~/.claude.json for the user's explicit claude mcp remove command"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installing_removes_legacy_duplicated_hooks_and_keeps_a_foreign_one() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-legacy");
         let settings_path = home_directory.join(".claude").join("settings.json");
         write_file(
             settings_path.clone(),
-            r#"{"model":"opus[1m]","hooks":{"UserPromptSubmit":[{"hooks":[
-                {"type":"command","command":"codegraph prompt-hook"}]}]}}"#,
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"/Users/andy/.claude/hooks/record-pending-question.sh"}]},
+                  {"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"'/Users/andy/.claude/hooks/record-pending-question.sh'"}]},
+                  {"matcher":"Bash","hooks":[{"type":"command","command":"echo foreign"}]}
+                ],
+                "MessageDisplay": [
+                  {"hooks":[{"type":"command","command":"/Users/andy/.claude/hooks/record-live-message.sh"}]},
+                  {"hooks":[{"type":"command","command":"'/Users/andy/.claude/hooks/record-live-message.sh'"}]}
+                ]
+              }
+            }"#,
         );
+        fs::create_dir_all(home_directory.join(".claude").join("hooks"))?;
+        fs::write(
+            home_directory
+                .join(".claude")
+                .join("hooks")
+                .join("record-pending-question.sh"),
+            "#!/bin/sh\n",
+        )?;
+        fs::write(
+            home_directory
+                .join(".claude")
+                .join("hooks")
+                .join("record-live-message.sh"),
+            "#!/bin/sh\n",
+        )?;
 
+        install_zed_hooks(&home_directory)?;
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        let pre = settings
+            .pointer("/hooks/PreToolUse")
+            .and_then(serde_json::Value::as_array)
+            .context("PreToolUse entries")?;
         assert!(
-            !question_hook_is_installed(&home_directory),
-            "nothing is installed before installing it"
+            pre.iter().any(|entry| {
+                entry_command_strings(entry)
+                    .iter()
+                    .any(|command| command.contains("echo foreign"))
+            }),
+            "a foreign PreToolUse matcher must survive: {pre:?}"
         );
-
-        let backup = install_question_hook(&home_directory)?
-            .context("settings that existed are copied aside")?;
         assert!(
-            backup.is_file(),
-            "the copy has to exist to be worth anything"
+            !pre.iter().any(|entry| {
+                entry_command_strings(entry).iter().any(|command| {
+                    command.contains("record-pending-question.sh")
+                        || command.contains("record-live-message.sh")
+                })
+            }),
+            "legacy question hooks must be gone: {pre:?}"
         );
+        assert!(
+            !home_directory
+                .join(".claude")
+                .join("hooks")
+                .join("record-pending-question.sh")
+                .exists()
+        );
+        assert!(zed_hooks_installed(&home_directory));
+        Ok(())
+    }
 
+    #[test]
+    fn an_existing_status_line_is_chained_and_restored_on_uninstall() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-status");
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(
+            settings_path.clone(),
+            r#"{"statusLine":{"type":"command","command":"echo mine"}}"#,
+        );
+        match install_zed_hooks(&home_directory)? {
+            HookInstallOutcome::Installed { .. } => {}
+            other => panic!("chaining a status line writes settings, got {other:?}"),
+        }
+        let chained = fs::read_to_string(
+            home_directory
+                .join(".claude")
+                .join("zed-status")
+                .join("chained-command.txt"),
+        )?;
+        assert_eq!(chained, "echo mine");
+        uninstall_zed_hooks(&home_directory)?;
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
         assert_eq!(
-            settings.get("model").and_then(serde_json::Value::as_str),
-            Some("opus[1m]"),
-            "a setting this install knows nothing about must survive it"
-        );
-        assert_eq!(
             settings
-                .pointer("/hooks/UserPromptSubmit/0/hooks/0/command")
+                .pointer("/statusLine/command")
                 .and_then(serde_json::Value::as_str),
-            Some("codegraph prompt-hook"),
-            "another hook of another event must survive it"
+            Some("echo mine")
         );
-        assert!(question_hook_is_installed(&home_directory));
-
-        let script = home_directory.join(".claude").join(QUESTION_HOOK_SCRIPT);
-        assert!(script.is_file(), "the hook has to have something to run");
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_installed_hook_command_quotes_its_script_path_for_the_shell() -> Result<()> {
-        let home_directory = temporary_directory("hook command's path");
-        install_question_hook(&home_directory)?;
-        let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(
-            home_directory.join(".claude").join("settings.json"),
-        )?)?;
-        let command = settings
-            .pointer("/hooks/PreToolUse/0/hooks/0/command")
-            .and_then(serde_json::Value::as_str)
-            .context("the installed question hook command")?;
-        let payload = serde_json::json!({
-            "session_id": "quoted-command",
-            "tool_use_id": "call-1",
-            "tool_input": {"questions": []},
-        })
-        .to_string();
-
-        let actual = smol::block_on(run_with_stdin(
-            "/bin/sh",
-            &["-c", command],
-            payload.as_bytes(),
-        ))
-        .map_err(|error| format!("{error:#}"));
-        assert_eq!(
-            actual,
-            Ok(()),
-            "the command must execute a path containing spaces and a single quote; expected Ok(()), got {actual:?}"
-        );
-
-        let expected_path = home_directory
-            .join(".claude")
-            .join(PENDING_QUESTIONS_DIRECTORY)
-            .join("quoted-command.json");
-        assert_eq!(
-            expected_path.is_file(),
-            true,
-            "the executed hook must write {}; expected exists=true, got exists=false",
-            expected_path.display()
+        assert!(
+            !home_directory
+                .join(".claude")
+                .join("zed-status")
+                .join("chained-command.txt")
+                .exists()
         );
         Ok(())
     }
 
     #[test]
-    fn a_question_hook_with_the_wrong_matcher_is_not_the_installed_hook() -> Result<()> {
-        let home_directory = temporary_directory("question-hook-matcher");
-        install_question_hook(&home_directory)?;
+    fn uninstall_keeps_a_user_command_mixed_into_the_same_matcher() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-mixed-matcher");
         let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(
+            settings_path.clone(),
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "Bash",
+                    "hooks": [
+                      {"type": "command", "command": "echo user-own"},
+                      {"type": "command", "command": "'/Users/andy/.claude/hooks/zed-claude-events.sh'", "timeout": 5}
+                    ]
+                  },
+                  {"matcher": "Edit", "hooks": [{"type": "command", "command": "echo neighbour"}]}
+                ]
+              }
+            }"#,
+        );
+
+        uninstall_zed_hooks(&home_directory)?;
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        let pre = settings
+            .pointer("/hooks/PreToolUse")
+            .and_then(serde_json::Value::as_array)
+            .context("PreToolUse entries")?;
+        let commands: Vec<String> = pre.iter().flat_map(entry_command_strings).collect();
+        assert!(
+            commands.iter().any(|command| command == "echo user-own"),
+            "the user's command in a matcher that also named our script must survive uninstall; \
+             got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|command| command == "echo neighbour"),
+            "a neighbouring matcher that never named our script must survive uninstall; \
+             got {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command_refers_to(command, "zed-claude-events.sh")),
+            "our script must be gone: {commands:?}"
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_does_not_restore_a_status_line_the_user_replaced() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-status-replaced");
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(
+            settings_path.clone(),
+            r#"{"statusLine":{"type":"command","command":"echo mine"}}"#,
+        );
+        install_zed_hooks(&home_directory)?;
+
         let mut settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
-        let entry = settings
-            .pointer_mut("/hooks/PreToolUse/0")
+        let status_line = settings
+            .pointer_mut("/statusLine")
             .and_then(serde_json::Value::as_object_mut)
-            .context("the installed PreToolUse entry")?;
-        entry.insert("matcher".to_string(), serde_json::json!("Bash"));
-        fs::write(&settings_path, format!("{settings:#}\n"))?;
-
-        let actual = question_hook_is_installed(&home_directory);
-        assert_eq!(
-            actual, false,
-            "a PreToolUse hook for Bash never receives AskUserQuestion; expected installed=false, got installed={actual}"
+            .context("statusLine after install")?;
+        status_line.insert(
+            "command".to_string(),
+            serde_json::json!("echo replaced-after-install"),
         );
-        Ok(())
-    }
+        fs::write(&settings_path, format!("{:#}\n", settings))?;
 
-    /// The button offering to install is drawn from what is installed, so a second press
-    /// — or a press against settings someone else has already added it to — must not
-    /// leave the hook named twice or bury the settings under a pile of copies.
-    #[test]
-    fn installing_the_hook_a_second_time_changes_nothing() -> Result<()> {
-        let home_directory = temporary_directory("question-hook-twice");
-        install_question_hook(&home_directory)?;
-        let after_first = fs::read_to_string(home_directory.join(".claude").join("settings.json"))?;
+        uninstall_zed_hooks(&home_directory)?;
 
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        let command = settings
+            .pointer("/statusLine/command")
+            .and_then(serde_json::Value::as_str);
         assert_eq!(
-            install_question_hook(&home_directory)?,
-            None,
-            "nothing was changed, so nothing had to be copied aside"
+            command,
+            Some("echo replaced-after-install"),
+            "uninstall must not overwrite a statusLine the user replaced after install; \
+             expected Some(\"echo replaced-after-install\"), got {command:?}"
         );
-        assert_eq!(
-            fs::read_to_string(home_directory.join(".claude").join("settings.json"))?,
-            after_first,
-            "the settings are the same file they were"
-        );
-        Ok(())
-    }
-
-    /// A machine with no settings at all is a machine the hook can still be installed on:
-    /// refusing there would leave a fresh account unable to press the button.
-    #[test]
-    fn the_hook_installs_onto_a_machine_with_no_settings_yet() -> Result<()> {
-        let home_directory = temporary_directory("question-hook-fresh");
-        assert_eq!(
-            install_question_hook(&home_directory)?,
-            None,
-            "there were no settings to copy aside"
-        );
-        assert!(question_hook_is_installed(&home_directory));
-        Ok(())
-    }
-
-    /// The file the hook leaves behind is written when a question is asked and never
-    /// rewritten when it is answered, so a session id that could name a file outside the
-    /// directory it belongs to must not be followed.
-    #[test]
-    fn a_recorded_question_is_read_back_for_the_session_that_asked_it() -> Result<()> {
-        let home_directory = temporary_directory("question-read-back");
-        write_file(
-            home_directory
+        assert!(
+            !home_directory
                 .join(".claude")
-                .join(PENDING_QUESTIONS_DIRECTORY)
-                .join(format!("{REAL_SESSION_ID}.json")),
-            RECORDED_QUESTION,
+                .join("zed-status")
+                .join("chained-command.txt")
+                .exists(),
+            "the chained file is ours and must still be removed"
         );
 
-        let question = read_pending_question(&home_directory, REAL_SESSION_ID)?
-            .context("the session's recorded question is read back")?;
-        assert_eq!(question.tool_use_id, "toolu_01LgCXEavHobAUwqivtgDLvs");
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
 
+    #[test]
+    fn uninstall_leaves_a_non_array_hooks_field_and_a_hook_without_command_untouched() -> Result<()>
+    {
+        let home_directory = temporary_directory("zed-hooks-malformed-matcher");
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(
+            settings_path.clone(),
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "Bash",
+                    "hooks": {"type": "command", "command": "'/tmp/zed-claude-events.sh'"}
+                  },
+                  {
+                    "matcher": "Read",
+                    "hooks": [
+                      {"type": "prompt", "prompt": "confirm"},
+                      {"type": "command", "command": "'/tmp/hooks/zed-claude-events.sh'", "timeout": 5}
+                    ]
+                  }
+                ]
+              }
+            }"#,
+        );
+
+        uninstall_zed_hooks(&home_directory)?;
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+        let pre = settings
+            .pointer("/hooks/PreToolUse")
+            .and_then(serde_json::Value::as_array)
+            .context("PreToolUse entries")?;
+        let first = pre
+            .first()
+            .context("the matcher whose hooks field is not an array must remain")?;
         assert_eq!(
-            read_pending_question(&home_directory, "no-such-session")?,
-            None,
-            "a session that has asked nothing has no question waiting"
+            first.get("hooks"),
+            Some(&serde_json::json!({
+                "type": "command",
+                "command": "'/tmp/zed-claude-events.sh'"
+            })),
+            "a matcher whose hooks field is not an array must be left untouched, even if that object names our script"
         );
-        for rejected in IDS_THAT_NAME_MORE_THAN_ONE_ENTRY {
-            assert_eq!(
-                read_pending_question(&home_directory, rejected)?,
-                None,
-                "`{rejected}` must not be followed out of the directory"
-            );
-        }
+        let second = pre
+            .get(1)
+            .context("the matcher that mixed a prompt hook with our command must remain")?;
+        assert_eq!(
+            second.get("hooks"),
+            Some(&serde_json::json!([{"type": "prompt", "prompt": "confirm"}])),
+            "a hook object without a command must survive while our command is stripped"
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn unparseable_settings_write_nothing() -> Result<()> {
+        let home_directory = temporary_directory("zed-hooks-bad-settings");
+        let settings_path = home_directory.join(".claude").join("settings.json");
+        write_file(settings_path.clone(), "{not json");
+        let error = install_zed_hooks(&home_directory).expect_err("unparseable settings");
+        assert!(
+            error.to_string().contains("could not be parsed"),
+            "got {error:#}"
+        );
+        assert!(
+            !home_directory
+                .join(".claude")
+                .join("hooks")
+                .join("zed-claude-events.sh")
+                .exists(),
+            "scripts must not be written when settings cannot be parsed"
+        );
+        assert_eq!(fs::read_to_string(&settings_path)?, "{not json");
         Ok(())
     }
 
@@ -5564,7 +6345,10 @@ mod tests {
             .join("projects")
             .join("-a-project")
             .join(format!("{session_id}.jsonl"));
-        write_file(transcript_path.clone(), "{\"type\":\"user\",\"uuid\":\"m1\"}\n");
+        write_file(
+            transcript_path.clone(),
+            "{\"type\":\"user\",\"uuid\":\"m1\"}\n",
+        );
 
         let scan = || -> Result<Option<bool>> {
             let subagents_by_session = smol::block_on(list_subagents_for_sessions(
@@ -5637,10 +6421,8 @@ mod tests {
             empty_session_id.to_string(),
             missing_session_id.to_string(),
         ];
-        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ))?;
+        let subagents_by_session =
+            smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids))?;
 
         assert_eq!(subagents_by_session.len(), session_ids.len());
         let plain_subagents = subagents_by_session
@@ -5654,7 +6436,10 @@ mod tests {
             .get(workflow_session_id)
             .context("the workflow session has a result entry")?;
         assert_eq!(workflow_subagents.len(), 1);
-        assert_eq!(workflow_subagents[0].workflow_run_id.as_deref(), Some(REAL_WORKFLOW_RUN_ID));
+        assert_eq!(
+            workflow_subagents[0].workflow_run_id.as_deref(),
+            Some(REAL_WORKFLOW_RUN_ID)
+        );
         assert_eq!(workflow_subagents[0].transcript_path, workflow_transcript);
         assert_eq!(workflow_subagents[0].workflow_agent_finished, Some(true));
 
@@ -5702,21 +6487,21 @@ mod tests {
         std::fs::create_dir_all(&blocked_session_directory)?;
         // Not a directory: `read_dir` fails with something other than NotFound, which is
         // the class of error the scan used to return for the whole map.
-        std::fs::write(blocked_session_directory.join("subagents"), "not a directory")?;
+        std::fs::write(
+            blocked_session_directory.join("subagents"),
+            "not a directory",
+        )?;
 
         let session_ids = vec![
             readable_session_id.to_string(),
             blocked_session_id.to_string(),
         ];
-        let result = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ));
+        let result = smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids));
         let subagents_by_session = match result {
             Ok(subagents_by_session) => subagents_by_session,
-            Err(error) => panic!(
-                "expected Ok so the readable session is still listed, got Err({error:#})"
-            ),
+            Err(error) => {
+                panic!("expected Ok so the readable session is still listed, got Err({error:#})")
+            }
         };
 
         let readable_agent_ids: Vec<&str> = subagents_by_session
@@ -5737,9 +6522,7 @@ mod tests {
         );
 
         assert_eq!(
-            subagents_by_session
-                .get(blocked_session_id)
-                .map(Vec::len),
+            subagents_by_session.get(blocked_session_id).map(Vec::len),
             Some(0),
             "the blocked session stays a key mapping to no agents, got {:?}",
             subagents_by_session.get(blocked_session_id)
@@ -5770,15 +6553,13 @@ mod tests {
                 .map(|session_id| (*session_id).to_string()),
         );
 
-        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
-            &home_directory,
-            &session_ids,
-        ))
-        .unwrap_or_else(|error| {
-            panic!(
-                "a mix of a real session id and rejected ids must be Ok, got Err({error:#})"
-            )
-        });
+        let subagents_by_session =
+            smol::block_on(list_subagents_for_sessions(&home_directory, &session_ids))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a mix of a real session id and rejected ids must be Ok, got Err({error:#})"
+                    )
+                });
 
         assert_eq!(
             subagents_by_session.len(),
@@ -6148,7 +6929,11 @@ mod tests {
         let home_directory = temporary_directory("subagent-journal-order");
         let session_id = "parallel-session";
         let workflow_run_id = "wf_145c9932-8c7";
-        let started_in_order = ["a9f5821990bd75881", "ae82337df519e5f65", "a687e098981ffb2e2"];
+        let started_in_order = [
+            "a9f5821990bd75881",
+            "ae82337df519e5f65",
+            "a687e098981ffb2e2",
+        ];
 
         for (agent_id, phase) in started_in_order
             .iter()
@@ -6176,10 +6961,7 @@ mod tests {
             .join("workflows")
             .join(workflow_run_id);
         let mut journal = String::from("{\"type\":\"launched\"}\n");
-        for agent_id in started_in_order
-            .iter()
-            .chain(["ae7502cee18bbe2b4"].iter())
-        {
+        for agent_id in started_in_order.iter().chain(["ae7502cee18bbe2b4"].iter()) {
             journal.push_str(&format!(
                 "{{\"type\":\"started\",\"agentId\":\"{agent_id}\",\"phase\":\"Fan out\"}}\n"
             ));
@@ -6228,30 +7010,27 @@ mod hook_freshness_tests {
         fs::remove_dir_all(&home_directory).ok();
         fs::create_dir_all(&home_directory)?;
 
-        install_question_hook(&home_directory)?;
+        install_zed_hooks(&home_directory)?;
         assert!(
-            question_hook_is_installed(&home_directory),
+            zed_hooks_installed(&home_directory),
             "what was just installed must count as installed"
         );
 
-        // What a machine that installed an earlier version has: the settings still name
-        // the hook, and the script is still a file.
-        let (_, script, _) = INSTALLED_HOOKS[0];
-        let script = home_directory.join(".claude").join(script);
+        let script = events_hook_path(&home_directory);
         fs::write(
             &script,
             "#!/bin/sh\n# an older version of this hook\nexit 0\n",
         )?;
 
         assert!(
-            !question_hook_is_installed(&home_directory),
+            !zed_hooks_installed(&home_directory),
             "a script that is not the one this version writes is one the fixes have not \
              reached, and the reader has to be offered the install again"
         );
 
-        install_question_hook(&home_directory)?;
+        install_zed_hooks(&home_directory)?;
         assert!(
-            question_hook_is_installed(&home_directory),
+            zed_hooks_installed(&home_directory),
             "installing again must bring it up to date rather than leave it behind"
         );
 
@@ -6428,6 +7207,120 @@ mod mention_tests {
 
         fs::remove_dir_all(&home_directory).ok();
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn pasted_file_pruning_stays_in_its_directory_and_ignores_symlinks() {
+        let home_directory = tree("pasted-pruning");
+        let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
+        fs::create_dir_all(&directory).expect("creating the pasted-file directory");
+        let now_ms = PASTED_FILE_KEEP.as_millis() as i64 + 10_000;
+        let old_path = directory.join("pasted-1-aaaaaa.png");
+        fs::write(&old_path, b"old").expect("writing the old pasted file");
+        let outside = home_directory.join("outside.txt");
+        fs::write(&outside, b"outside").expect("writing the outside file");
+        let symlink = directory.join("pasted-2-bbbbbb.png");
+        std::os::unix::fs::symlink(&outside, &symlink).expect("creating the symlink");
+
+        prune_pasted_files(&directory, now_ms).expect("pruning old pasted files");
+
+        assert!(
+            !old_path.exists(),
+            "an owned pasted file older than seven days is removed"
+        );
+        assert!(
+            fs::symlink_metadata(&symlink).is_ok_and(|metadata| metadata.file_type().is_symlink()),
+            "a symlink in the pasted directory is left untouched"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("reading the outside file"),
+            b"outside",
+            "pruning must never follow the symlink out of the pasted directory"
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// Pruning is housekeeping, not part of the paste: one stale file this user cannot
+    /// unlink — written by another uid, or removed by a second window between this
+    /// prune's `read_dir` and its `symlink_metadata` — must not be what stops every
+    /// later paste from being written.
+    #[test]
+    #[cfg(unix)]
+    fn a_paste_is_written_even_when_an_old_file_cannot_be_pruned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home_directory = tree("pasted-unprunable");
+        let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
+        fs::create_dir_all(&directory).expect("creating the pasted-file directory");
+
+        // Old enough to be pruned, and sitting in a directory whose entries cannot be
+        // unlinked. The file being written already exists, so the write itself needs no
+        // permission the directory has taken away — only the prune does.
+        let old_path = directory.join("pasted-1-aaaaaa.png");
+        fs::write(&old_path, b"old").expect("writing the old pasted file");
+        let name = "pasted-2-bbbbbb.png";
+        fs::write(directory.join(name), b"stale").expect("writing the file to be replaced");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
+            .expect("making the pasted-file directory unwritable");
+
+        // Root ignores the mode bits, so there the premise of this test does not hold.
+        let running_as_root = fs::write(directory.join("root-probe"), b"").is_ok();
+        if running_as_root {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).ok();
+            fs::remove_dir_all(&home_directory).ok();
+            return;
+        }
+
+        let written = write_pasted_file(&home_directory, name, b"fresh bytes");
+        let outcome = match &written {
+            Ok(path) => format!("Ok({path})"),
+            Err(error) => format!("Err({error:#})"),
+        };
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).ok();
+
+        assert!(
+            written.is_ok(),
+            "a paste must survive a prune that cannot finish; expected Ok(<path>), got {outcome}"
+        );
+        assert_eq!(
+            fs::read(directory.join(name)).expect("reading the pasted file back"),
+            b"fresh bytes",
+            "the pasted bytes must reach the file the session is told to read"
+        );
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// The seven days are counted from the name's own timestamp, so the boundary has to
+    /// keep what is merely old rather than expired.
+    #[test]
+    fn pruning_keeps_a_pasted_file_that_is_not_yet_seven_days_old() {
+        let home_directory = tree("pasted-fresh");
+        let directory = home_directory.join(".claude").join(PASTED_FILE_DIRECTORY);
+        fs::create_dir_all(&directory).expect("creating the pasted-file directory");
+
+        let keep_ms = i64::try_from(PASTED_FILE_KEEP.as_millis()).expect("the keep window in ms");
+        let now_ms = keep_ms + 10_000;
+        let at_the_boundary = directory.join(format!("pasted-{}-cccccc.png", now_ms - keep_ms));
+        let a_moment_ago = directory.join(format!("pasted-{}-dddddd.png", now_ms - 1));
+        let unnamed = directory.join("notes.txt");
+        for path in [&at_the_boundary, &a_moment_ago, &unnamed] {
+            fs::write(path, b"keep").expect("writing a pasted file");
+        }
+
+        prune_pasted_files(&directory, now_ms).expect("pruning old pasted files");
+
+        for path in [&at_the_boundary, &a_moment_ago, &unnamed] {
+            assert!(
+                path.exists(),
+                "{} is not older than the keep window and must survive pruning",
+                path.display()
+            );
+        }
+
+        fs::remove_dir_all(&home_directory).ok();
+    }
 }
 
 #[cfg(test)]
@@ -6533,48 +7426,521 @@ mod slash_command_skill_tests {
 }
 
 #[cfg(test)]
-mod pane_key_tests {
+#[cfg(test)]
+mod attachment_boundary_tests {
     use super::*;
 
-    /// The key name is what crosses the connection between the panel and the machine the
-    /// session runs on: the panel writes it with `tmux_name` and the other end rebuilds
-    /// the key with `from_tmux_name`. A variant either side does not agree on is a
-    /// button that silently does nothing.
+    /// The boundary a sent file is judged against. Everything a session may hand its
+    /// reader sits under the directory the session works in or in the temporary
+    /// directory; a path that climbs out of either is what this has to refuse, because
+    /// the file it names is handed straight back to the requester.
     #[test]
-    fn test_every_pane_key_survives_the_name_it_crosses_a_connection_as() {
-        let keys = [
-            PaneKey::Up,
-            PaneKey::Down,
-            PaneKey::Enter,
-            PaneKey::Choice(Digit::One),
-            PaneKey::Choice(Digit::Nine),
-            PaneKey::CyclePermissionMode,
-            PaneKey::Cancel,
-            PaneKey::Quit,
-        ];
+    fn test_an_attachment_outside_the_working_directory_is_refused() {
+        let working_directory = Path::new("/home/coder/project");
 
-        for key in keys {
-            assert_eq!(
-                PaneKey::from_tmux_name(key.tmux_name()),
-                Some(key),
-                "{:?} did not survive being written as {:?}",
-                key,
-                key.tmux_name()
+        for allowed in [
+            "/home/coder/project/renders/poster.png",
+            "/home/coder/project/poster.png",
+            "/tmp/claude-501/scratchpad/grid.mp4",
+            "/private/tmp/claude-501/scratchpad/grid.mp4",
+        ] {
+            assert!(
+                attachment_is_readable(Path::new(allowed), working_directory),
+                "{allowed} is a file the session delivered and must be readable"
+            );
+        }
+
+        for refused in [
+            "/home/coder/.ssh/id_rsa",
+            "/home/coder/project/../.ssh/id_rsa",
+            "/home/coder/projectile/poster.png",
+            "/tmpfile/poster.png",
+            "renders/poster.png",
+        ] {
+            assert!(
+                !attachment_is_readable(Path::new(refused), working_directory),
+                "{refused} is outside the session's own directory and must be refused"
             );
         }
     }
 
-    /// The set is closed on purpose: a name that reached this from a registration, or
-    /// from a connection, must not become a keystroke of its own choosing.
+    /// A working directory that bounds nothing must not be read as bounding everything.
     #[test]
-    fn test_a_name_that_is_not_one_of_the_keys_is_refused() {
-        for name in ["C-z", "kill", "BTab ", "btab", "Enter Enter", "", "C-C"] {
-            assert_eq!(
-                PaneKey::from_tmux_name(name),
-                None,
-                "{name:?} was accepted as a key to send"
+    fn test_a_working_directory_that_is_no_boundary_allows_nothing_under_it() {
+        for no_boundary in ["/", "project", ""] {
+            assert!(
+                !attachment_is_readable(
+                    Path::new("/home/coder/.ssh/id_rsa"),
+                    Path::new(no_boundary)
+                ),
+                "a working directory of {no_boundary:?} must not open the filesystem"
             );
         }
     }
+}
 
+#[cfg(test)]
+mod session_lifecycle_tests {
+    use super::*;
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "claude-lifecycle-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("creating the temporary directory");
+        path
+    }
+
+    #[test]
+    fn parse_claude_agents_json_reads_the_documented_shapes() {
+        let listings = parse_claude_agents_json(
+            r#"[
+              {
+                "cwd": "/tmp/project",
+                "kind": "interactive",
+                "startedAt": "2026-09-18T00:00:00Z",
+                "pid": 4242,
+                "status": "waiting",
+                "waitingFor": "permission prompt",
+                "sessionId": "live-session",
+                "name": "live",
+                "unknownField": true
+              },
+              {
+                "cwd": "/tmp/project",
+                "kind": "background",
+                "startedAt": 1750000000000,
+                "id": "a1b2",
+                "state": "working",
+                "pid": 99,
+                "sessionId": "bg-session"
+              }
+            ]"#,
+        )
+        .expect("documented shapes must parse");
+
+        assert_eq!(listings.len(), 2);
+        assert_eq!(listings[0].kind, "interactive");
+        assert_eq!(listings[0].process_id, Some(4242));
+        assert_eq!(listings[0].status.as_deref(), Some("waiting"));
+        assert_eq!(
+            listings[0].waiting_for.as_deref(),
+            Some("permission prompt")
+        );
+        assert_eq!(listings[0].session_id.as_deref(), Some("live-session"));
+        assert_eq!(listings[1].kind, "background");
+        assert_eq!(listings[1].id.as_deref(), Some("a1b2"));
+        assert_eq!(listings[1].state.as_deref(), Some("working"));
+        assert_eq!(
+            listings[1].started_at.as_deref(),
+            Some("1750000000000"),
+            "a numeric startedAt is kept as text rather than dropping the row"
+        );
+    }
+
+    #[test]
+    fn parse_claude_agents_json_rejects_a_non_array() {
+        let error = parse_claude_agents_json(r#"{"kind":"interactive"}"#)
+            .expect_err("an object is not the documented shape");
+        assert!(error.to_string().contains("array"), "got {error:#}");
+    }
+
+    #[test]
+    fn split_complete_lines_drops_a_pending_line_past_the_cap() {
+        let mut pending = vec![b'x'; TAIL_PENDING_CAP_BYTES + 8];
+        let lines = split_complete_lines(&mut pending);
+        assert!(lines.is_empty(), "no newline, so nothing is a line");
+        assert!(
+            pending.is_empty(),
+            "the partial line is dropped so the next newline can resync"
+        );
+
+        pending.extend_from_slice(b"still-the-old-line\n{\"type\":\"user\"}\npartial");
+        let lines = split_complete_lines(&mut pending);
+        assert_eq!(
+            lines,
+            vec![
+                "still-the-old-line".to_string(),
+                r#"{"type":"user"}"#.to_string()
+            ]
+        );
+        assert_eq!(pending, b"partial");
+    }
+
+    /// A scan can read a conversation while the session is half way through appending a
+    /// line to it. Those bytes have to be read again by the next scan: split in two,
+    /// neither half parses, and the record they carry is lost for good.
+    #[test]
+    fn a_record_written_across_two_scans_is_absorbed_whole() {
+        let directory = temporary_directory("split-record");
+        let path = directory.join("conversation.jsonl");
+        let record =
+            r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_split"}]}}"#;
+        let (half_written, _) = record.split_at(40);
+
+        std::fs::write(&path, half_written).expect("writing the half-written line");
+        read_session_conversation(&path).expect("the scan that lands mid-line");
+
+        let scanned = READ_CONVERSATIONS
+            .lock()
+            .ok()
+            .and_then(|cache| Some(cache.as_ref()?.get(&path)?.offset_scanned));
+        assert_eq!(
+            scanned,
+            Some(0),
+            "the file holds no whole line yet, so nothing of it has been scanned"
+        );
+
+        std::fs::write(&path, format!("{record}\n")).expect("finishing the line");
+        let conversation = read_session_conversation(&path).expect("the scan after it is whole");
+        assert!(
+            conversation.answered_calls.contains("toolu_split"),
+            "the record finished between the two scans must be absorbed, so that the agent \
+             it answers stops reading as unfinished; answered_calls is {:?}",
+            conversation.answered_calls
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// One line that cannot be decoded must not hide the records after it: the offset the
+    /// scan records would never go back for them.
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_hide_the_records_after_it() {
+        let directory = temporary_directory("non-utf8-conversation");
+        let path = directory.join("conversation.jsonl");
+        let mut contents = Vec::new();
+        contents.extend_from_slice(
+            br#"{"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_before"}]}}"#,
+        );
+        contents.push(b'\n');
+        contents.extend_from_slice(b"{\"raw\":\"\xff\xfe\"}");
+        contents.push(b'\n');
+        contents.extend_from_slice(
+            br#"{"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_after"}]}}"#,
+        );
+        contents.push(b'\n');
+        std::fs::write(&path, &contents).expect("writing the conversation");
+
+        let conversation = read_session_conversation(&path).expect("scanning the conversation");
+        assert!(
+            conversation.answered_calls.contains("toolu_before"),
+            "the record before the undecodable line is still absorbed; answered_calls is {:?}",
+            conversation.answered_calls
+        );
+        assert!(
+            conversation.answered_calls.contains("toolu_after"),
+            "the records after an undecodable line must still be absorbed; answered_calls is {:?}",
+            conversation.answered_calls
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The bound on a command that stops answering has to end the process. The child is
+    /// spawned when its future is built, so a timeout that only stops waiting leaves it
+    /// running with nothing left watching it.
+    #[gpui::test]
+    async fn a_command_that_outlives_its_timeout_is_killed(cx: &mut gpui::TestAppContext) {
+        let directory = temporary_directory("kill-on-timeout");
+        let abandoned_marker = directory.join("abandoned-marker");
+        let control_marker = directory.join("control-marker");
+        let script = |marker: &Path| format!("sleep 1; : > '{}'", marker.display());
+
+        // The script is awaited for real rather than on the test clock: what this test is
+        // about is a process that outlives its bound, which no virtual timer can stand in
+        // for.
+        cx.executor().allow_parking();
+
+        // Run to completion, the same script does write its marker, so a missing marker
+        // below says the process was killed rather than that the script never worked.
+        let mut control_command = smol::process::Command::new("sh");
+        control_command.arg("-c").arg(script(&control_marker));
+        let control = output_within(
+            &mut control_command,
+            "the control script",
+            Duration::from_secs(60),
+            &cx.executor(),
+        )
+        .await
+        .expect("running the control script");
+        assert!(
+            control.status.success(),
+            "the control script must run: {control:?}"
+        );
+        assert!(
+            control_marker.is_file(),
+            "the control script must write {}",
+            control_marker.display()
+        );
+
+        let mut command = smol::process::Command::new("sh");
+        command.arg("-c").arg(script(&abandoned_marker));
+        let refusal =
+            output_within(&mut command, "the script", Duration::ZERO, &cx.executor()).await;
+        let refusal = refusal.expect_err("a command past its bound must be refused");
+        assert!(
+            format!("{refusal:#}").contains("has not answered"),
+            "got {refusal:#}"
+        );
+
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !abandoned_marker.exists(),
+            "the timed-out child must have been killed; it went on to write {}",
+            abandoned_marker.display()
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// An id reaches `claude` as one word of an argument list, and on a remote project it
+    /// is the far end that chose it.
+    #[test]
+    fn an_id_that_would_reach_claude_as_an_option_is_refused() {
+        assert_eq!(
+            claude_command_operand("a1b2c3d4"),
+            Some("a1b2c3d4"),
+            "the short id an agents listing gives must still be usable"
+        );
+        assert_eq!(
+            claude_command_operand("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d"),
+            Some("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d"),
+            "a session id is a hyphenated uuid and must still be resumable"
+        );
+        assert_eq!(
+            claude_command_operand("-p"),
+            None,
+            "an id must not be able to reach claude as an option"
+        );
+        assert_eq!(
+            claude_command_operand("--dangerously-skip-permissions"),
+            None
+        );
+        assert_eq!(claude_command_operand("x; rm -rf ~"), None);
+        assert_eq!(claude_command_operand(""), None);
+        assert_eq!(
+            claude_command_operand("abc/def"),
+            None,
+            "the path bound this grew out of is still in force"
+        );
+    }
+
+    #[test]
+    fn resume_session_id_with_a_separator_is_not_a_single_path_component() {
+        assert_eq!(single_path_component("abc/def"), None);
+        assert_eq!(single_path_component("abc"), Some("abc"));
+        assert_eq!(single_path_component(".."), None);
+    }
+
+    #[test]
+    fn session_files_directory_rejects_a_path_outside_the_cwd() {
+        let home = std::env::temp_dir().join(format!(
+            "zed-session-files-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).expect("creating the session cwd");
+        fs::create_dir_all(home.join(".claude").join("sessions")).expect("creating the registry");
+        fs::write(
+            home.join(".claude").join("sessions").join("11.json"),
+            format!(
+                r#"{{"pid":11,"sessionId":"listed","cwd":"{}","procStart":"Thu Sep 10 02:27:23 2026","version":"2.1.267","kind":"interactive"}}"#,
+                cwd.display()
+            ),
+        )
+        .expect("writing the registration");
+
+        let inside = session_files_directory(&home, "listed", Path::new("src"))
+            .expect("a sub-path of the cwd is allowed");
+        assert_eq!(inside, cwd.join("src"));
+
+        let outside = session_files_directory(&home, "listed", Path::new("/etc"));
+        assert!(outside.is_err(), "got {outside:?}");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// Every id Claude Code writes has to pass, and every id that could close a shell
+    /// word, reach `claude` as an option, or fail to be one path component has to fail.
+    #[test]
+    fn claude_command_operand_accepts_the_ids_claude_writes_and_refuses_the_rest() {
+        assert_eq!(
+            claude_command_operand("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d"),
+            Some("0f9a2b7c-1d4e-4a6b-8c2d-5e7f9a0b1c2d"),
+            "a session id is a hyphenated uuid"
+        );
+        assert_eq!(claude_command_operand("a1b2c3d4"), Some("a1b2c3d4"));
+        assert_eq!(
+            claude_command_operand("zed-41"),
+            Some("zed-41"),
+            "the short id an agents listing gives may carry a hyphen"
+        );
+        assert_eq!(
+            claude_command_operand(&"a".repeat(64)),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "64 bytes is the bound's own maximum and must still be usable"
+        );
+
+        assert_eq!(claude_command_operand("-p"), None);
+        assert_eq!(claude_command_operand("x;y"), None);
+        assert_eq!(claude_command_operand("x`y"), None);
+        assert_eq!(claude_command_operand("x y"), None);
+        assert_eq!(
+            claude_command_operand(&"a".repeat(65)),
+            None,
+            "65 bytes is past the bound"
+        );
+        assert_eq!(claude_command_operand(""), None);
+        assert_eq!(claude_command_operand(".."), None);
+        assert_eq!(
+            claude_command_operand("а1b2c3d4"),
+            None,
+            "a Cyrillic lookalike is not ASCII alphanumeric"
+        );
+        assert_eq!(claude_command_operand("a\0b"), None);
+    }
+
+    #[test]
+    fn a_relative_cwd_is_not_where_claude_is_started() {
+        let directory = temporary_directory("relative-cwd");
+        assert_eq!(
+            claude_command_working_directory(Path::new(".")),
+            None,
+            "a relative path is the process's directory, not a session's"
+        );
+        assert_eq!(
+            claude_command_working_directory(&directory),
+            Some(directory.as_path()),
+            "an absolute directory that exists is still where a resume may start"
+        );
+        assert_eq!(
+            claude_command_working_directory(&directory.join("gone")),
+            None,
+            "a path that does not exist is not a working directory"
+        );
+        let file = directory.join("file");
+        fs::write(&file, b"").expect("writing a file that is not a directory");
+        assert_eq!(
+            claude_command_working_directory(&file),
+            None,
+            "a file is not a working directory"
+        );
+        assert_eq!(
+            claude_command_working_directory(Path::new("/tmp\0nope")),
+            None,
+            "a path carrying a NUL is not a working directory"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn parse_claude_agents_json_refuses_a_10mb_array() {
+        let json = format!(
+            r#"[{{"kind":"interactive","id":"{}"}}]"#,
+            "a".repeat(10 * 1024 * 1024)
+        );
+        let error = match parse_claude_agents_json(&json) {
+            Err(error) => error,
+            Ok(listings) => panic!(
+                "a 10 MB array from a host must be refused; got {} listings, first id len {:?}",
+                listings.len(),
+                listings
+                    .first()
+                    .and_then(|listing| listing.id.as_ref().map(String::len))
+            ),
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("bytes") || message.contains("limit"),
+            "got {message}"
+        );
+    }
+
+    #[test]
+    fn parse_claude_agents_json_keeps_waiting_for_as_text_and_drops_a_nul_id_as_an_operand() {
+        let listings = parse_claude_agents_json(
+            r#"[{"kind":"background","id":"a\u0000b","waitingFor":"\u001b[31mred","sessionId":"s"}]"#,
+        )
+        .expect("adversarial scalars must still parse as text");
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].id.as_deref(), Some("a\0b"));
+        assert_eq!(listings[0].waiting_for.as_deref(), Some("\u{1b}[31mred"));
+        assert_eq!(
+            claude_command_operand(listings[0].id.as_deref().unwrap_or("")),
+            None,
+            "a NUL in an id must never reach claude or a shell"
+        );
+    }
+
+    #[test]
+    fn parse_claude_agents_json_refuses_deep_nesting_instead_of_panicking() {
+        let nested = format!(
+            "[{}{}{}]",
+            "{\"kind\":\"interactive\",\"x\":",
+            "{".repeat(200),
+            "}".repeat(201)
+        );
+        match parse_claude_agents_json(&nested) {
+            Ok(listings) => {
+                panic!("deep nesting must not be absorbed as listings, got {listings:?}")
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// The bound on a command that prints without bound has to refuse before the bytes
+    /// become a string the rest of this module holds.
+    #[gpui::test]
+    async fn a_command_whose_output_exceeds_the_cap_is_refused(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let mut command = smol::process::Command::new("head");
+        command
+            .arg("-c")
+            .arg(format!("{}", MAX_COMMAND_OUTPUT_BYTES + 1))
+            .arg("/dev/zero");
+        let refusal = match output_within(
+            &mut command,
+            "head",
+            Duration::from_secs(60),
+            &cx.executor(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(output) => panic!(
+                "a command that prints past the cap must be refused; got {} stdout bytes",
+                output.stdout.len()
+            ),
+        };
+        let message = format!("{refusal:#}");
+        assert!(
+            message.contains("bytes") || message.contains("limit"),
+            "got {message}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_command_whose_output_fits_the_cap_is_kept(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let mut command = smol::process::Command::new("head");
+        command.arg("-c").arg("16").arg("/dev/zero");
+        let output = output_within(
+            &mut command,
+            "head",
+            Duration::from_secs(60),
+            &cx.executor(),
+        )
+        .await
+        .expect("a 16-byte answer is inside the cap");
+        assert!(output.status.success(), "got {output:?}");
+        assert_eq!(output.stdout.len(), 16);
+    }
 }

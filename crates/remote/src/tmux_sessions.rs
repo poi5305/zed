@@ -150,9 +150,8 @@ pub async fn list_tmux_sessions() -> Result<TmuxSessionList> {
     // `tmux list-sessions` exits non-zero with "no server running on ..." when
     // no server has been started yet, which is a normal state and not an error.
     let mut sessions = parse_tmux_sessions(&String::from_utf8_lossy(&list_sessions.stdout));
-    // The mirrors Zed groups with a session to hold a terminal on one of its windows
-    // are its own bookkeeping, not sessions the user started; see
-    // [`crate::claude_sessions::attach_arguments`].
+    // The mirrors Zed used to group with a session to hold a terminal on one of
+    // its windows are its own bookkeeping, not sessions the user started.
     sessions.retain(|session| !is_zed_mirror_session(&session.name));
     if sessions.is_empty() {
         return Ok(TmuxSessionList {

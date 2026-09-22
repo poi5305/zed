@@ -542,21 +542,49 @@ message Envelope {
     TailClaudeTranscriptResponse tail_claude_transcript_response = 507;
     ReadClaudeFile read_claude_file = 508;
     ReadClaudeFileResponse read_claude_file_response = 509;
-    SendClaudeInput send_claude_input = 510;
-    ListClaudeSubagents list_claude_subagents = 511;
-    ListClaudeSubagentsResponse list_claude_subagents_response = 512;
-    CaptureClaudePane capture_claude_pane = 513;
-    CaptureClaudePaneResponse capture_claude_pane_response = 514;
-    GetClaudePendingQuestion get_claude_pending_question = 515;
-    GetClaudePendingQuestionResponse get_claude_pending_question_response = 516;
-    InstallClaudeQuestionHook install_claude_question_hook = 517;
-    InstallClaudeQuestionHookResponse install_claude_question_hook_response = 518;
-    ListClaudeSlashCommands list_claude_slash_commands = 519;
-    ListClaudeSlashCommandsResponse list_claude_slash_commands_response = 520;
-    ListClaudeSessionFiles list_claude_session_files = 521;
-    ListClaudeSessionFilesResponse list_claude_session_files_response = 522;
-    WriteClaudeSessionFile write_claude_session_file = 523;
-    WriteClaudeSessionFileResponse write_claude_session_file_response = 524; // current max
+    ListClaudeSubagents list_claude_subagents = 510;
+    ListClaudeSubagentsResponse list_claude_subagents_response = 511;
+    TailClaudeEvents tail_claude_events = 512;
+    TailClaudeEventsResponse tail_claude_events_response = 513;
+    ReadClaudeStatus read_claude_status = 514;
+    ReadClaudeStatusResponse read_claude_status_response = 515;
+    InstallClaudeHooks install_claude_hooks = 516;
+    InstallClaudeHooksResponse install_claude_hooks_response = 517;
+    ListClaudeSlashCommands list_claude_slash_commands = 518;
+    ListClaudeSlashCommandsResponse list_claude_slash_commands_response = 519;
+    ListClaudeSessionFiles list_claude_session_files = 520;
+    ListClaudeSessionFilesResponse list_claude_session_files_response = 521;
+    WriteClaudeSessionFile write_claude_session_file = 522;
+    WriteClaudeSessionFileResponse write_claude_session_file_response = 523;
+    ClaudeHooksInstalled claude_hooks_installed = 524;
+    ClaudeHooksInstalledResponse claude_hooks_installed_response = 525;
+    ClaudeChannelStatus claude_channel_status = 526;
+    ClaudeChannelStatusResponse claude_channel_status_response = 527;
+    ClaudeChannelSend claude_channel_send = 528;
+    ClaudeChannelSendResponse claude_channel_send_response = 529;
+    ClaudeChannelAnswerPermission claude_channel_answer_permission = 530;
+    ClaudeChannelAnswerPermissionResponse claude_channel_answer_permission_response = 531;
+    TailClaudeChannelInbox tail_claude_channel_inbox = 532;
+    TailClaudeChannelInboxResponse tail_claude_channel_inbox_response = 533;
+    ClaudeChannelInterrupt claude_channel_interrupt = 534;
+    ClaudeChannelInterruptResponse claude_channel_interrupt_response = 535;
+    ListClaudeSubagentsForSessions list_claude_subagents_for_sessions = 536;
+    ListClaudeSubagentsForSessionsResponse list_claude_subagents_for_sessions_response = 537;
+    ListClaudeAgents list_claude_agents = 538;
+    ListClaudeAgentsResponse list_claude_agents_response = 539;
+    ResumeClaudeSession resume_claude_session = 540;
+    ResumeClaudeSessionResponse resume_claude_session_response = 541;
+    RunClaudeAgentCommand run_claude_agent_command = 542;
+    RunClaudeAgentCommandResponse run_claude_agent_command_response = 543;
+    UninstallClaudeHooks uninstall_claude_hooks = 544;
+    UninstallClaudeHooksResponse uninstall_claude_hooks_response = 545;
+    SendClaudeInput send_claude_input = 546;
+    CaptureClaudePane capture_claude_pane = 547;
+    CaptureClaudePaneResponse capture_claude_pane_response = 548;
+    GetClaudePendingQuestion get_claude_pending_question = 549;
+    GetClaudePendingQuestionResponse get_claude_pending_question_response = 550;
+    InstallClaudeQuestionHook install_claude_question_hook = 551;
+    InstallClaudeQuestionHookResponse install_claude_question_hook_response = 552; // current max
   }
 
   reserved 87 to 88;
@@ -585,6 +613,7 @@ message Envelope {
   reserved 211 to 216, 232 to 233;
   reserved 397 to 398;
   reserved 406 to 408;
+  reserved 507;
 }
 
 message Hello {
