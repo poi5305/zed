@@ -136,6 +136,39 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+# Bundling the macOS app
+
+`script/bundle-mac` downloads two large archives. Both are pinned to a version, so a copy
+kept from an earlier bundle is byte-for-byte what the download would produce. Neither cache
+is a version the build checks — if the pin moves, delete the stale copy, or the bundle ships
+the old one.
+
+* **WebRTC, 255 MB** — `webrtc-sys`'s build script fetches `webrtc-<triple>.zip` for the
+  `WEBRTC_TAG` in `webrtc-sys/build/src/lib.rs`. Setting `LK_CUSTOM_WEBRTC` to an extracted
+  prebuilt of that same tag makes `download_webrtc()` return early and every other path read
+  the custom directory instead. This is upstream's own escape hatch.
+* **git, ~30 MB** — `download_git` fetches a dugite-native tarball for `GIT_VERSION` on
+  *every* bundle, including one whose Rust compilation was fully cached. `ZED_BUNDLE_GIT`
+  points it at a git binary to copy instead; the script fails loudly if the path is not
+  executable, rather than silently bundling no git. This hook is local to this fork.
+
+Both downloads come from GitHub's CDN, which sometimes serves this machine at tens of KB/s
+and looks exactly like a hang: cargo sits in `read2` on a build script's pipe with no rustc
+children, or the bundle prints `Downloading git binary` and stops. Confirm with
+`ps -eo pid,ppid,args | awk '$2==<pid>'` before concluding anything is stuck.
+
+The invocation that skips both:
+
+```
+LK_CUSTOM_WEBRTC=/Volumes/XDATA/data/webrtc-cache/webrtc-0001d84-4/mac-arm64-release \
+ZED_BUNDLE_GIT=/Volumes/XDATA/data/zed-bundle-cache/git-v2.43.3-fa29823-macOS-arm64 \
+  CARGO_BUILD_JOBS=6 script/bundle-mac -i
+```
+
+Refill either cache from a bundle that did download it: the app carries the git binary at
+`Contents/MacOS/git`, and the WebRTC prebuilt lands in
+`target/*/release/build/webrtc-sys-*/out/<tag>/<triple>/`.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:

@@ -166,6 +166,19 @@ function download_git() {
     local architecture=$1
     local target_binary=$2
 
+    # This download runs on every bundle, and GitHub's CDN sometimes serves it at a few
+    # tens of KB/s. The tarball is pinned to GIT_VERSION, so a copy kept from an earlier
+    # bundle is byte-for-byte the one this would fetch.
+    if [[ -n "${ZED_BUNDLE_GIT:-}" ]]; then
+        if [[ ! -x "${ZED_BUNDLE_GIT}" ]]; then
+            echo "ZED_BUNDLE_GIT is set but ${ZED_BUNDLE_GIT} is not an executable file."
+            exit 1
+        fi
+        echo "Using cached git binary: ${ZED_BUNDLE_GIT}"
+        cp "${ZED_BUNDLE_GIT}" "${target_binary}"
+        return
+    fi
+
     tmp_dir=$(mktemp -d)
     pushd "$tmp_dir"
 
