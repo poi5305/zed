@@ -26,6 +26,22 @@ const QUEUE_OPERATION_RECORD_TYPE: &str = "queue-operation";
 /// Claude Code's own accounting of what the session has cost.
 const COST_STATE_RECORD_TYPE: &str = "cost-state";
 
+const PERMISSION_MODE_RECORD_TYPE: &str = "permission-mode";
+const AI_TITLE_RECORD_TYPE: &str = "ai-title";
+const BRIDGE_SESSION_RECORD_TYPE: &str = "bridge-session";
+const ATTACHMENT_RECORD_TYPE: &str = "attachment";
+const TOTAL_TOKENS_REMINDER_ATTACHMENT: &str = "total_tokens_reminder";
+const AUTO_MODE_ATTACHMENT: &str = "auto_mode";
+const TOTAL_TOKENS_OPEN: &str = "<total_tokens>";
+
+/// Flags the `auto_mode` attachment records on a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoModeFlags {
+    pub bash_first: bool,
+    pub steer_only: bool,
+    pub bypass: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptRecord {
     pub uuid: Option<String>,
@@ -123,6 +139,11 @@ pub struct Transcript {
     /// Whether this transcript is itself one sub-agent's conversation rather than a
     /// session's own thread; see [`Self::for_sidechain`].
     reads_sidechain: bool,
+    last_permission_mode_index: Option<usize>,
+    last_ai_title_index: Option<usize>,
+    last_bridge_session_index: Option<usize>,
+    last_tokens_left_index: Option<usize>,
+    last_auto_mode_index: Option<usize>,
 }
 
 impl Transcript {
@@ -152,6 +173,11 @@ impl Transcript {
             leaf_uuid: None,
             overwritten_uuids: Vec::new(),
             reads_sidechain,
+            last_permission_mode_index: None,
+            last_ai_title_index: None,
+            last_bridge_session_index: None,
+            last_tokens_left_index: None,
+            last_auto_mode_index: None,
         }
     }
 
@@ -166,6 +192,14 @@ impl Transcript {
             let Some(uuid) = record.uuid.clone() else {
                 // Records such as `mode`, `last-prompt` and `ai-title` have no uuid, so
                 // nothing can reference them and they can never be a leaf.
+                let index = self.records.len();
+                match record.record_type.as_str() {
+                    PERMISSION_MODE_RECORD_TYPE => self.last_permission_mode_index = Some(index),
+                    AI_TITLE_RECORD_TYPE => self.last_ai_title_index = Some(index),
+                    BRIDGE_SESSION_RECORD_TYPE => self.last_bridge_session_index = Some(index),
+                    _ => {}
+                }
+                self.note_attachment_facts(index, &record);
                 self.records.push(record);
                 continue;
             };
@@ -185,10 +219,17 @@ impl Transcript {
             {
                 self.overwritten_uuids.push(uuid.clone());
             }
-            match existing_index.and_then(|index| self.records.get_mut(index)) {
-                Some(slot) => *slot = record,
+            match existing_index.filter(|index| *index < self.records.len()) {
+                Some(index) => {
+                    self.note_attachment_facts(index, &record);
+                    if let Some(slot) = self.records.get_mut(index) {
+                        *slot = record;
+                    }
+                }
                 None => {
-                    self.index_by_uuid.insert(uuid, self.records.len());
+                    let index = self.records.len();
+                    self.note_attachment_facts(index, &record);
+                    self.index_by_uuid.insert(uuid, index);
                     self.records.push(record);
                 }
             }
@@ -269,6 +310,86 @@ impl Transcript {
     /// - `popAll` — the queue was taken whole.
     pub fn queued_messages(&self) -> &VecDeque<SharedString> {
         &self.queued
+    }
+
+    /// The permission mode the transcript last recorded, which is not the `mode` record.
+    pub fn permission_mode(&self) -> Option<&str> {
+        self.string_at(
+            self.last_permission_mode_index,
+            PERMISSION_MODE_RECORD_TYPE,
+            "permissionMode",
+        )
+    }
+
+    pub fn ai_title(&self) -> Option<&str> {
+        self.string_at(self.last_ai_title_index, AI_TITLE_RECORD_TYPE, "aiTitle")
+    }
+
+    pub fn bridge_session_id(&self) -> Option<&str> {
+        self.string_at(
+            self.last_bridge_session_index,
+            BRIDGE_SESSION_RECORD_TYPE,
+            "bridgeSessionId",
+        )
+    }
+
+    /// Tokens remaining in the budget, from the newest `total_tokens_reminder` attachment.
+    pub fn tokens_left(&self) -> Option<u64> {
+        let record = self.records.get(self.last_tokens_left_index?)?;
+        // Re-checked rather than trusted: `absorb` replaces a record in place when its
+        // uuid comes back, and what comes back need not be the attachment the index was
+        // noted for.
+        let attachment = attachment_of_type(record, TOTAL_TOKENS_REMINDER_ATTACHMENT)?;
+        parse_tokens_left(attachment.get("text").and_then(Value::as_str)?)
+    }
+
+    /// The newest `auto_mode` attachment's flags, if the transcript has recorded one.
+    pub fn auto_mode(&self) -> Option<AutoModeFlags> {
+        let record = self.records.get(self.last_auto_mode_index?)?;
+        parse_auto_mode(record)
+    }
+
+    /// The `bashFirstSteer` the newest `auto_mode` attachment carries. It is a free
+    /// string rather than a flag, so it sits beside [`AutoModeFlags`] instead of in it.
+    pub fn auto_mode_steer(&self) -> Option<&str> {
+        let record = self.records.get(self.last_auto_mode_index?)?;
+        let attachment = attachment_of_type(record, AUTO_MODE_ATTACHMENT)?;
+        attachment
+            .get("bashFirstSteer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|steer| !steer.is_empty())
+    }
+
+    fn note_attachment_facts(&mut self, index: usize, record: &TranscriptRecord) {
+        if record.record_type != ATTACHMENT_RECORD_TYPE {
+            return;
+        }
+        let Some(attachment_type) = record
+            .raw
+            .get("attachment")
+            .and_then(|attachment| attachment.get("type"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        match attachment_type {
+            TOTAL_TOKENS_REMINDER_ATTACHMENT => self.last_tokens_left_index = Some(index),
+            AUTO_MODE_ATTACHMENT => self.last_auto_mode_index = Some(index),
+            _ => {}
+        }
+    }
+
+    fn string_at(
+        &self,
+        cached_index: Option<usize>,
+        record_type: &str,
+        field: &str,
+    ) -> Option<&str> {
+        cached_index
+            .and_then(|index| self.records.get(index))
+            .filter(|record| record.record_type == record_type)
+            .and_then(|record| record.raw.get(field).and_then(Value::as_str))
     }
 
     fn apply_queue_operation(&mut self, record: &TranscriptRecord) {
@@ -390,6 +511,72 @@ impl Transcript {
         path.reverse();
         path
     }
+}
+
+fn attachment_object(record: &TranscriptRecord) -> Option<&Value> {
+    record.raw.get("attachment")
+}
+
+fn attachment_of_type<'record>(
+    record: &'record TranscriptRecord,
+    attachment_type: &str,
+) -> Option<&'record Value> {
+    let attachment = attachment_object(record)?;
+    (attachment.get("type").and_then(Value::as_str) == Some(attachment_type)).then_some(attachment)
+}
+
+/// The count inside `<total_tokens>…`, however it was written.
+///
+/// Stopping at the first character that is not a digit reads "15,000,000" as 15, and a
+/// count the toolbar states as a fact is worse wrong than missing, so the groupings and
+/// the magnitude suffix Claude Code may write are read rather than cut off.
+fn parse_tokens_left(text: &str) -> Option<u64> {
+    let start = text.find(TOTAL_TOKENS_OPEN)?;
+    let after_open = text
+        .get(start.saturating_add(TOTAL_TOKENS_OPEN.len())..)?
+        .trim_start();
+
+    let mut digits = String::new();
+    let mut after_digits = "";
+    for (index, character) in after_open.char_indices() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        if (character == ',' || character == '_') && !digits.is_empty() {
+            continue;
+        }
+        after_digits = after_open.get(index..).unwrap_or_default();
+        break;
+    }
+    if digits.is_empty() {
+        return None;
+    }
+
+    // Only a suffix written against the digits counts, so "15 minutes" is 15 and not 15
+    // million.
+    let multiplier = match after_digits.chars().next() {
+        Some('K' | 'k') => 1_000,
+        Some('M' | 'm') => 1_000_000,
+        Some('G' | 'g') => 1_000_000_000,
+        _ => 1,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+fn parse_auto_mode(record: &TranscriptRecord) -> Option<AutoModeFlags> {
+    let attachment = attachment_of_type(record, AUTO_MODE_ATTACHMENT)?;
+    let flag = |key: &str| {
+        attachment
+            .get(key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    Some(AutoModeFlags {
+        bash_first: flag("bashFirst"),
+        steer_only: flag("steerOnly"),
+        bypass: flag("bypass"),
+    })
 }
 
 impl Default for Transcript {
@@ -981,6 +1168,153 @@ mod tests {
         transcript.absorb([record(r#"{"type":"mode"}"#), record(r#"{"type":"mode"}"#)]);
         assert_eq!(transcript.overwritten_uuids(), expected(&["b"]));
     }
+
+    #[test]
+    fn uuid_less_permission_mode_title_and_bridge_are_the_newest() {
+        let transcript = transcript(&[
+            r#"{"type":"permission-mode","permissionMode":"default"}"#.to_string(),
+            r#"{"type":"mode","mode":"normal"}"#.to_string(),
+            r#"{"type":"ai-title","aiTitle":"first title"}"#.to_string(),
+            r#"{"type":"bridge-session","bridgeSessionId":"session_old"}"#.to_string(),
+            r#"{"type":"permission-mode","permissionMode":"auto"}"#.to_string(),
+            r#"{"type":"ai-title","aiTitle":"later title"}"#.to_string(),
+            r#"{"type":"bridge-session","bridgeSessionId":"session_01abc"}"#.to_string(),
+        ]);
+
+        assert_eq!(transcript.permission_mode(), Some("auto"));
+        assert_eq!(transcript.ai_title(), Some("later title"));
+        assert_eq!(transcript.bridge_session_id(), Some("session_01abc"));
+    }
+
+    #[test]
+    fn tokens_left_parses_the_newest_total_tokens_reminder() {
+        let transcript = transcript(&[
+            r#"{"type":"attachment","uuid":"a","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>100 tokens left</total_tokens>"}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"b","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>15000000 tokens left</total_tokens>"}}"#.to_string(),
+        ]);
+        assert_eq!(transcript.tokens_left(), Some(15_000_000));
+    }
+
+    #[test]
+    fn a_malformed_tokens_reminder_yields_none() {
+        let transcript = transcript(&[
+            r#"{"type":"attachment","uuid":"a","attachment":{"type":"total_tokens_reminder","text":"no tags here"}}"#.to_string(),
+        ]);
+        assert_eq!(transcript.tokens_left(), None);
+    }
+
+    #[test]
+    fn auto_mode_flags_are_read_from_the_newest_attachment() {
+        let transcript = transcript(&[
+            r#"{"type":"attachment","uuid":"a","attachment":{"type":"auto_mode","bashFirst":false,"steerOnly":false,"bypass":true}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"b","attachment":{"type":"auto_mode","bashFirst":true,"bashFirstSteer":"strict","steerOnly":true,"bypass":false}}"#.to_string(),
+        ]);
+        assert_eq!(
+            transcript.auto_mode(),
+            Some(AutoModeFlags {
+                bash_first: true,
+                steer_only: true,
+                bypass: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_grouped_or_suffixed_token_count_is_never_read_as_its_first_digits() {
+        // A count the panel states as a fact is worse wrong than missing: "15,000,000"
+        // read as 15 puts "15 tokens left" in the toolbar of a session that has 15M.
+        for (text, expected) in [
+            (
+                "<total_tokens>15000000 tokens left</total_tokens>",
+                Some(15_000_000),
+            ),
+            (
+                "<total_tokens>15,000,000 tokens left</total_tokens>",
+                Some(15_000_000),
+            ),
+            (
+                "<total_tokens>15_000_000 tokens left</total_tokens>",
+                Some(15_000_000),
+            ),
+            (
+                "<total_tokens> 15000000 tokens left</total_tokens>",
+                Some(15_000_000),
+            ),
+            (
+                "<total_tokens>750K tokens left</total_tokens>",
+                Some(750_000),
+            ),
+            (
+                "<total_tokens>15M tokens left</total_tokens>",
+                Some(15_000_000),
+            ),
+            ("<total_tokens>no digits</total_tokens>", None),
+            ("nothing at all", None),
+        ] {
+            assert_eq!(
+                parse_tokens_left(text),
+                expected,
+                "for {text:?} expected {expected:?}, got {:?}",
+                parse_tokens_left(text)
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_reminder_is_not_read_as_a_token_count() {
+        let mut transcript = Transcript::new();
+        transcript.absorb([record(
+            r#"{"type":"attachment","uuid":"a","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>15000000 tokens left</total_tokens>"}}"#,
+        )]);
+        assert_eq!(transcript.tokens_left(), Some(15_000_000));
+
+        // `absorb` replaces a record in place when its uuid comes back, and what comes
+        // back need not be the attachment the index was noted for.
+        transcript.absorb([record(
+            r#"{"type":"attachment","uuid":"a","attachment":{"type":"environment","text":"<total_tokens>7 tokens left</total_tokens>"}}"#,
+        )]);
+        assert_eq!(
+            transcript.tokens_left(),
+            None,
+            "a count must come from a total_tokens_reminder, got {:?}",
+            transcript.tokens_left()
+        );
+    }
+
+    #[test]
+    fn cost_state_exposes_lines_and_model_usage() {
+        let transcript = transcript(&[r#"{"type":"cost-state","totalCostUSD":1.5,"totalLinesAdded":156,"totalLinesRemoved":23,"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":20,"costUSD":1.5}}}"#.to_string()]);
+        let reported = transcript
+            .spend()
+            .reported
+            .expect("a cost-state record reports a total");
+        assert_eq!(reported.lines_added, 156);
+        assert_eq!(reported.lines_removed, 23);
+        assert_eq!(
+            reported
+                .model_usage
+                .get(&SharedString::from("claude-opus-5"))
+                .map(|usage| usage.input_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_malformed_model_usage_map_is_empty() {
+        let transcript = transcript(&[
+            r#"{"type":"cost-state","totalCostUSD":1.0,"modelUsage":["not","an","object"]}"#
+                .to_string(),
+        ]);
+        let reported = transcript
+            .spend()
+            .reported
+            .expect("a cost-state record reports a total");
+        assert!(
+            reported.model_usage.is_empty(),
+            "a non-object modelUsage must not panic, got {:?}",
+            reported.model_usage
+        );
+    }
 }
 
 /// What a session has spent, and how the model answering it is configured.
@@ -1025,6 +1359,19 @@ pub struct ReportedCost {
     pub tool_duration_ms: u64,
     pub lines_added: u64,
     pub lines_removed: u64,
+    /// Per-model usage from `modelUsage` on the same record. Empty when the field is
+    /// missing or not an object.
+    pub model_usage: HashMap<SharedString, ModelUsage>,
+}
+
+/// One model's slice of a `cost-state` `modelUsage` map.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
 }
 
 impl ReportedCost {
@@ -1042,6 +1389,43 @@ impl ReportedCost {
             tool_duration_ms: number("totalToolDuration"),
             lines_added: number("totalLinesAdded"),
             lines_removed: number("totalLinesRemoved"),
+            model_usage: parse_model_usage(raw.get("modelUsage")),
         })
     }
+}
+
+fn parse_model_usage(value: Option<&Value>) -> HashMap<SharedString, ModelUsage> {
+    let mut usage = HashMap::default();
+    let Some(models) = value.and_then(Value::as_object) else {
+        return usage;
+    };
+    for (model, entry) in models {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        let number = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| entry.get(*key).and_then(Value::as_u64))
+                .unwrap_or(0)
+        };
+        let cost = entry
+            .get("costUSD")
+            .or_else(|| entry.get("costUsd"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        usage.insert(
+            SharedString::from(model.clone()),
+            ModelUsage {
+                input_tokens: number(&["inputTokens", "input_tokens"]),
+                output_tokens: number(&["outputTokens", "output_tokens"]),
+                cache_read_tokens: number(&["cacheReadInputTokens", "cache_read_input_tokens"]),
+                cache_creation_tokens: number(&[
+                    "cacheCreationInputTokens",
+                    "cache_creation_input_tokens",
+                ]),
+                cost_usd: cost,
+            },
+        );
+    }
+    usage
 }

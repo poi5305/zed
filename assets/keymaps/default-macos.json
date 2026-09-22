@@ -1752,13 +1752,17 @@
     },
   },
   {
+    "context": "ClaudeSessionsPanel",
+    "bindings": {
+      "escape": "claude_sessions::DismissMenus",
+    },
+  },
+  {
     "context": "ClaudeSessionsInput > Editor",
     "bindings": {
       "enter": "claude_sessions::SendMessage",
       "shift-enter": "editor::Newline",
-      // The button beside the input is labelled "Esc"; without this the key it names
-      // does nothing.
-      "escape": "claude_sessions::Interrupt",
+      "escape": "claude_sessions::DismissMenus",
       // The terminal's own history keys. The handler moves the cursor instead whenever
       // the box holds a draft, so these do not cost multi-line editing its arrows.
       "up": "claude_sessions::PreviousMessage",

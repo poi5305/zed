@@ -309,15 +309,31 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_list_tmux_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_sessions);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_subagents);
-        session.add_request_handler(cx.weak_entity(), Self::handle_get_claude_pending_question);
-        session.add_request_handler(cx.weak_entity(), Self::handle_install_claude_question_hook);
+        session.add_request_handler(
+            cx.weak_entity(),
+            Self::handle_list_claude_subagents_for_sessions,
+        );
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_agents);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_slash_commands);
         session.add_request_handler(cx.weak_entity(), Self::handle_list_claude_session_files);
         session.add_request_handler(cx.weak_entity(), Self::handle_write_claude_session_file);
+        session.add_request_handler(cx.weak_entity(), Self::handle_resume_claude_session);
+        session.add_request_handler(cx.weak_entity(), Self::handle_run_claude_agent_command);
         session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_transcript);
+        session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_events);
+        session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_status);
+        session.add_request_handler(cx.weak_entity(), Self::handle_install_claude_hooks);
+        session.add_request_handler(cx.weak_entity(), Self::handle_uninstall_claude_hooks);
+        session.add_request_handler(cx.weak_entity(), Self::handle_claude_hooks_installed);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
-        session.add_request_handler(cx.weak_entity(), Self::handle_send_claude_input);
-        session.add_request_handler(cx.weak_entity(), Self::handle_capture_claude_pane);
+        session.add_request_handler(cx.weak_entity(), Self::handle_claude_channel_status);
+        session.add_request_handler(cx.weak_entity(), Self::handle_claude_channel_send);
+        session.add_request_handler(
+            cx.weak_entity(),
+            Self::handle_claude_channel_answer_permission,
+        );
+        session.add_request_handler(cx.weak_entity(), Self::handle_claude_channel_interrupt);
+        session.add_request_handler(cx.weak_entity(), Self::handle_tail_claude_channel_inbox);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -1441,9 +1457,12 @@ impl HeadlessProject {
                         .map(|transcript_path| transcript_path.to_string_lossy().into_owned()),
                     context_tokens: summary.spend.map(|spend| spend.context_tokens).unwrap_or(0),
                     total_cost_usd: summary.spend.and_then(|spend| spend.total_cost_usd),
+                    bridge_session_id: summary.session.bridge_session_id,
                 })
                 .collect(),
             home_directory: home_directory.to_string_lossy().into_owned(),
+            liveness_unavailable_reason: remote::claude_sessions::liveness_unavailable_reason()
+                .map(str::to_string),
         })
     }
 
@@ -1465,86 +1484,198 @@ impl HeadlessProject {
             .await?;
 
         Ok(proto::ListClaudeSubagentsResponse {
-            subagents: subagents
+            subagents: subagents.into_iter().map(claude_subagent_proto).collect(),
+        })
+    }
+
+    async fn handle_list_claude_subagents_for_sessions(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ListClaudeSubagentsForSessions>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListClaudeSubagentsForSessionsResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_ids = envelope.payload.session_ids;
+
+        let by_session = cx
+            .background_spawn({
+                let home_directory = home_directory.clone();
+                async move {
+                    remote::claude_sessions::list_subagents_for_sessions(
+                        &home_directory,
+                        &session_ids,
+                    )
+                    .await
+                }
+            })
+            .await?;
+
+        Ok(proto::ListClaudeSubagentsForSessionsResponse {
+            by_session: by_session
                 .into_iter()
-                .map(|summary| proto::ClaudeSubagent {
-                    agent_id: summary.agent_id,
-                    workflow_run_id: summary.workflow_run_id,
-                    agent_type: summary.meta.agent_type,
-                    description: summary.meta.description,
-                    tool_use_id: summary.meta.tool_use_id,
-                    spawn_depth: summary.meta.spawn_depth,
-                    model: summary.meta.model,
-                    workflow_phase: summary.meta.workflow_phase,
-                    transcript_path: Some(summary.transcript_path.to_string_lossy().into_owned()),
-                    size: summary.size,
-                    workflow_agent_finished: summary.workflow_agent_finished,
-                    task_agent_finished: summary.task_agent_finished,
-                    request_shape: summary.meta.request_shape.clone(),
+                .map(|(session_id, subagents)| proto::ClaudeSubagentsOfSession {
+                    session_id,
+                    subagents: subagents.into_iter().map(claude_subagent_proto).collect(),
                 })
                 .collect(),
         })
     }
 
-    async fn handle_get_claude_pending_question(
+    async fn handle_list_claude_agents(
         _this: Entity<Self>,
-        envelope: TypedEnvelope<proto::GetClaudePendingQuestion>,
+        _envelope: TypedEnvelope<proto::ListClaudeAgents>,
         cx: AsyncApp,
-    ) -> Result<proto::GetClaudePendingQuestionResponse> {
-        let home_directory = paths::home_dir().to_path_buf();
-        let session_id = envelope.payload.session_id;
-
+    ) -> Result<proto::ListClaudeAgentsResponse> {
+        let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
-            let hook_installed =
-                remote::claude_sessions::question_hook_is_installed(&home_directory);
-            let question =
-                remote::claude_sessions::read_pending_question(&home_directory, &session_id)?;
-            let live_message =
-                remote::claude_sessions::read_live_message(&home_directory, &session_id)?;
-
-            Ok(proto::GetClaudePendingQuestionResponse {
-                tool_use_id: question
-                    .as_ref()
-                    .map(|question| question.tool_use_id.clone()),
-                questions: question
-                    .map(|question| {
-                        question
-                            .questions
-                            .into_iter()
-                            .map(|question| proto::ClaudeQuestion {
-                                header: question.header,
-                                question: question.question,
-                                options: question
-                                    .options
-                                    .into_iter()
-                                    .map(|option| proto::ClaudeQuestionOption {
-                                        label: option.label,
-                                        description: option.description,
-                                    })
-                                    .collect(),
-                                multi_select: question.multi_select,
-                            })
-                            .collect()
+            let agents = remote::claude_sessions::list_claude_agents(&executor).await?;
+            Ok(proto::ListClaudeAgentsResponse {
+                agents: agents
+                    .into_iter()
+                    .map(|agent| proto::ClaudeAgent {
+                        id: agent.id,
+                        kind: agent.kind,
+                        state: agent.state,
+                        status: agent.status,
+                        waiting_for: agent.waiting_for,
+                        pid: agent.process_id,
+                        session_id: agent.session_id,
+                        name: agent.name,
+                        cwd: agent
+                            .working_directory
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        started_at: agent.started_at,
                     })
-                    .unwrap_or_default(),
-                hook_installed,
-                live_message,
+                    .collect(),
             })
         })
         .await
     }
 
-    async fn handle_install_claude_question_hook(
+    async fn handle_resume_claude_session(
         _this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::InstallClaudeQuestionHook>,
+        envelope: TypedEnvelope<proto::ResumeClaudeSession>,
         cx: AsyncApp,
-    ) -> Result<proto::InstallClaudeQuestionHookResponse> {
+    ) -> Result<proto::ResumeClaudeSessionResponse> {
+        let session_id = envelope.payload.session_id;
+        let cwd = PathBuf::from(envelope.payload.cwd);
+        let executor = cx.background_executor().clone();
+
+        cx.background_spawn(async move {
+            let output =
+                remote::claude_sessions::resume_session_in_background(&session_id, &cwd, &executor)
+                    .await?;
+            Ok(proto::ResumeClaudeSessionResponse { output })
+        })
+        .await
+    }
+
+    async fn handle_run_claude_agent_command(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::RunClaudeAgentCommand>,
+        cx: AsyncApp,
+    ) -> Result<proto::RunClaudeAgentCommandResponse> {
+        let args = envelope.payload.args;
+        let cwd = PathBuf::from(envelope.payload.cwd);
+        let executor = cx.background_executor().clone();
+
+        cx.background_spawn(async move {
+            let output =
+                remote::claude_sessions::run_claude_agent_command(&args, &cwd, &executor).await?;
+            Ok(proto::RunClaudeAgentCommandResponse { output })
+        })
+        .await
+    }
+
+    async fn handle_tail_claude_events(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::TailClaudeEvents>,
+        cx: AsyncApp,
+    ) -> Result<proto::TailClaudeEventsResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
+        let tail_state = remote::claude_sessions::TailState {
+            path: None,
+            offset: envelope.payload.offset,
+            pending: envelope.payload.pending,
+        };
+
+        cx.background_spawn(async move {
+            let progress = remote::claude_sessions::read_events_tail(
+                &home_directory,
+                &session_id,
+                tail_state,
+            )?;
+            Ok(proto::TailClaudeEventsResponse {
+                path: progress
+                    .path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                start_offset: progress.start_offset,
+                offset: progress.offset,
+                pending: progress.pending,
+                lines: progress.lines,
+                restarted: progress.restarted,
+            })
+        })
+        .await
+    }
+
+    async fn handle_read_claude_status(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ReadClaudeStatus>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadClaudeStatusResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
+
+        cx.background_spawn(async move {
+            Ok(proto::ReadClaudeStatusResponse {
+                status_json: remote::claude_sessions::read_session_status(
+                    &home_directory,
+                    &session_id,
+                )?,
+            })
+        })
+        .await
+    }
+
+    async fn handle_install_claude_hooks(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::InstallClaudeHooks>,
+        cx: AsyncApp,
+    ) -> Result<proto::InstallClaudeHooksResponse> {
         let home_directory = paths::home_dir().to_path_buf();
 
         cx.background_spawn(async move {
-            let backup = remote::claude_sessions::install_question_hook(&home_directory)?;
-            Ok(proto::InstallClaudeQuestionHookResponse {
-                backup_path: backup.map(|path| path.to_string_lossy().into_owned()),
+            let outcome = remote::claude_sessions::install_zed_hooks(&home_directory)?;
+            Ok(hook_install_response(outcome))
+        })
+        .await
+    }
+
+    async fn handle_uninstall_claude_hooks(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::UninstallClaudeHooks>,
+        cx: AsyncApp,
+    ) -> Result<proto::UninstallClaudeHooksResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+
+        cx.background_spawn(async move {
+            remote::claude_sessions::uninstall_zed_hooks(&home_directory)?;
+            Ok(proto::UninstallClaudeHooksResponse {})
+        })
+        .await
+    }
+
+    async fn handle_claude_hooks_installed(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::ClaudeHooksInstalled>,
+        cx: AsyncApp,
+    ) -> Result<proto::ClaudeHooksInstalledResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+
+        cx.background_spawn(async move {
+            Ok(proto::ClaudeHooksInstalledResponse {
+                installed: remote::claude_sessions::zed_hooks_installed(&home_directory),
             })
         })
         .await
@@ -1555,10 +1686,17 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::ListClaudeSessionFiles>,
         cx: AsyncApp,
     ) -> Result<proto::ListClaudeSessionFilesResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
         let directory = PathBuf::from(envelope.payload.directory);
         let query = envelope.payload.query;
 
         cx.background_spawn(async move {
+            let directory = remote::claude_sessions::session_files_directory(
+                &home_directory,
+                &session_id,
+                &directory,
+            )?;
             Ok(proto::ListClaudeSessionFilesResponse {
                 paths: remote::claude_sessions::list_files_under(&directory, &query),
             })
@@ -1594,8 +1732,14 @@ impl HeadlessProject {
     ) -> Result<proto::ListClaudeSlashCommandsResponse> {
         let home_directory = paths::home_dir().to_path_buf();
         let project_root = envelope.payload.project_root.map(PathBuf::from);
+        let session_id = envelope.payload.session_id;
 
         cx.background_spawn(async move {
+            let project_root = remote::claude_sessions::slash_command_project_root(
+                &home_directory,
+                session_id.as_deref(),
+                project_root.as_deref(),
+            )?;
             let commands = remote::claude_sessions::list_slash_commands(
                 &home_directory,
                 project_root.as_deref(),
@@ -1690,7 +1834,12 @@ impl HeadlessProject {
         let request = envelope.payload;
         let file_path = PathBuf::from(request.path);
 
-        validate_claude_file_path(&file_path, &home_directory)?;
+        match request.session_id.as_deref() {
+            Some(session_id) => {
+                validate_claude_attachment_path(&file_path, &home_directory, session_id)?
+            }
+            None => validate_claude_file_path(&file_path, &home_directory)?,
+        }
 
         // An upper bound of 4 MiB prevents unbounded memory allocation if a client requests
         // an excessively large file. Because protobuf defaults unset numeric fields to 0,
@@ -1724,68 +1873,145 @@ impl HeadlessProject {
         })
     }
 
-    async fn handle_capture_claude_pane(
+    async fn handle_claude_channel_status(
         _this: Entity<Self>,
-        envelope: TypedEnvelope<proto::CaptureClaudePane>,
+        envelope: TypedEnvelope<proto::ClaudeChannelStatus>,
         cx: AsyncApp,
-    ) -> Result<proto::CaptureClaudePaneResponse> {
-        shell_environment_ready(&cx).await;
-        // Sanitized before it reaches tmux, exactly as a send's target is: this drives
-        // the same command with a value that came over the connection.
-        let Some(pane_target) = remote::claude_sessions::pane_target(&envelope.payload.pane_target)
-        else {
-            anyhow::bail!(
-                "invalid tmux pane target: {:?}",
-                envelope.payload.pane_target
-            );
-        };
-        // Shells out, so it is kept off the thread that serves the rest of the session.
-        let contents = cx
-            .background_spawn(
-                async move { remote::claude_sessions::capture_pane(&pane_target).await },
-            )
-            .await?;
+    ) -> Result<proto::ClaudeChannelStatusResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let claude_pid = envelope.payload.claude_pid;
+        if claude_pid == 0 {
+            anyhow::bail!("claude_pid must not be 0");
+        }
 
-        Ok(proto::CaptureClaudePaneResponse { contents })
+        cx.background_spawn(async move {
+            let status = remote::claude_sessions::channel_status(
+                &home_directory,
+                claude_pid,
+                remote::claude_sessions::now_millis(),
+            );
+            Ok(proto::ClaudeChannelStatusResponse {
+                live: status.live,
+                heartbeat_at_ms: status.heartbeat_at_ms,
+                server_pid: status.server_pid,
+                features: status.features,
+            })
+        })
+        .await
     }
 
-    async fn handle_send_claude_input(
+    async fn handle_claude_channel_send(
         _this: Entity<Self>,
-        envelope: TypedEnvelope<proto::SendClaudeInput>,
+        envelope: TypedEnvelope<proto::ClaudeChannelSend>,
         cx: AsyncApp,
-    ) -> Result<proto::Ack> {
-        shell_environment_ready(&cx).await;
+    ) -> Result<proto::ClaudeChannelSendResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
         let request = envelope.payload;
-        // The pane target must be sanitized before passing it to tmux to prevent command injection.
-        let Some(sanitized_pane_target) =
-            remote::claude_sessions::pane_target(&request.pane_target)
-        else {
-            anyhow::bail!("invalid tmux pane target: {:?}", request.pane_target);
+        if request.claude_pid == 0 {
+            anyhow::bail!("claude_pid must not be 0");
+        }
+        if request.content.len() > remote::claude_sessions::CHANNEL_MESSAGE_MAX_BYTES {
+            anyhow::bail!("message content exceeds 4 MiB");
+        }
+
+        cx.background_spawn(async move {
+            let outbox_file = remote::claude_sessions::channel_send_message(
+                &home_directory,
+                request.claude_pid,
+                &request.content,
+            )?;
+            Ok(proto::ClaudeChannelSendResponse { outbox_file })
+        })
+        .await
+    }
+
+    async fn handle_claude_channel_interrupt(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ClaudeChannelInterrupt>,
+        cx: AsyncApp,
+    ) -> Result<proto::ClaudeChannelInterruptResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+        if request.claude_pid == 0 {
+            anyhow::bail!("claude_pid must not be 0");
+        }
+        if request.reason.chars().count()
+            > remote::claude_sessions::CHANNEL_INTERRUPT_REASON_MAX_CHARS
+        {
+            anyhow::bail!(
+                "interrupt reason exceeds {} characters",
+                remote::claude_sessions::CHANNEL_INTERRUPT_REASON_MAX_CHARS
+            );
+        }
+
+        cx.background_spawn(async move {
+            let outbox_file = remote::claude_sessions::channel_interrupt(
+                &home_directory,
+                request.claude_pid,
+                &request.reason,
+            )?;
+            Ok(proto::ClaudeChannelInterruptResponse { outbox_file })
+        })
+        .await
+    }
+
+    async fn handle_claude_channel_answer_permission(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ClaudeChannelAnswerPermission>,
+        cx: AsyncApp,
+    ) -> Result<proto::ClaudeChannelAnswerPermissionResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+        if request.claude_pid == 0 {
+            anyhow::bail!("claude_pid must not be 0");
+        }
+
+        cx.background_spawn(async move {
+            let outbox_file = remote::claude_sessions::channel_answer_permission(
+                &home_directory,
+                request.claude_pid,
+                &request.request_id,
+                request.allow,
+            )?;
+            Ok(proto::ClaudeChannelAnswerPermissionResponse { outbox_file })
+        })
+        .await
+    }
+
+    async fn handle_tail_claude_channel_inbox(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::TailClaudeChannelInbox>,
+        cx: AsyncApp,
+    ) -> Result<proto::TailClaudeChannelInboxResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+        if request.claude_pid == 0 {
+            anyhow::bail!("claude_pid must not be 0");
+        }
+        let tail_state = remote::claude_sessions::TailState {
+            path: None,
+            offset: request.offset,
+            pending: request.pending,
         };
 
         cx.background_spawn(async move {
-            match request.input {
-                Some(proto::send_claude_input::Input::Text(text_to_send)) => {
-                    remote::claude_sessions::send_text(&sanitized_pane_target, &text_to_send)
-                        .await?;
-                }
-                Some(proto::send_claude_input::Input::Escape(_)) => {
-                    remote::claude_sessions::send_escape(&sanitized_pane_target).await?;
-                }
-                Some(proto::send_claude_input::Input::Key(key)) => {
-                    // The set is closed here as well as at the sender: a key name that
-                    // crossed the connection is not one this host wrote.
-                    let key = remote::claude_sessions::PaneKey::from_tmux_name(&key)
-                        .with_context(|| format!("unknown pane key {key:?}"))?;
-                    remote::claude_sessions::send_key(&sanitized_pane_target, key).await?;
-                }
-                None => anyhow::bail!("no input provided in SendClaudeInput"),
-            }
-            Ok::<_, anyhow::Error>(())
+            let progress = remote::claude_sessions::read_channel_inbox_tail(
+                &home_directory,
+                request.claude_pid,
+                tail_state,
+            )?;
+            Ok(proto::TailClaudeChannelInboxResponse {
+                path: progress
+                    .path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                start_offset: progress.start_offset,
+                offset: progress.offset,
+                pending: progress.pending,
+                lines: progress.lines,
+                restarted: progress.restarted,
+            })
         })
-        .await?;
-
-        Ok(proto::Ack {})
+        .await
     }
 
     async fn handle_get_remote_profiling_data(
@@ -1897,6 +2123,51 @@ fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+fn claude_subagent_proto(
+    summary: remote::claude_sessions::SubagentSummary,
+) -> proto::ClaudeSubagent {
+    proto::ClaudeSubagent {
+        agent_id: summary.agent_id,
+        workflow_run_id: summary.workflow_run_id,
+        agent_type: summary.meta.agent_type,
+        description: summary.meta.description,
+        tool_use_id: summary.meta.tool_use_id,
+        spawn_depth: summary.meta.spawn_depth,
+        model: summary.meta.model,
+        workflow_phase: summary.meta.workflow_phase,
+        transcript_path: Some(summary.transcript_path.to_string_lossy().into_owned()),
+        size: summary.size,
+        workflow_agent_finished: summary.workflow_agent_finished,
+        task_agent_finished: summary.task_agent_finished,
+        request_shape: summary.meta.request_shape.clone(),
+    }
+}
+
+fn hook_install_response(
+    outcome: remote::claude_sessions::HookInstallOutcome,
+) -> proto::InstallClaudeHooksResponse {
+    match outcome {
+        remote::claude_sessions::HookInstallOutcome::AlreadyCurrent => {
+            proto::InstallClaudeHooksResponse {
+                outcome: proto::ClaudeHookInstallOutcome::AlreadyCurrent as i32,
+                backup_path: None,
+            }
+        }
+        remote::claude_sessions::HookInstallOutcome::ScriptsRefreshed => {
+            proto::InstallClaudeHooksResponse {
+                outcome: proto::ClaudeHookInstallOutcome::ScriptsRefreshed as i32,
+                backup_path: None,
+            }
+        }
+        remote::claude_sessions::HookInstallOutcome::Installed { backup_path } => {
+            proto::InstallClaudeHooksResponse {
+                outcome: proto::ClaudeHookInstallOutcome::Installed as i32,
+                backup_path: backup_path.map(|path| path.to_string_lossy().into_owned()),
+            }
+        }
+    }
+}
+
 // The path a tail is allowed to follow, which is only ever the transcript of the session
 // the request names.
 //
@@ -1995,6 +2266,29 @@ fn validate_claude_file_path(path: &Path, home_directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// The files a request naming a session may read back: the ones that session recorded as
+// attachments live wherever it wrote them, so they are judged against that session's own
+// working directory rather than against `~/.claude/projects`.
+//
+// The working directory is read from the session's registration here, never taken from
+// the request: a boundary the requester names is not a boundary.
+fn validate_claude_attachment_path(
+    path: &Path,
+    home_directory: &Path,
+    session_id: &str,
+) -> Result<()> {
+    let working_directory =
+        remote::claude_sessions::session_working_directory(home_directory, session_id)
+            .with_context(|| format!("no session is registered as {session_id}"))?;
+
+    anyhow::ensure!(
+        remote::claude_sessions::attachment_is_readable(path, &working_directory),
+        "path {} is outside the working directory of session {session_id}",
+        path.display(),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2080,18 +2374,39 @@ mod tests {
     }
 
     #[test]
-    fn test_pane_target_sanitization() {
-        assert_eq!(
-            remote::claude_sessions::pane_target("%3"),
-            Some("%3".to_string())
-        );
-        assert_eq!(
-            remote::claude_sessions::pane_target("session:@0.%42"),
-            Some("%42".to_string())
-        );
-        assert_eq!(remote::claude_sessions::pane_target("invalid"), None);
-        assert_eq!(remote::claude_sessions::pane_target("%"), None);
-        assert_eq!(remote::claude_sessions::pane_target("%3; malicious"), None);
+    fn test_channel_handlers_reject_pid_zero_and_oversize_content() {
+        let home = std::env::temp_dir().join(format!(
+            "zed-channel-handler-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).expect("creating a temporary home");
+
+        match remote::claude_sessions::channel_send_message(&home, 0, "hello") {
+            Ok(name) => panic!("pid 0 must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("claude_pid"), "got {error:#}"),
+        }
+
+        let too_large = "x".repeat(remote::claude_sessions::CHANNEL_MESSAGE_MAX_BYTES + 1);
+        match remote::claude_sessions::channel_send_message(&home, 9, &too_large) {
+            Ok(name) => panic!("oversize content must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("4 MiB"), "got {error:#}"),
+        }
+
+        match remote::claude_sessions::channel_interrupt(&home, 0, "stop") {
+            Ok(name) => panic!("pid 0 must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("claude_pid"), "got {error:#}"),
+        }
+        let too_long = "x".repeat(remote::claude_sessions::CHANNEL_INTERRUPT_REASON_MAX_CHARS + 1);
+        match remote::claude_sessions::channel_interrupt(&home, 9, &too_long) {
+            Ok(name) => panic!("a 201-char reason must be refused, wrote {name}"),
+            Err(error) => assert!(error.to_string().contains("200"), "got {error:#}"),
+        }
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -2286,6 +2601,60 @@ mod tests {
         assert!(
             result.is_err(),
             "an invalid agent_id that fails path validation must return an error"
+        );
+    }
+
+    #[test]
+    fn list_claude_subagents_for_sessions_groups_by_session_id() {
+        let by_session = vec![
+            (
+                "session-a".to_string(),
+                vec![remote::claude_sessions::SubagentSummary {
+                    agent_id: "agent-1".to_string(),
+                    workflow_run_id: None,
+                    meta: remote::claude_sessions::SubagentMeta {
+                        agent_type: "general-purpose".to_string(),
+                        description: None,
+                        tool_use_id: None,
+                        spawn_depth: 1,
+                        model: None,
+                        workflow_phase: None,
+                        request_shape: None,
+                    },
+                    transcript_path: PathBuf::from("/tmp/a.jsonl"),
+                    size: 1,
+                    workflow_agent_finished: None,
+                    task_agent_finished: None,
+                }],
+            ),
+            ("session-b".to_string(), Vec::new()),
+        ];
+
+        let grouped: Vec<proto::ClaudeSubagentsOfSession> = by_session
+            .into_iter()
+            .map(|(session_id, subagents)| proto::ClaudeSubagentsOfSession {
+                session_id,
+                subagents: subagents.into_iter().map(claude_subagent_proto).collect(),
+            })
+            .collect();
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].session_id, "session-a");
+        assert_eq!(grouped[0].subagents.len(), 1);
+        assert_eq!(grouped[0].subagents[0].agent_id, "agent-1");
+        assert_eq!(grouped[1].session_id, "session-b");
+        assert!(grouped[1].subagents.is_empty());
+    }
+
+    #[test]
+    fn resume_claude_session_rejects_a_session_id_with_a_separator() {
+        assert!(
+            remote::claude_sessions::single_path_component("abc/def").is_none(),
+            "a session id with a separator must be rejected before resume runs"
+        );
+        assert_eq!(
+            remote::claude_sessions::single_path_component("abc"),
+            Some("abc")
         );
     }
 }

@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod blind_input_tests;
+mod blind_live_state_tests;
 #[cfg(test)]
 mod blind_registry_tests;
 #[cfg(test)]
@@ -7,6 +7,7 @@ mod blind_subagent_tests;
 #[cfg(test)]
 mod blind_transcript_tests;
 mod claude_sessions_panel;
+mod live_state;
 mod session_source;
 mod session_store;
 mod transcript;
@@ -21,13 +22,19 @@ pub use claude_sessions_panel::ClaudeSessionsPanel;
 // The registry parsing and liveness rules live in `remote`, so that the remote server can
 // run them without depending on this crate's UI. The alias keeps the path this crate's
 // own modules and tests use pointing at the one implementation.
-pub use remote::claude_sessions as session_registry;
-pub use session_registry::{RegisteredSession, SubagentMeta, SubagentSummary};
-pub use session_source::{
-    FileContents, LocalSource, RemoteSource, SessionInput, SessionListing, SessionSource,
+pub use live_state::{
+    ChannelInboxEvent, HookEvent, LiveMessage, LiveState, PendingQuestion, PermissionRequest,
+    RunningTool, StatusSnapshot, Turn, parse_channel_inbox_line, parse_hook_event, timestamp_ms,
 };
-pub use session_store::{ClaudeSessionStore, TranscriptTarget};
-pub use transcript::{CompactMetadata, Transcript, TranscriptRecord};
+pub use remote::claude_sessions as session_registry;
+pub use session_registry::HookInstallOutcome;
+pub use session_registry::{AgentListing, RegisteredSession, SubagentMeta, SubagentSummary};
+pub use session_source::{FileContents, LocalSource, RemoteSource, SessionListing, SessionSource};
+pub use session_store::{
+    ClaudeSessionStore, EndedReason, EndedSession, LiveSession, SessionRow, StoreClock,
+    TranscriptTarget,
+};
+pub use transcript::{AutoModeFlags, CompactMetadata, Transcript, TranscriptRecord};
 pub use usage::{ModelRates, Usage, rates_for_model};
 
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that
@@ -61,8 +68,8 @@ actions!(
         ToggleFocus,
         /// Sends the message to the selected Claude Code session.
         SendMessage,
-        /// Interrupts the selected Claude Code session, as Escape does in the terminal.
-        Interrupt,
+        /// Dismisses the slash-command or file menu in the message box.
+        DismissMenus,
         /// Opens the Claude sessions conversation as a tab in the editor area.
         OpenInEditor,
         /// Puts the previous message sent to this session back in the message box, as Up
