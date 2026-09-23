@@ -37,7 +37,10 @@ use settings::{DockSide, Settings as _};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme::Appearance;
-use tmux_sessions::tmux_attach_command;
+use tmux_sessions::{
+    ClaudeActivity, ClaudeSessionLinks, LinkedClaudeSession, TmuxSessionsPanel,
+    set_claude_session_links, tmux_attach_command,
+};
 use ui::{
     Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes, Scrollbars,
     SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
@@ -53,7 +56,9 @@ use crate::{
     HookInstallOutcome, LiveSession, LiveState, ModelRates, OpenInEditor, RegisteredSession,
     RunningTool, SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus, TranscriptRecord,
     TranscriptTarget, Turn, Usage, rates_for_model,
-    session_registry::{attachment_is_readable, tmux_session_name, workflow_run_id_in_tool_result},
+    session_registry::{
+        attachment_is_readable, tmux_session_name, window_target, workflow_run_id_in_tool_result,
+    },
     session_source::{FileContents, LocalSource, RemoteSource, SessionSource},
     terminal_anchors::{self, Anchoring, Glyphs, ScreenRow},
     transcript::{AutoModeFlags, Spend},
@@ -11479,6 +11484,94 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     }
 
     Some(output)
+}
+
+pub(super) fn install_tmux_session_links(cx: &mut App) {
+    set_claude_session_links(Arc::new(TmuxClaudeSessionLinks), cx);
+}
+
+struct TmuxClaudeSessionLinks;
+
+impl ClaudeSessionLinks for TmuxClaudeSessionLinks {
+    fn linked_sessions(&self, workspace: &Workspace, cx: &App) -> Vec<LinkedClaudeSession> {
+        let Some(panel) = workspace.panel::<ClaudeSessionsPanel>(cx) else {
+            return Vec::new();
+        };
+        let now = now_millis();
+        let store = panel.read(cx).store.read(cx);
+        store
+            .sessions()
+            .iter()
+            .filter_map(|live| {
+                let context_tokens = store
+                    .session_spend(&live.session_id)
+                    .map(|spend| spend.context_tokens);
+                linked_claude_session_for(live, context_tokens, now)
+            })
+            .collect()
+    }
+
+    fn observe(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<TmuxSessionsPanel>,
+    ) -> Option<Subscription> {
+        let store = workspace
+            .read(cx)
+            .panel::<ClaudeSessionsPanel>(cx)?
+            .read(cx)
+            .store
+            .clone();
+        Some(cx.observe(&store, |_, _, cx| cx.notify()))
+    }
+
+    fn open(
+        &self,
+        workspace: Entity<Workspace>,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
+        let Some(panel) = workspace.read(cx).panel::<ClaudeSessionsPanel>(cx) else {
+            anyhow::bail!("The Claude sessions panel is not available.");
+        };
+        let session_id = session_id.to_string();
+        panel.update(cx, |panel, cx| {
+            panel.select_session(session_id.clone(), cx);
+            panel.reveal_in_pane(Some(session_id), TranscriptTarget::Main, window, cx);
+        });
+        Ok(())
+    }
+}
+
+fn linked_claude_session_for(
+    live: &LiveSession,
+    context_tokens: Option<u64>,
+    now: i64,
+) -> Option<LinkedClaudeSession> {
+    // A background agent started from inside a session inherits its `$TMUX_PANE`, so it
+    // would claim the window of the interactive session the user is actually working in.
+    if live.background {
+        return None;
+    }
+    let tmux_target = live.tmux_target.as_deref()?;
+    let window_id = window_target(tmux_target)?;
+    let activity = if let Some(waiting) = live.waiting_for.as_deref() {
+        ClaudeActivity::Waiting(SharedString::from(waiting))
+    } else if live.status.as_deref() == Some("busy") {
+        ClaudeActivity::Working
+    } else {
+        ClaudeActivity::Idle(idle_for(live.updated_at, now))
+    };
+    Some(LinkedClaudeSession {
+        session_id: live.session_id.clone(),
+        window_id,
+        title: SharedString::from(preferred_session_name(&live.session, None)),
+        activity,
+        context: context_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| SharedString::from(compact_token_count(tokens))),
+    })
 }
 
 #[cfg(test)]

@@ -114,6 +114,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    claude_sessions_panel::install_tmux_session_links(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ClaudeSessionsPanel>(window, cx);

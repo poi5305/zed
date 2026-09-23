@@ -13,13 +13,15 @@ pub const LIST_SESSIONS_FORMAT: &str =
     "#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
 
 pub const LIST_WINDOWS_FORMAT: &str =
-    "#{session_name}\t#{window_index}\t#{window_name}\t#{?window_active,1,0}";
+    "#{session_name}\t#{window_index}\t#{window_name}\t#{?window_active,1,0}\t#{window_id}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxWindow {
     pub index: u32,
     pub name: String,
     pub active: bool,
+    /// Empty when the listing did not report one, or the value was not `@` and digits.
+    pub id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +80,9 @@ pub fn parse_tmux_sessions(list_sessions_stdout: &str) -> Vec<TmuxSession> {
 /// each window with the name of the session that owns it.
 ///
 /// A row whose window index is not a number is dropped on its own; the rows
-/// after it are still parsed.
+/// after it are still parsed. Four columns is a server that does not report
+/// `#{window_id}`; the id is then empty. A fifth column that is not `@`
+/// followed by digits is stored as empty rather than dropping the window.
 pub fn parse_tmux_windows(list_windows_stdout: &str) -> Vec<(String, TmuxWindow)> {
     let mut windows = Vec::new();
     for line in list_windows_stdout.lines() {
@@ -86,8 +90,10 @@ pub fn parse_tmux_windows(list_windows_stdout: &str) -> Vec<(String, TmuxWindow)
             continue;
         }
         let columns: Vec<&str> = line.split('\t').collect();
-        let [session_name, index, name, active] = columns.as_slice() else {
-            continue;
+        let (session_name, index, name, active, id) = match columns.as_slice() {
+            [session_name, index, name, active] => (*session_name, *index, *name, *active, ""),
+            [session_name, index, name, active, id] => (*session_name, *index, *name, *active, *id),
+            _ => continue,
         };
         let Ok(index) = index.trim().parse::<u32>() else {
             continue;
@@ -100,11 +106,25 @@ pub fn parse_tmux_windows(list_windows_stdout: &str) -> Vec<(String, TmuxWindow)
             TmuxWindow {
                 index,
                 name: name.to_string(),
-                active: *active == "1",
+                active: active == "1",
+                id: recorded_window_id(id),
             },
         ));
     }
     windows
+}
+
+/// `@` and one or more ASCII digits, as tmux prints `#{window_id}`. Anything else
+/// is not an id this panel can match a Claude session against.
+fn recorded_window_id(column: &str) -> String {
+    let id = column.trim();
+    let Some(digits) = id.strip_prefix('@') else {
+        return String::new();
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return String::new();
+    }
+    id.to_string()
 }
 
 /// Files each window under the session it names, ordered by window index.
@@ -254,6 +274,7 @@ mod tests {
                         index: 0,
                         name: "editor".to_string(),
                         active: true,
+                        id: String::new(),
                     }
                 ),
                 (
@@ -262,6 +283,7 @@ mod tests {
                         index: 1,
                         name: "server".to_string(),
                         active: false,
+                        id: String::new(),
                     }
                 ),
                 (
@@ -270,6 +292,7 @@ mod tests {
                         index: 0,
                         name: "shell".to_string(),
                         active: true,
+                        id: String::new(),
                     }
                 ),
             ]
@@ -296,6 +319,47 @@ mod tests {
             vec![(0, "editor"), (2, "logs"), (4, "build")],
             "a row with a non-numeric index and a row short of columns are each dropped alone, \
              and the rows after them are still parsed"
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_windows_reads_a_five_column_row_with_an_id() {
+        let windows = parse_tmux_windows("work\t0\teditor\t1\t@12\n");
+
+        assert_eq!(
+            windows,
+            vec![(
+                "work".to_string(),
+                TmuxWindow {
+                    index: 0,
+                    name: "editor".to_string(),
+                    active: true,
+                    id: "@12".to_string(),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_windows_reads_a_four_column_row_with_an_empty_id() {
+        let windows = parse_tmux_windows("work\t1\tserver\t0\n");
+
+        assert_eq!(
+            windows.first().map(|(_, window)| window.id.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_windows_stores_an_empty_id_for_a_malformed_id() {
+        let windows = parse_tmux_windows("work\t2\tlogs\t0\tnot-an-id\n");
+
+        assert_eq!(
+            windows
+                .first()
+                .map(|(_, window)| (window.index, window.id.as_str())),
+            Some((2, "")),
+            "a malformed id does not drop the window"
         );
     }
 

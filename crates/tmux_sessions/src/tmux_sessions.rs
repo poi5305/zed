@@ -1,9 +1,77 @@
 mod tmux_sessions_panel;
 
-use gpui::{App, actions};
+use std::sync::Arc;
+
+use gpui::{App, Context, Entity, Global, SharedString, Subscription, Window, actions};
 use workspace::Workspace;
 
 pub use tmux_sessions_panel::TmuxSessionsPanel;
+
+/// What a linked Claude session is doing, in the same terms the Claude panel uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaudeActivity {
+    Working,
+    Waiting(SharedString),
+    Idle(Option<SharedString>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedClaudeSession {
+    pub session_id: String,
+    /// The tmux window id the session runs in, e.g. `@3`.
+    pub window_id: String,
+    pub title: SharedString,
+    pub activity: ClaudeActivity,
+    /// The context the newest answer was given, as the Claude panel shows it (`214K`).
+    pub context: Option<SharedString>,
+}
+
+pub trait ClaudeSessionLinks: 'static {
+    /// Every live Claude session that runs in a tmux window, as the Claude panel of `workspace` knows them.
+    fn linked_sessions(&self, workspace: &Workspace, cx: &App) -> Vec<LinkedClaudeSession>;
+    /// Re-render `cx`'s panel whenever that list may have changed. `None` while the Claude panel of this
+    /// workspace has not been created yet (the tmux panel retries later).
+    ///
+    /// Takes the workspace entity rather than `&Workspace` from `workspace.read(cx)`: that reference
+    /// borrows `cx` for as long as it lives, and registering the subscription needs `&mut Context`.
+    fn observe(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<TmuxSessionsPanel>,
+    ) -> Option<Subscription>;
+    /// Opens the Claude session's tab. Errors are returned for the tmux panel to show.
+    fn open(
+        &self,
+        workspace: Entity<Workspace>,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()>;
+}
+
+struct ClaudeSessionLinksState(Arc<dyn ClaudeSessionLinks>);
+
+impl Global for ClaudeSessionLinksState {}
+
+pub fn set_claude_session_links(links: Arc<dyn ClaudeSessionLinks>, cx: &mut App) {
+    cx.set_global(ClaudeSessionLinksState(links));
+}
+
+pub fn claude_session_links(cx: &App) -> Option<Arc<dyn ClaudeSessionLinks>> {
+    cx.try_global::<ClaudeSessionLinksState>()
+        .map(|state| Arc::clone(&state.0))
+}
+
+/// The linked session running in `window_id`. `None` when `window_id` is empty.
+pub fn linked_claude_session<'a>(
+    links: &'a [LinkedClaudeSession],
+    window_id: &str,
+) -> Option<&'a LinkedClaudeSession> {
+    if window_id.is_empty() {
+        return None;
+    }
+    links.iter().find(|link| link.window_id == window_id)
+}
 
 actions!(
     tmux_sessions,
@@ -57,6 +125,8 @@ pub fn tmux_attach_command(session_name: &str, window_index: Option<u32>) -> Str
 
 #[cfg(test)]
 mod tests {
+    use gpui::SharedString;
+
     use super::*;
 
     #[test]
@@ -116,6 +186,32 @@ mod tests {
             tmux_attach_command("app*", Some(1)),
             "tmux attach -t '=app*:1'"
         );
+    }
+
+    #[test]
+    fn test_linked_claude_session_matches_by_id_and_rejects_an_empty_id() {
+        let links = [
+            LinkedClaudeSession {
+                session_id: "session-1".to_string(),
+                window_id: "@12".to_string(),
+                title: SharedString::from("editor"),
+                activity: ClaudeActivity::Working,
+                context: None,
+            },
+            LinkedClaudeSession {
+                session_id: "blank".to_string(),
+                window_id: String::new(),
+                title: SharedString::from("untitled"),
+                activity: ClaudeActivity::Idle(None),
+                context: None,
+            },
+        ];
+
+        assert_eq!(
+            linked_claude_session(&links, "@12").map(|link| link.session_id.as_str()),
+            Some("session-1")
+        );
+        assert_eq!(linked_claude_session(&links, ""), None);
     }
 
     /// Re-runs the quoting through a real shell so that the escaping is checked

@@ -8,6 +8,8 @@ message TmuxWindow {
   uint32 index = 1;
   string name = 2;
   bool active = 3;
+  // Empty when the server did not report one. An empty id is not a link.
+  string id = 4;
 }
 
 message TmuxSession {
