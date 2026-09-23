@@ -775,7 +775,7 @@ pub struct ClaudeSessionsPanel {
     /// One turn's calls, taken before collapse drops the thinking and tool entries.
     /// The last record of a call is often one of those. Keyed by the turn's first
     /// entry, which collapse keeps.
-    turn_bills: HashMap<SharedString, (Vec<Usage>, Usage)>,
+    turn_bills: HashMap<SharedString, (Vec<Usage>, Usage, Vec<Option<SharedString>>)>,
     list_state: ListState,
     /// Whether the list of sessions is showing its rows. Collapsing it gives the whole
     /// panel to the conversation, which is what the user is here to read.
@@ -1368,6 +1368,7 @@ fn rail_draw_slots(entries: &[Entry]) -> Vec<RailWorth> {
 struct Billed {
     call_id: SharedString,
     usage: Usage,
+    answered_at: Option<SharedString>,
 }
 
 /// What every record of the conversation was billed, keyed the way `build_entries` keys
@@ -1393,7 +1394,14 @@ fn billing_of_path(path: &[&TranscriptRecord]) -> HashMap<SharedString, Billed> 
             .filter(|request_id| !request_id.is_empty())
             .map(|request_id| SharedString::from(request_id.to_string()))
             .unwrap_or_else(|| base_key.clone());
-        billing.insert(base_key, Billed { call_id, usage });
+        billing.insert(
+            base_key,
+            Billed {
+                call_id,
+                usage,
+                answered_at: answered_at(&record.raw),
+            },
+        );
     }
     billing
 }
@@ -1414,7 +1422,9 @@ fn billed_entry(entry: &Entry, billing: &HashMap<SharedString, Billed>) -> Optio
         return Some(billed.clone());
     }
     let EntryKind::Message {
-        usage: Some(usage), ..
+        usage: Some(usage),
+        answered_at,
+        ..
     } = &entry.kind
     else {
         return None;
@@ -1422,18 +1432,32 @@ fn billed_entry(entry: &Entry, billing: &HashMap<SharedString, Billed>) -> Optio
     Some(Billed {
         call_id: record_id,
         usage: *usage,
+        answered_at: answered_at.clone(),
     })
 }
 
 /// Every billed API call of one turn, oldest first, and their total.
+#[cfg(test)]
 fn turn_billing(
     entries: &[Entry],
     turn_start: usize,
     billing: &HashMap<SharedString, Billed>,
 ) -> (Vec<Usage>, Usage) {
+    let (calls, total, _) = turn_bill(entries, turn_start, billing);
+    (calls, total)
+}
+
+/// Every billed API call of one turn, oldest first, their total, and when each call's
+/// newest record was written.
+fn turn_bill(
+    entries: &[Entry],
+    turn_start: usize,
+    billing: &HashMap<SharedString, Billed>,
+) -> (Vec<Usage>, Usage, Vec<Option<SharedString>>) {
     let mut calls = Vec::new();
+    let mut finished_at = Vec::new();
     let Some(turn) = entries.get(turn_start..) else {
-        return (calls, Usage::default());
+        return (calls, Usage::default(), finished_at);
     };
 
     // The call stays where it started. A later record of the same call is a fuller
@@ -1450,16 +1474,20 @@ fn turn_billing(
             if let Some(call) = calls.get_mut(index) {
                 *call = billed.usage;
             }
+            if let Some(call_finished_at) = finished_at.get_mut(index) {
+                *call_finished_at = billed.answered_at;
+            }
         } else {
             call_index.insert(billed.call_id, calls.len());
             calls.push(billed.usage);
+            finished_at.push(billed.answered_at);
         }
     }
     let mut total = Usage::default();
     for usage in &calls {
         total = total.add(*usage);
     }
-    (calls, total)
+    (calls, total, finished_at)
 }
 
 /// `[start, end)` of the turn that contains `index`. A turn runs from a user
@@ -1543,13 +1571,13 @@ fn cost_anchor_at(
 fn turn_bills(
     entries: &[Entry],
     billing: &HashMap<SharedString, Billed>,
-) -> HashMap<SharedString, (Vec<Usage>, Usage)> {
+) -> HashMap<SharedString, (Vec<Usage>, Usage, Vec<Option<SharedString>>)> {
     let mut bills = HashMap::default();
     for (index, entry) in entries.iter().enumerate() {
         if index != 0 && !entry_starts_user_turn(&entry.kind) {
             continue;
         }
-        let bill = turn_billing(entries, index, billing);
+        let bill = turn_bill(entries, index, billing);
         if bill.0.is_empty() {
             continue;
         }
@@ -1562,11 +1590,39 @@ fn turn_bills(
 fn displayed_turn_usage(
     entries: &[Entry],
     index: usize,
-    bills: &HashMap<SharedString, (Vec<Usage>, Usage)>,
-) -> Option<(Vec<Usage>, Usage)> {
+    bills: &HashMap<SharedString, (Vec<Usage>, Usage, Vec<Option<SharedString>>)>,
+) -> Option<(Vec<Usage>, Usage, Vec<Option<SharedString>>)> {
     let (start, _) = turn_bounds(entries, index)?;
     let turn_id = &entries.get(start)?.key;
     bills.get(turn_id).cloned()
+}
+
+/// A turn's cost card: one line per call when the reader has opened it, otherwise the
+/// turn's total. Each line is dated by when its call finished, and the total by the
+/// turn's last call.
+fn turn_cost_lines(
+    calls: Vec<Usage>,
+    total: Usage,
+    finished_at: &[Option<SharedString>],
+    expanded: bool,
+    rates: ModelRates,
+) -> Vec<SharedString> {
+    if !expanded {
+        let turn_finished_at = finished_at.last().and_then(Option::as_ref);
+        return vec![SharedString::from(answer_summary(
+            total,
+            rates,
+            turn_finished_at,
+        ))];
+    }
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, usage)| {
+            let call_finished_at = finished_at.get(index).and_then(Option::as_ref);
+            SharedString::from(answer_summary(usage, rates, call_finished_at))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7844,7 +7900,8 @@ impl ClaudeSessionsPanel {
             return None;
         }
         let (start, _) = turn_bounds(&self.entries, index)?;
-        let (calls, total) = displayed_turn_usage(&self.entries, index, &self.turn_bills)?;
+        let (calls, total, finished_at) =
+            displayed_turn_usage(&self.entries, index, &self.turn_bills)?;
         if calls.is_empty() {
             return None;
         }
@@ -7853,11 +7910,7 @@ impl ClaudeSessionsPanel {
         let turn_id = self.entries.get(start)?.key.clone();
         let cost_key = turn_cost_key(&turn_id);
         let expanded = self.expanded.contains(&cost_key);
-        let usages = if expanded { calls } else { vec![total] };
-        let lines: Vec<SharedString> = usages
-            .into_iter()
-            .map(|usage| SharedString::from(answer_summary(usage, rates, None)))
-            .collect();
+        let lines = turn_cost_lines(calls, total, &finished_at, expanded, rates);
         let toggle_key = cost_key;
         Some(
             v_flex()
@@ -19521,7 +19574,7 @@ mod tests {
             .iter()
             .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
             .expect("the turn with a tool call collapses to a summary");
-        let (calls, _) = displayed_turn_usage(&collapsed, summary, &bills)
+        let (calls, _, _) = displayed_turn_usage(&collapsed, summary, &bills)
             .expect("the collapsed turn still has a bill");
         let outputs: Vec<u64> = calls.iter().map(|usage| usage.output_tokens).collect();
         assert_eq!(
@@ -19538,7 +19591,7 @@ mod tests {
             .iter()
             .position(|entry| entry.key.as_ref() == "u2")
             .expect("the next turn's user message survives collapse");
-        let (next_calls, _) = displayed_turn_usage(&collapsed, second, &bills)
+        let (next_calls, _, _) = displayed_turn_usage(&collapsed, second, &bills)
             .expect("the next turn has its own bill");
         assert_eq!(
             next_calls
@@ -19587,7 +19640,7 @@ mod tests {
             "the collapsed entries themselves no longer contain a billed record"
         );
 
-        let (_, total) = displayed_turn_usage(&collapsed, summary, &bills)
+        let (_, total, _) = displayed_turn_usage(&collapsed, summary, &bills)
             .expect("the bill was taken before those entries were dropped");
         assert_eq!(
             total.output_tokens, 1403,
@@ -19597,6 +19650,170 @@ mod tests {
         assert!(
             cost_anchor_at(&collapsed, summary, true, &billing),
             "with the pre-collapse bill, the summary carries the card"
+        );
+    }
+
+    fn timed_line(line: String, timestamp: &str) -> String {
+        let mut value: Value = serde_json::from_str(&line).expect("the fixture is json");
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                TIMESTAMP_FIELD.to_string(),
+                Value::String(timestamp.to_string()),
+            );
+        }
+        value.to_string()
+    }
+
+    fn local_clock(timestamp: &str) -> SharedString {
+        SharedString::from(
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .expect("the fixture parses")
+                .with_timezone(&chrono::Local)
+                .format(CLOCK_FORMAT)
+                .to_string(),
+        )
+    }
+
+    fn usage_from_json(usage: &Value) -> Usage {
+        Usage::from_record(&serde_json::json!({"message": {"usage": usage}}))
+            .expect("the fixture carries usage")
+    }
+
+    /// Two calls, the first written as a thinking and a tool record a couple of minutes
+    /// apart, the second as a text record. Collapse drops the first call's records.
+    fn two_timed_calls() -> (Vec<Entry>, (Vec<Usage>, Usage, Vec<Option<SharedString>>)) {
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            timed_line(
+                billed_block_line(
+                    "a1",
+                    Some("req-1"),
+                    thinking_block(),
+                    &usage_json(4, 100, 10, 1),
+                ),
+                "2026-09-13T15:00:00Z",
+            ),
+            timed_line(
+                billed_block_line(
+                    "a2",
+                    Some("req-1"),
+                    read_call_block("c1"),
+                    &usage_json(4, 100, 10, 1403),
+                ),
+                "2026-09-13T15:02:00Z",
+            ),
+            timed_line(
+                billed_block_line(
+                    "b1",
+                    Some("req-2"),
+                    text_block("noted"),
+                    &usage_json(4, 100, 10, 9),
+                ),
+                "2026-09-13T15:09:00Z",
+            ),
+        ]);
+        let bills = turn_bills(&entries, &billing);
+        let collapsed = collapse_turns(
+            entries,
+            &HashSet::default(),
+            false,
+            false,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        let summary = collapsed
+            .iter()
+            .position(|entry| matches!(entry.kind, EntryKind::TurnSummary { .. }))
+            .expect("the turn with a tool call collapses to a summary");
+        let bill = displayed_turn_usage(&collapsed, summary, &bills)
+            .expect("the bill was taken before collapse");
+        (collapsed, bill)
+    }
+
+    /// The closed card is the whole turn, and the turn was over when its last call was.
+    #[test]
+    fn the_closed_cost_card_is_dated_by_the_turns_last_call() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        let (_, (calls, total, finished_at)) = two_timed_calls();
+
+        let lines = turn_cost_lines(calls, total, &finished_at, false, rates);
+        let last_call = local_clock("2026-09-13T15:09:00Z");
+        assert_eq!(
+            lines,
+            vec![SharedString::from(answer_summary(
+                total,
+                rates,
+                Some(&last_call)
+            ))],
+            "the closed card leads with {last_call}, when req-2 finished"
+        );
+    }
+
+    /// A call is written as several records, and the one that is billed, the newest, is
+    /// also when the call finished. Its records are gone from the collapsed turn.
+    #[test]
+    fn each_line_of_the_open_cost_card_is_dated_by_its_calls_newest_record() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        let (_, (calls, total, finished_at)) = two_timed_calls();
+
+        let lines = turn_cost_lines(calls, total, &finished_at, true, rates);
+        let first_call = local_clock("2026-09-13T15:02:00Z");
+        let second_call = local_clock("2026-09-13T15:09:00Z");
+        assert_eq!(
+            lines,
+            vec![
+                SharedString::from(answer_summary(
+                    usage_from_json(&usage_json(4, 100, 10, 1403)),
+                    rates,
+                    Some(&first_call),
+                )),
+                SharedString::from(answer_summary(
+                    usage_from_json(&usage_json(4, 100, 10, 9)),
+                    rates,
+                    Some(&second_call),
+                )),
+            ],
+            "req-1 finished at {first_call} (its tool record), not when its thinking record was written"
+        );
+    }
+
+    /// The newest record is when a call finished. When it says no time, the line says
+    /// none, rather than an older snapshot's time or another call's.
+    #[test]
+    fn a_call_whose_newest_record_has_no_timestamp_is_not_dated() {
+        let rates = rates_for_model("claude-opus-5").expect("opus 5 is priced");
+        let first = usage_json(4, 100, 10, 1403);
+        let second = usage_json(4, 100, 10, 9);
+        let (entries, billing) = turn_of(&[
+            user_message_line("u1", "go"),
+            timed_line(
+                billed_block_line(
+                    "a1",
+                    Some("req-1"),
+                    thinking_block(),
+                    &usage_json(4, 100, 10, 1),
+                ),
+                "2026-09-13T15:00:00Z",
+            ),
+            billed_block_line("a2", Some("req-1"), read_call_block("c1"), &first),
+            billed_block_line("b1", Some("req-2"), text_block("noted"), &second),
+        ]);
+        let bills = turn_bills(&entries, &billing);
+        let (calls, total, finished_at) =
+            displayed_turn_usage(&entries, 0, &bills).expect("the turn was billed");
+
+        assert_eq!(
+            turn_cost_lines(calls.clone(), total, &finished_at, true, rates),
+            vec![
+                SharedString::from(answer_summary(usage_from_json(&first), rates, None)),
+                SharedString::from(answer_summary(usage_from_json(&second), rates, None)),
+            ],
+            "neither call's newest record says when it was written"
+        );
+        assert_eq!(
+            turn_cost_lines(calls, total, &finished_at, false, rates),
+            vec![SharedString::from(answer_summary(total, rates, None))],
+            "the turn's last call says no time, so neither does the closed card"
         );
     }
 
