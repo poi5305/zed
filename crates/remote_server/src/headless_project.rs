@@ -1419,6 +1419,14 @@ impl HeadlessProject {
         })
     }
 
+    fn cache_ttl_code(cache_ttl: remote::claude_sessions::CacheTtl) -> u32 {
+        match cache_ttl {
+            remote::claude_sessions::CacheTtl::Unknown => 0,
+            remote::claude_sessions::CacheTtl::FiveMinutes => 1,
+            remote::claude_sessions::CacheTtl::OneHour => 2,
+        }
+    }
+
     async fn handle_list_claude_sessions(
         _this: Entity<Self>,
         envelope: TypedEnvelope<proto::ListClaudeSessions>,
@@ -1440,25 +1448,32 @@ impl HeadlessProject {
         Ok(proto::ListClaudeSessionsResponse {
             sessions: session_summaries
                 .into_iter()
-                .map(|summary| proto::ClaudeSession {
-                    process_id: summary.session.process_id,
-                    session_id: summary.session.session_id,
-                    working_directory: summary
-                        .session
-                        .working_directory
-                        .to_string_lossy()
-                        .into_owned(),
-                    version: summary.session.version,
-                    name: summary.session.name,
-                    status: summary.session.status,
-                    updated_at: summary.session.updated_at,
-                    tmux_target: summary.session.tmux_target,
-                    transcript_path: summary
-                        .transcript_path
-                        .map(|transcript_path| transcript_path.to_string_lossy().into_owned()),
-                    context_tokens: summary.spend.map(|spend| spend.context_tokens).unwrap_or(0),
-                    total_cost_usd: summary.spend.and_then(|spend| spend.total_cost_usd),
-                    bridge_session_id: summary.session.bridge_session_id,
+                .map(|summary| {
+                    let spend = summary.spend;
+                    proto::ClaudeSession {
+                        process_id: summary.session.process_id,
+                        session_id: summary.session.session_id,
+                        working_directory: summary
+                            .session
+                            .working_directory
+                            .to_string_lossy()
+                            .into_owned(),
+                        version: summary.session.version,
+                        name: summary.session.name,
+                        status: summary.session.status,
+                        updated_at: summary.session.updated_at,
+                        tmux_target: summary.session.tmux_target,
+                        transcript_path: summary
+                            .transcript_path
+                            .map(|transcript_path| transcript_path.to_string_lossy().into_owned()),
+                        context_tokens: spend.map(|spend| spend.context_tokens).unwrap_or(0),
+                        total_cost_usd: spend.and_then(|spend| spend.total_cost_usd),
+                        bridge_session_id: summary.session.bridge_session_id,
+                        last_answer_at_ms: spend.and_then(|spend| spend.last_answer_at_ms),
+                        cache_ttl: spend
+                            .map(|spend| Self::cache_ttl_code(spend.cache_ttl))
+                            .unwrap_or(0),
+                    }
                 })
                 .collect(),
             home_directory: home_directory.to_string_lossy().into_owned(),

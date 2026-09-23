@@ -24,6 +24,23 @@ pub struct LinkedClaudeSession {
     pub activity: ClaudeActivity,
     /// The context the newest answer was given, as the Claude panel shows it (`214K`).
     pub context: Option<SharedString>,
+    /// Keep-alive chip for this window. `None` hides it.
+    pub keep_alive: Option<KeepAliveBadge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeepAliveBadge {
+    pub enabled: bool,
+    pub label: SharedString,
+    pub tone: BadgeTone,
+    pub tooltip: SharedString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeTone {
+    Accent,
+    Warning,
+    Muted,
 }
 
 pub trait ClaudeSessionLinks: 'static {
@@ -39,6 +56,8 @@ pub trait ClaudeSessionLinks: 'static {
         workspace: &Entity<Workspace>,
         cx: &mut Context<TmuxSessionsPanel>,
     ) -> Option<Subscription>;
+    /// Turns prompt-cache keep-alive on or off for `session_id`.
+    fn toggle_keep_alive(&self, session_id: &str, cx: &mut App);
     /// Opens the Claude session's tab. Errors are returned for the tmux panel to show.
     fn open(
         &self,
@@ -197,6 +216,7 @@ mod tests {
                 title: SharedString::from("editor"),
                 activity: ClaudeActivity::Working,
                 context: None,
+                keep_alive: None,
             },
             LinkedClaudeSession {
                 session_id: "blank".to_string(),
@@ -204,6 +224,7 @@ mod tests {
                 title: SharedString::from("untitled"),
                 activity: ClaudeActivity::Idle(None),
                 context: None,
+                keep_alive: None,
             },
         ];
 

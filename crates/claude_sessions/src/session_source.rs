@@ -21,9 +21,9 @@ use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
 
 use crate::session_registry::{
-    self, AgentListing, ChannelStatus, HookInstallOutcome, RegisteredSession, SessionSummary,
-    SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress, TailState,
-    TranscriptSpend, channel_answer_permission, channel_interrupt, channel_send_message,
+    self, AgentListing, CacheTtl, ChannelStatus, HookInstallOutcome, RegisteredSession,
+    SessionSummary, SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress,
+    TailState, TranscriptSpend, channel_answer_permission, channel_interrupt, channel_send_message,
     channel_status, now_millis, read_channel_inbox_tail, read_events_tail, read_session_status,
     read_subagent_transcript_tail, read_transcript_tail,
 };
@@ -898,14 +898,25 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
             bridge_session_id: session.bridge_session_id,
         },
         transcript_path: session.transcript_path.map(PathBuf::from),
-        // Zero context means the far end found no answer to read, which is the same
-        // thing as having nothing to report.
-        spend: (session.context_tokens > 0 || session.total_cost_usd.is_some()).then_some(
-            TranscriptSpend {
-                context_tokens: session.context_tokens,
-                total_cost_usd: session.total_cost_usd,
-            },
-        ),
+        // Zero context means the far end found no answer to read. An answer time with
+        // no token count is still an answer, which keep-alive has to see.
+        spend: (session.context_tokens > 0
+            || session.total_cost_usd.is_some()
+            || session.last_answer_at_ms.is_some())
+        .then_some(TranscriptSpend {
+            context_tokens: session.context_tokens,
+            total_cost_usd: session.total_cost_usd,
+            last_answer_at_ms: session.last_answer_at_ms,
+            cache_ttl: cache_ttl_from_code(session.cache_ttl),
+        }),
+    }
+}
+
+fn cache_ttl_from_code(code: u32) -> CacheTtl {
+    match code {
+        1 => CacheTtl::FiveMinutes,
+        2 => CacheTtl::OneHour,
+        _ => CacheTtl::Unknown,
     }
 }
 
@@ -1040,6 +1051,8 @@ mod tests {
             context_tokens: 0,
             total_cost_usd: None,
             bridge_session_id: Some("bridge-abc".to_string()),
+            last_answer_at_ms: None,
+            cache_ttl: 0,
         }
     }
 
@@ -1103,6 +1116,52 @@ mod tests {
         // The fields that are always present still arrive.
         assert_eq!(summary.session.process_id, 4321);
         assert_eq!(summary.session.session_id, "abc-123");
+    }
+
+    #[test]
+    fn a_listed_session_keeps_the_answer_time_and_cache_ttl() {
+        let summary = session_summary_from_proto(proto::ClaudeSession {
+            context_tokens: 0,
+            total_cost_usd: None,
+            last_answer_at_ms: Some(1_700_000_000_000),
+            cache_ttl: 2,
+            ..wire_session()
+        });
+        let spend = summary
+            .spend
+            .expect("an answer time is something to report");
+        assert_eq!(spend.last_answer_at_ms, Some(1_700_000_000_000));
+        assert_eq!(spend.cache_ttl, CacheTtl::OneHour);
+        assert_eq!(spend.context_tokens, 0);
+
+        let five_minutes = session_summary_from_proto(proto::ClaudeSession {
+            context_tokens: 8,
+            cache_ttl: 1,
+            ..wire_session()
+        });
+        assert_eq!(
+            five_minutes.spend.expect("context").cache_ttl,
+            CacheTtl::FiveMinutes
+        );
+
+        let unknown = session_summary_from_proto(proto::ClaudeSession {
+            context_tokens: 8,
+            cache_ttl: 9,
+            ..wire_session()
+        });
+        assert_eq!(unknown.spend.expect("context").cache_ttl, CacheTtl::Unknown);
+
+        let ttl_alone = session_summary_from_proto(proto::ClaudeSession {
+            context_tokens: 0,
+            total_cost_usd: None,
+            last_answer_at_ms: None,
+            cache_ttl: 2,
+            ..wire_session()
+        });
+        assert_eq!(
+            ttl_alone.spend, None,
+            "a ttl alone is not an answer the scan found"
+        );
     }
 
     #[test]

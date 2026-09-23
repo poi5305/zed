@@ -826,6 +826,29 @@ pub struct ClaudeSessionsSettingsContent {
     ///
     /// Default: "⏺"
     pub assistant_glyph: Option<String>,
+    /// Sends a short message while a session is idle so its one-hour prompt cache stays warm.
+    pub keep_alive: Option<ClaudeSessionsKeepAliveContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ClaudeSessionsKeepAliveContent {
+    /// How often to send a keep-alive message while the session is idle, in minutes.
+    ///
+    /// Default: 50
+    ///
+    /// Clamped to 5-55.
+    pub interval_minutes: Option<u32>,
+    /// How long a session may stay idle before keep-alive stops, in hours.
+    ///
+    /// Default: 12
+    ///
+    /// Clamped to 1-48.
+    pub max_hours: Option<u32>,
+    /// The message sent to refresh the prompt cache. Empty is ignored.
+    ///
+    /// Default: a short instruction to reply with only "ok".
+    pub message: Option<String>,
 }
 
 #[with_fallible_options]

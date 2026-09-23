@@ -19,8 +19,8 @@ use workspace::{
 use remote::tmux_sessions::list_tmux_sessions;
 
 use crate::{
-    ClaudeActivity, LinkedClaudeSession, ToggleFocus, claude_session_links, linked_claude_session,
-    tmux_attach_command,
+    BadgeTone, ClaudeActivity, KeepAliveBadge, LinkedClaudeSession, ToggleFocus,
+    claude_session_links, linked_claude_session, tmux_attach_command,
 };
 
 const TMUX_SESSIONS_PANEL_KEY: &str = "TmuxSessionsPanel";
@@ -461,6 +461,50 @@ impl TmuxSessionsPanel {
         )
     }
 
+    fn keep_alive_chip(
+        session_index: usize,
+        window_index: usize,
+        session_id: &str,
+        badge: KeepAliveBadge,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session_id = session_id.to_string();
+        let tooltip = badge.tooltip.clone();
+        let color = match badge.tone {
+            BadgeTone::Accent => Color::Accent,
+            BadgeTone::Warning => Color::Warning,
+            BadgeTone::Muted => Color::Muted,
+        };
+        let icon = if badge.enabled {
+            IconName::Flame
+        } else {
+            IconName::Clock
+        };
+        h_flex()
+            .id(SharedString::from(format!(
+                "tmux-keep-alive-{session_index}-{window_index}"
+            )))
+            .gap_0p5()
+            .cursor_pointer()
+            .tooltip(move |_, cx| {
+                Tooltip::with_meta("Keep prompt cache warm", None, tooltip.clone(), cx)
+            })
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if let Some(links) = claude_session_links(cx) {
+                    links.toggle_keep_alive(&session_id, cx);
+                }
+            })
+            .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+            .child(
+                Label::new(badge.label)
+                    .size(LabelSize::XSmall)
+                    .color(color)
+                    .single_line(),
+            )
+            .into_any_element()
+    }
+
     fn render_window(
         &self,
         session_index: usize,
@@ -572,6 +616,15 @@ impl TmuxSessionsPanel {
                                 .color(Color::Muted)
                                 .single_line(),
                         )
+                    })
+                    .when_some(linked.keep_alive.clone(), |this, badge| {
+                        this.child(Self::keep_alive_chip(
+                            session_index,
+                            window_index,
+                            &linked.session_id,
+                            badge,
+                            cx,
+                        ))
                     }),
             ),
         )

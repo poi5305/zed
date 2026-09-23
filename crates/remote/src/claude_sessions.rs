@@ -1220,6 +1220,18 @@ const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 /// read for every listed session on every scan of a directory of multi-megabyte files.
 const SPEND_TAIL_BYTES: u64 = 256 * 1024;
 
+/// How long the cache entry a usage record wrote will live.
+///
+/// `Unknown` is an old remote, or a tail that has not yet seen a cache write. A later
+/// answer that only reads the cache does not change this: the read keeps the entry's own TTL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheTtl {
+    #[default]
+    Unknown,
+    FiveMinutes,
+    OneHour,
+}
+
 /// What a session is costing, as the end of its transcript reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TranscriptSpend {
@@ -1233,6 +1245,11 @@ pub struct TranscriptSpend {
     /// only the answers in the tail, and a total that is silently partial is worse than
     /// no total at all.
     pub total_cost_usd: Option<f64>,
+    /// When the newest usage record in the tail was written, if its timestamp parsed.
+    /// A missing or unparseable timestamp leaves the previous answer's time in place.
+    pub last_answer_at_ms: Option<i64>,
+    /// Taken from the newest usage record that wrote the cache. A read leaves it alone.
+    pub cache_ttl: CacheTtl,
 }
 
 /// Reads the end of a transcript for what its session is costing.
@@ -1315,9 +1332,40 @@ fn spend_in_lines<'a>(lines: impl Iterator<Item = &'a str>) -> TranscriptSpend {
         spend.context_tokens = tokens("input_tokens")
             .saturating_add(tokens("cache_read_input_tokens"))
             .saturating_add(tokens("cache_creation_input_tokens"));
+        // A missing or unparseable timestamp is not a reason to forget the previous answer.
+        if let Some(answered_at_ms) = record
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.timestamp_millis())
+        {
+            spend.last_answer_at_ms = Some(answered_at_ms);
+        }
+        // No write in this answer: a cache read keeps the TTL of the entry it read.
+        if let Some(cache_ttl) = cache_ttl_written(usage) {
+            spend.cache_ttl = cache_ttl;
+        }
     }
 
     spend
+}
+
+/// `None` when this answer did not write the cache, so the caller keeps the previous TTL.
+fn cache_ttl_written(usage: &serde_json::Value) -> Option<CacheTtl> {
+    let creation = usage.get("cache_creation")?;
+    let tokens = |key: &str| {
+        creation
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    if tokens("ephemeral_1h_input_tokens") > 0 {
+        Some(CacheTtl::OneHour)
+    } else if tokens("ephemeral_5m_input_tokens") > 0 {
+        Some(CacheTtl::FiveMinutes)
+    } else {
+        None
+    }
 }
 
 /// Splits every complete line out of `buffer`, leaving any trailing partial line behind.
@@ -1911,7 +1959,7 @@ const PASTED_FILE_DIRECTORY: &str = "zed-pasted";
 const PASTED_FILE_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Larger than any screenshot, and small enough that a paste cannot fill a disk.
-const MAX_PASTED_FILE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_PASTED_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Writes `contents` where the session can read it, and reports the path to give it.
 ///
@@ -3662,6 +3710,122 @@ mod tests {
         );
 
         assert_eq!(spend.context_tokens, 4);
+    }
+
+    fn answer_millis(timestamp: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .expect("test timestamp parses")
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn the_tail_reads_the_newest_answer_time_and_an_hour_cache_write() {
+        let timestamp = "2026-09-13T15:11:12.113Z";
+        let both = spend_in_lines(
+            [format!(
+                r#"{{"timestamp":"{timestamp}","type":"assistant","message":{{"usage":{{"input_tokens":1,"cache_creation":{{"ephemeral_1h_input_tokens":10,"ephemeral_5m_input_tokens":4}}}}}}}}"#
+            )
+            .as_str()]
+            .into_iter(),
+        );
+        assert_eq!(both.last_answer_at_ms, Some(answer_millis(timestamp)));
+        assert_eq!(
+            both.cache_ttl,
+            CacheTtl::OneHour,
+            "an hour write wins when the same answer also wrote a five-minute entry"
+        );
+    }
+
+    #[test]
+    fn a_five_minute_cache_write_is_read_from_the_newest_usage_record() {
+        let timestamp = "2026-09-13T15:11:12.113Z";
+        let spend = spend_in_lines(
+            [
+                format!(
+                    r#"{{"timestamp":"{timestamp}","type":"assistant","message":{{"usage":{{"input_tokens":1,"cache_creation":{{"ephemeral_1h_input_tokens":9,"ephemeral_5m_input_tokens":0}}}}}}}}"#
+                )
+                .as_str(),
+                r#"{"timestamp":"2026-09-13T16:00:00.000Z","type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":3}}}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(spend.cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(
+            spend.last_answer_at_ms,
+            Some(answer_millis("2026-09-13T16:00:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn a_read_only_answer_keeps_the_previous_cache_ttl() {
+        let first = "2026-09-13T15:11:12.113Z";
+        let second = "2026-09-13T15:40:00.000Z";
+        let zeros = spend_in_lines(
+            [
+                format!(
+                    r#"{{"timestamp":"{first}","type":"assistant","message":{{"usage":{{"input_tokens":1,"cache_creation":{{"ephemeral_1h_input_tokens":8,"ephemeral_5m_input_tokens":0}}}}}}}}"#
+                )
+                .as_str(),
+                format!(
+                    r#"{{"timestamp":"{second}","type":"assistant","message":{{"usage":{{"input_tokens":1,"cache_read_input_tokens":20,"cache_creation":{{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0}}}}}}}}"#
+                )
+                .as_str(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(zeros.cache_ttl, CacheTtl::OneHour);
+        assert_eq!(zeros.last_answer_at_ms, Some(answer_millis(second)));
+
+        let no_creation_object = spend_in_lines(
+            [
+                r#"{"timestamp":"2026-09-13T15:11:12.113Z","type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":6}}}}"#,
+                r#"{"timestamp":"2026-09-13T15:50:00.000Z","type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":6}}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(no_creation_object.cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(
+            no_creation_object.last_answer_at_ms,
+            Some(answer_millis("2026-09-13T15:50:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn an_unparseable_answer_timestamp_leaves_the_previous_time() {
+        let first = "2026-09-13T15:11:12.113Z";
+        let spend = spend_in_lines(
+            [
+                format!(
+                    r#"{{"timestamp":"{first}","type":"assistant","message":{{"usage":{{"input_tokens":1,"cache_creation":{{"ephemeral_1h_input_tokens":4,"ephemeral_5m_input_tokens":0}}}}}}}}"#
+                )
+                .as_str(),
+                r#"{"timestamp":"not-a-timestamp","type":"assistant","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":3}}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":1}}}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(spend.last_answer_at_ms, Some(answer_millis(first)));
+        assert_eq!(spend.cache_ttl, CacheTtl::FiveMinutes);
+        // Context is the flat token fields, not the ephemeral split inside cache_creation.
+        assert_eq!(spend.context_tokens, 3);
+    }
+
+    #[test]
+    fn a_compaction_does_not_move_the_answer_time_or_the_cache_ttl() {
+        let timestamp = "2026-09-13T15:11:12.113Z";
+        let spend = spend_in_lines(
+            [
+                format!(
+                    r#"{{"timestamp":"{timestamp}","type":"assistant","message":{{"usage":{{"input_tokens":2,"cache_read_input_tokens":10,"cache_creation":{{"ephemeral_1h_input_tokens":5,"ephemeral_5m_input_tokens":0}}}}}}}}"#
+                )
+                .as_str(),
+                r#"{"timestamp":"2026-09-13T18:00:00.000Z","type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":17,"postTokens":4}}"#,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(spend.context_tokens, 4);
+        assert_eq!(spend.last_answer_at_ms, Some(answer_millis(timestamp)));
+        assert_eq!(spend.cache_ttl, CacheTtl::OneHour);
     }
 
     #[test]

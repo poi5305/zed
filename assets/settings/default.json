@@ -858,6 +858,9 @@
   "claude_sessions": {
     // Where to dock the Claude sessions panel. Can be 'left' or 'right'.
     "dock": "left",
+    // `message` is omitted so the Rust default applies.
+    // interval_minutes is clamped to 5-55. max_hours is clamped to 1-48.
+    // "keep_alive": { "interval_minutes": 50, "max_hours": 12 }
   },
   "project_panel": {
     // Whether to show the project panel button in the status bar

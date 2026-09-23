@@ -19,6 +19,11 @@ message ClaudeSession {
   optional double total_cost_usd = 11;
   // The id of the session on claude.ai, when the registry recorded one.
   optional string bridge_session_id = 12;
+  // When the newest usage record in the transcript tail was written.
+  // Absent when that record had no timestamp, or the remote is too old to send one.
+  optional int64 last_answer_at_ms = 13;
+  // 0 unknown, 1 five minutes, 2 one hour.
+  uint32 cache_ttl = 14;
 }
 
 // Request to list Claude Code sessions on the remote host.
