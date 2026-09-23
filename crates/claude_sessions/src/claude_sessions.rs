@@ -9,6 +9,7 @@ mod blind_subagent_tests;
 #[cfg(test)]
 mod blind_transcript_tests;
 mod claude_sessions_panel;
+mod keep_alive;
 mod live_state;
 mod session_source;
 mod session_store;
@@ -25,6 +26,7 @@ pub use claude_sessions_panel::ClaudeSessionsPanel;
 // The registry parsing and liveness rules live in `remote`, so that the remote server can
 // run them without depending on this crate's UI. The alias keeps the path this crate's
 // own modules and tests use pointing at the one implementation.
+pub use keep_alive::*;
 pub use live_state::{
     ChannelInboxEvent, HookEvent, LiveMessage, LiveState, PendingQuestion, PermissionRequest,
     RunningTool, StatusSnapshot, Turn, parse_channel_inbox_line, parse_hook_event, timestamp_ms,
@@ -37,6 +39,7 @@ pub use session_store::{
     ClaudeSessionStore, EndedReason, EndedSession, LiveSession, SessionRow, StoreClock,
     TranscriptTarget,
 };
+pub use session_store::{keep_alive_registry, try_keep_alive_registry};
 pub use terminal_anchors::{
     AnchorGlyph, AnchorRow, Anchoring, Glyphs, MAX_TRANSCRIPT_ANCHORS, MIN_SKELETON, ScreenRow,
     TranscriptAnchor, align, anchor_rows, rows_match, screen_rows, skeleton,
@@ -47,13 +50,15 @@ pub use usage::{ModelRates, Usage, rates_for_model};
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that
 /// the side the user dragged it to is still there after a restart — the same place every
 /// other panel keeps it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, RegisterSetting)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, RegisterSetting)]
 pub struct ClaudeSessionsSettings {
     pub dock: DockSide,
     #[serde(default = "default_user_prompt_glyph")]
     pub user_prompt_glyph: char,
     #[serde(default = "default_assistant_glyph")]
     pub assistant_glyph: char,
+    #[serde(default)]
+    pub keep_alive: KeepAliveConfig,
 }
 
 fn default_user_prompt_glyph() -> char {
@@ -99,6 +104,15 @@ impl Settings for ClaudeSessionsSettings {
                     .and_then(|claude_sessions| claude_sessions.assistant_glyph.as_deref()),
                 default_assistant_glyph(),
             ),
+            keep_alive: {
+                let keep_alive =
+                    claude_sessions.and_then(|claude_sessions| claude_sessions.keep_alive.as_ref());
+                KeepAliveConfig::new(
+                    keep_alive.and_then(|keep_alive| keep_alive.interval_minutes),
+                    keep_alive.and_then(|keep_alive| keep_alive.max_hours),
+                    keep_alive.and_then(|keep_alive| keep_alive.message.clone()),
+                )
+            },
         }
     }
 }
@@ -114,6 +128,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    keep_alive_registry(cx);
     claude_sessions_panel::install_tmux_session_links(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -128,7 +143,9 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use settings::{ClaudeSessionsSettingsContent, Settings, SettingsContent};
+    use settings::{
+        ClaudeSessionsKeepAliveContent, ClaudeSessionsSettingsContent, Settings, SettingsContent,
+    };
 
     use super::*;
 
@@ -166,5 +183,26 @@ mod tests {
         let empty = ClaudeSessionsSettings::from_settings(&content);
         assert_eq!(empty.user_prompt_glyph, '>');
         assert_eq!(empty.assistant_glyph, '⏺');
+    }
+
+    #[test]
+    fn keep_alive_settings_are_clamped_when_read() {
+        let defaults = ClaudeSessionsSettings::from_settings(&SettingsContent::default());
+        assert_eq!(defaults.keep_alive, KeepAliveConfig::default());
+
+        let mut content = SettingsContent::default();
+        content.claude_sessions = Some(ClaudeSessionsSettingsContent {
+            keep_alive: Some(ClaudeSessionsKeepAliveContent {
+                interval_minutes: Some(1),
+                max_hours: Some(100),
+                message: Some(String::new()),
+            }),
+            ..Default::default()
+        });
+        let settings = ClaudeSessionsSettings::from_settings(&content);
+        assert_eq!(
+            settings.keep_alive,
+            KeepAliveConfig::new(Some(1), Some(100), Some(String::new()))
+        );
     }
 }

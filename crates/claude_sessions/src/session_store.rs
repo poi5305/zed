@@ -14,12 +14,17 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
-use gpui::{Context, FutureExt as _, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Global, SharedString, Task};
 use serde_json::Value;
+use settings::Settings as _;
 use util::ResultExt as _;
 
 use crate::{
     Turn,
+    keep_alive::{
+        CacheTtl, KeepAliveConfig, KeepAliveState, KeepAliveStatus, SessionFacts, observe_answer,
+        record_ping, status as keep_alive_status,
+    },
     live_state::{
         ChannelInboxEvent, LiveState, StatusSnapshot, parse_channel_inbox_line, parse_hook_event,
         timestamp_ms,
@@ -38,6 +43,7 @@ const EVENTS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const HOOKS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CHANNEL_INBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CHANNEL_STATUS_POLL_TICKS: u32 = 4;
 const CHANNEL_INBOX_EVENTS_CAP: usize = 200;
 /// How far apart the hook's `PermissionRequest` and the channel's `permission_request`
@@ -298,6 +304,7 @@ pub struct ClaudeSessionStore {
     _status_poll: Task<()>,
     _hooks_poll: Task<()>,
     _channel_poll: Task<()>,
+    _keep_alive_poll: Task<()>,
     _outstanding_scan: Option<Task<()>>,
     _scan_watchdog: Option<Task<()>>,
 }
@@ -337,6 +344,113 @@ impl FollowedConversation {
             pending: self.pending.clone(),
         }
     }
+}
+
+struct KeepAliveRegistryGlobal(Entity<KeepAliveRegistry>);
+
+impl Global for KeepAliveRegistryGlobal {}
+
+pub struct KeepAliveRegistry {
+    states: HashMap<String, KeepAliveState>,
+    errors: HashMap<String, SharedString>,
+    _tick: Task<()>,
+}
+
+impl KeepAliveRegistry {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            states: HashMap::default(),
+            errors: HashMap::default(),
+            _tick: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(KEEP_ALIVE_POLL_INTERVAL)
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }),
+        }
+    }
+
+    pub fn state(&self, session_id: &str) -> KeepAliveState {
+        self.states
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(KeepAliveState::default)
+    }
+
+    pub fn error(&self, session_id: &str) -> Option<SharedString> {
+        self.errors.get(session_id).cloned()
+    }
+
+    /// Records a newer answer. Sessions that were never enabled still get an entry once
+    /// an answer time exists, so turning keep-alive on later starts from that answer.
+    pub fn observe(&mut self, session_id: &str, answered_at_ms: Option<i64>) -> bool {
+        if answered_at_ms.is_none() && !self.states.contains_key(session_id) {
+            return false;
+        }
+        let state = self.states.entry(session_id.to_string()).or_default();
+        let before = state.clone();
+        observe_answer(state, answered_at_ms, now_millis());
+        *state != before
+    }
+
+    pub fn toggle(&mut self, session_id: &str) {
+        let state = self.states.entry(session_id.to_string()).or_default();
+        let enabled = !state.enabled;
+        crate::keep_alive::set_enabled(state, enabled);
+    }
+
+    pub fn set_error(&mut self, session_id: &str, error: Option<String>) {
+        match error {
+            Some(error) => {
+                self.errors
+                    .insert(session_id.to_string(), SharedString::from(error));
+            }
+            None => {
+                self.errors.remove(session_id);
+            }
+        }
+    }
+
+    pub fn record_ping_if_send_now(
+        &mut self,
+        session_id: &str,
+        facts: SessionFacts,
+        config: &KeepAliveConfig,
+        now_ms: i64,
+    ) -> bool {
+        let state = self.states.entry(session_id.to_string()).or_default();
+        if keep_alive_status(state, facts, config, now_ms) != KeepAliveStatus::SendNow {
+            return false;
+        }
+        record_ping(state, now_ms);
+        true
+    }
+}
+
+pub fn keep_alive_registry(cx: &mut App) -> Entity<KeepAliveRegistry> {
+    if let Some(existing) = cx.try_global::<KeepAliveRegistryGlobal>() {
+        return existing.0.clone();
+    }
+    let registry = cx.new(KeepAliveRegistry::new);
+    cx.set_global(KeepAliveRegistryGlobal(registry.clone()));
+    registry
+}
+
+pub fn try_keep_alive_registry(cx: &App) -> Option<Entity<KeepAliveRegistry>> {
+    cx.try_global::<KeepAliveRegistryGlobal>()
+        .map(|global| global.0.clone())
+}
+
+struct KeepAlivePing {
+    session_id: String,
+    process_id: u32,
+    message: String,
+    config: KeepAliveConfig,
+    source: Arc<dyn SessionSource>,
 }
 
 impl ClaudeSessionStore {
@@ -391,6 +505,7 @@ impl ClaudeSessionStore {
             _status_poll: Task::ready(()),
             _hooks_poll: Task::ready(()),
             _channel_poll: Task::ready(()),
+            _keep_alive_poll: Task::ready(()),
             _outstanding_scan: None,
             _scan_watchdog: None,
         };
@@ -400,6 +515,8 @@ impl ClaudeSessionStore {
         this._status_poll = this.spawn_status_poll(cx);
         this._hooks_poll = this.spawn_hooks_poll(cx);
         this._channel_poll = this.spawn_channel_poll(cx);
+        this._keep_alive_poll = this.spawn_keep_alive_poll(cx);
+        keep_alive_registry(cx);
         this
     }
 
@@ -715,6 +832,226 @@ impl ClaudeSessionStore {
 
     pub fn channel_live(&self) -> bool {
         self.channel.as_ref().is_some_and(|status| status.live)
+    }
+
+    /// Channel liveness for the keep-alive chip.
+    ///
+    /// Only the selected session has been asked. Until that poll, the channel is treated
+    /// as live so the chip does not say it is missing before anyone has looked.
+    pub fn keep_alive_channel_live(&self, session_id: &str) -> bool {
+        if self.selected.as_deref() != Some(session_id) {
+            return true;
+        }
+        match &self.channel {
+            Some(status) => status.live,
+            None => true,
+        }
+    }
+
+    fn observe_keep_alive_answers(&mut self, cx: &mut Context<Self>) {
+        let answers: Vec<(String, Option<i64>)> = self
+            .live_sessions
+            .iter()
+            .map(|live| {
+                let answered_at = self
+                    .session_spend
+                    .get(&live.session.session_id)
+                    .and_then(|spend| spend.last_answer_at_ms);
+                (live.session.session_id.clone(), answered_at)
+            })
+            .collect();
+        let registry = keep_alive_registry(cx);
+        registry.update(cx, |registry, cx| {
+            let mut changed = false;
+            for (session_id, answered_at) in answers {
+                if registry.observe(&session_id, answered_at) {
+                    changed = true;
+                }
+            }
+            if changed {
+                cx.notify();
+            }
+        });
+    }
+
+    fn spawn_keep_alive_poll(&self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(KEEP_ALIVE_POLL_INTERVAL)
+                    .await;
+                let Ok(due) = this.update(cx, |store, cx| store.keep_alive_due(cx)) else {
+                    break;
+                };
+                for ping in due {
+                    Self::send_keep_alive(this.clone(), ping, cx).await;
+                }
+            }
+        })
+    }
+
+    fn keep_alive_due(&self, cx: &App) -> Vec<KeepAlivePing> {
+        let Some(config) =
+            crate::ClaudeSessionsSettings::try_get(cx).map(|settings| settings.keep_alive.clone())
+        else {
+            return Vec::new();
+        };
+        let Some(registry) = try_keep_alive_registry(cx) else {
+            return Vec::new();
+        };
+        let registry = registry.read(cx);
+        let now_ms = now_millis();
+        let mut due = Vec::new();
+        for live in &self.live_sessions {
+            if live.background || live.process_id == 0 {
+                continue;
+            }
+            let session_id = live.session.session_id.as_str();
+            let state = registry.state(session_id);
+            if !state.enabled {
+                continue;
+            }
+            let facts = SessionFacts {
+                cache_ttl: self
+                    .session_spend
+                    .get(session_id)
+                    .map(|spend| spend.cache_ttl)
+                    .unwrap_or(CacheTtl::Unknown),
+                busy: live.status.as_deref() == Some("busy"),
+                waiting: live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
+                channel_live: true,
+            };
+            if keep_alive_status(&state, facts, &config, now_ms) != KeepAliveStatus::SendNow {
+                continue;
+            }
+            due.push(KeepAlivePing {
+                session_id: session_id.to_string(),
+                process_id: live.process_id,
+                message: config.message.clone(),
+                config: config.clone(),
+                source: self.source.clone(),
+            });
+        }
+        due
+    }
+
+    fn claim_keep_alive_ping(
+        &mut self,
+        session_id: &str,
+        config: &KeepAliveConfig,
+        now_ms: i64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (background, process_id, busy, waiting) = {
+            let Some(live) = self
+                .live_sessions
+                .iter()
+                .find(|live| live.session.session_id == session_id)
+            else {
+                return false;
+            };
+            (
+                live.background,
+                live.process_id,
+                live.status.as_deref() == Some("busy"),
+                live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
+            )
+        };
+        if background || process_id == 0 {
+            return false;
+        }
+        let facts = SessionFacts {
+            cache_ttl: self
+                .session_spend
+                .get(session_id)
+                .map(|spend| spend.cache_ttl)
+                .unwrap_or(CacheTtl::Unknown),
+            busy,
+            waiting,
+            channel_live: true,
+        };
+        let registry = keep_alive_registry(cx);
+        registry.update(cx, |registry, cx| {
+            let claimed = registry.record_ping_if_send_now(session_id, facts, config, now_ms);
+            if claimed {
+                cx.notify();
+            }
+            claimed
+        })
+    }
+
+    fn set_keep_alive_error(
+        &self,
+        session_id: &str,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let registry = keep_alive_registry(cx);
+        registry.update(cx, |registry, cx| {
+            registry.set_error(session_id, error);
+            cx.notify();
+        });
+    }
+
+    async fn send_keep_alive(
+        this: gpui::WeakEntity<Self>,
+        ping: KeepAlivePing,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        // Bounded because the poll awaits each ping in turn: a host that never answers
+        // would otherwise stop keep-alive for every session this store follows.
+        let status = ping
+            .source
+            .channel_status(ping.process_id)
+            .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+            .await
+            .unwrap_or_else(|_| Err(anyhow!(timeout_message("reading channel status"))));
+        let live = match &status {
+            Ok(status) => status.live,
+            Err(_) => false,
+        };
+        if !live {
+            let message = match status {
+                Err(error) => format!("{error:#}"),
+                Ok(_) => "Channel not loaded".to_string(),
+            };
+            this.update(cx, |store, cx| {
+                store.set_keep_alive_error(&ping.session_id, Some(message), cx);
+            })
+            .log_err();
+            return;
+        }
+
+        let now_ms = now_millis();
+        let claimed = this.update(cx, |store, cx| {
+            store.claim_keep_alive_ping(&ping.session_id, &ping.config, now_ms, cx)
+        });
+        if !claimed.unwrap_or(false) {
+            return;
+        }
+
+        // The ping is already recorded, so a send that times out but did arrive is
+        // waited on as unanswered rather than sent again.
+        match ping
+            .source
+            .channel_send_message(ping.process_id, ping.message)
+            .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+            .await
+            .unwrap_or_else(|_| Err(anyhow!(timeout_message("sending the keep-alive message"))))
+        {
+            Ok(_) => {
+                this.update(cx, |store, cx| {
+                    store.set_keep_alive_error(&ping.session_id, None, cx);
+                })
+                .log_err();
+            }
+            Err(error) => {
+                this.update(cx, |store, cx| {
+                    store.set_keep_alive_error(&ping.session_id, Some(format!("{error:#}")), cx);
+                })
+                .log_err();
+            }
+        }
     }
 
     pub fn can_interrupt(&self) -> bool {
@@ -1848,6 +2185,8 @@ impl ClaudeSessionStore {
             }
         }
 
+        self.observe_keep_alive_answers(cx);
+
         if changed {
             cx.notify();
         }
@@ -2203,8 +2542,6 @@ mod tests {
         Mutex,
         atomic::{AtomicU32, Ordering},
     };
-
-    use gpui::AppContext as _;
 
     use crate::{
         session_registry::{
@@ -5692,5 +6029,484 @@ mod tests {
             "an assistant quoting the interrupt text must not idle the turn; got {}",
             turn_name(&live.turn)
         );
+    }
+
+    /// A source whose listing reports an answer 55 minutes old on a one-hour cache, so
+    /// keep-alive is due as soon as it is turned on. Everything else is the plain fake.
+    struct KeepAliveSource {
+        inner: FakeSource,
+        spend: TranscriptSpend,
+        hang_channel_status: bool,
+        hang_send: bool,
+        executor: gpui::BackgroundExecutor,
+        channel_status_calls: AtomicU32,
+        keep_alive_sends: AtomicU32,
+    }
+
+    const KEEP_ALIVE_SESSION: &str = "keep-alive-session";
+    const KEEP_ALIVE_PID: u32 = 71;
+
+    impl KeepAliveSource {
+        fn new(home_directory: PathBuf, executor: gpui::BackgroundExecutor) -> Self {
+            Self {
+                inner: FakeSource::new(home_directory, fake_process_starts(vec![KEEP_ALIVE_PID])),
+                spend: TranscriptSpend {
+                    context_tokens: 1_000,
+                    total_cost_usd: None,
+                    last_answer_at_ms: Some(now_millis() - 55 * 60_000),
+                    cache_ttl: CacheTtl::OneHour,
+                },
+                hang_channel_status: false,
+                hang_send: false,
+                executor,
+                channel_status_calls: AtomicU32::new(0),
+                keep_alive_sends: AtomicU32::new(0),
+            }
+        }
+
+        fn hang<T: Send + 'static>(&self, value: Result<T>) -> Task<Result<T>> {
+            let executor = self.executor.clone();
+            self.executor.spawn(async move {
+                executor.timer(Duration::from_secs(3600)).await;
+                value
+            })
+        }
+    }
+
+    impl SessionSource for KeepAliveSource {
+        fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>> {
+            let home_directory = &self.inner.home_directory;
+            let registry_directory = home_directory.join(".claude").join("sessions");
+            let process_start_of_pid = |process_id: u32| {
+                self.inner
+                    .process_starts
+                    .get(&process_id)
+                    .map(|start_time| normalize_whitespace(start_time))
+            };
+            Task::ready(
+                read_registrations(&registry_directory).map(|registrations| SessionListing {
+                    sessions: visible_sessions(
+                        registrations,
+                        project_root.as_deref(),
+                        now_millis(),
+                        HEARTBEAT_CUTOFF_MILLIS,
+                        &process_start_of_pid,
+                    )
+                    .into_iter()
+                    .map(|session| SessionSummary {
+                        transcript_path: None,
+                        session,
+                        spend: Some(self.spend),
+                    })
+                    .collect(),
+                    home_directory: home_directory.clone(),
+                    liveness_unavailable_reason: None,
+                }),
+            )
+        }
+
+        fn tail_transcript(
+            &self,
+            session_id: String,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner.tail_transcript(session_id, state)
+        }
+
+        fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
+            self.inner.list_subagents(session_id)
+        }
+
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
+            self.inner.list_subagents_for_sessions(session_ids)
+        }
+
+        fn tail_subagent(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner
+                .tail_subagent(session_id, agent_id, workflow_run_id, state)
+        }
+
+        fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
+            self.inner.tail_events(session_id, state)
+        }
+
+        fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
+            self.inner.read_status(session_id)
+        }
+
+        fn install_hooks(&self) -> Task<Result<HookInstallOutcome>> {
+            self.inner.install_hooks()
+        }
+
+        fn hooks_installed(&self) -> Task<Result<bool>> {
+            self.inner.hooks_installed()
+        }
+
+        fn list_session_files(
+            &self,
+            directory: PathBuf,
+            query: String,
+        ) -> Task<Result<Vec<String>>> {
+            self.inner.list_session_files(directory, query)
+        }
+
+        fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>> {
+            self.inner.write_session_file(name, contents)
+        }
+
+        fn list_slash_commands(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<Result<Vec<crate::session_registry::SlashCommand>>> {
+            self.inner.list_slash_commands(project_root)
+        }
+
+        fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
+            self.inner.read_file(path, max_bytes)
+        }
+
+        fn read_attachment(
+            &self,
+            session_id: String,
+            path: PathBuf,
+            max_bytes: u64,
+        ) -> Task<Result<FileContents>> {
+            self.inner.read_attachment(session_id, path, max_bytes)
+        }
+
+        fn channel_status(&self, _claude_pid: u32) -> Task<Result<ChannelStatus>> {
+            self.channel_status_calls.fetch_add(1, Ordering::SeqCst);
+            let status = ChannelStatus {
+                live: true,
+                heartbeat_at_ms: Some(now_millis()),
+                server_pid: None,
+                features: Vec::new(),
+            };
+            if self.hang_channel_status {
+                return self.hang(Ok(status));
+            }
+            Task::ready(Ok(status))
+        }
+
+        fn channel_send_message(&self, _claude_pid: u32, _content: String) -> Task<Result<String>> {
+            self.keep_alive_sends.fetch_add(1, Ordering::SeqCst);
+            if self.hang_send {
+                return self.hang(Ok("sent".to_string()));
+            }
+            Task::ready(Ok("sent".to_string()))
+        }
+
+        fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>> {
+            self.inner.channel_interrupt(claude_pid, reason)
+        }
+
+        fn channel_answer_permission(
+            &self,
+            claude_pid: u32,
+            request_id: String,
+            allow: bool,
+        ) -> Task<Result<String>> {
+            self.inner
+                .channel_answer_permission(claude_pid, request_id, allow)
+        }
+
+        fn tail_channel_inbox(
+            &self,
+            claude_pid: u32,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner.tail_channel_inbox(claude_pid, state)
+        }
+    }
+
+    fn keep_alive_fixture(label: &str) -> PathBuf {
+        let home_directory = temporary_directory(label);
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join(format!("{KEEP_ALIVE_PID}.json")),
+            &registration_json(KEEP_ALIVE_PID, KEEP_ALIVE_SESSION),
+        );
+        home_directory
+    }
+
+    /// Settings, one store on `source`, the first scan applied, and keep-alive turned on.
+    fn start_keep_alive(
+        source: Arc<KeepAliveSource>,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<ClaudeSessionStore> {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let store = cx.new(|cx| ClaudeSessionStore::new(source, None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            keep_alive_registry(cx).update(cx, |registry, _| registry.toggle(KEEP_ALIVE_SESSION));
+        });
+        store
+    }
+
+    fn keep_alive_error(cx: &mut gpui::TestAppContext) -> Option<SharedString> {
+        cx.update(|cx| keep_alive_registry(cx).read(cx).error(KEEP_ALIVE_SESSION))
+    }
+
+    #[gpui::test]
+    async fn a_channel_status_that_never_answers_is_reported_and_does_not_stall_keep_alive(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut source =
+            KeepAliveSource::new(keep_alive_fixture("keep-alive-hung-status"), cx.executor());
+        source.hang_channel_status = true;
+        let source = Arc::new(source);
+        let _store = start_keep_alive(source.clone(), cx);
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(source.channel_status_calls.load(Ordering::SeqCst), 1);
+
+        cx.executor()
+            .advance_clock(REGISTRY_SCAN_TIMEOUT + Duration::from_secs(1));
+        cx.run_until_parked();
+        let error = keep_alive_error(cx);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("has not answered")),
+            "a channel status that never answers must be reported as a timeout; got {error:?}"
+        );
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            source.channel_status_calls.load(Ordering::SeqCst),
+            2,
+            "the next poll must ask again instead of waiting on the hung request"
+        );
+        assert_eq!(source.keep_alive_sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn a_send_that_never_answers_is_reported_and_is_not_sent_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut source =
+            KeepAliveSource::new(keep_alive_fixture("keep-alive-hung-send"), cx.executor());
+        source.hang_send = true;
+        let source = Arc::new(source);
+        let _store = start_keep_alive(source.clone(), cx);
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(source.keep_alive_sends.load(Ordering::SeqCst), 1);
+
+        cx.executor()
+            .advance_clock(REGISTRY_SCAN_TIMEOUT + Duration::from_secs(1));
+        cx.run_until_parked();
+        let error = keep_alive_error(cx);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("has not answered")),
+            "a send that never answers must be reported as a timeout; got {error:?}"
+        );
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL * 4);
+        cx.run_until_parked();
+        assert_eq!(
+            source.keep_alive_sends.load(Ordering::SeqCst),
+            1,
+            "a ping that may have been delivered is waited on, never sent twice"
+        );
+    }
+
+    #[gpui::test]
+    async fn two_stores_following_one_session_send_one_ping(cx: &mut gpui::TestAppContext) {
+        let source = Arc::new(KeepAliveSource::new(
+            keep_alive_fixture("keep-alive-two-stores"),
+            cx.executor(),
+        ));
+        let _first = start_keep_alive(source.clone(), cx);
+        let _second = cx.new(|cx| ClaudeSessionStore::new(source.clone(), None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL * 4);
+        cx.run_until_parked();
+        assert_eq!(source.keep_alive_sends.load(Ordering::SeqCst), 1);
+        let state = cx.update(|cx| keep_alive_registry(cx).read(cx).state(KEEP_ALIVE_SESSION));
+        assert_eq!(state.pings_sent, 1);
+        assert_eq!(keep_alive_error(cx), None);
+    }
+
+    /// Answers the keep-alive send only after `delay`, to show that the bound on the send
+    /// does not cut off one that is slow but still inside it.
+    struct SlowSend {
+        inner: Arc<KeepAliveSource>,
+        delay: Duration,
+    }
+
+    impl SessionSource for SlowSend {
+        fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>> {
+            self.inner.list_sessions(project_root)
+        }
+
+        fn tail_transcript(
+            &self,
+            session_id: String,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner.tail_transcript(session_id, state)
+        }
+
+        fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
+            self.inner.list_subagents(session_id)
+        }
+
+        fn list_subagents_for_sessions(
+            &self,
+            session_ids: Vec<String>,
+        ) -> Task<Result<HashMap<String, Vec<SubagentSummary>>>> {
+            self.inner.list_subagents_for_sessions(session_ids)
+        }
+
+        fn tail_subagent(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner
+                .tail_subagent(session_id, agent_id, workflow_run_id, state)
+        }
+
+        fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
+            self.inner.tail_events(session_id, state)
+        }
+
+        fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
+            self.inner.read_status(session_id)
+        }
+
+        fn install_hooks(&self) -> Task<Result<HookInstallOutcome>> {
+            self.inner.install_hooks()
+        }
+
+        fn hooks_installed(&self) -> Task<Result<bool>> {
+            self.inner.hooks_installed()
+        }
+
+        fn list_session_files(
+            &self,
+            directory: PathBuf,
+            query: String,
+        ) -> Task<Result<Vec<String>>> {
+            self.inner.list_session_files(directory, query)
+        }
+
+        fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>> {
+            self.inner.write_session_file(name, contents)
+        }
+
+        fn list_slash_commands(
+            &self,
+            project_root: Option<PathBuf>,
+        ) -> Task<Result<Vec<crate::session_registry::SlashCommand>>> {
+            self.inner.list_slash_commands(project_root)
+        }
+
+        fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
+            self.inner.read_file(path, max_bytes)
+        }
+
+        fn read_attachment(
+            &self,
+            session_id: String,
+            path: PathBuf,
+            max_bytes: u64,
+        ) -> Task<Result<FileContents>> {
+            self.inner.read_attachment(session_id, path, max_bytes)
+        }
+
+        fn channel_status(&self, claude_pid: u32) -> Task<Result<ChannelStatus>> {
+            self.inner.channel_status(claude_pid)
+        }
+
+        fn channel_send_message(&self, claude_pid: u32, content: String) -> Task<Result<String>> {
+            let send = self.inner.channel_send_message(claude_pid, content);
+            let executor = self.inner.executor.clone();
+            let delay = self.delay;
+            self.inner.executor.spawn(async move {
+                executor.timer(delay).await;
+                send.await
+            })
+        }
+
+        fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>> {
+            self.inner.channel_interrupt(claude_pid, reason)
+        }
+
+        fn channel_answer_permission(
+            &self,
+            claude_pid: u32,
+            request_id: String,
+            allow: bool,
+        ) -> Task<Result<String>> {
+            self.inner
+                .channel_answer_permission(claude_pid, request_id, allow)
+        }
+
+        fn tail_channel_inbox(
+            &self,
+            claude_pid: u32,
+            state: TailState,
+        ) -> Task<Result<TailProgress>> {
+            self.inner.tail_channel_inbox(claude_pid, state)
+        }
+    }
+
+    #[gpui::test]
+    async fn a_send_that_is_slow_but_inside_the_bound_is_not_reported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let inner = Arc::new(KeepAliveSource::new(
+            keep_alive_fixture("keep-alive-slow-send"),
+            cx.executor(),
+        ));
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let source = Arc::new(SlowSend {
+            inner: inner.clone(),
+            delay: REGISTRY_SCAN_TIMEOUT - Duration::from_secs(1),
+        });
+        let _store = cx.new(|cx| ClaudeSessionStore::new(source, None, cx));
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            keep_alive_registry(cx).update(cx, |registry, _| registry.toggle(KEEP_ALIVE_SESSION));
+        });
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(REGISTRY_SCAN_TIMEOUT + Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert_eq!(inner.keep_alive_sends.load(Ordering::SeqCst), 1);
+        assert_eq!(keep_alive_error(cx), None);
     }
 }

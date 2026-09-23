@@ -24,11 +24,12 @@ use std::{
 use collections::{HashMap, HashSet};
 use fs::Fs;
 use gpui::{
-    AbsoluteLength, Animation, AnimationExt as _, AnyElement, AsyncWindowContext, DragMoveEvent,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat,
-    Length, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Rems, Render, ScrollHandle, Subscription, Task,
-    TextStyleRefinement, WeakEntity, canvas, img, list, pulsating_between, relative,
+    AbsoluteLength, Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext,
+    ClipboardEntry, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    Hsla, Image, ImageFormat, KeyDownEvent, Keystroke, Length, ListAlignment, ListSizingBehavior,
+    ListState, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Rems, Render,
+    ScrollHandle, Subscription, Task, TextStyleRefinement, WeakEntity, canvas, img, list,
+    pulsating_between, relative,
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use project::Project;
@@ -38,12 +39,12 @@ use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme::Appearance;
 use tmux_sessions::{
-    ClaudeActivity, ClaudeSessionLinks, LinkedClaudeSession, TmuxSessionsPanel,
-    set_claude_session_links, tmux_attach_command,
+    BadgeTone, ClaudeActivity, ClaudeSessionLinks, KeepAliveBadge, LinkedClaudeSession,
+    TmuxSessionsPanel, set_claude_session_links, tmux_attach_command,
 };
 use ui::{
-    Button, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes, Scrollbars,
-    SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
+    Button, ButtonSize, ButtonStyle, Disclosure, Divider, ListItem, ListItemSpacing, ScrollAxes,
+    Scrollbars, SelectableButton as _, TintColor, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
@@ -52,16 +53,22 @@ use workspace::{
 };
 
 use crate::{
-    ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, EndedReason, EndedSession,
-    HookInstallOutcome, LiveSession, LiveState, ModelRates, OpenInEditor, RegisteredSession,
-    RunningTool, SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus, TranscriptRecord,
-    TranscriptTarget, Turn, Usage, rates_for_model,
+    CacheTtl, ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, EndedReason,
+    EndedSession, HookInstallOutcome, KeepAliveConfig, KeepAliveState, KeepAliveStatus,
+    LiveSession, LiveState, ModelRates, ONE_HOUR_CACHE_MS, OpenInEditor, RegisteredSession,
+    RunningTool, SessionFacts, SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus,
+    TranscriptRecord, TranscriptTarget, Turn, Usage, format_countdown,
+    keep_alive::{TEN_MINUTES_MS, pause_reason_text},
+    ping_and_rewrite_cost, rates_for_model,
     session_registry::{
-        attachment_is_readable, tmux_session_name, window_target, workflow_run_id_in_tool_result,
+        TranscriptSpend, attachment_is_readable, tmux_session_name, window_target,
+        workflow_run_id_in_tool_result,
     },
     session_source::{FileContents, LocalSource, RemoteSource, SessionSource},
+    status as keep_alive_status,
     terminal_anchors::{self, Anchoring, Glyphs, ScreenRow},
     transcript::{AutoModeFlags, Spend},
+    try_keep_alive_registry,
 };
 
 const CLAUDE_SESSIONS_PANEL_KEY: &str = "ClaudeSessionsPanel";
@@ -561,6 +568,87 @@ fn uninstall_hooks_note(result: anyhow::Result<()>) -> SharedString {
     }
 }
 
+/// True only for a remote project whose clipboard's first entry is an image.
+fn intercepts_image_paste(is_remote: bool, first_entry_is_image: bool) -> bool {
+    is_remote && first_entry_is_image
+}
+
+/// `pasted-{now_ms}.{ext}`. This crate does not depend on `sha2`, so the name has no content hash.
+fn pasted_file_name(now_ms: i64, extension: &str) -> String {
+    format!("pasted-{}.{extension}", now_ms.max(0))
+}
+
+const PASTE_NOTE_PREFIX: &str = "Pasting the image:";
+
+/// Checked before the upload: the host refuses anything larger, and sending it first would
+/// hold the connection that the registry scans also wait on.
+fn pasted_image_size_error(length: usize) -> Option<String> {
+    (length > crate::session_registry::MAX_PASTED_FILE_BYTES).then(|| {
+        format!(
+            "the image is {length} bytes, and the limit is {}",
+            crate::session_registry::MAX_PASTED_FILE_BYTES
+        )
+    })
+}
+
+fn is_ctrl_v(keystroke: &Keystroke) -> bool {
+    keystroke.key == "v"
+        && keystroke.modifiers.control
+        && !keystroke.modifiers.alt
+        && !keystroke.modifiers.shift
+        && !keystroke.modifiers.platform
+        && !keystroke.modifiers.function
+}
+
+fn clipboard_image(cx: &App) -> Option<Image> {
+    let clipboard = cx.read_from_clipboard()?;
+    match clipboard.entries().first() {
+        Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => Some(image.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod image_paste_tests {
+    use super::{intercepts_image_paste, pasted_file_name, pasted_image_size_error};
+    use crate::session_registry::MAX_PASTED_FILE_BYTES;
+
+    #[test]
+    fn an_image_over_the_host_limit_is_refused_before_it_is_sent() {
+        assert_eq!(
+            pasted_image_size_error(MAX_PASTED_FILE_BYTES + 1),
+            Some(format!(
+                "the image is {} bytes, and the limit is {MAX_PASTED_FILE_BYTES}",
+                MAX_PASTED_FILE_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn an_image_the_host_would_accept_is_not_refused() {
+        assert_eq!(pasted_image_size_error(MAX_PASTED_FILE_BYTES), None);
+        assert_eq!(pasted_image_size_error(5 * 1024 * 1024), None);
+        assert_eq!(pasted_image_size_error(1), None);
+    }
+
+    #[test]
+    fn intercepts_image_paste_only_for_a_remote_image() {
+        assert!(intercepts_image_paste(true, true));
+        assert!(!intercepts_image_paste(true, false));
+        assert!(!intercepts_image_paste(false, true));
+        assert!(!intercepts_image_paste(false, false));
+    }
+
+    #[test]
+    fn pasted_file_names_include_time_and_extension() {
+        assert_eq!(
+            pasted_file_name(1_700_000_000_000, "png"),
+            "pasted-1700000000000.png"
+        );
+        assert_eq!(pasted_file_name(-1, "jpg"), "pasted-0.jpg");
+    }
+}
+
 /// Wall-clock milliseconds, as the registrations record them.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -702,6 +790,7 @@ pub struct ClaudeSessionsPanel {
     terminal: Option<Entity<TerminalView>>,
     terminal_for: Option<TerminalTarget>,
     _terminal_attach: Task<()>,
+    _pasting: Task<()>,
     /// Hides the transcript rail. The embedded terminal stays: collapsing the rail is
     /// not detaching, and an attached client is what the reader is looking at.
     rail_expanded: bool,
@@ -807,6 +896,7 @@ pub struct ClaudeSessionsPanel {
     /// must not scroll again, or the reader can never move the rail themselves.
     followed_index: Option<usize>,
     _store_subscription: Subscription,
+    _keep_alive_subscription: Subscription,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2824,6 +2914,10 @@ impl ClaudeSessionsPanel {
             }
             cx.notify();
         });
+        let keep_alive = crate::keep_alive_registry(cx);
+        let keep_alive_subscription = cx.observe(&keep_alive, |_: &mut Self, _, cx| {
+            cx.notify();
+        });
 
         Self {
             workspace,
@@ -2836,6 +2930,7 @@ impl ClaudeSessionsPanel {
             terminal: None,
             terminal_for: None,
             _terminal_attach: Task::ready(()),
+            _pasting: Task::ready(()),
             rail_expanded: true,
             rail_shows_everything: false,
             permission_answered: false,
@@ -2891,6 +2986,7 @@ impl ClaudeSessionsPanel {
             hovered_anchor: None,
             followed_index: None,
             _store_subscription: store_subscription,
+            _keep_alive_subscription: keep_alive_subscription,
         }
     }
 
@@ -4155,6 +4251,10 @@ impl ClaudeSessionsPanel {
                                     .single_line()
                             }))
                             .child(Label::new(name).size(LabelSize::Small).single_line())
+                            .when_some(
+                                self.keep_alive_dock_icon(index, &session_id, cx),
+                                |this, icon| this.child(icon),
+                            )
                             .when(is_bridged, |this| {
                                 this.child(
                                     Icon::new(IconName::Link)
@@ -5342,6 +5442,75 @@ impl ClaudeSessionsPanel {
         )
     }
 
+    fn toggle_keep_alive(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let registry = crate::keep_alive_registry(cx);
+        registry.update(cx, |registry, cx| {
+            registry.toggle(session_id);
+            cx.notify();
+        });
+    }
+
+    fn keep_alive_toolbar_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        if !matches!(store.transcript_target(), TranscriptTarget::Main) {
+            return None;
+        }
+        let session_id = store.selected()?.to_string();
+        let chip = keep_alive_chip_for(&store, &session_id, None, cx)?;
+        let tooltip_meta = chip.tooltip_meta.clone();
+        let session_for_click = session_id.clone();
+        Some(
+            Button::new(
+                SharedString::from(format!("claude-keep-alive-{session_id}")),
+                chip.label.clone(),
+            )
+            .style(ButtonStyle::Subtle)
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::XSmall)
+            .color(chip.label_color)
+            .selected_label_color(chip.label_color)
+            .start_icon(
+                Icon::new(chip.icon)
+                    .size(IconSize::XSmall)
+                    .color(chip.icon_color),
+            )
+            .toggle_state(chip.enabled)
+            .tooltip(move |_, cx| {
+                Tooltip::with_meta("Keep prompt cache warm", None, tooltip_meta.clone(), cx)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_keep_alive(&session_for_click, cx);
+            }))
+            .into_any_element(),
+        )
+    }
+
+    fn keep_alive_dock_icon(
+        &self,
+        index: usize,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let chip = keep_alive_chip_for(&store, session_id, None, cx)?;
+        if !chip.enabled {
+            return None;
+        }
+        let tooltip = chip.dock_tooltip.clone();
+        let color = chip.icon_color;
+        Some(
+            div()
+                .id(SharedString::from(format!("claude-keep-warm-{index}")))
+                .tooltip(Tooltip::text(tooltip))
+                .child(
+                    Icon::new(IconName::Flame)
+                        .size(IconSize::XSmall)
+                        .color(color),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_conversation_toolbar(
         &self,
         window: &mut Window,
@@ -5471,6 +5640,8 @@ impl ClaudeSessionsPanel {
             .map(|fact| fact.to_string())
             .collect::<Vec<_>>()
             .join(" · ");
+
+        let keep_alive_button = self.keep_alive_toolbar_button(cx);
 
         h_flex()
             .w_full()
@@ -5613,7 +5784,8 @@ impl ClaudeSessionsPanel {
                             .label_size(LabelSize::XSmall)
                             .toggle_state(showing_costs)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
-                    ),
+                    )
+                    .when_some(keep_alive_button, |this, button| this.child(button)),
             )
     }
 
@@ -7546,9 +7718,106 @@ impl ClaudeSessionsPanel {
         SharedString::from(SELECT_A_SESSION)
     }
 
+    /// Writes a pasted image onto the session's machine and pastes that path into the
+    /// embedded terminal. Local projects and text pastes are left to `TerminalView`.
+    fn paste_remote_image(&mut self, cx: &mut Context<Self>) {
+        let is_remote = self
+            .workspace
+            .upgrade()
+            .is_some_and(|workspace| workspace.read(cx).project().read(cx).is_via_remote_server());
+        // A local paste is TerminalView's alone, so the clipboard is not even read for it.
+        let image = if is_remote { clipboard_image(cx) } else { None };
+        if !intercepts_image_paste(is_remote, image.is_some()) {
+            return;
+        }
+        cx.stop_propagation();
+        let Some(image) = image else {
+            return;
+        };
+        let Some(terminal_id) = self
+            .terminal
+            .as_ref()
+            .map(|view| view.read(cx).terminal().entity_id())
+        else {
+            return;
+        };
+        if let Some(error) = pasted_image_size_error(image.bytes.len()) {
+            self.lifecycle_note = Some(SharedString::from(format!("{PASTE_NOTE_PREFIX} {error}")));
+            cx.notify();
+            return;
+        }
+        let name = pasted_file_name(now_millis(), image.format.extension());
+        let write = self.source.write_session_file(name, image.bytes);
+        self._pasting = cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| {
+                let Some(terminal) = this
+                    .terminal
+                    .as_ref()
+                    .map(|view| view.read(cx).terminal().clone())
+                    .filter(|terminal| terminal.entity_id() == terminal_id)
+                else {
+                    // Another session's terminal: neither its path nor its error belongs here.
+                    return;
+                };
+                match written {
+                    Ok(path) => {
+                        terminal.update(cx, |terminal, _| {
+                            terminal.paste(&format!("{path} "));
+                        });
+                        if this
+                            .lifecycle_note
+                            .as_ref()
+                            .is_some_and(|note| note.starts_with(PASTE_NOTE_PREFIX))
+                        {
+                            this.lifecycle_note = None;
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        this.lifecycle_note =
+                            Some(SharedString::from(format!("{PASTE_NOTE_PREFIX} {error:#}")));
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        });
+    }
+
     fn render_terminal_area(&self, cx: &mut Context<Self>) -> AnyElement {
         let body = if let Some(terminal) = self.terminal.clone() {
-            div().size_full().child(terminal)
+            let terminal = div()
+                .size_full()
+                .capture_action::<terminal::Paste>(cx.listener(
+                    |this, _: &terminal::Paste, _window, cx| {
+                        this.paste_remote_image(cx);
+                    },
+                ))
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if is_ctrl_v(&event.keystroke) {
+                        this.paste_remote_image(cx);
+                    }
+                }))
+                .child(terminal);
+            // With a terminal attached the placeholder, the tab's only other place for this
+            // note, is gone, so a failed paste would otherwise say nothing.
+            match self
+                .lifecycle_note
+                .clone()
+                .filter(|note| note.starts_with(PASTE_NOTE_PREFIX))
+            {
+                Some(note) => v_flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .child(div().flex_1().min_h_0().w_full().child(terminal)),
+                None => terminal,
+            }
         } else {
             div().size_full().p_2().child(
                 Label::new(self.terminal_placeholder(cx))
@@ -11486,6 +11755,243 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
+struct KeepAliveChip {
+    enabled: bool,
+    icon: IconName,
+    icon_color: Color,
+    label: SharedString,
+    label_color: Color,
+    tooltip_meta: SharedString,
+    dock_tooltip: SharedString,
+    tmux_label: SharedString,
+    tone: BadgeTone,
+}
+
+fn keep_alive_tooltip_meta(
+    config: &KeepAliveConfig,
+    context_tokens: u64,
+    rates: Option<ModelRates>,
+    detail: Option<&str>,
+    error: Option<&str>,
+) -> SharedString {
+    let mut lines = Vec::new();
+    if let Some(detail) = detail {
+        lines.push(detail.to_string());
+    }
+    let mut sentence = format!(
+        "Sends a short message every {} min while idle, for up to {} h.",
+        config.interval_ms / 60_000,
+        config.max_idle_ms / 3_600_000,
+    );
+    if context_tokens > 0
+        && let Some(rates) = rates
+    {
+        let (ping, rewrite) = ping_and_rewrite_cost(context_tokens, rates);
+        sentence.push(' ');
+        sentence.push_str(&format!(
+            "≈ {} per ping vs ≈ {} to rebuild the cache.",
+            format_usd(ping),
+            format_usd(rewrite),
+        ));
+    }
+    lines.push(sentence);
+    if let Some(error) = error {
+        lines.push(error.to_string());
+    }
+    SharedString::from(lines.join("\n"))
+}
+
+fn keep_alive_dock_tooltip(label: &str, detail: Option<&str>, error: Option<&str>) -> SharedString {
+    let mut lines = vec![label.to_string()];
+    if let Some(detail) = detail {
+        lines.push(detail.to_string());
+    }
+    if let Some(error) = error {
+        lines.push(error.to_string());
+    }
+    SharedString::from(lines.join("\n"))
+}
+
+fn keep_alive_chip_model(
+    spend: Option<TranscriptSpend>,
+    state: &KeepAliveState,
+    facts: SessionFacts,
+    config: &KeepAliveConfig,
+    rates: Option<ModelRates>,
+    context_tokens: u64,
+    error: Option<&str>,
+    now_ms: i64,
+) -> Option<KeepAliveChip> {
+    if !state.enabled {
+        if facts.cache_ttl != CacheTtl::OneHour {
+            return None;
+        }
+        let answered_at = spend
+            .and_then(|spend| spend.last_answer_at_ms)
+            .or(state.last_seen_answer_ms)?;
+        let expires = answered_at.saturating_add(ONE_HOUR_CACHE_MS);
+        let (label, label_color) = if now_ms >= expires {
+            (SharedString::from("cache expired"), Color::Muted)
+        } else {
+            let remaining = expires.saturating_sub(now_ms);
+            let label_color = if remaining <= TEN_MINUTES_MS {
+                Color::Warning
+            } else {
+                Color::Muted
+            };
+            (
+                SharedString::from(format!("cache {}", format_countdown(remaining))),
+                label_color,
+            )
+        };
+        return Some(KeepAliveChip {
+            enabled: false,
+            icon: IconName::Clock,
+            icon_color: Color::Muted,
+            tmux_label: label.clone(),
+            dock_tooltip: label.clone(),
+            tooltip_meta: keep_alive_tooltip_meta(config, context_tokens, rates, None, error),
+            tone: if label_color == Color::Warning {
+                BadgeTone::Warning
+            } else {
+                BadgeTone::Muted
+            },
+            label,
+            label_color,
+        });
+    }
+
+    let (icon_color, label, tmux_label, detail) =
+        match keep_alive_status(state, facts, config, now_ms) {
+            KeepAliveStatus::Off => return None,
+            KeepAliveStatus::Scheduled { next_ping_ms, .. } => {
+                let countdown = format_countdown(next_ping_ms.saturating_sub(now_ms));
+                (
+                    Color::Accent,
+                    SharedString::from(format!("warm · ping in {countdown}")),
+                    SharedString::from(format!("ping in {countdown}")),
+                    None,
+                )
+            }
+            KeepAliveStatus::SendNow | KeepAliveStatus::AwaitingReply { .. } => (
+                Color::Accent,
+                SharedString::from("warm · pinging…"),
+                SharedString::from("pinging…"),
+                None,
+            ),
+            KeepAliveStatus::Paused(reason) => (
+                Color::Warning,
+                SharedString::from("warm · paused"),
+                SharedString::from("paused"),
+                Some(pause_reason_text(reason).to_string()),
+            ),
+            KeepAliveStatus::LimitReached { idle_since_ms } => {
+                let idle_hours = now_ms.saturating_sub(idle_since_ms) / 3_600_000;
+                let max_hours = config.max_idle_ms / 3_600_000;
+                (
+                    Color::Muted,
+                    SharedString::from("warm · stopped"),
+                    SharedString::from("stopped"),
+                    Some(format!(
+                        "Idle for {idle_hours} h; keep-alive stops after {max_hours} h"
+                    )),
+                )
+            }
+            KeepAliveStatus::CacheExpired { .. } => (
+                Color::Muted,
+                SharedString::from("cache expired"),
+                SharedString::from("cache expired"),
+                None,
+            ),
+        };
+    let detail_text = detail.as_deref();
+    Some(KeepAliveChip {
+        enabled: true,
+        icon: IconName::Flame,
+        icon_color,
+        label_color: icon_color,
+        tooltip_meta: keep_alive_tooltip_meta(config, context_tokens, rates, detail_text, error),
+        dock_tooltip: keep_alive_dock_tooltip(label.as_ref(), detail_text, error),
+        tone: match icon_color {
+            Color::Warning => BadgeTone::Warning,
+            Color::Accent => BadgeTone::Accent,
+            _ => BadgeTone::Muted,
+        },
+        tmux_label,
+        label,
+    })
+}
+
+fn keep_alive_chip_for(
+    store: &ClaudeSessionStore,
+    session_id: &str,
+    live: Option<&LiveSession>,
+    cx: &App,
+) -> Option<KeepAliveChip> {
+    let live = live.or_else(|| {
+        store
+            .sessions()
+            .iter()
+            .find(|session| session.session.session_id == session_id)
+    })?;
+    let (state, error) = match try_keep_alive_registry(cx) {
+        Some(registry) => {
+            let registry = registry.read(cx);
+            (registry.state(session_id), registry.error(session_id))
+        }
+        None => (KeepAliveState::default(), None),
+    };
+    let spend = store.session_spend(session_id);
+    let facts = SessionFacts {
+        cache_ttl: spend
+            .map(|spend| spend.cache_ttl)
+            .unwrap_or(CacheTtl::Unknown),
+        busy: live.status.as_deref() == Some("busy"),
+        waiting: live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
+        channel_live: store.keep_alive_channel_live(session_id),
+    };
+    let config = ClaudeSessionsSettings::try_get(cx)
+        .map(|settings| settings.keep_alive.clone())
+        .unwrap_or_default();
+    let transcript = (store.selected() == Some(session_id)
+        && matches!(store.transcript_target(), TranscriptTarget::Main))
+    .then(|| store.transcript().spend());
+    let context_tokens = transcript
+        .as_ref()
+        .map(|spend| spend.context_tokens)
+        .filter(|tokens| *tokens > 0)
+        .or_else(|| spend.map(|spend| spend.context_tokens))
+        .unwrap_or(0);
+    let rates = transcript
+        .as_ref()
+        .and_then(|spend| spend.model.as_deref())
+        .and_then(rates_for_model);
+    keep_alive_chip_model(
+        spend,
+        &state,
+        facts,
+        &config,
+        rates,
+        context_tokens,
+        error.as_deref(),
+        crate::session_registry::now_millis(),
+    )
+}
+
+fn keep_alive_badge(
+    store: &ClaudeSessionStore,
+    live: &LiveSession,
+    cx: &App,
+) -> Option<KeepAliveBadge> {
+    let chip = keep_alive_chip_for(store, &live.session.session_id, Some(live), cx)?;
+    Some(KeepAliveBadge {
+        enabled: chip.enabled,
+        label: chip.tmux_label,
+        tone: chip.tone,
+        tooltip: chip.tooltip_meta,
+    })
+}
+
 pub(super) fn install_tmux_session_links(cx: &mut App) {
     set_claude_session_links(Arc::new(TmuxClaudeSessionLinks), cx);
 }
@@ -11506,7 +12012,8 @@ impl ClaudeSessionLinks for TmuxClaudeSessionLinks {
                 let context_tokens = store
                     .session_spend(&live.session_id)
                     .map(|spend| spend.context_tokens);
-                linked_claude_session_for(live, context_tokens, now)
+                let keep_alive = keep_alive_badge(store, live, cx);
+                linked_claude_session_for(live, context_tokens, keep_alive, now)
             })
             .collect()
     }
@@ -11522,7 +12029,21 @@ impl ClaudeSessionLinks for TmuxClaudeSessionLinks {
             .read(cx)
             .store
             .clone();
-        Some(cx.observe(&store, |_, _, cx| cx.notify()))
+        let store_subscription = cx.observe(&store, |_, _, cx| cx.notify());
+        let registry = crate::keep_alive_registry(cx);
+        let registry_subscription = cx.observe(&registry, |_, _, cx| cx.notify());
+        Some(Subscription::join(
+            store_subscription,
+            registry_subscription,
+        ))
+    }
+
+    fn toggle_keep_alive(&self, session_id: &str, cx: &mut App) {
+        let registry = crate::keep_alive_registry(cx);
+        registry.update(cx, |registry, cx| {
+            registry.toggle(session_id);
+            cx.notify();
+        });
     }
 
     fn open(
@@ -11547,6 +12068,7 @@ impl ClaudeSessionLinks for TmuxClaudeSessionLinks {
 fn linked_claude_session_for(
     live: &LiveSession,
     context_tokens: Option<u64>,
+    keep_alive: Option<KeepAliveBadge>,
     now: i64,
 ) -> Option<LinkedClaudeSession> {
     // A background agent started from inside a session inherits its `$TMUX_PANE`, so it
@@ -11571,6 +12093,7 @@ fn linked_claude_session_for(
         context: context_tokens
             .filter(|tokens| *tokens > 0)
             .map(|tokens| SharedString::from(compact_token_count(tokens))),
+        keep_alive,
     })
 }
 
@@ -15043,6 +15566,11 @@ mod tests {
                             this.rebuild_entries(cx);
                             cx.notify();
                         });
+                    let keep_alive = crate::keep_alive_registry(cx);
+                    let keep_alive_subscription =
+                        cx.observe(&keep_alive, |_: &mut ClaudeSessionsPanel, _, cx| {
+                            cx.notify();
+                        });
 
                     ClaudeSessionsPanel {
                         workspace: WeakEntity::new_invalid(),
@@ -15055,6 +15583,7 @@ mod tests {
                         terminal: None,
                         terminal_for: None,
                         _terminal_attach: Task::ready(()),
+                        _pasting: Task::ready(()),
                         rail_expanded: true,
                         rail_shows_everything: false,
                         permission_answered: false,
@@ -15110,6 +15639,7 @@ mod tests {
                         hovered_anchor: None,
                         followed_index: None,
                         _store_subscription: store_subscription,
+                        _keep_alive_subscription: keep_alive_subscription,
                     }
                 })
             })
