@@ -1501,6 +1501,7 @@ impl HeadlessProject {
                             index: window.index,
                             name: window.name,
                             active: window.active,
+                            id: window.id,
                         })
                         .collect(),
                 })

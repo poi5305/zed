@@ -1,7 +1,8 @@
 use collections::HashSet;
 use gpui::{
-    AnyElement, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, FutureExt as _,
-    Render, Task, WeakEntity,
+    Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, FutureExt as _, Render, Subscription, Task, WeakEntity,
+    pulsating_between,
 };
 use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
@@ -17,7 +18,10 @@ use workspace::{
 
 use remote::tmux_sessions::list_tmux_sessions;
 
-use crate::{ToggleFocus, tmux_attach_command};
+use crate::{
+    ClaudeActivity, LinkedClaudeSession, ToggleFocus, claude_session_links, linked_claude_session,
+    tmux_attach_command,
+};
 
 const TMUX_SESSIONS_PANEL_KEY: &str = "TmuxSessionsPanel";
 
@@ -55,11 +59,14 @@ pub struct TmuxSessionsPanel {
     /// False only when the remote host has no tmux binary; a host with tmux
     /// installed but no server running reports true with no sessions.
     tmux_available: bool,
-    /// Sessions whose windows are shown, by session name.
-    expanded_sessions: HashSet<String>,
+    /// Sessions whose windows are hidden, by session name. A name that is absent is
+    /// expanded, so the windows (and any Claude session in them) are visible before a click.
+    collapsed_sessions: HashSet<String>,
     loading: bool,
     error: Option<SharedString>,
     _refresh: Task<()>,
+    /// Retried from `render` until the Claude panel exists to subscribe to.
+    _claude_links: Option<Subscription>,
 }
 
 impl TmuxSessionsPanel {
@@ -93,10 +100,11 @@ impl TmuxSessionsPanel {
                 remote_client,
                 sessions: Vec::new(),
                 tmux_available: true,
-                expanded_sessions: HashSet::default(),
+                collapsed_sessions: HashSet::default(),
                 loading: false,
                 error: None,
                 _refresh: Task::ready(()),
+                _claude_links: None,
             };
             this.refresh(cx);
             this
@@ -171,7 +179,7 @@ impl TmuxSessionsPanel {
                     .iter()
                     .map(|session| session.name.clone())
                     .collect();
-                self.expanded_sessions.retain(|name| names.contains(name));
+                self.collapsed_sessions.retain(|name| names.contains(name));
             }
             Err(error) => self.error = Some(error.to_string().into()),
         }
@@ -179,8 +187,8 @@ impl TmuxSessionsPanel {
     }
 
     fn toggle_session(&mut self, session_name: &str, cx: &mut Context<Self>) {
-        if !self.expanded_sessions.remove(session_name) {
-            self.expanded_sessions.insert(session_name.to_string());
+        if !self.collapsed_sessions.remove(session_name) {
+            self.collapsed_sessions.insert(session_name.to_string());
         }
         cx.notify();
     }
@@ -240,7 +248,54 @@ impl TmuxSessionsPanel {
         .detach();
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn observe_claude_links(&mut self, cx: &mut Context<Self>) {
+        if self._claude_links.is_some() {
+            return;
+        }
+        let Some(links) = claude_session_links(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        self._claude_links = links.observe(&workspace, cx);
+    }
+
+    fn current_claude_links(&self, cx: &App) -> Vec<LinkedClaudeSession> {
+        let Some(links) = claude_session_links(cx) else {
+            return Vec::new();
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        links.linked_sessions(workspace.read(cx), cx)
+    }
+
+    fn open_linked_claude(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(links) = claude_session_links(cx) else {
+            self.error = Some("The Claude sessions panel is not available.".into());
+            cx.notify();
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if let Err(error) = links.open(workspace, session_id, window, cx) {
+            self.error = Some(error.to_string().into());
+            cx.notify();
+        }
+    }
+
+    fn render_toolbar(
+        &self,
+        links: &[LinkedClaudeSession],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         h_flex()
             .p_1()
             .gap_1()
@@ -248,9 +303,18 @@ impl TmuxSessionsPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Label::new("Tmux Sessions")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Tmux Sessions")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(listing_summary(&self.sessions, links))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             )
             .child(
                 IconButton::new("tmux-sessions-refresh", IconName::RotateCw)
@@ -261,17 +325,30 @@ impl TmuxSessionsPanel {
             )
     }
 
-    fn render_session(&self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_session(
+        &self,
+        index: usize,
+        links: &[LinkedClaudeSession],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let session = self.sessions.get(index)?;
         let name = session.name.clone();
-        let expanded = self.expanded_sessions.contains(&name);
+        let expanded = !self.collapsed_sessions.contains(&name);
         let window_count = session.window_count;
         let attached = session.attached;
+        let hosted: Vec<&LinkedClaudeSession> = session
+            .windows
+            .iter()
+            .filter_map(|tmux_window| linked_claude_session(links, &tmux_window.id))
+            .collect();
+        let any_waiting = hosted
+            .iter()
+            .any(|link| matches!(link.activity, ClaudeActivity::Waiting(_)));
 
         // The disclosure is a child of the row rather than `ListItem::toggle`,
         // which draws it at `left(rems(-1.))` — outside a row whose indent level
         // is zero, where the panel clips it. `ButtonLike` stops click
-        // propagation, so toggling here does not also attach to the session.
+        // propagation, so toggling here does not also open the session.
         let header = ListItem::new(SharedString::from(format!("tmux-session-{index}")))
             .spacing(ListItemSpacing::Sparse)
             .start_slot(
@@ -292,11 +369,18 @@ impl TmuxSessionsPanel {
                             move |this, _, _, cx| this.toggle_session(&name, cx)
                         })),
                     )
-                    .child(Icon::new(IconName::Terminal).size(IconSize::Small)),
+                    .child(Icon::new(IconName::Terminal).size(IconSize::Small).color(
+                        if attached {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
+                    )),
             )
             .child(
                 h_flex()
                     .gap_1()
+                    .overflow_hidden()
                     .child(Label::new(name.clone()).single_line())
                     .child(
                         Label::new(if window_count == 1 {
@@ -313,12 +397,42 @@ impl TmuxSessionsPanel {
                                 .size(LabelSize::Small)
                                 .color(Color::Accent),
                         )
+                    })
+                    .when(!hosted.is_empty(), |this| {
+                        this.child(Icon::new(IconName::AiClaude).size(IconSize::XSmall).color(
+                            if any_waiting {
+                                Color::Warning
+                            } else {
+                                Color::Muted
+                            },
+                        ))
+                        .child(
+                            Label::new(hosted.len().to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
                     }),
             )
-            .tooltip(Tooltip::text(format!("Attach to {name}")))
+            .end_slot(
+                IconButton::new(
+                    SharedString::from(format!("tmux-session-terminal-{index}")),
+                    IconName::Terminal,
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text("Open session in terminal"))
+                .on_click(cx.listener({
+                    let name = name.clone();
+                    move |this, _, window, cx| this.attach(&name, None, window, cx)
+                })),
+            )
+            .tooltip(Tooltip::text(if expanded {
+                "Hide windows"
+            } else {
+                "Show windows"
+            }))
             .on_click(cx.listener({
                 let name = name.clone();
-                move |this, _, window, cx| this.attach(&name, None, window, cx)
+                move |this, _, _, cx| this.toggle_session(&name, cx)
             }));
 
         let windows = expanded.then(|| {
@@ -327,43 +441,14 @@ impl TmuxSessionsPanel {
                 .iter()
                 .enumerate()
                 .map(|(window_index, tmux_window)| {
-                    let session_name = name.clone();
-                    let target_index = tmux_window.index;
-                    ListItem::new(SharedString::from(format!(
-                        "tmux-window-{index}-{window_index}"
-                    )))
-                    .spacing(ListItemSpacing::Sparse)
-                    .indent_level(1)
-                    .start_slot(Icon::new(IconName::Screen).size(IconSize::Small).color(
-                        if tmux_window.active {
-                            Color::Accent
-                        } else {
-                            Color::Muted
-                        },
-                    ))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Label::new(format!("{}:", tmux_window.index))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new(tmux_window.name.clone()).single_line())
-                            .when(tmux_window.active, |this| {
-                                this.child(
-                                    Label::new("active")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Accent),
-                                )
-                            }),
+                    self.render_window(
+                        index,
+                        &name,
+                        window_index,
+                        tmux_window,
+                        linked_claude_session(links, &tmux_window.id),
+                        cx,
                     )
-                    .tooltip(Tooltip::text(format!(
-                        "Attach to {session_name}:{target_index}"
-                    )))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.attach(&session_name, Some(target_index), window, cx)
-                    }))
                 })
                 .collect::<Vec<_>>()
         });
@@ -373,6 +458,159 @@ impl TmuxSessionsPanel {
                 .child(header)
                 .children(windows.into_iter().flatten())
                 .into_any_element(),
+        )
+    }
+
+    fn render_window(
+        &self,
+        session_index: usize,
+        session_name: &str,
+        window_index: usize,
+        tmux_window: &proto::TmuxWindow,
+        linked: Option<&LinkedClaudeSession>,
+        cx: &mut Context<Self>,
+    ) -> ListItem {
+        let target_index = tmux_window.index;
+        let identity = h_flex()
+            .gap_1()
+            .overflow_hidden()
+            .child(
+                Label::new(format!("{}:", tmux_window.index))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(tmux_window.name.clone()).single_line())
+            .when(tmux_window.active, |this| {
+                this.child(
+                    Label::new("active")
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            });
+
+        let row = ListItem::new(SharedString::from(format!(
+            "tmux-window-{session_index}-{window_index}"
+        )))
+        .spacing(ListItemSpacing::Sparse)
+        .indent_level(1);
+
+        let Some(linked) = linked else {
+            let session_name = session_name.to_string();
+            return row
+                .start_slot(Icon::new(IconName::Screen).size(IconSize::Small).color(
+                    if tmux_window.active {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    },
+                ))
+                .child(identity)
+                .end_slot(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "tmux-window-terminal-{session_index}-{window_index}"
+                        )),
+                        IconName::Terminal,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Open window in terminal"))
+                    .on_click(cx.listener({
+                        let session_name = session_name.clone();
+                        move |this, _, window, cx| {
+                            this.attach(&session_name, Some(target_index), window, cx)
+                        }
+                    })),
+                )
+                .tooltip(Tooltip::text(format!(
+                    "Attach to {session_name}:{target_index}"
+                )))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.attach(&session_name, Some(target_index), window, cx)
+                }));
+        };
+
+        let session_id = linked.session_id.clone();
+        let title = linked.title.clone();
+        let session_name = session_name.to_string();
+        row.start_slot(claude_status_dot(
+            &linked.activity,
+            SharedString::from(format!(
+                "tmux-window-indicator-{session_index}-{window_index}"
+            )),
+        ))
+        .child(
+            v_flex().gap_0p5().overflow_hidden().child(identity).child(
+                h_flex()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        Icon::new(IconName::AiClaude)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(title.clone())
+                            .size(LabelSize::XSmall)
+                            .single_line()
+                            .truncate(),
+                    )
+                    .when_some(
+                        claude_activity_label(&linked.activity),
+                        |this, (text, color)| {
+                            this.child(
+                                Label::new(text)
+                                    .size(LabelSize::XSmall)
+                                    .color(color)
+                                    .single_line(),
+                            )
+                        },
+                    )
+                    .when_some(linked.context.clone(), |this, context| {
+                        this.child(
+                            Label::new(context)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    }),
+            ),
+        )
+        .end_slot(
+            h_flex()
+                .gap_0p5()
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "tmux-window-claude-{session_index}-{window_index}"
+                        )),
+                        IconName::AiClaude,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Open Claude session"))
+                    .on_click(cx.listener({
+                        let session_id = session_id.clone();
+                        move |this, _, window, cx| this.open_linked_claude(&session_id, window, cx)
+                    })),
+                )
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "tmux-window-terminal-{session_index}-{window_index}"
+                        )),
+                        IconName::Terminal,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Open window in terminal"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.attach(&session_name, Some(target_index), window, cx)
+                    })),
+                ),
+        )
+        .tooltip(Tooltip::text(format!("Open Claude session {title}")))
+        .on_click(
+            cx.listener(move |this, _, window, cx| {
+                this.open_linked_claude(&session_id, window, cx)
+            }),
         )
     }
 
@@ -416,13 +654,15 @@ impl TmuxSessionsPanel {
 
 impl Render for TmuxSessionsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.observe_claude_links(cx);
+        let links = self.current_claude_links(cx);
         let empty_message = self.empty_message();
 
         v_flex()
             .key_context("TmuxSessionsPanel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(&links, cx))
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().p_2().child(Label::new(error).color(Color::Error)))
             })
@@ -441,7 +681,8 @@ impl Render for TmuxSessionsPanel {
                         )
                     })
                     .children(
-                        (0..self.sessions.len()).filter_map(|index| self.render_session(index, cx)),
+                        (0..self.sessions.len())
+                            .filter_map(|index| self.render_session(index, &links, cx)),
                     ),
             )
     }
@@ -513,6 +754,62 @@ impl Panel for TmuxSessionsPanel {
     }
 }
 
+fn listing_summary(sessions: &[proto::TmuxSession], links: &[LinkedClaudeSession]) -> String {
+    let session_count = sessions.len();
+    let sessions_label = if session_count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{session_count} sessions")
+    };
+    let claude_count = sessions
+        .iter()
+        .flat_map(|session| session.windows.iter())
+        .filter(|window| linked_claude_session(links, &window.id).is_some())
+        .count();
+    if claude_count == 0 {
+        sessions_label
+    } else {
+        format!("{sessions_label} · {claude_count} Claude")
+    }
+}
+
+/// `idle_for` already includes the "idle" word, so `Idle(Some(text))` is shown as that text.
+fn claude_activity_label(activity: &ClaudeActivity) -> Option<(SharedString, Color)> {
+    match activity {
+        ClaudeActivity::Working => Some(("Working".into(), Color::Success)),
+        ClaudeActivity::Waiting(waiting) => {
+            Some((format!("Waiting: {waiting}").into(), Color::Warning))
+        }
+        ClaudeActivity::Idle(Some(idle)) => Some((idle.clone(), Color::Muted)),
+        ClaudeActivity::Idle(None) => None,
+    }
+}
+
+fn claude_status_dot(activity: &ClaudeActivity, id: impl Into<ElementId>) -> AnyElement {
+    let (color, pulse) = match activity {
+        ClaudeActivity::Waiting(_) => (Color::Warning, true),
+        ClaudeActivity::Working => (Color::Success, true),
+        ClaudeActivity::Idle(_) => (Color::Muted, false),
+    };
+    let dot = div().child(
+        Icon::new(IconName::Indicator)
+            .size(IconSize::XSmall)
+            .color(color),
+    );
+    if pulse {
+        dot.with_animation(
+            id,
+            Animation::new(Duration::from_secs(2))
+                .repeat()
+                .with_easing(pulsating_between(0.2, 0.8)),
+            |dot, delta| dot.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
+    }
+}
+
 /// What a listing that was never answered is reported as. The panel has no poll of its
 /// own, so this is the state it is left in until the user refreshes.
 fn unanswered_within(timeout: Duration) -> anyhow::Error {
@@ -533,6 +830,7 @@ fn proto_session(session: remote::tmux_sessions::TmuxSession) -> proto::TmuxSess
                 index: window.index,
                 name: window.name,
                 active: window.active,
+                id: window.id,
             })
             .collect(),
     }
@@ -645,10 +943,11 @@ mod tests {
             remote_client: Some(client),
             sessions: Vec::new(),
             tmux_available: true,
-            expanded_sessions: HashSet::default(),
+            collapsed_sessions: HashSet::default(),
             loading: false,
             error: None,
             _refresh: Task::ready(()),
+            _claude_links: None,
         })
     }
 
@@ -740,7 +1039,8 @@ mod tests {
         let panel = panel_for(client, cx);
 
         panel.update(cx, |panel, cx| panel.refresh(cx));
-        cx.executor().advance_clock(nearly_the_bound + Duration::from_millis(1));
+        cx.executor()
+            .advance_clock(nearly_the_bound + Duration::from_millis(1));
         cx.run_until_parked();
 
         let (message, names) = panel.read_with(cx, |panel, _| {
