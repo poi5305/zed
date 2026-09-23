@@ -2,7 +2,7 @@ use collections::HashSet;
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     AsyncWindowContext, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontStyle, Global,
-    ReadGlobal as _, Render, Subscription, TextStyle, WeakEntity,
+    ReadGlobal as _, Render, Subscription, Task, TextStyle, WeakEntity,
 };
 use recent_projects::RemoteSettings;
 use remote::{
@@ -15,6 +15,7 @@ use settings::{
     update_settings_file,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 use theme_settings::ThemeSettings;
 use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -105,12 +106,20 @@ pub struct ForwardPortsPanel {
     /// Why the detector gave up, while there is no detector running.
     port_detector_stopped: Option<SharedString>,
     auto_forward: OnAutoForward,
+    /// Closes each of this panel's toasts once it has been up for `TOAST_LIFETIME`. Keyed by
+    /// the toast, so showing it again replaces the timer instead of letting the old one close
+    /// the new toast early.
+    toast_expiries: HashMap<NotificationId, Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 /// Identifies the notification a detected port gets, so that a port which is
 /// still listening on the next scan does not stack up notifications.
 struct DetectedPortNotification;
+
+/// How long a toast from this panel stays up when it is not dismissed. The workspace's own
+/// autohide is five seconds, too short to notice a port on another screen.
+const TOAST_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// Identifies the notification a failed forward reports itself through.
 struct ForwardFailureNotification;
@@ -242,6 +251,7 @@ impl ForwardPortsPanel {
                 _port_detector_subscription: None,
                 port_detector_stopped: None,
                 auto_forward: OnAutoForward::default(),
+                toast_expiries: HashMap::default(),
                 _subscriptions: subscriptions,
             };
             this.start_port_detector(cx);
@@ -583,10 +593,11 @@ impl ForwardPortsPanel {
     /// not something the user has asked to see on their own machine.
     fn notify_detected_port(&mut self, key: ConnectionKey, port: u16, cx: &mut Context<Self>) {
         let panel = cx.weak_entity();
+        let id = NotificationId::composite::<DetectedPortNotification>(SharedString::from(
+            port.to_string(),
+        ));
         let toast = Toast::new(
-            NotificationId::composite::<DetectedPortNotification>(SharedString::from(
-                port.to_string(),
-            )),
+            id.clone(),
             format!("Port {port} is now listening on the remote host."),
         )
         .on_click("Forward", move |_window, cx| {
@@ -598,9 +609,24 @@ impl ForwardPortsPanel {
                 .log_err();
         });
 
+        self.show_toast(id, toast, cx);
+    }
+
+    fn show_toast(&mut self, id: NotificationId, toast: Toast, cx: &mut Context<Self>) {
         self.workspace
             .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
             .log_err();
+        let workspace = self.workspace.clone();
+        let expiry = cx.spawn({
+            let id = id.clone();
+            async move |_, cx| {
+                cx.background_executor().timer(TOAST_LIFETIME).await;
+                workspace
+                    .update(cx, |workspace, cx| workspace.dismiss_toast(&id, cx))
+                    .log_err();
+            }
+        });
+        self.toast_expiries.insert(id, expiry);
     }
 
     /// Whether this forward can be connected or disconnected from here at all:
@@ -629,13 +655,9 @@ impl ForwardPortsPanel {
     /// Shows a message as a notification as well as in the panel, for a failure
     /// that followed a gesture made outside the panel.
     fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        let toast = Toast::new(
-            NotificationId::unique::<ForwardFailureNotification>(),
-            message.into(),
-        );
-        self.workspace
-            .update(cx, |workspace, cx| workspace.show_toast(toast, cx))
-            .log_err();
+        let id = NotificationId::unique::<ForwardFailureNotification>();
+        let toast = Toast::new(id.clone(), message.into());
+        self.show_toast(id, toast, cx);
     }
 
     /// Whether the connection already forwards a local port that would collide
