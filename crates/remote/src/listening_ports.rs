@@ -7,15 +7,26 @@
 //! `extHostTunnelService.ts`, which solves the same problem from inside the
 //! remote server.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use collections::HashSet;
+use collections::{HashMap, HashSet};
+
+use crate::claude_sessions::RegisteredSession;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListeningPort {
     pub host: String,
     pub port: u16,
+}
+
+/// A listening port together with the process whose socket it is, when the
+/// platform's listing names one.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ListeningSocket {
+    pub port: ListeningPort,
+    pub process_id: Option<u32>,
 }
 
 /// The state `/proc/net/tcp` uses for `TCP_LISTEN`.
@@ -77,6 +88,16 @@ pub fn parse_ip_address(hex: &str) -> Option<String> {
 /// short of columns, or not hexadecimal are dropped individually so that a
 /// single corrupt row cannot hide the rows after it.
 pub fn parse_proc_net_tcp(contents: &str) -> Vec<ListeningPort> {
+    parse_proc_net_tcp_with_inodes(contents)
+        .into_iter()
+        .map(|(port, _)| port)
+        .collect()
+}
+
+/// Like [`parse_proc_net_tcp`], but also returns each row's socket inode, which
+/// is what ties the socket to the process holding it. An inode of `0`, or a
+/// row without the column, has no owner to find.
+pub fn parse_proc_net_tcp_with_inodes(contents: &str) -> Vec<(ListeningPort, Option<u64>)> {
     let mut lines = contents.trim().lines();
     let Some(header) = lines.next() else {
         return Vec::new();
@@ -91,6 +112,7 @@ pub fn parse_proc_net_tcp(contents: &str) -> Vec<ListeningPort> {
     let Some(address_column) = names.iter().position(|name| *name == "local_address") else {
         return Vec::new();
     };
+    let inode_column = names.iter().position(|name| *name == "inode");
 
     let mut ports = Vec::new();
     let mut seen = HashSet::default();
@@ -112,15 +134,36 @@ pub fn parse_proc_net_tcp(contents: &str) -> Vec<ListeningPort> {
             continue;
         };
         if seen.insert((host.clone(), port)) {
-            ports.push(ListeningPort { host, port });
+            let inode = inode_column
+                .and_then(|column| fields.get(column))
+                .and_then(|inode| inode.parse::<u64>().ok())
+                .filter(|inode| *inode != 0);
+            ports.push((ListeningPort { host, port }, inode));
         }
     }
     ports
 }
 
+/// Reads the inode out of a `/proc/<pid>/fd/<n>` link target, which for a
+/// socket is spelled `socket:[<inode>]`.
+pub fn parse_socket_link_inode(link: &str) -> Option<u64> {
+    link.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
 /// Parses `lsof -nP -iTCP -sTCP:LISTEN`, whose rows end in
 /// `TCP <address> (LISTEN)`.
 pub fn parse_lsof_output(contents: &str) -> Vec<ListeningPort> {
+    parse_lsof_output_with_pids(contents)
+        .into_iter()
+        .map(|socket| socket.port)
+        .collect()
+}
+
+/// Like [`parse_lsof_output`], but keeps the PID from each row's second column.
+pub fn parse_lsof_output_with_pids(contents: &str) -> Vec<ListeningSocket> {
     let mut ports = Vec::new();
     let mut seen = HashSet::default();
     for line in contents.lines() {
@@ -137,8 +180,9 @@ pub fn parse_lsof_output(contents: &str) -> Vec<ListeningPort> {
         let Some(port) = parse_host_and_port(address) else {
             continue;
         };
+        let process_id = fields.get(1).and_then(|pid| pid.parse::<u32>().ok());
         if seen.insert(port.clone()) {
-            ports.push(port);
+            ports.push(ListeningSocket { port, process_id });
         }
     }
     ports
@@ -147,6 +191,15 @@ pub fn parse_lsof_output(contents: &str) -> Vec<ListeningPort> {
 /// Parses `netstat -ano`, whose TCP rows are
 /// `TCP <local> <remote> LISTENING <pid>`.
 pub fn parse_netstat_output(contents: &str) -> Vec<ListeningPort> {
+    parse_netstat_output_with_pids(contents)
+        .into_iter()
+        .map(|socket| socket.port)
+        .collect()
+}
+
+/// Like [`parse_netstat_output`], but keeps the PID from each row's last
+/// column. PID 0 is the idle process, which owns nothing a user started.
+pub fn parse_netstat_output_with_pids(contents: &str) -> Vec<ListeningSocket> {
     let mut ports = Vec::new();
     let mut seen = HashSet::default();
     for line in contents.lines() {
@@ -169,8 +222,12 @@ pub fn parse_netstat_output(contents: &str) -> Vec<ListeningPort> {
         let Some(port) = parse_host_and_port(address) else {
             continue;
         };
+        let process_id = fields
+            .last()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| *pid != 0);
         if seen.insert(port.clone()) {
-            ports.push(port);
+            ports.push(ListeningSocket { port, process_id });
         }
     }
     ports
@@ -217,35 +274,136 @@ pub fn is_forwardable_host(host: &str) -> bool {
 
 /// Reads the listening ports of the machine this is running on.
 pub async fn scan_listening_ports() -> Result<Vec<ListeningPort>> {
-    let mut ports = platform_scan().await?;
-    ports.retain(|port| is_forwardable_host(&port.host));
-    ports.sort();
-    ports.dedup();
+    Ok(scan_listening_sockets()
+        .await?
+        .into_iter()
+        .map(|socket| socket.port)
+        .collect())
+}
+
+/// Reads the listening ports of the machine this is running on, with the
+/// process that owns each one where it can be seen.
+pub async fn scan_listening_sockets() -> Result<Vec<ListeningSocket>> {
+    let mut sockets = platform_scan().await?;
+    sockets.retain(|socket| is_forwardable_host(&socket.port.host));
+    sockets.sort();
+    sockets.dedup_by(|later, earlier| later.port == earlier.port);
+    Ok(sockets)
+}
+
+/// Merges the optional `/proc/net/tcp` and `tcp6` reads.
+///
+/// `NotFound` means that file is absent (no IPv6, or the container hid it),
+/// which is not a failed scan when the other file was actually read, an
+/// empty table included. Any other error can hide listeners, so an empty
+/// result is still a failure, as is every file missing.
+#[cfg(any(target_os = "linux", test))]
+fn merge_optional_reads<T>(
+    reads: impl IntoIterator<Item = (&'static str, std::io::Result<Vec<T>>)>,
+) -> Result<Vec<T>> {
+    let mut ports = Vec::new();
+    let mut any_success = false;
+    let mut missing_path = None;
+    let mut failed_read = None;
+    for (path, read) in reads {
+        match read {
+            Ok(rows) => {
+                any_success = true;
+                ports.extend(rows);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_path = Some(path);
+            }
+            Err(error) => failed_read = Some((path, error)),
+        }
+    }
+    if ports.is_empty()
+        && let Some((path, error)) = failed_read
+    {
+        return Err(error).with_context(|| format!("could not read {path}"));
+    }
+    if !any_success && let Some(path) = missing_path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no listening-port table could be read",
+        ))
+        .with_context(|| format!("could not read {path}"));
+    }
     Ok(ports)
 }
 
 #[cfg(target_os = "linux")]
-async fn platform_scan() -> Result<Vec<ListeningPort>> {
+async fn platform_scan() -> Result<Vec<ListeningSocket>> {
     // Both files are optional: a kernel built without IPv6 has no `tcp6`, and
     // a container may hide either, which is not a reason to report nothing.
-    let mut ports = Vec::new();
-    let mut last_error = None;
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => ports.extend(parse_proc_net_tcp(&contents)),
-            Err(error) => last_error = Some((path, error)),
+    let ports = merge_optional_reads([
+        (
+            "/proc/net/tcp",
+            std::fs::read_to_string("/proc/net/tcp")
+                .map(|contents| parse_proc_net_tcp_with_inodes(&contents)),
+        ),
+        (
+            "/proc/net/tcp6",
+            std::fs::read_to_string("/proc/net/tcp6")
+                .map(|contents| parse_proc_net_tcp_with_inodes(&contents)),
+        ),
+    ])?;
+
+    let inodes: HashSet<u64> = ports.iter().filter_map(|(_, inode)| *inode).collect();
+    let owners = socket_inode_owners(&inodes);
+    Ok(ports
+        .into_iter()
+        .map(|(port, inode)| ListeningSocket {
+            process_id: inode.and_then(|inode| owners.get(&inode).copied()),
+            port,
+        })
+        .collect())
+}
+
+/// Finds which process holds each socket by reading every `/proc/<pid>/fd`
+/// link. Another user's descriptors cannot be read without privileges, and a
+/// process can exit mid-walk, so each unreadable entry is skipped on its own and
+/// its sockets are simply left without an owner.
+#[cfg(target_os = "linux")]
+fn socket_inode_owners(inodes: &HashSet<u64>) -> HashMap<u64, u32> {
+    let mut owners = HashMap::default();
+    if inodes.is_empty() {
+        return owners;
+    }
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return owners;
+    };
+    for process in processes.flatten() {
+        let Some(process_id) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            let Ok(target) = std::fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let Some(inode) = target.to_str().and_then(parse_socket_link_inode) else {
+                continue;
+            };
+            if inodes.contains(&inode) {
+                owners.entry(inode).or_insert(process_id);
+            }
+        }
+        if owners.len() == inodes.len() {
+            break;
         }
     }
-    if ports.is_empty()
-        && let Some((path, error)) = last_error
-    {
-        return Err(error).with_context(|| format!("could not read {path}"));
-    }
-    Ok(ports)
+    owners
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-async fn platform_scan() -> Result<Vec<ListeningPort>> {
+async fn platform_scan() -> Result<Vec<ListeningSocket>> {
     let output = util::command::new_command("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
         .output()
@@ -254,17 +412,19 @@ async fn platform_scan() -> Result<Vec<ListeningPort>> {
     // `lsof` exits non-zero when some file descriptors could not be inspected,
     // which is the normal case for an unprivileged process, so the exit status
     // is not a reason to discard the rows it did print.
-    Ok(parse_lsof_output(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_lsof_output_with_pids(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 #[cfg(target_os = "windows")]
-async fn platform_scan() -> Result<Vec<ListeningPort>> {
+async fn platform_scan() -> Result<Vec<ListeningSocket>> {
     let output = util::command::new_command("netstat")
         .arg("-ano")
         .output()
         .await
         .context("could not run netstat")?;
-    Ok(parse_netstat_output(&String::from_utf8_lossy(
+    Ok(parse_netstat_output_with_pids(&String::from_utf8_lossy(
         &output.stdout,
     )))
 }
@@ -275,8 +435,182 @@ async fn platform_scan() -> Result<Vec<ListeningPort>> {
     target_os = "freebsd",
     target_os = "windows"
 )))]
-async fn platform_scan() -> Result<Vec<ListeningPort>> {
+async fn platform_scan() -> Result<Vec<ListeningSocket>> {
     anyhow::bail!("listening port detection is not implemented for this platform")
+}
+
+/// What is known about one process when attributing a port to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessDetails {
+    pub parent_process_id: Option<u32>,
+    pub name: String,
+    pub working_directory: Option<PathBuf>,
+}
+
+/// Who opened a listening port, and whether that makes it this project's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PortOwner {
+    pub process_id: Option<u32>,
+    pub process_name: Option<String>,
+    pub in_project: bool,
+    pub claude_session_id: Option<String>,
+    pub claude_session_name: Option<String>,
+}
+
+/// Far deeper than any real process tree, so the bound only ever stops a
+/// parent chain that loops.
+pub const MAX_PARENT_HOPS: usize = 64;
+
+/// A directory as stored, plus its canonical path when that spelling differs.
+///
+/// Process working directories from sysinfo and `/proc/<pid>/cwd` are already
+/// resolved. Worktree roots and Claude registration directories are the paths
+/// the user opened, which may still go through a symlink (`/tmp` to
+/// `/private/tmp`, `/home` to `/data/home`). A match on either spelling counts.
+/// Canonicalize failing leaves only the raw path.
+struct ResolvedDirectory {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+fn resolved_directory(path: &Path) -> ResolvedDirectory {
+    let canonical = std::fs::canonicalize(path)
+        .ok()
+        .filter(|canonical| canonical != path);
+    ResolvedDirectory {
+        raw: path.to_path_buf(),
+        canonical,
+    }
+}
+
+fn path_is_inside(path: &Path, root: &ResolvedDirectory) -> bool {
+    path.starts_with(&root.raw)
+        || root
+            .canonical
+            .as_ref()
+            .is_some_and(|canonical| path.starts_with(canonical))
+}
+
+fn directory_is_inside(directory: &Path, roots: &[ResolvedDirectory]) -> bool {
+    roots.iter().any(|root| path_is_inside(directory, root))
+}
+
+/// Registration directories are not pre-resolved, so both the stored path and
+/// its canonical path are compared. Roots are resolved once by the caller.
+fn registered_directory_is_inside(directory: &Path, roots: &[ResolvedDirectory]) -> bool {
+    if directory_is_inside(directory, roots) {
+        return true;
+    }
+    std::fs::canonicalize(directory)
+        .ok()
+        .is_some_and(|canonical| directory_is_inside(&canonical, roots))
+}
+
+struct PreparedAttribution<'a> {
+    roots: Vec<ResolvedDirectory>,
+    registrations: &'a [RegisteredSession],
+    session_inside_project: Vec<bool>,
+}
+
+impl<'a> PreparedAttribution<'a> {
+    fn prepare(registrations: &'a [RegisteredSession], worktree_roots: &[PathBuf]) -> Self {
+        let roots = worktree_roots
+            .iter()
+            .map(|root| resolved_directory(root))
+            .collect::<Vec<_>>();
+        let session_inside_project = registrations
+            .iter()
+            .map(|session| registered_directory_is_inside(&session.working_directory, &roots))
+            .collect();
+        Self {
+            roots,
+            registrations,
+            session_inside_project,
+        }
+    }
+
+    fn attribute(
+        &self,
+        process_id: Option<u32>,
+        processes: &HashMap<u32, ProcessDetails>,
+    ) -> PortOwner {
+        let Some(process_id) = process_id else {
+            return PortOwner::default();
+        };
+        let process = processes.get(&process_id);
+        let session_index = nearest_session_index(process_id, processes, self.registrations);
+        let session = session_index.and_then(|index| self.registrations.get(index));
+        let session_inside = session_index
+            .and_then(|index| self.session_inside_project.get(index).copied())
+            .unwrap_or(false);
+        let process_inside = process
+            .and_then(|process| process.working_directory.as_deref())
+            .is_some_and(|directory| directory_is_inside(directory, &self.roots));
+
+        PortOwner {
+            process_id: Some(process_id),
+            process_name: process.map(|process| process.name.clone()),
+            in_project: process_inside || session_inside,
+            claude_session_id: session.map(|session| session.session_id.clone()),
+            claude_session_name: session.and_then(|session| session.name.clone()),
+        }
+    }
+}
+
+/// Decides who owns a port and whether it belongs to the project whose
+/// worktrees are `worktree_roots`: either the owning process runs inside one
+/// of them, or it descends from a Claude Code session that does. A port whose
+/// owner cannot be seen and has no such ancestor is not the project's.
+pub fn attribute_port_owner(
+    process_id: Option<u32>,
+    processes: &HashMap<u32, ProcessDetails>,
+    registrations: &[RegisteredSession],
+    worktree_roots: &[PathBuf],
+) -> PortOwner {
+    PreparedAttribution::prepare(registrations, worktree_roots).attribute(process_id, processes)
+}
+
+/// Attributes every socket from one scan. Worktree roots and registration
+/// directories are canonicalized once here, on the caller's thread, which the
+/// remote server keeps off the session thread.
+pub fn attribute_listening_sockets(
+    sockets: Vec<ListeningSocket>,
+    processes: &HashMap<u32, ProcessDetails>,
+    registrations: &[RegisteredSession],
+    worktree_roots: &[PathBuf],
+) -> Vec<(ListeningPort, PortOwner)> {
+    let prepared = PreparedAttribution::prepare(registrations, worktree_roots);
+    sockets
+        .into_iter()
+        .map(|socket| {
+            let owner = prepared.attribute(socket.process_id, processes);
+            (socket.port, owner)
+        })
+        .collect()
+}
+
+fn nearest_session_index(
+    process_id: u32,
+    processes: &HashMap<u32, ProcessDetails>,
+    registrations: &[RegisteredSession],
+) -> Option<usize> {
+    let mut visited = HashSet::default();
+    let mut current = Some(process_id);
+    while let Some(process_id) = current {
+        if visited.len() >= MAX_PARENT_HOPS || !visited.insert(process_id) {
+            return None;
+        }
+        if let Some(index) = registrations
+            .iter()
+            .position(|session| session.process_id == process_id)
+        {
+            return Some(index);
+        }
+        current = processes
+            .get(&process_id)
+            .and_then(|process| process.parent_process_id);
+    }
+    None
 }
 
 /// The floor VS Code puts under the scan interval.
@@ -601,6 +935,464 @@ Active Connections\r
                 "{host} is not reachable through the remote loopback"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_proc_net_tcp_with_inodes_reads_the_inode_column() {
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            proc_net_tcp_header(),
+            "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0",
+            "   1: 00000000:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 0 1 0000000000000000 100 0 0 10 0",
+        );
+
+        assert_eq!(
+            parse_proc_net_tcp_with_inodes(&contents),
+            vec![
+                (
+                    ListeningPort {
+                        host: "127.0.0.1".to_string(),
+                        port: 8080,
+                    },
+                    Some(12345)
+                ),
+                (
+                    ListeningPort {
+                        host: "0.0.0.0".to_string(),
+                        port: 8081,
+                    },
+                    None
+                ),
+            ],
+            "the inode is the column named inode once rx_queue and tm->when are dropped, \
+             and inode 0 means no process holds the socket"
+        );
+    }
+
+    #[test]
+    fn test_parse_socket_link_inode() {
+        assert_eq!(parse_socket_link_inode("socket:[12345]"), Some(12345));
+        for link in [
+            "pipe:[12345]",
+            "socket:[]",
+            "socket:[12x]",
+            "socket:12345",
+            "/dev/null",
+            "anon_inode:[eventfd]",
+        ] {
+            assert_eq!(
+                parse_socket_link_inode(link),
+                None,
+                "{link:?} is not a socket"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_lsof_output_with_pids_keeps_the_pid_column() {
+        let contents = "\
+COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node      12345 user   23u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:3000 (LISTEN)
+python3   99999 user    3u  IPv4 0x000000000000beef      0t0  TCP *:8000 (LISTEN)
+";
+
+        assert_eq!(
+            parse_lsof_output_with_pids(contents),
+            vec![
+                ListeningSocket {
+                    port: ListeningPort {
+                        host: "127.0.0.1".to_string(),
+                        port: 3000,
+                    },
+                    process_id: Some(12345),
+                },
+                ListeningSocket {
+                    port: ListeningPort {
+                        host: "0.0.0.0".to_string(),
+                        port: 8000,
+                    },
+                    process_id: Some(99999),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_netstat_output_with_pids_keeps_the_last_column() {
+        let contents = "\
+  Proto  Local Address          Foreign Address        State           PID\r
+  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       1234\r
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       0\r
+";
+
+        assert_eq!(
+            parse_netstat_output_with_pids(contents),
+            vec![
+                ListeningSocket {
+                    port: ListeningPort {
+                        host: "127.0.0.1".to_string(),
+                        port: 3000,
+                    },
+                    process_id: Some(1234),
+                },
+                ListeningSocket {
+                    port: ListeningPort {
+                        host: "0.0.0.0".to_string(),
+                        port: 135,
+                    },
+                    process_id: None,
+                },
+            ],
+            "the trailing carriage return is not part of the PID, and PID 0 owns nothing"
+        );
+    }
+
+    fn process(parent: Option<u32>, name: &str, working_directory: Option<&str>) -> ProcessDetails {
+        ProcessDetails {
+            parent_process_id: parent,
+            name: name.to_string(),
+            working_directory: working_directory.map(PathBuf::from),
+        }
+    }
+
+    fn registration(
+        process_id: u32,
+        session_id: &str,
+        name: Option<&str>,
+        cwd: &str,
+    ) -> RegisteredSession {
+        RegisteredSession {
+            process_id,
+            session_id: session_id.to_string(),
+            working_directory: PathBuf::from(cwd),
+            process_start: String::new(),
+            version: String::new(),
+            kind: String::new(),
+            name: name.map(str::to_string),
+            status: None,
+            updated_at: None,
+            tmux_target: None,
+            bridge_session_id: None,
+        }
+    }
+
+    fn roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/work/app")]
+    }
+
+    #[test]
+    fn test_attribute_port_owner_process_inside_a_worktree_is_in_project() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (100, process(Some(1), "node", Some("/work/app/frontend"))),
+        ]);
+
+        assert_eq!(
+            attribute_port_owner(Some(100), &processes, &[], &roots()),
+            PortOwner {
+                process_id: Some(100),
+                process_name: Some("node".to_string()),
+                in_project: true,
+                claude_session_id: None,
+                claude_session_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_attribute_port_owner_claude_ancestor_inside_a_worktree_is_in_project() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (50, process(Some(1), "claude", Some("/work/app"))),
+            (60, process(Some(50), "zsh", Some("/tmp"))),
+            (70, process(Some(60), "python3", Some("/tmp/scratch"))),
+        ]);
+        let registrations = [registration(
+            50,
+            "session-a",
+            Some("fix-login"),
+            "/work/app",
+        )];
+
+        assert_eq!(
+            attribute_port_owner(Some(70), &processes, &registrations, &roots()),
+            PortOwner {
+                process_id: Some(70),
+                process_name: Some("python3".to_string()),
+                in_project: true,
+                claude_session_id: Some("session-a".to_string()),
+                claude_session_name: Some("fix-login".to_string()),
+            },
+            "the process runs outside the project, but the Claude session it descends from does not"
+        );
+    }
+
+    #[test]
+    fn test_attribute_port_owner_neighbouring_claude_session_is_named_but_not_in_project() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (50, process(Some(1), "claude", Some("/work/app"))),
+            (80, process(Some(1), "claude", Some("/work/other"))),
+            (90, process(Some(80), "node", Some("/work/other/web"))),
+        ]);
+        let registrations = [
+            registration(50, "session-a", Some("fix-login"), "/work/app"),
+            registration(80, "session-b", None, "/work/other"),
+        ];
+
+        assert_eq!(
+            attribute_port_owner(Some(90), &processes, &registrations, &roots()),
+            PortOwner {
+                process_id: Some(90),
+                process_name: Some("node".to_string()),
+                in_project: false,
+                claude_session_id: Some("session-b".to_string()),
+                claude_session_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_attribute_port_owner_unknown_owner_is_not_in_project() {
+        let processes = HashMap::from_iter([(1, process(None, "init", Some("/")))]);
+        assert_eq!(
+            attribute_port_owner(None, &processes, &[], &roots()),
+            PortOwner::default(),
+            "a socket with no visible owner is nobody's"
+        );
+        assert_eq!(
+            attribute_port_owner(Some(4242), &processes, &[], &roots()),
+            PortOwner {
+                process_id: Some(4242),
+                ..PortOwner::default()
+            },
+            "a PID the process table cannot see has no name or directory to go by"
+        );
+
+        let unreadable = HashMap::from_iter([(300, process(Some(1), "postgres", None))]);
+        assert!(
+            !attribute_port_owner(Some(300), &unreadable, &[], &roots()).in_project,
+            "a process whose working directory cannot be read is not in the project"
+        );
+    }
+
+    #[test]
+    fn test_attribute_port_owner_survives_a_parent_cycle() {
+        let processes = HashMap::from_iter([
+            (10, process(Some(20), "a", Some("/elsewhere"))),
+            (20, process(Some(10), "b", Some("/elsewhere"))),
+        ]);
+        let registrations = [registration(999, "session-z", None, "/work/app")];
+
+        assert_eq!(
+            attribute_port_owner(Some(10), &processes, &registrations, &roots()),
+            PortOwner {
+                process_id: Some(10),
+                process_name: Some("a".to_string()),
+                in_project: false,
+                claude_session_id: None,
+                claude_session_name: None,
+            }
+        );
+
+        let self_parent = HashMap::from_iter([(7, process(Some(7), "loop", None))]);
+        assert!(!attribute_port_owner(Some(7), &self_parent, &registrations, &roots()).in_project);
+    }
+
+    #[test]
+    fn test_attribute_port_owner_stops_after_the_hop_limit() {
+        // A chain one longer than the limit, with the Claude session at its top.
+        let chain_length = MAX_PARENT_HOPS as u32 + 1;
+        let processes: HashMap<u32, ProcessDetails> = (1..=chain_length)
+            .map(|process_id| {
+                let parent = (process_id > 1).then(|| process_id - 1);
+                (process_id, process(parent, "sh", None))
+            })
+            .collect();
+        let registrations = [registration(1, "session-top", None, "/work/app")];
+
+        assert_eq!(
+            attribute_port_owner(Some(chain_length), &processes, &registrations, &roots())
+                .claude_session_id,
+            None
+        );
+        assert_eq!(
+            attribute_port_owner(Some(chain_length - 1), &processes, &registrations, &roots())
+                .claude_session_id
+                .as_deref(),
+            Some("session-top"),
+            "a chain of exactly {MAX_PARENT_HOPS} processes still reaches its top"
+        );
+    }
+
+    #[test]
+    fn test_attribute_port_owner_matches_worktree_roots_by_path_component() {
+        let processes = HashMap::from_iter([
+            (100, process(None, "node", Some("/work/app2"))),
+            (101, process(None, "node", Some("/work/app"))),
+        ]);
+        let registrations = [registration(200, "session-c", None, "/work/app2/sub")];
+        let child_of_session = HashMap::from_iter([
+            (200, process(None, "claude", Some("/work/app2/sub"))),
+            (201, process(Some(200), "node", Some("/tmp"))),
+        ]);
+
+        assert!(
+            !attribute_port_owner(Some(100), &processes, &[], &roots()).in_project,
+            "/work/app2 shares a string prefix with /work/app but is not inside it"
+        );
+        assert!(
+            attribute_port_owner(Some(101), &processes, &[], &roots()).in_project,
+            "the worktree root itself is inside the project"
+        );
+        assert!(
+            !attribute_port_owner(Some(201), &child_of_session, &registrations, &roots())
+                .in_project,
+            "a Claude session in /work/app2 is not inside /work/app either"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_attribute_port_owner_matches_a_worktree_opened_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        struct TemporaryDirectory(std::path::PathBuf);
+        impl Drop for TemporaryDirectory {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!(
+                        "failed to remove temporary directory {}: {error}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let temporary = TemporaryDirectory(std::env::temp_dir().join(format!(
+            "zed-port-owner-symlink-{}-{unique}",
+            std::process::id()
+        )));
+        let real_application = temporary.0.join("real").join("app");
+        let real_sibling = temporary.0.join("real").join("app2");
+        let frontend = real_application.join("frontend");
+        let sibling_frontend = real_sibling.join("frontend");
+        let link_application = temporary.0.join("links").join("app");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::create_dir_all(&sibling_frontend).unwrap();
+        std::fs::create_dir_all(link_application.parent().unwrap()).unwrap();
+        symlink(&real_application, &link_application).unwrap();
+
+        let resolved_application = std::fs::canonicalize(&real_application).unwrap();
+        let resolved_frontend = std::fs::canonicalize(&frontend).unwrap();
+        let resolved_sibling = std::fs::canonicalize(&sibling_frontend).unwrap();
+        let link_directory = link_application.to_str().unwrap();
+        let resolved_frontend_directory = resolved_frontend.to_str().unwrap();
+        let resolved_sibling_directory = resolved_sibling.to_str().unwrap();
+        let outside_directory = temporary.0.join("outside");
+        let outside = outside_directory.to_str().unwrap();
+
+        let inside_processes = HashMap::from_iter([(
+            100,
+            process(None, "node", Some(resolved_frontend_directory)),
+        )]);
+        let sibling_processes =
+            HashMap::from_iter([(101, process(None, "node", Some(resolved_sibling_directory)))]);
+        let session_processes = HashMap::from_iter([
+            (50, process(None, "claude", Some(outside))),
+            (70, process(Some(50), "python3", Some(outside))),
+        ]);
+        let registrations = [registration(
+            50,
+            "session-a",
+            Some("fix-login"),
+            link_directory,
+        )];
+
+        let process_owner = attribute_port_owner(
+            Some(100),
+            &inside_processes,
+            &[],
+            std::slice::from_ref(&link_application),
+        );
+        let sibling_owner = attribute_port_owner(
+            Some(101),
+            &sibling_processes,
+            &[],
+            std::slice::from_ref(&link_application),
+        );
+        let session_owner = attribute_port_owner(
+            Some(70),
+            &session_processes,
+            &registrations,
+            std::slice::from_ref(&resolved_application),
+        );
+
+        assert_eq!(
+            (
+                process_owner.in_project,
+                sibling_owner.in_project,
+                session_owner.in_project,
+                session_owner.claude_session_id.as_deref(),
+            ),
+            (true, false, true, Some("session-a")),
+            "process {process_owner:?}\nsibling {sibling_owner:?}\nsession {session_owner:?}\nlink {}\nresolved {}",
+            link_application.display(),
+            resolved_application.display(),
+        );
+    }
+
+    #[test]
+    fn test_a_missing_proc_net_table_does_not_fail_when_the_other_was_read() {
+        let missing = || std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        let actual = merge_optional_reads([
+            ("/proc/net/tcp", Ok(Vec::<u16>::new())),
+            ("/proc/net/tcp6", Err(missing())),
+        ]);
+        assert_eq!(
+            actual
+                .as_ref()
+                .map(Vec::len)
+                .map_err(|error| error.to_string()),
+            Ok(0),
+            "not found is an absent optional table; an empty successful read is a real answer"
+        );
+
+        let denied_and_empty = merge_optional_reads([
+            ("/proc/net/tcp", Err(denied())),
+            ("/proc/net/tcp6", Ok(Vec::<u16>::new())),
+        ]);
+        assert!(
+            denied_and_empty.is_err(),
+            "a permission error on one table with no rows from the other must still fail the scan, got {denied_and_empty:?}"
+        );
+
+        let both_missing: Result<Vec<u16>> = merge_optional_reads([
+            ("/proc/net/tcp", Err(missing())),
+            ("/proc/net/tcp6", Err(missing())),
+        ]);
+        assert!(
+            both_missing.is_err(),
+            "when neither table can be read the scan must fail, got {both_missing:?}"
+        );
+
+        let kept = merge_optional_reads([
+            ("/proc/net/tcp", Ok(vec![7u16])),
+            ("/proc/net/tcp6", Err(missing())),
+        ]);
+        assert_eq!(
+            kept.as_ref()
+                .map(Vec::len)
+                .map_err(|error| error.to_string()),
+            Ok(1),
+            "rows from the table that could be read are kept when the other is absent, got {kept:?}"
+        );
     }
 
     #[test]

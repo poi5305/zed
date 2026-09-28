@@ -1362,22 +1362,52 @@ impl HeadlessProject {
     }
 
     async fn handle_get_listening_ports(
-        _this: Entity<Self>,
+        this: Entity<Self>,
         _envelope: TypedEnvelope<proto::GetListeningPorts>,
         cx: AsyncApp,
     ) -> Result<proto::GetListeningPortsResponse> {
+        let worktree_roots: Vec<PathBuf> = cx.read_entity(&this, |this, cx| {
+            this.worktree_store
+                .read(cx)
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect()
+        });
+        let registry_directory = paths::home_dir().join(".claude").join("sessions");
+
         // Scanning reads files on Linux but shells out on the other platforms,
         // so it is kept off the thread that serves the rest of the session.
         let ports = cx
-            .background_spawn(async move { remote::listening_ports::scan_listening_ports().await })
+            .background_spawn(async move {
+                let sockets = remote::listening_ports::scan_listening_sockets().await?;
+                let processes = listening_port_process_table();
+                // A registry that cannot be read leaves Claude ancestry unknown.
+                // Ports can still match by their own working directory, and the
+                // scan itself still succeeds.
+                let registrations =
+                    remote::claude_sessions::read_registrations(&registry_directory)
+                        .log_err()
+                        .unwrap_or_default();
+                anyhow::Ok(remote::listening_ports::attribute_listening_sockets(
+                    sockets,
+                    &processes,
+                    &registrations,
+                    &worktree_roots,
+                ))
+            })
             .await?;
 
         Ok(proto::GetListeningPortsResponse {
             ports: ports
                 .into_iter()
-                .map(|port| proto::ListeningPort {
+                .map(|(port, owner)| proto::ListeningPort {
                     host: port.host,
                     port: u32::from(port.port),
+                    pid: owner.process_id,
+                    process_name: owner.process_name,
+                    in_project: Some(owner.in_project),
+                    claude_session_id: owner.claude_session_id,
+                    claude_session_name: owner.claude_session_name,
                 })
                 .collect(),
         })
@@ -2117,6 +2147,31 @@ fn prompt_to_proto(
             proto::language_server_prompt_request::Critical {},
         ),
     }
+}
+
+/// Every process this server can see, with what port attribution needs. The
+/// whole table is read because the parent chain of a port's owner is not known
+/// until it is walked.
+fn listening_port_process_table() -> HashMap<u32, remote::listening_ports::ProcessDetails> {
+    let refresh_kind = RefreshKind::nothing().with_processes(
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cwd(UpdateKind::Always),
+    );
+    System::new_with_specifics(refresh_kind)
+        .processes()
+        .values()
+        .map(|process| {
+            (
+                process.pid().as_u32(),
+                remote::listening_ports::ProcessDetails {
+                    parent_process_id: process.parent().map(|parent| parent.as_u32()),
+                    name: process.name().to_string_lossy().into_owned(),
+                    working_directory: process.cwd().map(Path::to_path_buf),
+                },
+            )
+        })
+        .collect()
 }
 
 fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {

@@ -7,6 +7,7 @@
 
 use collections::HashSet;
 use remote::ListeningPort;
+use remote::listening_ports::PortOwner;
 use settings::AutoForwardPortsContent;
 
 /// What should happen when a port is detected. Same set of choices as
@@ -107,6 +108,53 @@ impl ListeningPortTracker {
     }
 }
 
+/// A port the remote server reported, with who opened it. `owner` is `None`
+/// only from a server too old to attribute ports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetectedPort {
+    pub port: ListeningPort,
+    pub owner: Option<PortOwner>,
+}
+
+/// Of the ports that just appeared, the ones worth offering: those this
+/// project's processes opened. An old server says nothing about ownership, and
+/// its ports are offered as they always were.
+pub fn ports_to_offer(
+    detected: Vec<DetectedPort>,
+    appeared: &[ListeningPort],
+) -> Vec<DetectedPort> {
+    detected
+        .into_iter()
+        .filter(|detected| appeared.contains(&detected.port))
+        .filter(|detected| detected.owner.as_ref().is_none_or(|owner| owner.in_project))
+        .collect()
+}
+
+/// The text of the notification offering a detected port.
+pub fn detected_port_message(port: u16, owner: Option<&PortOwner>) -> String {
+    let mut details = Vec::new();
+    if let Some(owner) = owner {
+        if let Some(process_name) = &owner.process_name {
+            details.push(process_name.clone());
+        }
+        if let Some(session) = owner
+            .claude_session_name
+            .as_ref()
+            .or(owner.claude_session_id.as_ref())
+        {
+            details.push(format!("Claude session \"{session}\""));
+        }
+    }
+    if details.is_empty() {
+        format!("Port {port} is now listening on the remote host.")
+    } else {
+        format!(
+            "Port {port} is now listening on the remote host ({}).",
+            details.join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +164,97 @@ mod tests {
             host: host.to_string(),
             port,
         }
+    }
+
+    fn owned(in_project: bool) -> PortOwner {
+        PortOwner {
+            process_id: Some(100),
+            process_name: Some("node".to_string()),
+            in_project,
+            claude_session_id: None,
+            claude_session_name: None,
+        }
+    }
+
+    fn detected(port: u16, owner: Option<PortOwner>) -> DetectedPort {
+        DetectedPort {
+            port: listening("127.0.0.1", port),
+            owner,
+        }
+    }
+
+    #[test]
+    fn test_ports_to_offer_keeps_only_this_projects_ports() {
+        let mut tracker = ListeningPortTracker::new();
+        let baseline = [detected(22, Some(owned(false)))];
+        tracker.observe(baseline.iter().map(|port| port.port.clone()).collect());
+
+        let scan = vec![
+            detected(22, Some(owned(false))),
+            detected(3000, Some(owned(true))),
+            detected(4000, Some(owned(false))),
+        ];
+        let appeared = tracker.observe(scan.iter().map(|port| port.port.clone()).collect());
+        assert_eq!(
+            ports_to_offer(scan.clone(), &appeared),
+            vec![detected(3000, Some(owned(true)))],
+            "a port opened outside the project is not offered, and the baseline port is not new"
+        );
+
+        assert_eq!(
+            tracker.observe(scan.iter().map(|port| port.port.clone()).collect()),
+            Vec::new(),
+            "the suppressed port is still tracked, so it does not come back on the next scan"
+        );
+    }
+
+    #[test]
+    fn test_ports_to_offer_offers_every_port_from_an_old_server() {
+        let appeared = vec![listening("127.0.0.1", 3000), listening("127.0.0.1", 4000)];
+        assert_eq!(
+            ports_to_offer(vec![detected(3000, None), detected(4000, None)], &appeared),
+            vec![detected(3000, None), detected(4000, None)]
+        );
+    }
+
+    #[test]
+    fn test_detected_port_message_names_the_owner() {
+        assert_eq!(
+            detected_port_message(3000, None),
+            "Port 3000 is now listening on the remote host.",
+            "an old server's ports keep the old text"
+        );
+        assert_eq!(
+            detected_port_message(3000, Some(&PortOwner::default())),
+            "Port 3000 is now listening on the remote host."
+        );
+        assert_eq!(
+            detected_port_message(3000, Some(&owned(true))),
+            "Port 3000 is now listening on the remote host (node)."
+        );
+        assert_eq!(
+            detected_port_message(
+                3000,
+                Some(&PortOwner {
+                    claude_session_id: Some("0f3a".to_string()),
+                    claude_session_name: Some("fix-login".to_string()),
+                    ..owned(true)
+                })
+            ),
+            "Port 3000 is now listening on the remote host (node, Claude session \"fix-login\")."
+        );
+        assert_eq!(
+            detected_port_message(
+                3000,
+                Some(&PortOwner {
+                    process_name: None,
+                    claude_session_id: Some("0f3a".to_string()),
+                    ..owned(true)
+                })
+            ),
+            "Port 3000 is now listening on the remote host (Claude session \"0f3a\").",
+            "an unnamed session is called by its id"
+        );
     }
 
     #[test]

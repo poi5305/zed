@@ -31,7 +31,10 @@ use crate::{
     apply_port_forward_edit, can_add_forward, choose_local_port, connection_is_editable,
     connection_key_for_options, connection_label, connection_label_for_key, describe_port_forward,
     local_port_is_configured,
-    port_detection::{AutoForwardAction, OnAutoForward, auto_forward_action, on_auto_forward},
+    port_detection::{
+        AutoForwardAction, OnAutoForward, auto_forward_action, detected_port_message,
+        on_auto_forward,
+    },
     port_detector::{PortDetector, PortDetectorEvent},
     port_forward_endpoints, port_forwards_for_key_mut, remove_port_forward, tunnelled_forwards,
     validate_port_forward,
@@ -576,31 +579,39 @@ impl ForwardPortsPanel {
             AutoForwardAction::Forward { open_in_browser } => Some(open_in_browser),
         };
 
-        for port in ports {
-            if self.detected_port_is_forwarded(&key, port.port) {
+        for detected in ports {
+            let port = detected.port.port;
+            if self.detected_port_is_forwarded(&key, port) {
                 continue;
             }
             match forward_immediately {
                 Some(open_in_browser) => {
-                    self.forward_detected_port(key.clone(), port.port, open_in_browser, cx)
+                    self.forward_detected_port(key.clone(), port, open_in_browser, cx)
                 }
-                None => self.notify_detected_port(key.clone(), port.port, cx),
+                None => self.notify_detected_port(
+                    key.clone(),
+                    port,
+                    detected_port_message(port, detected.owner.as_ref()),
+                    cx,
+                ),
             }
         }
     }
 
     /// Offers the forward rather than making it: a port on the remote host is
     /// not something the user has asked to see on their own machine.
-    fn notify_detected_port(&mut self, key: ConnectionKey, port: u16, cx: &mut Context<Self>) {
+    fn notify_detected_port(
+        &mut self,
+        key: ConnectionKey,
+        port: u16,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
         let panel = cx.weak_entity();
         let id = NotificationId::composite::<DetectedPortNotification>(SharedString::from(
             port.to_string(),
         ));
-        let toast = Toast::new(
-            id.clone(),
-            format!("Port {port} is now listening on the remote host."),
-        )
-        .on_click("Forward", move |_window, cx| {
+        let toast = Toast::new(id.clone(), message).on_click("Forward", move |_window, cx| {
             let key = key.clone();
             panel
                 .update(cx, |panel, cx| {

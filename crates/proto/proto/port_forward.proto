@@ -44,7 +44,14 @@ message GetListeningPortsResponse {
   repeated ListeningPort ports = 1;
 }
 
+// A server that attributes ports sets `in_project` on every one; an older
+// server leaves it unset, which is how a client tells the two apart.
 message ListeningPort {
   string host = 1;
   uint32 port = 2;
+  optional uint32 pid = 3;
+  optional string process_name = 4;
+  optional bool in_project = 5;
+  optional string claude_session_id = 6;
+  optional string claude_session_name = 7;
 }
