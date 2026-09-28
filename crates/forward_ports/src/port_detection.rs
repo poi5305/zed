@@ -114,11 +114,16 @@ impl ListeningPortTracker {
 pub struct DetectedPort {
     pub port: ListeningPort,
     pub owner: Option<PortOwner>,
+    /// False when the server judged the port not worth a notification: one
+    /// the operating system picked, or a browser's. An older server never
+    /// says so.
+    pub worth_offering: bool,
 }
 
 /// Of the ports that just appeared, the ones worth offering: those this
-/// project's processes opened. An old server says nothing about ownership, and
-/// its ports are offered as they always were.
+/// project's processes opened, less the ones the server marked as not worth
+/// it. An old server says nothing about ownership, and its ports are offered
+/// as they always were.
 pub fn ports_to_offer(
     detected: Vec<DetectedPort>,
     appeared: &[ListeningPort],
@@ -127,6 +132,7 @@ pub fn ports_to_offer(
         .into_iter()
         .filter(|detected| appeared.contains(&detected.port))
         .filter(|detected| detected.owner.as_ref().is_none_or(|owner| owner.in_project))
+        .filter(|detected| detected.worth_offering)
         .collect()
 }
 
@@ -180,7 +186,33 @@ mod tests {
         DetectedPort {
             port: listening("127.0.0.1", port),
             owner,
+            worth_offering: true,
         }
+    }
+
+    #[test]
+    fn test_ports_to_offer_skips_ports_the_server_says_are_not_worth_offering() {
+        let appeared = vec![
+            listening("127.0.0.1", 8977),
+            listening("127.0.0.1", 9641),
+            listening("127.0.0.1", 39205),
+        ];
+        let browser = DetectedPort {
+            worth_offering: false,
+            ..detected(9641, Some(owned(true)))
+        };
+        let ephemeral = DetectedPort {
+            worth_offering: false,
+            ..detected(39205, Some(owned(true)))
+        };
+        assert_eq!(
+            ports_to_offer(
+                vec![detected(8977, Some(owned(true))), browser, ephemeral],
+                &appeared
+            ),
+            vec![detected(8977, Some(owned(true)))],
+            "a project's dev server is offered; its browser and OS-assigned ports are not"
+        );
     }
 
     #[test]
