@@ -847,7 +847,7 @@ pub struct ClaudeSessionsKeepAliveContent {
     pub max_hours: Option<u32>,
     /// The message sent to refresh the prompt cache. Empty is ignored.
     ///
-    /// Default: a short instruction to reply with only "ok".
+    /// Default: "ok".
     pub message: Option<String>,
 }
 
