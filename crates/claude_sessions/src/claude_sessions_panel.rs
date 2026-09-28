@@ -11981,12 +11981,14 @@ fn keep_alive_chip_for(
     live: Option<&LiveSession>,
     cx: &App,
 ) -> Option<KeepAliveChip> {
-    let live = live.or_else(|| {
-        store
+    if live.is_none()
+        && !store
             .sessions()
             .iter()
-            .find(|session| session.session.session_id == session_id)
-    })?;
+            .any(|session| session.session.session_id == session_id)
+    {
+        return None;
+    }
     let (state, error) = match try_keep_alive_registry(cx) {
         Some(registry) => {
             let registry = registry.read(cx);
@@ -11999,8 +12001,6 @@ fn keep_alive_chip_for(
         cache_ttl: spend
             .map(|spend| spend.cache_ttl)
             .unwrap_or(CacheTtl::Unknown),
-        busy: live.status.as_deref() == Some("busy"),
-        waiting: live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
         channel_live: store.keep_alive_channel_live(session_id),
     };
     let config = ClaudeSessionsSettings::try_get(cx)

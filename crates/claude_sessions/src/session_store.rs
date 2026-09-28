@@ -917,8 +917,6 @@ impl ClaudeSessionStore {
                     .get(session_id)
                     .map(|spend| spend.cache_ttl)
                     .unwrap_or(CacheTtl::Unknown),
-                busy: live.status.as_deref() == Some("busy"),
-                waiting: live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
                 channel_live: true,
             };
             if keep_alive_status(&state, facts, &config, now_ms) != KeepAliveStatus::SendNow {
@@ -942,7 +940,7 @@ impl ClaudeSessionStore {
         now_ms: i64,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (background, process_id, busy, waiting) = {
+        let (background, process_id) = {
             let Some(live) = self
                 .live_sessions
                 .iter()
@@ -950,12 +948,7 @@ impl ClaudeSessionStore {
             else {
                 return false;
             };
-            (
-                live.background,
-                live.process_id,
-                live.status.as_deref() == Some("busy"),
-                live.waiting_for.is_some() || live.status.as_deref() == Some("waiting"),
-            )
+            (live.background, live.process_id)
         };
         if background || process_id == 0 {
             return false;
@@ -966,8 +959,6 @@ impl ClaudeSessionStore {
                 .get(session_id)
                 .map(|spend| spend.cache_ttl)
                 .unwrap_or(CacheTtl::Unknown),
-            busy,
-            waiting,
             channel_live: true,
         };
         let registry = keep_alive_registry(cx);
@@ -6328,6 +6319,71 @@ mod tests {
             source.keep_alive_sends.load(Ordering::SeqCst),
             1,
             "a ping that may have been delivered is waited on, never sent twice"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_busy_session_is_still_pinged_once_the_interval_is_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("keep-alive-busy");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join(format!("{KEEP_ALIVE_PID}.json")),
+            &registration_json(KEEP_ALIVE_PID, KEEP_ALIVE_SESSION)
+                .replace(r#""name":"live""#, r#""name":"live","status":"busy""#),
+        );
+        let source = Arc::new(KeepAliveSource::new(home_directory, cx.executor()));
+        let store = start_keep_alive(source.clone(), cx);
+        let status = store.read_with(cx, |store, _| {
+            store
+                .sessions()
+                .first()
+                .and_then(|live| live.session.status.clone())
+        });
+        assert_eq!(status.as_deref(), Some("busy"));
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            source.keep_alive_sends.load(Ordering::SeqCst),
+            1,
+            "a session left busy by background tasks or subagents must still be pinged, \
+             or its cache expires while they run"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_session_waiting_for_the_user_is_still_pinged_once_the_interval_is_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("keep-alive-waiting");
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join(format!("{KEEP_ALIVE_PID}.json")),
+            &registration_json(KEEP_ALIVE_PID, KEEP_ALIVE_SESSION)
+                .replace(r#""name":"live""#, r#""name":"live","status":"waiting""#),
+        );
+        let source = Arc::new(KeepAliveSource::new(home_directory, cx.executor()));
+        let store = start_keep_alive(source.clone(), cx);
+        let status = store.read_with(cx, |store, _| {
+            store
+                .sessions()
+                .first()
+                .and_then(|live| live.session.status.clone())
+        });
+        assert_eq!(status.as_deref(), Some("waiting"));
+
+        cx.executor().advance_clock(KEEP_ALIVE_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            source.keep_alive_sends.load(Ordering::SeqCst),
+            1,
+            "a session waiting for the user must still be pinged once the interval is up"
         );
     }
 

@@ -12,8 +12,9 @@ pub const MAX_INTERVAL_MINUTES: u32 = 55;
 pub const DEFAULT_MAX_HOURS: u32 = 12;
 pub const MIN_MAX_HOURS: u32 = 1;
 pub const MAX_MAX_HOURS: u32 = 48;
-pub const DEFAULT_MESSAGE: &str =
-    "[keep-alive] Reply with only \"ok\". Do not run tools or continue any task.";
+/// A bare word rather than an instruction: a ping queued behind a long tool call lands in
+/// the middle of a task, and telling Claude to stop there would derail it.
+pub const DEFAULT_MESSAGE: &str = "ok";
 pub const ONE_HOUR_CACHE_MS: i64 = 3_600_000;
 /// How long an unanswered ping is waited for, on Zed's clock, before keep-alive pauses, and how long
 /// after a ping every newly observed answer still counts as part of its reply (see `observe_answer`).
@@ -80,8 +81,6 @@ pub struct KeepAliveState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionFacts {
     pub cache_ttl: CacheTtl,
-    pub busy: bool,
-    pub waiting: bool,
     pub channel_live: bool,
 }
 
@@ -89,8 +88,6 @@ pub struct SessionFacts {
 pub enum PauseReason {
     NoAnswerYet,
     CacheTtlNotOneHour,
-    Busy,
-    Waiting,
     ChannelNotLoaded,
     PingUnanswered,
 }
@@ -213,12 +210,9 @@ pub fn status(
             expired_ms: expires,
         };
     }
-    if facts.busy {
-        return KeepAliveStatus::Paused(PauseReason::Busy);
-    }
-    if facts.waiting {
-        return KeepAliveStatus::Paused(PauseReason::Waiting);
-    }
+    // Neither a busy session nor one waiting for the user pauses the ping: a session left busy
+    // by background tasks or subagents makes no API calls of its own while it waits on them,
+    // so pausing would let the cache expire under them.
     let next = seen.saturating_add(config.interval_ms);
     if now_ms >= next {
         if facts.channel_live {
@@ -264,8 +258,6 @@ pub(crate) fn pause_reason_text(reason: PauseReason) -> &'static str {
         PauseReason::CacheTtlNotOneHour => {
             "This session's cache lives 5 minutes (or the host is too old to say)"
         }
-        PauseReason::Busy => "Claude is working",
-        PauseReason::Waiting => "Claude is waiting for you",
         PauseReason::ChannelNotLoaded => "The Zed channel is not loaded in this session",
         PauseReason::PingUnanswered => "The last ping got no answer",
     }
@@ -290,8 +282,6 @@ mod tests {
     fn hour_facts() -> SessionFacts {
         SessionFacts {
             cache_ttl: CacheTtl::OneHour,
-            busy: false,
-            waiting: false,
             channel_live: true,
         }
     }
@@ -413,25 +403,6 @@ mod tests {
             KeepAliveStatus::CacheExpired {
                 expired_ms: ONE_HOUR_CACHE_MS
             }
-        );
-    }
-
-    #[test]
-    fn status_pauses_while_claude_is_busy_or_waiting() {
-        let state = ready_state();
-        let config = default_config();
-        let now = config.interval_ms;
-        let mut facts = hour_facts();
-        facts.busy = true;
-        facts.waiting = true;
-        assert_eq!(
-            status(&state, facts, &config, now),
-            KeepAliveStatus::Paused(PauseReason::Busy)
-        );
-        facts.busy = false;
-        assert_eq!(
-            status(&state, facts, &config, now),
-            KeepAliveStatus::Paused(PauseReason::Waiting)
         );
     }
 
