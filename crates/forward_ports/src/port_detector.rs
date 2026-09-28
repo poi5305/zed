@@ -1,10 +1,10 @@
 use std::time::Instant;
 
 use gpui::{AsyncApp, Context, EventEmitter, SharedString, Task, WeakEntity};
-use remote::{ListeningPort, ScanTimings};
+use remote::{ListeningPort, ScanTimings, listening_ports::PortOwner};
 use rpc::{AnyProtoClient, proto};
 
-use crate::port_detection::ListeningPortTracker;
+use crate::port_detection::{DetectedPort, ListeningPortTracker, ports_to_offer};
 
 /// A remote server that does not answer the request at all - an older build,
 /// or a platform where scanning is not implemented - would otherwise be polled
@@ -12,9 +12,10 @@ use crate::port_detection::ListeningPortTracker;
 pub const MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 pub enum PortDetectorEvent {
-    /// Ports that were not listening on the previous scan. The scan made when
-    /// the connection opens is the baseline and never produces this.
-    PortsAppeared(Vec<ListeningPort>),
+    /// Ports of this project that were not listening on the previous scan.
+    /// The scan made when the connection opens is the baseline and never
+    /// produces this.
+    PortsAppeared(Vec<DetectedPort>),
     /// Scanning has been abandoned. Nothing will be detected until a new
     /// detector is built, so whoever owns this one has to say so and offer a
     /// way to start again.
@@ -61,21 +62,37 @@ impl PortDetector {
             match response {
                 Ok(response) => {
                     consecutive_failures = 0;
-                    let ports = response
+                    let detected: Vec<DetectedPort> = response
                         .ports
                         .into_iter()
                         .filter_map(|port| {
-                            Some(ListeningPort {
-                                host: port.host,
-                                port: u16::try_from(port.port).ok()?,
+                            let owner = port.in_project.map(|in_project| PortOwner {
+                                process_id: port.pid,
+                                process_name: port.process_name,
+                                in_project,
+                                claude_session_id: port.claude_session_id,
+                                claude_session_name: port.claude_session_name,
+                            });
+                            Some(DetectedPort {
+                                port: ListeningPort {
+                                    host: port.host,
+                                    port: u16::try_from(port.port).ok()?,
+                                },
+                                owner,
                             })
                         })
                         .collect();
                     let updated = this.update(cx, |this, cx| {
                         this.timings.record(elapsed);
-                        let appeared = this.tracker.observe(ports);
-                        if !appeared.is_empty() {
-                            cx.emit(PortDetectorEvent::PortsAppeared(appeared));
+                        // Every port is tracked, the project's or not, so that
+                        // what counts as new is the same as before ownership
+                        // was known.
+                        let appeared = this
+                            .tracker
+                            .observe(detected.iter().map(|port| port.port.clone()).collect());
+                        let offered = ports_to_offer(detected, &appeared);
+                        if !offered.is_empty() {
+                            cx.emit(PortDetectorEvent::PortsAppeared(offered));
                         }
                     });
                     if updated.is_err() {
