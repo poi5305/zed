@@ -26,6 +26,7 @@ pub enum PortDetectorEvent {
 pub struct PortDetector {
     project_id: u64,
     client: AnyProtoClient,
+    connection_id: Option<String>,
     tracker: ListeningPortTracker,
     timings: ScanTimings,
     _scan_task: Task<()>,
@@ -34,10 +35,19 @@ pub struct PortDetector {
 impl EventEmitter<PortDetectorEvent> for PortDetector {}
 
 impl PortDetector {
-    pub fn new(project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) -> Self {
+    /// `connection_id` is what this window's remote terminals carry as
+    /// `ZED_REMOTE_CONNECTION_ID`, which narrows the ports offered to the
+    /// ones those terminals, or this project's Claude sessions, opened.
+    pub fn new(
+        project_id: u64,
+        client: AnyProtoClient,
+        connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             project_id,
             client,
+            connection_id,
             tracker: ListeningPortTracker::new(),
             timings: ScanTimings::default(),
             _scan_task: cx.spawn(async move |this, cx| Self::scan_loop(this, cx).await),
@@ -47,15 +57,22 @@ impl PortDetector {
     async fn scan_loop(this: WeakEntity<Self>, cx: &mut AsyncApp) {
         let mut consecutive_failures = 0usize;
         loop {
-            let Ok((project_id, client)) =
-                this.read_with(cx, |this, _| (this.project_id, this.client.clone()))
-            else {
+            let Ok((project_id, client, connection_id)) = this.read_with(cx, |this, _| {
+                (
+                    this.project_id,
+                    this.client.clone(),
+                    this.connection_id.clone(),
+                )
+            }) else {
                 return;
             };
 
             let started_at = Instant::now();
             let response = client
-                .request(proto::GetListeningPorts { project_id })
+                .request(proto::GetListeningPorts {
+                    project_id,
+                    connection_id,
+                })
                 .await;
             let elapsed = started_at.elapsed();
 
@@ -79,6 +96,7 @@ impl PortDetector {
                                     port: u16::try_from(port.port).ok()?,
                                 },
                                 owner,
+                                worth_offering: port.not_worth_offering != Some(true),
                             })
                         })
                         .collect();
@@ -185,7 +203,7 @@ mod tests {
             requests: requests.clone(),
             handlers: Mutex::default(),
         }));
-        let detector = cx.new(|cx| PortDetector::new(1, client, cx));
+        let detector = cx.new(|cx| PortDetector::new(1, client, None, cx));
 
         let stopped_reasons = Arc::new(Mutex::new(Vec::<SharedString>::new()));
         let subscription = cx.update(|cx| {

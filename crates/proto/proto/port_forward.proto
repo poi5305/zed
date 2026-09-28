@@ -36,8 +36,13 @@ message ClosePortTunnel {
 
 // Detection of the ports that are listening on the remote host, so that a new
 // server started there can be offered for forwarding.
+// `connection_id` is the value this client sets as `ZED_REMOTE_CONNECTION_ID`
+// in its terminals. With it, a port is the project's only when it descends from
+// one of those terminals or from a Claude session inside a worktree. An older
+// client leaves it unset and gets the working-directory rule it was built for.
 message GetListeningPorts {
   uint64 project_id = 1;
+  optional string connection_id = 2;
 }
 
 message GetListeningPortsResponse {
@@ -54,4 +59,8 @@ message ListeningPort {
   optional bool in_project = 5;
   optional string claude_session_id = 6;
   optional string claude_session_name = 7;
+  // Set when the port is not worth a notification even if it is the
+  // project's: the operating system picked it, or a browser holds it. Unset
+  // from an older server, which means offer it.
+  optional bool not_worth_offering = 8;
 }

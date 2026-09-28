@@ -1002,6 +1002,13 @@ impl RemoteClient {
         self.client.clone().into()
     }
 
+    /// Names this connection to the remote server. It is fixed for the life of
+    /// the client and survives reconnects, since reconnecting rejoins the
+    /// server by it.
+    pub fn unique_identifier(&self) -> &str {
+        &self.unique_identifier
+    }
+
     pub fn connection_options(&self) -> RemoteConnectionOptions {
         self.connection_options.clone()
     }

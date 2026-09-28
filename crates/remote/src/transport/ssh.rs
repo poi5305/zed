@@ -1968,7 +1968,7 @@ fn build_command_posix(
 fn build_command_windows(
     input_program: Option<String>,
     input_args: &[String],
-    _input_env: &HashMap<String, String>,
+    input_env: &HashMap<String, String>,
     working_dir: Option<String>,
     port_forward: Option<(u16, String, u16)>,
     ssh_env: HashMap<String, String>,
@@ -1998,17 +1998,23 @@ fn build_command_windows(
         )?;
     }
 
-    // Windows OpenSSH has an 8K character limit for command lines. Sending a lot of environment variables easily puts us over the limit.
-    // Until we have a better solution for this, we just won't set environment variables for now.
-    // for (k, v) in input_env.iter() {
-    //     write!(
-    //         exec,
-    //         "$env:{}={} {} ",
-    //         k,
-    //         shell_kind.try_quote(v).context("shell quoting")?,
-    //         shell_kind.sequential_and_commands_separator()
-    //     )?;
-    // }
+    // Windows OpenSSH has an 8K character limit for command lines. The full
+    // environment blows past it, so the only variable forwarded is the one port
+    // attribution matches: this window's connection id.
+    if let Some(connection_id) =
+        input_env.get(crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR)
+    {
+        let quoted = shell_kind
+            .try_quote(connection_id)
+            .context("shell quoting")?;
+        write!(
+            exec,
+            "$env:{}={} {} ",
+            crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR,
+            quoted,
+            shell_kind.sequential_and_commands_separator()
+        )?;
+    }
 
     if let Some(input_program) = input_program {
         write!(
@@ -2200,6 +2206,68 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Windows OpenSSH cannot carry the whole environment (the command line is
+    /// capped near 8K), but this window's connection id is a single short
+    /// assignment and is what port attribution matches on.
+    #[test]
+    fn test_windows_remote_shell_receives_zed_remote_connection_id() -> Result<()> {
+        let mut input_env = HashMap::default();
+        input_env.insert("PATH".to_string(), "x".repeat(7_000));
+        input_env.insert(
+            crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR.to_string(),
+            "workspace-7".to_string(),
+        );
+
+        let command = build_command_windows(
+            None,
+            &[],
+            &input_env,
+            None,
+            None,
+            HashMap::default(),
+            PathStyle::Windows,
+            "powershell.exe",
+            ShellKind::PowerShell,
+            Vec::new(),
+            "user@host",
+            Interactive::Yes,
+        )?;
+
+        let script = decode_powershell_encoded_command(&command)?;
+        assert_eq!(
+            script,
+            "$env:ZED_REMOTE_CONNECTION_ID=workspace-7 ; powershell.exe",
+            "windows remote shell must inherit this window's connection id without copying the rest of the environment"
+        );
+        Ok(())
+    }
+
+    fn decode_powershell_encoded_command(command: &CommandTemplate) -> Result<String> {
+        use base64::Engine as _;
+
+        let argument = command
+            .args
+            .last()
+            .context("missing remote command argument")?;
+        let encoded = argument
+            .strip_prefix("powershell.exe -E ")
+            .context("remote command is not a powershell -E payload")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .context("powershell command is not base64")?;
+        if !bytes.len().is_multiple_of(2) {
+            anyhow::bail!(
+                "powershell command byte length {} is odd",
+                bytes.len()
+            );
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&units).context("powershell command is not utf-16")
     }
 
     #[test]

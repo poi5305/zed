@@ -1363,9 +1363,10 @@ impl HeadlessProject {
 
     async fn handle_get_listening_ports(
         this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::GetListeningPorts>,
+        envelope: TypedEnvelope<proto::GetListeningPorts>,
         cx: AsyncApp,
     ) -> Result<proto::GetListeningPortsResponse> {
+        let connection_id = envelope.payload.connection_id;
         let worktree_roots: Vec<PathBuf> = cx.read_entity(&this, |this, cx| {
             this.worktree_store
                 .read(cx)
@@ -1377,10 +1378,11 @@ impl HeadlessProject {
 
         // Scanning reads files on Linux but shells out on the other platforms,
         // so it is kept off the thread that serves the rest of the session.
-        let ports = cx
+        let (ports, ephemeral_ports) = cx
             .background_spawn(async move {
                 let sockets = remote::listening_ports::scan_listening_sockets().await?;
-                let processes = listening_port_process_table();
+                let mut system = listening_port_system();
+                let processes = listening_port_process_table(&system);
                 // A registry that cannot be read leaves Claude ancestry unknown.
                 // Ports can still match by their own working directory, and the
                 // scan itself still succeeds.
@@ -1388,12 +1390,22 @@ impl HeadlessProject {
                     remote::claude_sessions::read_registrations(&registry_directory)
                         .log_err()
                         .unwrap_or_default();
-                anyhow::Ok(remote::listening_ports::attribute_listening_sockets(
+                let mut marker_of =
+                    |process_id: u32| connection_marker_of(&mut system, process_id);
+                let marker = connection_id.as_deref().map(|connection_id| {
+                    remote::listening_ports::ConnectionMarker {
+                        connection_id,
+                        marker_of: &mut marker_of,
+                    }
+                });
+                let ports = remote::listening_ports::attribute_listening_sockets(
                     sockets,
                     &processes,
                     &registrations,
                     &worktree_roots,
-                ))
+                    marker,
+                );
+                anyhow::Ok((ports, remote::listening_ports::ephemeral_port_range()))
             })
             .await?;
 
@@ -1401,6 +1413,11 @@ impl HeadlessProject {
             ports: ports
                 .into_iter()
                 .map(|(port, owner)| proto::ListeningPort {
+                    not_worth_offering: Some(!remote::listening_ports::is_worth_offering(
+                        port.port,
+                        owner.process_name.as_deref(),
+                        &ephemeral_ports,
+                    )),
                     host: port.host,
                     port: u32::from(port.port),
                     pid: owner.process_id,
@@ -2152,13 +2169,19 @@ fn prompt_to_proto(
 /// Every process this server can see, with what port attribution needs. The
 /// whole table is read because the parent chain of a port's owner is not known
 /// until it is walked.
-fn listening_port_process_table() -> HashMap<u32, remote::listening_ports::ProcessDetails> {
+fn listening_port_system() -> System {
     let refresh_kind = RefreshKind::nothing().with_processes(
         ProcessRefreshKind::nothing()
             .without_tasks()
             .with_cwd(UpdateKind::Always),
     );
     System::new_with_specifics(refresh_kind)
+}
+
+fn listening_port_process_table(
+    system: &System,
+) -> HashMap<u32, remote::listening_ports::ProcessDetails> {
+    system
         .processes()
         .values()
         .map(|process| {
@@ -2172,6 +2195,39 @@ fn listening_port_process_table() -> HashMap<u32, remote::listening_ports::Proce
             )
         })
         .collect()
+}
+
+/// Reads one process's `ZED_REMOTE_CONNECTION_ID`. Environments are read
+/// only for the processes attribution asks about, the parent chains of socket
+/// owners, rather than for the whole table on every scan. Another user's
+/// process, or one that has exited, reads as unmarked.
+///
+/// On Linux the file is read directly: sysinfo's single-pid refresh still
+/// lists every process in /proc before filtering, which a scan would repeat
+/// for every ancestor it looks up.
+#[cfg(target_os = "linux")]
+fn connection_marker_of(_system: &mut System, process_id: u32) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{process_id}/environ")).ok()?;
+    remote::listening_ports::connection_marker_in_environ(&environ)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connection_marker_of(system: &mut System, process_id: u32) -> Option<String> {
+    let pid = sysinfo::Pid::from_u32(process_id);
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_environ(UpdateKind::Always),
+    );
+    let prefix = format!("{}=", remote::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR);
+    system.process(pid)?.environ().iter().find_map(|entry| {
+        entry
+            .to_str()?
+            .strip_prefix(prefix.as_str())
+            .map(str::to_string)
+    })
 }
 
 fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {

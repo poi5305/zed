@@ -7,6 +7,7 @@
 //! `extHostTunnelService.ts`, which solves the same problem from inside the
 //! remote server.
 
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -506,10 +507,63 @@ fn registered_directory_is_inside(directory: &Path, roots: &[ResolvedDirectory])
         .is_some_and(|canonical| directory_is_inside(&canonical, roots))
 }
 
+/// Set on every remote terminal a Zed client spawns, to that client's
+/// connection identifier, so that the remote server can tell which window's
+/// terminals a listening process descends from.
+pub const REMOTE_CONNECTION_ID_ENV_VAR: &str = "ZED_REMOTE_CONNECTION_ID";
+
+/// Reads [`REMOTE_CONNECTION_ID_ENV_VAR`] out of a NUL-separated environment
+/// block, as `/proc/<pid>/environ` spells it.
+pub fn connection_marker_in_environ(environ: &[u8]) -> Option<String> {
+    let prefix = format!("{REMOTE_CONNECTION_ID_ENV_VAR}=");
+    environ.split(|byte| *byte == 0).find_map(|entry| {
+        entry
+            .strip_prefix(prefix.as_bytes())
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(str::to_string)
+    })
+}
+
+/// The connection that asked for the scan, and how to read the
+/// [`REMOTE_CONNECTION_ID_ENV_VAR`] of a process. The lookup returns `None`
+/// when the variable is unset or the environment cannot be read.
+pub struct ConnectionMarker<'a> {
+    pub connection_id: &'a str,
+    pub marker_of: &'a mut dyn FnMut(u32) -> Option<String>,
+}
+
 struct PreparedAttribution<'a> {
     roots: Vec<ResolvedDirectory>,
     registrations: &'a [RegisteredSession],
     session_inside_project: Vec<bool>,
+}
+
+/// Whether a process or one of its ancestors was spawned by a terminal of the
+/// connection in `marker`. Each process's environment is read at most once
+/// per scan, since sockets usually share most of their parent chain.
+fn descends_from_marked_terminal(
+    process_id: u32,
+    processes: &HashMap<u32, ProcessDetails>,
+    marker: &mut ConnectionMarker,
+    marked: &mut HashMap<u32, bool>,
+) -> bool {
+    let mut visited = HashSet::default();
+    let mut current = Some(process_id);
+    while let Some(process_id) = current {
+        if visited.len() >= MAX_PARENT_HOPS || !visited.insert(process_id) {
+            return false;
+        }
+        let is_marked = *marked.entry(process_id).or_insert_with(|| {
+            (marker.marker_of)(process_id).as_deref() == Some(marker.connection_id)
+        });
+        if is_marked {
+            return true;
+        }
+        current = processes
+            .get(&process_id)
+            .and_then(|process| process.parent_process_id);
+    }
+    false
 }
 
 impl<'a> PreparedAttribution<'a> {
@@ -529,10 +583,16 @@ impl<'a> PreparedAttribution<'a> {
         }
     }
 
+    /// With a `marker`, a port is the project's only when it descends from one
+    /// of the asking connection's terminals or from a Claude session inside a
+    /// worktree; the owner's own working directory no longer counts, because
+    /// anything started from inside the project directory would pass it.
+    /// Without one (an older client), the working directory still counts.
     fn attribute(
         &self,
         process_id: Option<u32>,
         processes: &HashMap<u32, ProcessDetails>,
+        marker: Option<(&mut ConnectionMarker, &mut HashMap<u32, bool>)>,
     ) -> PortOwner {
         let Some(process_id) = process_id else {
             return PortOwner::default();
@@ -543,14 +603,20 @@ impl<'a> PreparedAttribution<'a> {
         let session_inside = session_index
             .and_then(|index| self.session_inside_project.get(index).copied())
             .unwrap_or(false);
-        let process_inside = process
-            .and_then(|process| process.working_directory.as_deref())
-            .is_some_and(|directory| directory_is_inside(directory, &self.roots));
+        let in_project = session_inside
+            || match marker {
+                Some((marker, marked)) => {
+                    descends_from_marked_terminal(process_id, processes, marker, marked)
+                }
+                None => process
+                    .and_then(|process| process.working_directory.as_deref())
+                    .is_some_and(|directory| directory_is_inside(directory, &self.roots)),
+            };
 
         PortOwner {
             process_id: Some(process_id),
             process_name: process.map(|process| process.name.clone()),
-            in_project: process_inside || session_inside,
+            in_project,
             claude_session_id: session.map(|session| session.session_id.clone()),
             claude_session_name: session.and_then(|session| session.name.clone()),
         }
@@ -567,26 +633,110 @@ pub fn attribute_port_owner(
     registrations: &[RegisteredSession],
     worktree_roots: &[PathBuf],
 ) -> PortOwner {
-    PreparedAttribution::prepare(registrations, worktree_roots).attribute(process_id, processes)
+    PreparedAttribution::prepare(registrations, worktree_roots).attribute(
+        process_id,
+        processes,
+        None,
+    )
 }
 
 /// Attributes every socket from one scan. Worktree roots and registration
 /// directories are canonicalized once here, on the caller's thread, which the
-/// remote server keeps off the session thread.
+/// remote server keeps off the session thread. `marker` is the asking
+/// connection's, when the client sent one.
 pub fn attribute_listening_sockets(
     sockets: Vec<ListeningSocket>,
     processes: &HashMap<u32, ProcessDetails>,
     registrations: &[RegisteredSession],
     worktree_roots: &[PathBuf],
+    mut marker: Option<ConnectionMarker>,
 ) -> Vec<(ListeningPort, PortOwner)> {
     let prepared = PreparedAttribution::prepare(registrations, worktree_roots);
+    let mut marked = HashMap::default();
     sockets
         .into_iter()
         .map(|socket| {
-            let owner = prepared.attribute(socket.process_id, processes);
+            let owner = prepared.attribute(
+                socket.process_id,
+                processes,
+                marker.as_mut().map(|marker| (marker, &mut marked)),
+            );
             (socket.port, owner)
         })
         .collect()
+}
+
+/// Linux's default `net.ipv4.ip_local_port_range`.
+pub const LINUX_DEFAULT_EPHEMERAL_PORTS: RangeInclusive<u16> = 32768..=60999;
+
+/// The IANA dynamic range, which macOS and Windows use for ephemeral ports.
+pub const IANA_EPHEMERAL_PORTS: RangeInclusive<u16> = 49152..=65535;
+
+/// Parses `/proc/sys/net/ipv4/ip_local_port_range`, two whitespace-separated
+/// numbers.
+pub fn parse_ip_local_port_range(contents: &str) -> Option<RangeInclusive<u16>> {
+    let mut numbers = contents.split_whitespace().map(str::parse::<u16>);
+    let low = numbers.next()?.ok()?;
+    let high = numbers.next()?.ok()?;
+    (low <= high).then_some(low..=high)
+}
+
+/// The range the operating system picks from when a program binds port 0.
+pub fn ephemeral_port_range() -> RangeInclusive<u16> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|contents| parse_ip_local_port_range(&contents))
+            .unwrap_or(LINUX_DEFAULT_EPHEMERAL_PORTS)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        IANA_EPHEMERAL_PORTS
+    }
+}
+
+/// Browser process names, compared whole and without case. A browser's
+/// listening socket is its remote-debugging endpoint (an MCP driving Chrome
+/// opens one per page), never a server the user wants to open. Whole names
+/// rather than prefixes, so a dev tool whose name starts with "chrom" is not
+/// caught. Linux reports at most 15 bytes of a name, hence the truncated forms.
+const BROWSER_PROCESS_NAMES: &[&str] = &[
+    "chrome",
+    "chromium",
+    "chromium-browser",
+    "chromium-browse",
+    "chrome-headless-shell",
+    "chrome-headless",
+    "headless_shell",
+    "chrome_crashpad_handler",
+    "chrome_crashpad",
+    "google chrome",
+    "google-chrome",
+    "msedge",
+    "microsoft edge",
+    "firefox",
+    "firefox-bin",
+    "firefox-esr",
+];
+
+/// Whether a port the project opened should still be offered: not when the
+/// operating system chose it (a program that binds port 0 is talking to
+/// itself, not serving anything a person would open) and not when a browser
+/// holds it.
+pub fn is_worth_offering(
+    port: u16,
+    process_name: Option<&str>,
+    ephemeral_ports: &RangeInclusive<u16>,
+) -> bool {
+    if ephemeral_ports.contains(&port) {
+        return false;
+    }
+    !process_name.is_some_and(|name| {
+        BROWSER_PROCESS_NAMES
+            .iter()
+            .any(|browser| name.eq_ignore_ascii_case(browser))
+    })
 }
 
 fn nearest_session_index(
@@ -1223,6 +1373,284 @@ python3   99999 user    3u  IPv4 0x000000000000beef      0t0  TCP *:8000 (LISTEN
             Some("session-top"),
             "a chain of exactly {MAX_PARENT_HOPS} processes still reaches its top"
         );
+    }
+
+    fn socket(port: u16, process_id: u32) -> ListeningSocket {
+        ListeningSocket {
+            port: ListeningPort {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            process_id: Some(process_id),
+        }
+    }
+
+    /// Attributes one socket as the connection `connection_id` would, with
+    /// `environment` standing in for each process's marker variable, and
+    /// returns whether it is in the project plus every PID whose environment
+    /// was read.
+    fn attribute_for_connection(
+        owner: u32,
+        processes: &HashMap<u32, ProcessDetails>,
+        registrations: &[RegisteredSession],
+        connection_id: Option<&str>,
+        environment: &HashMap<u32, &str>,
+    ) -> (bool, Vec<u32>) {
+        let mut lookups = Vec::new();
+        let mut marker_of = |process_id: u32| {
+            lookups.push(process_id);
+            environment.get(&process_id).map(|value| value.to_string())
+        };
+        let marker = connection_id.map(|connection_id| ConnectionMarker {
+            connection_id,
+            marker_of: &mut marker_of,
+        });
+        let attributed = attribute_listening_sockets(
+            vec![socket(3000, owner)],
+            processes,
+            registrations,
+            &roots(),
+            marker,
+        );
+        let in_project = attributed
+            .first()
+            .is_some_and(|(_, owner)| owner.in_project);
+        (in_project, lookups)
+    }
+
+    #[test]
+    fn test_attribute_with_marker_a_process_under_this_connections_terminal_is_in_project() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "sshd", Some("/"))),
+            (10, process(Some(1), "zsh", Some("/home/me"))),
+            (20, process(Some(10), "npm", Some("/tmp/elsewhere"))),
+            (30, process(Some(20), "node", Some("/tmp/elsewhere"))),
+        ]);
+        // Only the shell carries the marker, as if `node` had been started
+        // with a cleared environment.
+        let environment = HashMap::from_iter([(10, "workspace-7")]);
+
+        assert!(
+            attribute_for_connection(30, &processes, &[], Some("workspace-7"), &environment).0,
+            "node descends from this connection's terminal, wherever it runs"
+        );
+        assert!(
+            !attribute_for_connection(30, &processes, &[], Some("workspace-8"), &environment).0,
+            "another window's terminal does not make the port this window's"
+        );
+    }
+
+    #[test]
+    fn test_attribute_with_marker_ignores_a_working_directory_inside_a_worktree() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (100, process(Some(1), "workerd", Some("/work/app/frontend"))),
+        ]);
+        let environment = HashMap::default();
+
+        assert!(
+            !attribute_for_connection(100, &processes, &[], Some("workspace-7"), &environment).0,
+            "a client that sends its connection id no longer trusts the working directory"
+        );
+        assert_eq!(
+            attribute_for_connection(100, &processes, &[], None, &environment),
+            (true, Vec::new()),
+            "an older client that sends no id keeps the working-directory rule, and no environment is read"
+        );
+    }
+
+    #[test]
+    fn test_attribute_with_marker_a_claude_session_inside_a_worktree_still_counts() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "tmux", Some("/"))),
+            (50, process(Some(1), "claude", Some("/work/app"))),
+            (70, process(Some(50), "node", Some("/tmp/scratch"))),
+            (80, process(None, "claude", Some("/work/other"))),
+            (90, process(Some(80), "node", Some("/work/app"))),
+        ]);
+        let registrations = [
+            registration(50, "session-a", Some("web-tools"), "/work/app"),
+            registration(80, "session-b", None, "/work/other"),
+        ];
+        let environment = HashMap::default();
+
+        assert!(
+            attribute_for_connection(
+                70,
+                &processes,
+                &registrations,
+                Some("workspace-7"),
+                &environment
+            )
+            .0,
+            "a Claude session in a worktree needs no terminal marker"
+        );
+        assert!(
+            !attribute_for_connection(
+                90,
+                &processes,
+                &registrations,
+                Some("workspace-7"),
+                &environment
+            )
+            .0,
+            "a session outside the project does not count, even though the process runs inside it"
+        );
+    }
+
+    #[test]
+    fn test_attribute_with_marker_an_unreadable_environment_is_unmarked() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (10, process(Some(1), "zsh", Some("/work/app"))),
+            (20, process(Some(10), "node", Some("/work/app"))),
+        ]);
+        let unreadable = HashMap::default();
+        let (in_project, lookups) =
+            attribute_for_connection(20, &processes, &[], Some("workspace-7"), &unreadable);
+        assert_eq!(
+            (in_project, lookups),
+            (false, vec![20, 10, 1]),
+            "every ancestor is tried, and none that cannot be read counts as marked"
+        );
+
+        let empty_marker = HashMap::from_iter([(10, "")]);
+        assert!(
+            !attribute_for_connection(20, &processes, &[], Some("workspace-7"), &empty_marker).0
+        );
+    }
+
+    #[test]
+    fn test_attribute_with_marker_survives_a_parent_cycle_and_reads_each_process_once() {
+        let processes = HashMap::from_iter([
+            (10, process(Some(20), "a", Some("/work/app"))),
+            (20, process(Some(10), "b", Some("/work/app"))),
+            (7, process(Some(7), "loop", None)),
+        ]);
+        let environment = HashMap::default();
+
+        assert_eq!(
+            attribute_for_connection(10, &processes, &[], Some("workspace-7"), &environment),
+            (false, vec![10, 20])
+        );
+        assert_eq!(
+            attribute_for_connection(7, &processes, &[], Some("workspace-7"), &environment),
+            (false, vec![7])
+        );
+
+        let chain_length = MAX_PARENT_HOPS as u32 + 5;
+        let chain: HashMap<u32, ProcessDetails> = (1..=chain_length)
+            .map(|process_id| {
+                let parent = (process_id > 1).then(|| process_id - 1);
+                (process_id, process(parent, "sh", None))
+            })
+            .collect();
+        let marked_top = HashMap::from_iter([(1, "workspace-7")]);
+        let (in_project, lookups) =
+            attribute_for_connection(chain_length, &chain, &[], Some("workspace-7"), &marked_top);
+        assert_eq!(
+            (in_project, lookups.len()),
+            (false, MAX_PARENT_HOPS),
+            "the walk stops at the hop limit rather than reading the whole chain"
+        );
+    }
+
+    #[test]
+    fn test_attribute_with_marker_reads_a_shared_ancestor_once_per_scan() {
+        let processes = HashMap::from_iter([
+            (1, process(None, "init", Some("/"))),
+            (10, process(Some(1), "zsh", Some("/"))),
+            (20, process(Some(10), "node", Some("/"))),
+            (30, process(Some(10), "node", Some("/"))),
+        ]);
+        let mut lookups = Vec::new();
+        let mut marker_of = |process_id: u32| {
+            lookups.push(process_id);
+            None
+        };
+        let attributed = attribute_listening_sockets(
+            vec![socket(3000, 20), socket(5173, 30)],
+            &processes,
+            &[],
+            &roots(),
+            Some(ConnectionMarker {
+                connection_id: "workspace-7",
+                marker_of: &mut marker_of,
+            }),
+        );
+        assert_eq!(attributed.len(), 2);
+        assert_eq!(lookups, vec![20, 10, 1, 30]);
+    }
+
+    #[test]
+    fn test_connection_marker_in_environ() {
+        assert_eq!(
+            connection_marker_in_environ(
+                b"PATH=/bin\0ZED_REMOTE_CONNECTION_ID_X=wrong\0\xff\xfe\0ZED_REMOTE_CONNECTION_ID=workspace-7=a\0"
+            )
+            .as_deref(),
+            Some("workspace-7=a"),
+            "a longer name sharing the prefix and a non-UTF-8 entry are skipped"
+        );
+        assert_eq!(
+            connection_marker_in_environ(b"ZED_REMOTE_CONNECTION_ID=workspace-7").as_deref(),
+            Some("workspace-7"),
+            "the last entry need not end in NUL"
+        );
+        assert_eq!(connection_marker_in_environ(b"PATH=/bin\0"), None);
+        assert_eq!(connection_marker_in_environ(b""), None);
+    }
+
+    #[test]
+    fn test_is_worth_offering_skips_ephemeral_ports_and_browsers() {
+        let ephemeral = LINUX_DEFAULT_EPHEMERAL_PORTS;
+        for port in [3000, 5173, 8080, 8977, 9229] {
+            assert!(
+                is_worth_offering(port, Some("node"), &ephemeral),
+                "a dev server on {port} is offered"
+            );
+        }
+        assert!(is_worth_offering(8977, Some("MainThread"), &ephemeral));
+        assert!(is_worth_offering(32767, None, &ephemeral));
+        assert!(is_worth_offering(60999 + 1, Some("node"), &ephemeral));
+        for port in [32768, 33675, 39205, 44427, 60999] {
+            assert!(
+                !is_worth_offering(port, Some("node"), &ephemeral),
+                "{port} is one the kernel hands out for port 0"
+            );
+        }
+        for browser in [
+            "chrome",
+            "Chrome",
+            "chromium-browse",
+            "Google Chrome",
+            "chrome_crashpad",
+            "firefox",
+            "msedge",
+        ] {
+            assert!(
+                !is_worth_offering(9641, Some(browser), &ephemeral),
+                "{browser} holds a debugging port"
+            );
+        }
+        for not_a_browser in ["chromatic", "chrome-devtools-mcp", "node"] {
+            assert!(
+                is_worth_offering(9641, Some(not_a_browser), &ephemeral),
+                "{not_a_browser} is not a browser"
+            );
+        }
+        assert!(!is_worth_offering(50000, Some("node"), &IANA_EPHEMERAL_PORTS));
+        assert!(is_worth_offering(40000, Some("node"), &IANA_EPHEMERAL_PORTS));
+    }
+
+    #[test]
+    fn test_parse_ip_local_port_range() {
+        assert_eq!(parse_ip_local_port_range("32768\t60999\n"), Some(32768..=60999));
+        assert_eq!(parse_ip_local_port_range("1024 65535"), Some(1024..=65535));
+        assert_eq!(parse_ip_local_port_range("60999 32768"), None);
+        assert_eq!(parse_ip_local_port_range("32768"), None);
+        assert_eq!(parse_ip_local_port_range("a b"), None);
+        assert_eq!(parse_ip_local_port_range(""), None);
     }
 
     #[test]

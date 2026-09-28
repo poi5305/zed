@@ -616,6 +616,10 @@ fn create_remote_shell(
     cx: &mut App,
 ) -> Result<(Shell, HashMap<String, String>)> {
     insert_zed_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
+    env.insert(
+        remote::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR.to_string(),
+        remote_client.read(cx).unique_identifier().to_string(),
+    );
 
     let (program, args) = match spawn_command {
         Some((program, args)) => (Some(program.clone()), args),

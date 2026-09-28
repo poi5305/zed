@@ -102,6 +102,7 @@ pub struct ForwardPortsPanel {
     /// Kept so that a detector which gave up can be built again without
     /// reopening the connection.
     proto_client: Option<AnyProtoClient>,
+    connection_id: Option<String>,
     /// Watches the remote host for servers that were started after the
     /// connection was made.
     _port_detector: Option<Entity<PortDetector>>,
@@ -217,6 +218,7 @@ impl ForwardPortsPanel {
             let mut connected_dev_container = None;
             let mut established_at_connect = Vec::new();
             let mut proto_client = None;
+            let mut connection_id = None;
             if let Some(remote_client) = remote_client {
                 let options = remote_client.read(cx).connection_options();
                 connected_connection = connection_key_for_options(&options);
@@ -232,6 +234,7 @@ impl ForwardPortsPanel {
                 }
 
                 proto_client = Some(remote_client.read(cx).proto_client());
+                connection_id = Some(remote_client.read(cx).unique_identifier().to_string());
                 let store = port_forward_store(&remote_client, cx);
                 subscriptions.push(cx.observe(&store, |_: &mut Self, _, cx| cx.notify()));
                 port_forwards = Some(store);
@@ -250,6 +253,7 @@ impl ForwardPortsPanel {
                 established_at_connect,
                 disconnected: HashSet::default(),
                 proto_client,
+                connection_id,
                 _port_detector: None,
                 _port_detector_subscription: None,
                 port_detector_stopped: None,
@@ -273,7 +277,10 @@ impl ForwardPortsPanel {
         let Some(proto_client) = self.proto_client.clone() else {
             return;
         };
-        let detector = cx.new(|cx| PortDetector::new(REMOTE_SERVER_PROJECT_ID, proto_client, cx));
+        let connection_id = self.connection_id.clone();
+        let detector = cx.new(|cx| {
+            PortDetector::new(REMOTE_SERVER_PROJECT_ID, proto_client, connection_id, cx)
+        });
         self._port_detector_subscription =
             Some(cx.subscribe(&detector, Self::on_port_detector_event));
         self._port_detector = Some(detector);
