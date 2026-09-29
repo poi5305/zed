@@ -38,6 +38,8 @@ pub use remote::claude_sessions as session_registry;
 pub use session_registry::HookInstallOutcome;
 pub use session_registry::{AgentListing, RegisteredSession, SubagentMeta, SubagentSummary};
 pub use session_source::{FileContents, LocalSource, RemoteSource, SessionListing, SessionSource};
+#[cfg(target_family = "wasm")]
+pub use session_source::{WebSource, set_remote_client};
 pub use session_store::{
     ClaudeSessionStore, EndedReason, EndedSession, LiveSession, SessionRow, StoreClock,
     TranscriptTarget,
@@ -48,8 +50,6 @@ pub use terminal_anchors::{
     TranscriptAnchor, align, anchor_rows, rows_match, screen_rows, skeleton,
 };
 pub use transcript::{AutoModeFlags, CompactMetadata, Transcript, TranscriptRecord};
-#[cfg(target_family = "wasm")]
-pub use session_source::{WebSource, set_remote_client};
 pub use usage::{ModelRates, Usage, rates_for_model};
 
 /// The panel's own settings. Its dock side lives here rather than in the panel, so that

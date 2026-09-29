@@ -23,17 +23,19 @@ pub fn dispatch(fs_rpc: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "ClaudeSessions::list_slash_commands" => list_slash_commands(params),
         "ClaudeSessions::list_files_under" => list_files_under(params),
         "ClaudeSessions::write_pasted_file" => write_pasted_file(params),
-        "ClaudeSessions::read_pending_question" => read_pending_question(params),
-        "ClaudeSessions::question_hook_is_installed" => question_hook_is_installed(),
-        "ClaudeSessions::read_live_message" => read_live_message(params),
-        "ClaudeSessions::install_question_hook" => install_question_hook(),
+        "ClaudeSessions::read_events_tail" => read_events_tail(params),
+        "ClaudeSessions::read_session_status" => read_session_status(params),
+        "ClaudeSessions::install_zed_hooks" => install_zed_hooks(),
+        "ClaudeSessions::uninstall_zed_hooks" => uninstall_zed_hooks(),
+        "ClaudeSessions::zed_hooks_installed" => zed_hooks_installed(),
         "ClaudeSessions::read_subagent_transcript_tail" => read_subagent_transcript_tail(params),
         "ClaudeSessions::subagent_transcript_path" => subagent_transcript_path(params),
         "ClaudeSessions::pane_target" => pane_target(params),
-        "ClaudeSessions::send_text" => send_text(params),
-        "ClaudeSessions::send_escape" => send_escape(params),
-        "ClaudeSessions::send_key" => send_key(params),
-        "ClaudeSessions::capture_pane" => capture_pane(params),
+        "ClaudeSessions::channel_status" => channel_status(params),
+        "ClaudeSessions::channel_send_message" => channel_send_message(params),
+        "ClaudeSessions::channel_interrupt" => channel_interrupt(params),
+        "ClaudeSessions::channel_answer_permission" => channel_answer_permission(params),
+        "ClaudeSessions::read_channel_inbox_tail" => read_channel_inbox_tail(params),
         // SessionSource::read_file has no twin in remote::claude_sessions; the SSH
         // handler owns this boundary, so the JSON-RPC path copies that handler.
         "ClaudeSessions::read_file" => read_file(params),
@@ -99,12 +101,6 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn sanitized_pane_target(params: &Value) -> Result<String> {
-    let pane_target = required_string(params, "pane_target")?;
-    remote::claude_sessions::pane_target(&pane_target)
-        .ok_or_else(|| anyhow!("invalid tmux pane target: {pane_target:?}"))
-}
-
 fn session_json(summary: remote::claude_sessions::SessionSummary) -> Value {
     json!({
         "process_id": summary.session.process_id,
@@ -118,7 +114,32 @@ fn session_json(summary: remote::claude_sessions::SessionSummary) -> Value {
         "transcript_path": summary.transcript_path.as_deref().map(path_string),
         "context_tokens": summary.spend.map(|spend| spend.context_tokens).unwrap_or(0),
         "total_cost_usd": summary.spend.and_then(|spend| spend.total_cost_usd),
+        "bridge_session_id": summary.session.bridge_session_id,
+        "last_answer_at_ms": summary.spend.and_then(|spend| spend.last_answer_at_ms),
+        "cache_ttl": summary.spend.map(|spend| cache_ttl_code(spend.cache_ttl)).unwrap_or(0),
     })
+}
+
+// The codes `proto::ClaudeSession::cache_ttl` uses, copied from the SSH handler so both
+// transports mean the same thing by them.
+fn cache_ttl_code(cache_ttl: remote::claude_sessions::CacheTtl) -> u32 {
+    match cache_ttl {
+        remote::claude_sessions::CacheTtl::Unknown => 0,
+        remote::claude_sessions::CacheTtl::FiveMinutes => 1,
+        remote::claude_sessions::CacheTtl::OneHour => 2,
+    }
+}
+
+fn claude_pid_param(params: &Value) -> Result<u32> {
+    let claude_pid = params
+        .get("claude_pid")
+        .and_then(Value::as_u64)
+        .and_then(|claude_pid| u32::try_from(claude_pid).ok())
+        .unwrap_or(0);
+    if claude_pid == 0 {
+        bail!("claude_pid must not be 0");
+    }
+    Ok(claude_pid)
 }
 
 fn subagent_json(summary: remote::claude_sessions::SubagentSummary) -> Value {
@@ -160,6 +181,7 @@ fn list_sessions(params: &Value) -> Result<Value> {
     Ok(json!({
         "sessions": sessions.into_iter().map(session_json).collect::<Vec<_>>(),
         "home_directory": path_string(&home_directory),
+        "liveness_unavailable_reason": remote::claude_sessions::liveness_unavailable_reason(),
     }))
 }
 
@@ -196,6 +218,12 @@ fn list_subagents(params: &Value) -> Result<Value> {
 fn list_slash_commands(params: &Value) -> Result<Value> {
     let home_directory = home_directory();
     let project_root = optional_string(params, "project_root").map(PathBuf::from);
+    let session_id = optional_string(params, "session_id");
+    let project_root = remote::claude_sessions::slash_command_project_root(
+        &home_directory,
+        session_id.as_deref(),
+        project_root.as_deref(),
+    )?;
     let commands =
         remote::claude_sessions::list_slash_commands(&home_directory, project_root.as_deref());
     Ok(json!({
@@ -218,7 +246,15 @@ fn list_slash_commands(params: &Value) -> Result<Value> {
 }
 
 fn list_files_under(params: &Value) -> Result<Value> {
-    let directory = PathBuf::from(required_string(params, "directory")?);
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let directory = remote::claude_sessions::session_files_directory(
+        &home_directory(),
+        session_id,
+        &PathBuf::from(required_string(params, "directory")?),
+    )?;
     let query = params
         .get("query")
         .and_then(Value::as_str)
@@ -237,59 +273,120 @@ fn write_pasted_file(params: &Value) -> Result<Value> {
     Ok(json!({ "path": path }))
 }
 
-fn read_pending_question(params: &Value) -> Result<Value> {
+fn read_events_tail(params: &Value) -> Result<Value> {
     let home_directory = home_directory();
     let session_id = required_string(params, "session_id")?;
-    let question = remote::claude_sessions::read_pending_question(&home_directory, &session_id)?;
-    Ok(match question {
-        Some(question) => json!({
-            "tool_use_id": question.tool_use_id,
-            "questions": question
-                .questions
-                .into_iter()
-                .map(|question| {
-                    json!({
-                        "header": question.header,
-                        "question": question.question,
-                        "options": question
-                            .options
-                            .into_iter()
-                            .map(|option| {
-                                json!({
-                                    "label": option.label,
-                                    "description": option.description,
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                        "multi_select": question.multi_select,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        }),
-        None => Value::Null,
-    })
+    let state = remote::claude_sessions::TailState {
+        path: None,
+        offset: u64_param(params, "offset"),
+        pending: optional_base64(params, "pending")?,
+    };
+    let progress = remote::claude_sessions::read_events_tail(&home_directory, &session_id, state)?;
+    Ok(tail_json(progress))
 }
 
-fn question_hook_is_installed() -> Result<Value> {
-    Ok(Value::Bool(
-        remote::claude_sessions::question_hook_is_installed(&home_directory()),
-    ))
-}
-
-fn read_live_message(params: &Value) -> Result<Value> {
-    let home_directory = home_directory();
+fn read_session_status(params: &Value) -> Result<Value> {
     let session_id = required_string(params, "session_id")?;
-    Ok(json!(remote::claude_sessions::read_live_message(
-        &home_directory,
+    Ok(json!(remote::claude_sessions::read_session_status(
+        &home_directory(),
         &session_id
     )?))
 }
 
-fn install_question_hook() -> Result<Value> {
-    let backup = remote::claude_sessions::install_question_hook(&home_directory())?;
+fn install_zed_hooks() -> Result<Value> {
+    Ok(
+        match remote::claude_sessions::install_zed_hooks(&home_directory())? {
+            remote::claude_sessions::HookInstallOutcome::AlreadyCurrent => {
+                json!({ "outcome": "already_current" })
+            }
+            remote::claude_sessions::HookInstallOutcome::ScriptsRefreshed => {
+                json!({ "outcome": "scripts_refreshed" })
+            }
+            remote::claude_sessions::HookInstallOutcome::Installed { backup_path } => json!({
+                "outcome": "installed",
+                "backup_path": backup_path.as_deref().map(path_string),
+            }),
+        },
+    )
+}
+
+fn uninstall_zed_hooks() -> Result<Value> {
+    remote::claude_sessions::uninstall_zed_hooks(&home_directory())?;
+    Ok(Value::Null)
+}
+
+fn zed_hooks_installed() -> Result<Value> {
+    Ok(Value::Bool(remote::claude_sessions::zed_hooks_installed(
+        &home_directory(),
+    )))
+}
+
+fn channel_status(params: &Value) -> Result<Value> {
+    let claude_pid = claude_pid_param(params)?;
+    let status = remote::claude_sessions::channel_status(
+        &home_directory(),
+        claude_pid,
+        remote::claude_sessions::now_millis(),
+    );
     Ok(json!({
-        "backup_path": backup.as_deref().map(path_string),
+        "live": status.live,
+        "heartbeat_at_ms": status.heartbeat_at_ms,
+        "server_pid": status.server_pid,
+        "features": status.features,
     }))
+}
+
+fn channel_send_message(params: &Value) -> Result<Value> {
+    let claude_pid = claude_pid_param(params)?;
+    let content = required_string(params, "content")?;
+    if content.len() > remote::claude_sessions::CHANNEL_MESSAGE_MAX_BYTES {
+        bail!("message content exceeds 4 MiB");
+    }
+    let outbox_file =
+        remote::claude_sessions::channel_send_message(&home_directory(), claude_pid, &content)?;
+    Ok(json!({ "outbox_file": outbox_file }))
+}
+
+fn channel_interrupt(params: &Value) -> Result<Value> {
+    let claude_pid = claude_pid_param(params)?;
+    let reason = required_string(params, "reason")?;
+    if reason.chars().count() > remote::claude_sessions::CHANNEL_INTERRUPT_REASON_MAX_CHARS {
+        bail!(
+            "interrupt reason exceeds {} characters",
+            remote::claude_sessions::CHANNEL_INTERRUPT_REASON_MAX_CHARS
+        );
+    }
+    let outbox_file =
+        remote::claude_sessions::channel_interrupt(&home_directory(), claude_pid, &reason)?;
+    Ok(json!({ "outbox_file": outbox_file }))
+}
+
+fn channel_answer_permission(params: &Value) -> Result<Value> {
+    let claude_pid = claude_pid_param(params)?;
+    let request_id = required_string(params, "request_id")?;
+    let allow = params
+        .get("allow")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("missing allow"))?;
+    let outbox_file = remote::claude_sessions::channel_answer_permission(
+        &home_directory(),
+        claude_pid,
+        &request_id,
+        allow,
+    )?;
+    Ok(json!({ "outbox_file": outbox_file }))
+}
+
+fn read_channel_inbox_tail(params: &Value) -> Result<Value> {
+    let claude_pid = claude_pid_param(params)?;
+    let state = remote::claude_sessions::TailState {
+        path: None,
+        offset: u64_param(params, "offset"),
+        pending: optional_base64(params, "pending")?,
+    };
+    let progress =
+        remote::claude_sessions::read_channel_inbox_tail(&home_directory(), claude_pid, state)?;
+    Ok(tail_json(progress))
 }
 
 fn read_subagent_transcript_tail(params: &Value) -> Result<Value> {
@@ -334,38 +431,15 @@ fn pane_target(params: &Value) -> Result<Value> {
     Ok(json!(remote::claude_sessions::pane_target(&tmux_field)))
 }
 
-fn send_text(params: &Value) -> Result<Value> {
-    let pane_target = sanitized_pane_target(params)?;
-    let text = required_string(params, "text")?;
-    smol::block_on(remote::claude_sessions::send_text(&pane_target, &text))?;
-    Ok(Value::Null)
-}
-
-fn send_escape(params: &Value) -> Result<Value> {
-    let pane_target = sanitized_pane_target(params)?;
-    smol::block_on(remote::claude_sessions::send_escape(&pane_target))?;
-    Ok(Value::Null)
-}
-
-fn send_key(params: &Value) -> Result<Value> {
-    let pane_target = sanitized_pane_target(params)?;
-    let key = required_string(params, "key")?;
-    let key = remote::claude_sessions::PaneKey::from_tmux_name(&key)
-        .with_context(|| format!("unknown pane key {key:?}"))?;
-    smol::block_on(remote::claude_sessions::send_key(&pane_target, key))?;
-    Ok(Value::Null)
-}
-
-fn capture_pane(params: &Value) -> Result<Value> {
-    let pane_target = sanitized_pane_target(params)?;
-    let contents = smol::block_on(remote::claude_sessions::capture_pane(&pane_target))?;
-    Ok(json!({ "contents": contents }))
-}
-
 fn read_file(params: &Value) -> Result<Value> {
     let home_directory = home_directory();
     let file_path = PathBuf::from(required_string(params, "path")?);
-    validate_claude_file_path(&file_path, &home_directory)?;
+    match optional_string(params, "session_id") {
+        Some(session_id) => {
+            validate_claude_attachment_path(&file_path, &home_directory, &session_id)?
+        }
+        None => validate_claude_file_path(&file_path, &home_directory)?,
+    }
 
     const MAXIMUM_READ_BYTES: u64 = 4 * 1024 * 1024;
     let requested = u64_param(params, "max_bytes");
@@ -437,6 +511,24 @@ fn validate_claude_file_path(path: &Path, home_directory: &Path) -> Result<()> {
             allowed_directory.display()
         );
     }
+    Ok(())
+}
+
+// Copied from the SSH handler: an attachment is judged against the working directory
+// the session registered, never one the request names.
+fn validate_claude_attachment_path(
+    path: &Path,
+    home_directory: &Path,
+    session_id: &str,
+) -> Result<()> {
+    let working_directory =
+        remote::claude_sessions::session_working_directory(home_directory, session_id)
+            .with_context(|| format!("no session is registered as {session_id}"))?;
+    anyhow::ensure!(
+        remote::claude_sessions::attachment_is_readable(path, &working_directory),
+        "path {} is outside the working directory of session {session_id}",
+        path.display(),
+    );
     Ok(())
 }
 
@@ -531,17 +623,19 @@ mod tests {
         "ClaudeSessions::list_slash_commands",
         "ClaudeSessions::list_files_under",
         "ClaudeSessions::write_pasted_file",
-        "ClaudeSessions::read_pending_question",
-        "ClaudeSessions::question_hook_is_installed",
-        "ClaudeSessions::read_live_message",
-        "ClaudeSessions::install_question_hook",
+        "ClaudeSessions::read_events_tail",
+        "ClaudeSessions::read_session_status",
+        "ClaudeSessions::install_zed_hooks",
+        "ClaudeSessions::uninstall_zed_hooks",
+        "ClaudeSessions::zed_hooks_installed",
         "ClaudeSessions::read_subagent_transcript_tail",
         "ClaudeSessions::subagent_transcript_path",
         "ClaudeSessions::pane_target",
-        "ClaudeSessions::send_text",
-        "ClaudeSessions::send_escape",
-        "ClaudeSessions::send_key",
-        "ClaudeSessions::capture_pane",
+        "ClaudeSessions::channel_status",
+        "ClaudeSessions::channel_send_message",
+        "ClaudeSessions::channel_interrupt",
+        "ClaudeSessions::channel_answer_permission",
+        "ClaudeSessions::read_channel_inbox_tail",
         "ClaudeSessions::read_file",
     ];
 
