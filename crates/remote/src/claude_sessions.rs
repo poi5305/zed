@@ -15,7 +15,7 @@ use std::{
         Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -511,8 +511,7 @@ pub async fn process_start_times(_process_ids: Vec<u32>) -> HashMap<u32, String>
     HashMap::default()
 }
 
-// wasm checks liveness through `process_start_times`'s `ps` arm, so it has a check to
-// offer just as unix does.
+// On wasm the listing comes from the server, which answers this for its own host.
 #[cfg(any(unix, target_family = "wasm"))]
 pub fn liveness_unavailable_reason() -> Option<&'static str> {
     None

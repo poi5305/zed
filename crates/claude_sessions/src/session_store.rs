@@ -2538,8 +2538,6 @@ mod tests {
         atomic::{AtomicU32, Ordering},
     };
 
-    use gpui::AppContext as _;
-
     /// The text of a scan failure this test recognizes among whatever else the test
     /// binary logs.
     const SCAN_FAILURE: &str = "claude-scan-probe: the registry directory is unreadable";
@@ -3988,14 +3986,6 @@ mod tests {
         cx.run_until_parked();
 
         std::fs::remove_dir_all(&home_directory).ok();
-    }
-
-    fn registration_json_with_tmux(process_id: u32, session_id: &str, tmux: &str) -> String {
-        format!(
-            r#"{{"pid":{process_id},"sessionId":"{session_id}","cwd":"/tmp",
-"procStart":"{FAKE_PROCESS_START}","version":"2.1.267","kind":"interactive",
-"tmux":"{tmux}","name":"live"}}"#
-        )
     }
 
     /// A registry scan that failed has to reach the log, not only the store.

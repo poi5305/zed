@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 #[cfg(target_family = "wasm")]
 use std::sync::OnceLock;
-#[cfg(target_family = "wasm")]
+#[cfg(any(test, target_family = "wasm"))]
 use util::ResultExt as _;
 
 use crate::session_registry::{
@@ -918,53 +918,87 @@ impl WebSource {
 }
 
 #[cfg(target_family = "wasm")]
-impl SessionSource for WebSource {
-    fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>> {
+impl WebSource {
+    fn call<R: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Task<Result<R>> {
         let client = match wasm_rpc_client() {
             Ok(client) => client,
             Err(error) => return Task::ready(Err(error)),
         };
-        let params = json!({
-            "project_root": project_root.as_deref().map(path_to_wire),
-        });
+        self.executor
+            .spawn(async move { client.call::<_, R>(method, &params).await })
+    }
+
+    fn tail(&self, method: &'static str, params: serde_json::Value) -> Task<Result<TailProgress>> {
+        let response = self.call::<TailProgressJson>(method, params);
+        self.executor
+            .spawn(async move { tail_progress_from_json(response.await?) })
+    }
+
+    fn read_claude_file(
+        &self,
+        path: PathBuf,
+        max_bytes: u64,
+        session_id: Option<String>,
+    ) -> Task<Result<FileContents>> {
+        let response = self.call::<ReadFileJson>(
+            "ClaudeSessions::read_file",
+            json!({
+                "path": path_to_wire(&path),
+                "max_bytes": max_bytes,
+                "session_id": session_id,
+            }),
+        );
         self.executor.spawn(async move {
-            let response = client
-                .call::<_, ListSessionsJson>("ClaudeSessions::list_sessions", &params)
-                .await?;
-            Ok(session_listing_from_json(response))
+            let response = response.await?;
+            Ok(FileContents {
+                bytes: decode_bytes(&response.contents)?,
+                truncated: response.truncated,
+            })
         })
+    }
+
+    fn outbox_file(&self, method: &'static str, params: serde_json::Value) -> Task<Result<String>> {
+        let response = self.call::<OutboxFileJson>(method, params);
+        self.executor
+            .spawn(async move { Ok(response.await?.outbox_file) })
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl SessionSource for WebSource {
+    fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>> {
+        let response = self.call::<ListSessionsJson>(
+            "ClaudeSessions::list_sessions",
+            json!({ "project_root": project_root.as_deref().map(path_to_wire) }),
+        );
+        self.executor
+            .spawn(async move { Ok(session_listing_from_json(response.await?)) })
     }
 
     fn tail_transcript(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "session_id": session_id,
-            "path": state.path.as_deref().map(path_to_wire),
-            "offset": state.offset,
-            "pending": encode_bytes(&state.pending),
-        });
-        self.executor.spawn(async move {
-            let response = client
-                .call::<_, TailProgressJson>("ClaudeSessions::read_transcript_tail", &params)
-                .await?;
-            tail_progress_from_json(response)
-        })
+        self.tail(
+            "ClaudeSessions::read_transcript_tail",
+            json!({
+                "session_id": session_id,
+                "path": state.path.as_deref().map(path_to_wire),
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+            }),
+        )
     }
 
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({ "session_id": session_id });
+        let response = self.call::<ListSubagentsJson>(
+            "ClaudeSessions::list_subagents",
+            json!({ "session_id": session_id }),
+        );
         self.executor.spawn(async move {
-            let response = client
-                .call::<_, ListSubagentsJson>("ClaudeSessions::list_subagents", &params)
-                .await?;
             Ok(response
+                .await?
                 .subagents
                 .into_iter()
                 .map(subagent_summary_from_json)
@@ -973,7 +1007,7 @@ impl SessionSource for WebSource {
     }
 
     /// One request per session rather than one that names them all: the far end already
-    /// answers [`ClaudeSessions::list_subagents`], matching [`RemoteSource`].
+    /// answers [`ClaudeSessions::list_subagents`].
     fn list_subagents_for_sessions(
         &self,
         session_ids: Vec<String>,
@@ -1004,62 +1038,74 @@ impl SessionSource for WebSource {
         })
     }
 
-    fn pending_question(&self, session_id: String) -> Task<Result<QuestionState>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({ "session_id": session_id });
+    fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
+        self.tail(
+            "ClaudeSessions::read_events_tail",
+            json!({
+                "session_id": session_id,
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+            }),
+        )
+    }
+
+    fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
+        self.call(
+            "ClaudeSessions::read_session_status",
+            json!({ "session_id": session_id }),
+        )
+    }
+
+    fn install_hooks(&self) -> Task<Result<HookInstallOutcome>> {
+        let response =
+            self.call::<InstallHooksJson>("ClaudeSessions::install_zed_hooks", json!({}));
         self.executor.spawn(async move {
-            let question = client
-                .call::<_, Option<PendingQuestionJson>>(
-                    "ClaudeSessions::read_pending_question",
-                    &params,
-                )
-                .await?;
-            let hook_installed = client
-                .call::<_, bool>("ClaudeSessions::question_hook_is_installed", &json!({}))
-                .await?;
-            let live_message = client
-                .call::<_, Option<String>>("ClaudeSessions::read_live_message", &params)
-                .await?;
-            Ok(QuestionState {
-                question: pending_question_from_json(question),
-                hook_installed,
-                live_message,
+            let response = response.await?;
+            Ok(match response.outcome.as_str() {
+                "installed" => HookInstallOutcome::Installed {
+                    backup_path: response.backup_path.map(PathBuf::from),
+                },
+                "scripts_refreshed" => HookInstallOutcome::ScriptsRefreshed,
+                _ => HookInstallOutcome::AlreadyCurrent,
             })
         })
     }
 
-    fn install_question_hook(&self) -> Task<Result<Option<PathBuf>>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
+    fn uninstall_hooks(&self) -> Task<Result<()>> {
+        let response =
+            self.call::<serde_json::Value>("ClaudeSessions::uninstall_zed_hooks", json!({}));
         self.executor.spawn(async move {
-            let response = client
-                .call::<_, InstallHookJson>("ClaudeSessions::install_question_hook", &json!({}))
-                .await?;
-            Ok(response.backup_path.map(PathBuf::from))
+            response.await?;
+            Ok(())
         })
+    }
+
+    fn hooks_installed(&self) -> Task<Result<bool>> {
+        self.call("ClaudeSessions::zed_hooks_installed", json!({}))
     }
 
     fn list_slash_commands(
         &self,
         project_root: Option<PathBuf>,
     ) -> Task<Result<Vec<SlashCommand>>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "project_root": project_root.map(|root| root.to_string_lossy().into_owned()),
-        });
+        self.list_slash_commands_for(project_root, None)
+    }
+
+    fn list_slash_commands_for(
+        &self,
+        project_root: Option<PathBuf>,
+        session_id: Option<String>,
+    ) -> Task<Result<Vec<SlashCommand>>> {
+        let response = self.call::<ListSlashCommandsJson>(
+            "ClaudeSessions::list_slash_commands",
+            json!({
+                "project_root": project_root.map(|root| root.to_string_lossy().into_owned()),
+                "session_id": session_id,
+            }),
+        );
         self.executor.spawn(async move {
-            let response = client
-                .call::<_, ListSlashCommandsJson>("ClaudeSessions::list_slash_commands", &params)
-                .await?;
             Ok(response
+                .await?
                 .commands
                 .into_iter()
                 .map(slash_command_from_json)
@@ -1068,37 +1114,36 @@ impl SessionSource for WebSource {
     }
 
     fn list_session_files(&self, directory: PathBuf, query: String) -> Task<Result<Vec<String>>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "directory": directory.to_string_lossy(),
-            "query": query,
-        });
-        self.executor.spawn(async move {
-            let response = client
-                .call::<_, ListSessionFilesJson>("ClaudeSessions::list_files_under", &params)
-                .await?;
-            Ok(response.paths)
-        })
+        self.list_session_files_in(String::new(), directory, query)
+    }
+
+    fn list_session_files_in(
+        &self,
+        session_id: String,
+        directory: PathBuf,
+        query: String,
+    ) -> Task<Result<Vec<String>>> {
+        let response = self.call::<ListSessionFilesJson>(
+            "ClaudeSessions::list_files_under",
+            json!({
+                "session_id": session_id,
+                "directory": directory.to_string_lossy(),
+                "query": query,
+            }),
+        );
+        self.executor
+            .spawn(async move { Ok(response.await?.paths) })
     }
 
     fn write_session_file(&self, name: String, contents: Vec<u8>) -> Task<Result<String>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "name": name,
-            "contents": encode_bytes(&contents),
-        });
-        self.executor.spawn(async move {
-            let response = client
-                .call::<_, WriteSessionFileJson>("ClaudeSessions::write_pasted_file", &params)
-                .await?;
-            Ok(response.path)
-        })
+        let response = self.call::<WriteSessionFileJson>(
+            "ClaudeSessions::write_pasted_file",
+            json!({
+                "name": name,
+                "contents": encode_bytes(&contents),
+            }),
+        );
+        self.executor.spawn(async move { Ok(response.await?.path) })
     }
 
     fn tail_subagent(
@@ -1108,102 +1153,92 @@ impl SessionSource for WebSource {
         workflow_run_id: Option<String>,
         state: TailState,
     ) -> Task<Result<TailProgress>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "workflow_run_id": workflow_run_id,
-            "offset": state.offset,
-            "pending": encode_bytes(&state.pending),
-        });
-        self.executor.spawn(async move {
-            let response = client
-                .call::<_, TailProgressJson>(
-                    "ClaudeSessions::read_subagent_transcript_tail",
-                    &params,
-                )
-                .await?;
-            tail_progress_from_json(response)
-        })
+        self.tail(
+            "ClaudeSessions::read_subagent_transcript_tail",
+            json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "workflow_run_id": workflow_run_id,
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+            }),
+        )
     }
 
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({
-            "path": path_to_wire(&path),
-            "max_bytes": max_bytes,
-        });
+        self.read_claude_file(path, max_bytes, None)
+    }
+
+    fn read_attachment(
+        &self,
+        session_id: String,
+        path: PathBuf,
+        max_bytes: u64,
+    ) -> Task<Result<FileContents>> {
+        self.read_claude_file(path, max_bytes, Some(session_id))
+    }
+
+    fn channel_status(&self, claude_pid: u32) -> Task<Result<ChannelStatus>> {
+        let response = self.call::<ChannelStatusJson>(
+            "ClaudeSessions::channel_status",
+            json!({ "claude_pid": claude_pid }),
+        );
         self.executor.spawn(async move {
-            let response = client
-                .call::<_, ReadFileJson>("ClaudeSessions::read_file", &params)
-                .await?;
-            Ok(FileContents {
-                bytes: decode_bytes(&response.contents)?,
-                truncated: response.truncated,
+            let response = response.await?;
+            Ok(ChannelStatus {
+                live: response.live,
+                heartbeat_at_ms: response.heartbeat_at_ms,
+                server_pid: response.server_pid,
+                features: response.features,
             })
         })
     }
 
-    fn capture_pane(&self, pane_target: String) -> Task<Result<String>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let params = json!({ "pane_target": pane_target });
-        self.executor.spawn(async move {
-            let response = client
-                .call::<_, CapturePaneJson>("ClaudeSessions::capture_pane", &params)
-                .await?;
-            Ok(response.contents)
-        })
+    fn channel_send_message(&self, claude_pid: u32, content: String) -> Task<Result<String>> {
+        self.outbox_file(
+            "ClaudeSessions::channel_send_message",
+            json!({ "claude_pid": claude_pid, "content": content }),
+        )
     }
 
-    fn send_input(&self, pane_target: String, input: SessionInput) -> Task<Result<()>> {
-        let client = match wasm_rpc_client() {
-            Ok(client) => client,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        self.executor.spawn(async move {
-            match input {
-                SessionInput::Text(text) => {
-                    client
-                        .call_void(
-                            "ClaudeSessions::send_text",
-                            &json!({
-                                "pane_target": pane_target,
-                                "text": text,
-                            }),
-                        )
-                        .await?;
-                }
-                SessionInput::Escape => {
-                    client
-                        .call_void(
-                            "ClaudeSessions::send_escape",
-                            &json!({ "pane_target": pane_target }),
-                        )
-                        .await?;
-                }
-                SessionInput::Key(key) => {
-                    client
-                        .call_void(
-                            "ClaudeSessions::send_key",
-                            &json!({
-                                "pane_target": pane_target,
-                                "key": key.tmux_name(),
-                            }),
-                        )
-                        .await?;
-                }
-            }
-            Ok(())
-        })
+    fn channel_interrupt(&self, claude_pid: u32, reason: String) -> Task<Result<String>> {
+        self.outbox_file(
+            "ClaudeSessions::channel_interrupt",
+            json!({ "claude_pid": claude_pid, "reason": reason }),
+        )
+    }
+
+    fn channel_answer_permission(
+        &self,
+        claude_pid: u32,
+        request_id: String,
+        allow: bool,
+    ) -> Task<Result<String>> {
+        self.outbox_file(
+            "ClaudeSessions::channel_answer_permission",
+            json!({
+                "claude_pid": claude_pid,
+                "request_id": request_id,
+                "allow": allow,
+            }),
+        )
+    }
+
+    fn tail_channel_inbox(&self, claude_pid: u32, state: TailState) -> Task<Result<TailProgress>> {
+        self.tail(
+            "ClaudeSessions::read_channel_inbox_tail",
+            json!({
+                "claude_pid": claude_pid,
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+            }),
+        )
+    }
+
+    // The browser has no filesystem of its own: every path a session names is the
+    // server's, so a sent file is always fetched rather than opened by its local name.
+    fn is_remote(&self) -> bool {
+        true
     }
 }
 
@@ -1212,6 +1247,7 @@ impl SessionSource for WebSource {
 struct ListSessionsJson {
     sessions: Vec<ClaudeSessionJson>,
     home_directory: String,
+    liveness_unavailable_reason: Option<String>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1228,6 +1264,9 @@ struct ClaudeSessionJson {
     transcript_path: Option<String>,
     context_tokens: u64,
     total_cost_usd: Option<f64>,
+    bridge_session_id: Option<String>,
+    last_answer_at_ms: Option<i64>,
+    cache_ttl: u32,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1267,31 +1306,24 @@ struct TailProgressJson {
 
 #[cfg(target_family = "wasm")]
 #[derive(Deserialize)]
-struct PendingQuestionJson {
-    tool_use_id: String,
-    questions: Vec<QuestionJson>,
-}
-
-#[cfg(target_family = "wasm")]
-#[derive(Deserialize)]
-struct QuestionJson {
-    header: String,
-    question: String,
-    options: Vec<QuestionOptionJson>,
-    multi_select: bool,
-}
-
-#[cfg(target_family = "wasm")]
-#[derive(Deserialize)]
-struct QuestionOptionJson {
-    label: String,
-    description: Option<String>,
-}
-
-#[cfg(target_family = "wasm")]
-#[derive(Deserialize)]
-struct InstallHookJson {
+struct InstallHooksJson {
+    outcome: String,
     backup_path: Option<String>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct ChannelStatusJson {
+    live: bool,
+    heartbeat_at_ms: Option<i64>,
+    server_pid: Option<u32>,
+    features: Vec<String>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct OutboxFileJson {
+    outbox_file: String,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1329,12 +1361,6 @@ struct ReadFileJson {
 }
 
 #[cfg(target_family = "wasm")]
-#[derive(Deserialize)]
-struct CapturePaneJson {
-    contents: String,
-}
-
-#[cfg(target_family = "wasm")]
 fn encode_bytes(bytes: &[u8]) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     BASE64.encode(bytes)
@@ -1364,9 +1390,13 @@ fn session_listing_from_json(response: ListSessionsJson) -> SessionListing {
                 transcript_path: session.transcript_path,
                 context_tokens: session.context_tokens,
                 total_cost_usd: session.total_cost_usd,
+                bridge_session_id: session.bridge_session_id,
+                last_answer_at_ms: session.last_answer_at_ms,
+                cache_ttl: session.cache_ttl,
             })
             .collect(),
         home_directory: response.home_directory,
+        liveness_unavailable_reason: response.liveness_unavailable_reason,
     })
 }
 
@@ -1401,33 +1431,6 @@ fn tail_progress_from_json(response: TailProgressJson) -> Result<TailProgress> {
             restarted: response.restarted,
         },
     ))
-}
-
-#[cfg(target_family = "wasm")]
-fn pending_question_from_json(question: Option<PendingQuestionJson>) -> Option<PendingQuestion> {
-    let question = question?;
-    pending_question_from_proto(&proto::GetClaudePendingQuestionResponse {
-        tool_use_id: Some(question.tool_use_id),
-        questions: question
-            .questions
-            .into_iter()
-            .map(|question| proto::ClaudeQuestion {
-                header: question.header,
-                question: question.question,
-                options: question
-                    .options
-                    .into_iter()
-                    .map(|option| proto::ClaudeQuestionOption {
-                        label: option.label,
-                        description: option.description,
-                    })
-                    .collect(),
-                multi_select: question.multi_select,
-            })
-            .collect(),
-        hook_installed: false,
-        live_message: None,
-    })
 }
 
 #[cfg(target_family = "wasm")]
