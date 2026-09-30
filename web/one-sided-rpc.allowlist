@@ -30,6 +30,11 @@ Extensions::rebuild_dev
 Extensions::runtime_call
 Extensions::versions
 
+# Server-side staging of an installed extension's upload payload for a remote
+# project. Caller lands in WP14-C (browser extension sync).
+Extensions::stage_for_remote
+Extensions::release_staging
+
 # The claude_sessions panel resolves a pane target and a subagent transcript
 # path locally on wasm today. If the panel ever needs the server's answer
 # instead, these are already here.

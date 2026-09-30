@@ -5,6 +5,7 @@ use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_enco
 use remote::{
     DockerConnectionOptions, RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
 };
+use serde::Deserialize;
 
 const SSH_SCHEME: &str = "ssh";
 const WSL_SCHEME: &str = "wsl";
@@ -28,6 +29,10 @@ const PATH_ESCAPES: &AsciiSet = &CONTROLS
 
 /// The authority also has to hide the delimiters that would otherwise end it.
 const AUTHORITY_ESCAPES: &AsciiSet = &PATH_ESCAPES.add(b'/').add(b'@').add(b':');
+
+/// Host text inside an authority. `:` stays literal so an IPv6 address is still
+/// an address; `[` and `]` would otherwise end the brackets put around one.
+const HOST_BODY_ESCAPES: &AsciiSet = &PATH_ESCAPES.add(b'[').add(b']');
 
 /// Where the folders of a `ProjectEntry` live.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +103,7 @@ pub fn remote_project_uri(options: &RemoteConnectionOptions, path: &Path) -> Opt
                 uri.push_str(&utf8_percent_encode(username, AUTHORITY_ESCAPES).to_string());
                 uri.push('@');
             }
-            uri.push_str(&options.host.to_bracketed_string());
+            uri.push_str(&ssh_uri_host(&options.host.to_bracketed_string()));
             if let Some(port) = options.port {
                 uri.push_str(&format!(":{port}"));
             }
@@ -126,6 +131,149 @@ pub fn remote_project_uri(options: &RemoteConnectionOptions, path: &Path) -> Opt
         #[allow(unreachable_patterns)]
         _ => return None,
     })
+}
+
+/// The host as it has to appear in an `ssh://` URI. `IpAddr` is already bracketed
+/// and cannot carry a zone id. A hostname that still contains `:` is that zone
+/// form; without brackets the first colon is read back as a port.
+fn ssh_uri_host(rendered: &str) -> String {
+    if let Some(inner) = rendered
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return format!("[{}]", utf8_percent_encode(inner, HOST_BODY_ESCAPES));
+    }
+    let encoded = utf8_percent_encode(&rendered, HOST_BODY_ESCAPES).to_string();
+    if encoded.contains(':') {
+        format!("[{encoded}]")
+    } else {
+        encoded
+    }
+}
+
+/// Why a remote project that is not `ssh://` cannot be opened from the browser: its
+/// only route to another machine is the `ssh` of the server it is served from.
+fn unsupported_browser_remote(options: &RemoteConnectionOptions) -> String {
+    let kind = match options {
+        RemoteConnectionOptions::Ssh(_) => SSH_SCHEME,
+        RemoteConnectionOptions::Wsl(_) => WSL_SCHEME,
+        RemoteConnectionOptions::Docker(_) => DOCKER_SCHEME,
+        #[allow(unreachable_patterns)]
+        _ => "this kind of",
+    };
+    format!(
+        "{kind}:// projects cannot be opened from the browser; only {SSH_SCHEME}:// projects can be"
+    )
+}
+
+/// What the web server answers to `RemoteSsh::capabilities`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct SshCapabilities {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    /// Whether the server process has an ssh-agent to sign with.
+    #[serde(default)]
+    pub ssh_agent: bool,
+}
+
+/// Said when the server is off but did not say why, which only an older server does.
+const SSH_DISABLED_FALLBACK_REASON: &str = "ssh is disabled on this server";
+
+/// Shown where an ssh project is offered while the server cannot sign in with a key, so
+/// the password prompt that follows is not a surprise.
+pub const PUBLIC_KEY_HINT: &str = "This server has no ssh-agent, so ssh projects may ask for a password each time. Set up a public key for the server account to skip that.";
+
+impl SshCapabilities {
+    /// Why ssh projects cannot be opened, or `None` when they can.
+    pub fn disabled_reason(&self) -> Option<String> {
+        if self.enabled {
+            return None;
+        }
+        Some(
+            self.reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| SSH_DISABLED_FALLBACK_REASON.to_string()),
+        )
+    }
+
+    pub fn wants_public_key_hint(&self) -> bool {
+        self.enabled && !self.ssh_agent
+    }
+}
+
+/// The URIs a new browser tab is opened with to show `paths` over `options`. The tab's
+/// own entry point turns them back into a connection, so they have to be the ones
+/// `parse_project_location` reads.
+///
+/// `capabilities` is `None` while the server has not answered; the attempt is then
+/// allowed, because the tab reports a real connection error and a failed capability
+/// lookup must not lock out a server that does support ssh.
+pub fn remote_tab_paths(
+    options: &RemoteConnectionOptions,
+    paths: &[PathBuf],
+    capabilities: Option<&SshCapabilities>,
+) -> Result<Vec<PathBuf>> {
+    if !matches!(options, RemoteConnectionOptions::Ssh(_)) {
+        bail!("{}", unsupported_browser_remote(options));
+    }
+    if let Some(reason) = capabilities.and_then(SshCapabilities::disabled_reason) {
+        bail!("{reason}");
+    }
+    paths
+        .iter()
+        .map(|path| {
+            remote_project_uri(options, path)
+                .map(PathBuf::from)
+                .with_context(|| {
+                    format!(
+                        "\"{}\" cannot be written as an ssh:// address",
+                        path.display()
+                    )
+                })
+        })
+        .collect()
+}
+
+/// What the browser opens when its address names a project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchLocation {
+    Local(Vec<PathBuf>),
+    Remote {
+        options: RemoteConnectionOptions,
+        paths: Vec<PathBuf>,
+    },
+    /// An address the browser cannot open, with the reason to show.
+    Refused(String),
+}
+
+/// Reads the `path=` values of the page address. Only a value with a `://` goes through
+/// `parse_project_location`: a plain path passes through untouched, so neither `~`
+/// expansion nor de-duplication changes what a local address opened before.
+pub fn launch_location(candidates: &[String]) -> LaunchLocation {
+    let Some((first, rest)) = candidates.split_first() else {
+        return LaunchLocation::Local(Vec::new());
+    };
+    if !candidates.iter().any(|candidate| candidate.contains("://")) {
+        return LaunchLocation::Local(candidates.iter().map(PathBuf::from).collect());
+    }
+    match parse_project_location(first, rest) {
+        Ok(ProjectLocation::Local(paths)) => LaunchLocation::Local(paths),
+        Ok(ProjectLocation::Remote {
+            options: options @ RemoteConnectionOptions::Ssh(_),
+            paths,
+        }) => LaunchLocation::Remote { options, paths },
+        Ok(ProjectLocation::Remote { options, .. }) => {
+            LaunchLocation::Refused(unsupported_browser_remote(&options))
+        }
+        Err(error) => LaunchLocation::Refused(format!("{error:#}")),
+    }
 }
 
 /// The scheme VS Code writes for a folder that is not on this machine. What follows it
@@ -365,8 +513,13 @@ fn parse_ssh_authority(authority: &str, candidate: &str) -> Result<SshConnection
     };
     let host = decode(host).with_context(|| format!("decoding the host of \"{candidate}\""))?;
     // RFC 3986 makes the host of a URI case-insensitive, so `HOST.COM` and
-    // `host.com` have to resolve to one connection rather than two.
-    let host = host.to_ascii_lowercase();
+    // `host.com` have to resolve to one connection rather than two. The part
+    // after `%` is an interface name on a link-local address, and that name is
+    // case-sensitive. A DNS name has no `%`.
+    let host = match host.split_once('%') {
+        Some((address, zone)) => format!("{}%{zone}", address.to_ascii_lowercase()),
+        None => host.to_ascii_lowercase(),
+    };
     if host.is_empty() {
         bail!("\"{candidate}\" does not name a host");
     }
@@ -904,5 +1057,263 @@ mod tests {
                 "{path} is a path on this machine, not a uri"
             );
         }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn enabled_capabilities(ssh_agent: bool) -> SshCapabilities {
+        SshCapabilities {
+            enabled: true,
+            reason: None,
+            commit: Some("abc1234".to_string()),
+            platforms: vec!["linux-x86_64".to_string()],
+            ssh_agent,
+        }
+    }
+
+    fn ssh_location(uri: &str) -> (RemoteConnectionOptions, Vec<PathBuf>) {
+        match parse(uri, &[]).expect("a well-formed ssh uri") {
+            ProjectLocation::Remote { options, paths } => (options, paths),
+            other => panic!("expected a remote location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_capabilities_parse_what_the_server_answers() {
+        let disabled: SshCapabilities = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "reason": "ssh is disabled on this server: start zed-web-server with --allow-ssh",
+            "commit": null,
+            "platforms": [],
+            "ssh_agent": false,
+        }))
+        .expect("the disabled answer parses");
+        assert!(!disabled.enabled);
+        assert_eq!(
+            disabled.disabled_reason().as_deref(),
+            Some("ssh is disabled on this server: start zed-web-server with --allow-ssh")
+        );
+
+        let enabled: SshCapabilities = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "reason": null,
+            "commit": "abc1234",
+            "platforms": ["linux-x86_64", "macos-aarch64"],
+            "ssh_agent": true,
+        }))
+        .expect("the enabled answer parses");
+        assert_eq!(enabled.disabled_reason(), None);
+        assert_eq!(enabled.platforms, ["linux-x86_64", "macos-aarch64"]);
+        assert!(!enabled.wants_public_key_hint());
+    }
+
+    #[test]
+    fn test_a_disabled_server_without_a_reason_still_explains_itself() {
+        for reason in [None, Some(String::new()), Some("  ".to_string())] {
+            let capabilities = SshCapabilities {
+                reason,
+                ..SshCapabilities::default()
+            };
+            assert_eq!(
+                capabilities.disabled_reason().as_deref(),
+                Some(SSH_DISABLED_FALLBACK_REASON)
+            );
+        }
+    }
+
+    #[test]
+    fn test_public_key_hint_needs_ssh_on_and_no_agent() {
+        assert!(enabled_capabilities(false).wants_public_key_hint());
+        assert!(!enabled_capabilities(true).wants_public_key_hint());
+        assert!(
+            !SshCapabilities::default().wants_public_key_hint(),
+            "a disabled server shows its reason, not advice about keys"
+        );
+    }
+
+    #[test]
+    fn test_tab_paths_are_the_uris_the_new_tab_parses_back() {
+        let (options, paths) = ssh_location("ssh://andy@devbox:2222/home/andy/my%20proj%23one");
+        assert_eq!(paths, [PathBuf::from("/home/andy/my proj#one")]);
+
+        let uris = remote_tab_paths(
+            &options,
+            &[paths[0].clone(), PathBuf::from("/srv/other")],
+            Some(&enabled_capabilities(true)),
+        )
+        .expect("an enabled server opens ssh projects");
+        assert_eq!(
+            uris,
+            [
+                PathBuf::from("ssh://andy@devbox:2222/home/andy/my%20proj%23one"),
+                PathBuf::from("ssh://andy@devbox:2222/srv/other"),
+            ]
+        );
+
+        let uris: Vec<String> = uris.iter().map(|uri| uri.display().to_string()).collect();
+        match parse_project_location(&uris[0], &uris[1..]).expect("the tab can read them") {
+            ProjectLocation::Remote {
+                options: reparsed,
+                paths: reparsed_paths,
+            } => {
+                assert_eq!(reparsed, options);
+                assert_eq!(
+                    reparsed_paths,
+                    [
+                        PathBuf::from("/home/andy/my proj#one"),
+                        PathBuf::from("/srv/other")
+                    ]
+                );
+            }
+            other => panic!("expected a remote location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tab_paths_keep_a_remote_path_that_starts_with_workspace() {
+        let (options, paths) = ssh_location("ssh://host/workspace/app");
+        let uris = remote_tab_paths(&options, &paths, None).expect("unknown capabilities allow it");
+        assert_eq!(uris, [PathBuf::from("ssh://host/workspace/app")]);
+    }
+
+    #[test]
+    fn test_tab_paths_refuse_with_the_servers_reason_when_ssh_is_off() {
+        let (options, paths) = ssh_location("ssh://host/srv/app");
+        let capabilities = SshCapabilities {
+            enabled: false,
+            reason: Some("ssh is disabled on this server: start it with --allow-ssh".to_string()),
+            ..SshCapabilities::default()
+        };
+        let error = remote_tab_paths(&options, &paths, Some(&capabilities))
+            .expect_err("a disabled server opens nothing");
+        assert_eq!(
+            error.to_string(),
+            "ssh is disabled on this server: start it with --allow-ssh"
+        );
+    }
+
+    #[test]
+    fn test_tab_paths_refuse_wsl_and_docker_even_when_ssh_is_on() {
+        for uri in ["wsl://Ubuntu/home/me/app", "docker://dev/workspace"] {
+            let (options, paths) = ssh_location(uri);
+            let error = remote_tab_paths(&options, &paths, Some(&enabled_capabilities(true)))
+                .expect_err("only ssh has a route from the browser");
+            assert!(
+                error.to_string().contains("only ssh:// projects can be"),
+                "got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tab_paths_refuse_a_path_that_has_no_uri_form() {
+        let (options, _) = ssh_location("ssh://host/srv/app");
+        let error = remote_tab_paths(&options, &[PathBuf::from("relative/dir")], None)
+            .expect_err("a relative path cannot be written as an address");
+        assert!(error.to_string().contains("relative/dir"), "got: {error}");
+    }
+
+    #[test]
+    fn test_launch_location_leaves_plain_paths_untouched() {
+        let candidates = strings(&["/workspace/app", "~/notes", "/workspace/app"]);
+        assert_eq!(
+            launch_location(&candidates),
+            LaunchLocation::Local(vec![
+                PathBuf::from("/workspace/app"),
+                PathBuf::from("~/notes"),
+                PathBuf::from("/workspace/app"),
+            ]),
+            "no scheme means no tilde expansion and no de-duplication"
+        );
+        assert_eq!(
+            launch_location(&strings(&["/a/b://c"])),
+            LaunchLocation::Local(vec![PathBuf::from("/a/b://c")]),
+            "a `://` inside a path is not a scheme"
+        );
+        assert_eq!(launch_location(&[]), LaunchLocation::Local(Vec::new()));
+    }
+
+    #[test]
+    fn test_launch_location_opens_an_ssh_address_as_a_remote_project() {
+        let candidates = strings(&[
+            "ssh://andy@devbox:2222/workspace/app",
+            "ssh://andy@devbox:2222/srv/other",
+        ]);
+        match launch_location(&candidates) {
+            LaunchLocation::Remote { options, paths } => {
+                assert!(matches!(options, RemoteConnectionOptions::Ssh(_)));
+                assert_eq!(
+                    paths,
+                    [PathBuf::from("/workspace/app"), PathBuf::from("/srv/other")],
+                    "the remote path stays as written, /workspace or not"
+                );
+            }
+            other => panic!("expected a remote project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_launch_location_refuses_what_the_browser_cannot_open() {
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &["wsl://Ubuntu/home/me"],
+                "wsl:// projects cannot be opened",
+            ),
+            (&["docker://dev/srv"], "docker:// projects cannot be opened"),
+            (&["http://example.com/x"], "unsupported scheme"),
+            (
+                &["ssh://host/srv/a", "/workspace/local"],
+                "every folder of a project must be in the same place",
+            ),
+        ];
+        for (candidates, expected) in cases {
+            match launch_location(&strings(candidates)) {
+                LaunchLocation::Refused(message) => assert!(
+                    message.contains(expected),
+                    "{candidates:?} should be refused with \"{expected}\", got: {message}"
+                ),
+                other => panic!("{candidates:?} should be refused, got {other:?}"),
+            }
+        }
+    }
+
+    fn rendered_ssh_uri(uri: &str) -> Result<String, String> {
+        let location = parse(uri, &[]).map_err(|error| format!("parse error {error:#}"))?;
+        let ProjectLocation::Remote { options, paths } = location else {
+            return Err("parsed as a local path".to_string());
+        };
+        let Some(path) = paths.first() else {
+            return Err("parsed with no folder".to_string());
+        };
+        remote_project_uri(&options, path).ok_or_else(|| "rendered as None".to_string())
+    }
+
+    #[test]
+    fn test_ssh_uri_round_trip_keeps_zone_user_port_space_unicode_and_percent() {
+        // The address the browser writes back has to parse to the same connection.
+        // `%2F` in a path is a separator (`/` is left unescaped); a literal `%2F`
+        // in a name is `%252F`. Neither may be rejected.
+        let cases = [
+            (
+                "ssh://andy%40ex.com@[fe80::1%25ETH0]:2222/home/my%20proj/%E5%AE%89",
+                "ssh://andy%40ex.com@[fe80::1%25ETH0]:2222/home/my%20proj/%E5%AE%89",
+            ),
+            ("ssh://[::1]:22/home/a", "ssh://[::1]:22/home/a"),
+            ("ssh://andy@devbox:2222/home/a/p", "ssh://andy@devbox:2222/home/a/p"),
+            ("ssh://host/a%2Fb", "ssh://host/a/b"),
+            ("ssh://host/a%252Fb", "ssh://host/a%252Fb"),
+            ("ssh://host/home/%E5%AE%89", "ssh://host/home/%E5%AE%89"),
+        ];
+        let mut failures = Vec::new();
+        for (uri, expected) in cases {
+            match rendered_ssh_uri(uri) {
+                Ok(actual) if actual == expected => {}
+                Ok(actual) => failures.push(format!("expected {expected} actual {actual}")),
+                Err(error) => failures.push(format!("expected {expected} actual error {error}")),
+            }
+        }
+        assert_eq!(failures, Vec::<String>::new());
     }
 }

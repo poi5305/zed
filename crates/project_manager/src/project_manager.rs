@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use workspace::Workspace;
 
 pub use project_location::{
-    ImportedPath, ProjectLocation, import_vscode_path, parse_project_location, remote_project_uri,
+    ImportedPath, LaunchLocation, PUBLIC_KEY_HINT, ProjectLocation, SshCapabilities,
+    import_vscode_path, launch_location, parse_project_location, remote_project_uri,
+    remote_tab_paths,
 };
 pub use project_manager_button::ProjectManagerButton;
 pub use project_manager_panel::ProjectManagerPanel;
@@ -248,6 +250,30 @@ pub fn set_open_in_new_tab(open: fn(&[PathBuf]) -> anyhow::Result<()>) {
     if OPEN_IN_NEW_TAB.set(open).is_err() {
         log::warn!("project manager: the new-tab opener was already set");
     }
+}
+
+/// Asks the server what its ssh support is. Only the web entry point holds the connection
+/// to that server, so it is handed in rather than reached from here.
+#[cfg(target_family = "wasm")]
+static SSH_CAPABILITIES_LOADER: std::sync::OnceLock<
+    fn() -> futures::future::LocalBoxFuture<'static, anyhow::Result<SshCapabilities>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_family = "wasm")]
+pub fn set_ssh_capabilities_loader(
+    load: fn() -> futures::future::LocalBoxFuture<'static, anyhow::Result<SshCapabilities>>,
+) {
+    if SSH_CAPABILITIES_LOADER.set(load).is_err() {
+        log::warn!("project manager: the ssh capabilities loader was already set");
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn load_ssh_capabilities() -> anyhow::Result<SshCapabilities> {
+    let load = SSH_CAPABILITIES_LOADER
+        .get()
+        .context("this build cannot ask the server about its ssh support")?;
+    load().await
 }
 
 #[cfg(target_family = "wasm")]

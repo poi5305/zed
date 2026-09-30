@@ -24,9 +24,10 @@ use workspace::{
 };
 
 use crate::{
-    ImportMerge, ProjectEntry, ProjectGroup, ProjectLocation, ToggleFocus, filter_projects,
-    group_projects, import_vscode_projects, load_projects, merge_imported_projects,
-    project_entry_element_id, remote_project_uri, save_projects, vscode_project_files,
+    ImportMerge, PUBLIC_KEY_HINT, ProjectEntry, ProjectGroup, ProjectLocation, SshCapabilities,
+    ToggleFocus, filter_projects, group_projects, import_vscode_projects, load_projects,
+    merge_imported_projects, project_entry_element_id, remote_project_uri, save_projects,
+    vscode_project_files,
 };
 
 const PROJECT_MANAGER_PANEL_KEY: &str = "ProjectManagerPanel";
@@ -51,6 +52,12 @@ pub struct ProjectManagerPanel {
     save_task: Task<()>,
     import_task: Task<()>,
     edit_task: Task<()>,
+    /// What the server said about its ssh support, once it has said it. Only a browser
+    /// asks; everywhere else an ssh project is opened by this process itself.
+    ssh_capabilities: Option<SshCapabilities>,
+    // Held so dropping the panel cancels the lookup; nothing reads the task's value.
+    _ssh_capabilities_task: Task<()>,
+    _open_remote_task: Task<()>,
     _watch_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -119,12 +126,33 @@ impl ProjectManagerPanel {
                 save_task: Task::ready(()),
                 import_task: Task::ready(()),
                 edit_task: Task::ready(()),
+                ssh_capabilities: None,
+                _ssh_capabilities_task: Task::ready(()),
+                _open_remote_task: Task::ready(()),
                 _watch_task: watch_task,
                 _subscriptions: subscriptions,
             };
             this.reload(cx);
+            #[cfg(target_family = "wasm")]
+            this.load_ssh_capabilities(cx);
             this
         })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn load_ssh_capabilities(&mut self, cx: &mut Context<Self>) {
+        self._ssh_capabilities_task = cx.spawn(async move |this, cx| {
+            // A server that cannot answer is not one that refuses ssh: the rows stay as
+            // they were and a click finds out for itself.
+            let Some(capabilities) = crate::load_ssh_capabilities().await.log_err() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.ssh_capabilities = Some(capabilities);
+                cx.notify();
+            })
+            .log_err();
+        });
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -218,27 +246,44 @@ impl ProjectManagerPanel {
                 if paths.is_empty() {
                     return;
                 }
-                // Refused rather than hidden, which docs/web-zed-plan.md §6.4 allows either
-                // of. Hiding makes a project the user knows they have vanish from a list
-                // without saying why; refusing names the reason. A browser cannot open an
-                // SSH, WSL or docker connection of its own -- its "remote" is already the
-                // machine this workspace runs on.
+                // A tab holds one GPUI window and this one is already connected to the
+                // server, so a remote project gets a tab of its own whose address names it.
                 #[cfg(target_family = "wasm")]
-                {
-                    let _ = (options, paths, new_window);
-                    self.report_error(
-                        anyhow::anyhow!(
-                            "ssh://, wsl:// and docker:// projects cannot be opened from the \
-                             browser: this window is already connected to the machine they \
-                             would be opened from"
-                        ),
-                        cx,
-                    );
-                }
+                self.open_remote_in_new_tab(options, paths, cx);
                 #[cfg(not(target_family = "wasm"))]
                 self.open_remote(options, paths, new_window, window, cx);
             }
         }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn open_remote_in_new_tab(
+        &mut self,
+        options: RemoteConnectionOptions,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.ssh_capabilities.clone();
+        self._open_remote_task = cx.spawn(async move |this, cx| {
+            // Asked again when the first lookup failed, so a server that was not ready
+            // when the panel opened is not refused for good.
+            let capabilities = match known {
+                Some(capabilities) => Some(capabilities),
+                None => crate::load_ssh_capabilities().await.log_err(),
+            };
+            this.update(cx, |this, cx| {
+                if let Some(capabilities) = &capabilities {
+                    this.ssh_capabilities = Some(capabilities.clone());
+                    cx.notify();
+                }
+                if let Err(error) = crate::remote_tab_paths(&options, &paths, capabilities.as_ref())
+                    .and_then(|uris| crate::open_in_new_tab(&uris))
+                {
+                    this.report_error(error, cx);
+                }
+            })
+            .log_err();
+        });
     }
 
     fn open_remote(
@@ -278,6 +323,13 @@ impl ProjectManagerPanel {
             }
         })
         .detach();
+    }
+
+    fn shows_public_key_hint(&self) -> bool {
+        self.ssh_capabilities
+            .as_ref()
+            .is_some_and(SshCapabilities::wants_public_key_hint)
+            && self.project_rows.iter().any(|row| row.uses_ssh)
     }
 
     fn report_error(&mut self, error: anyhow::Error, cx: &mut Context<Self>) {
@@ -530,8 +582,17 @@ impl ProjectManagerPanel {
 
         let icon = row.icon;
         let host = row.host.clone();
-        let tooltip = row.tooltip.clone();
-        let color = row.color;
+        // Drawn disabled rather than hidden: a project the reader knows they have should
+        // not vanish from the list without saying why.
+        let ssh_off = self
+            .ssh_capabilities
+            .as_ref()
+            .filter(|_| row.uses_ssh)
+            .and_then(SshCapabilities::disabled_reason);
+        let (tooltip, color) = match ssh_off {
+            Some(reason) => (SharedString::from(reason), Color::Disabled),
+            None => (row.tooltip.clone(), row.color),
+        };
 
         Some(
             ListItem::new(element_id.clone())
@@ -576,6 +637,7 @@ impl ProjectManagerPanel {
 struct ProjectRow {
     icon: IconName,
     host: Option<SharedString>,
+    uses_ssh: bool,
     tooltip: SharedString,
     color: Color,
 }
@@ -587,18 +649,21 @@ fn project_row(project: &ProjectEntry) -> ProjectRow {
         Ok(ProjectLocation::Local(_)) => ProjectRow {
             icon: IconName::Folder,
             host: None,
+            uses_ssh: false,
             tooltip: SharedString::from(project.root_path.clone()),
             color: Color::Default,
         },
         Ok(ProjectLocation::Remote { options, .. }) => ProjectRow {
             icon: IconName::Server,
             host: Some(SharedString::from(options.display_name())),
+            uses_ssh: matches!(options, RemoteConnectionOptions::Ssh(_)),
             tooltip: SharedString::from(project.root_path.clone()),
             color: Color::Default,
         },
         Err(error) => ProjectRow {
             icon: IconName::Warning,
             host: None,
+            uses_ssh: false,
             tooltip: SharedString::from(format!("{error:#}")),
             color: Color::Error,
         },
@@ -768,6 +833,15 @@ impl Render for ProjectManagerPanel {
             )
             .when_some(self.load_error.clone(), |this, error| {
                 this.child(div().p_2().child(Label::new(error).color(Color::Error)))
+            })
+            .when(self.shows_public_key_hint(), |this| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new(PUBLIC_KEY_HINT)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
             })
             .when(!self.notice.is_empty(), |this| {
                 this.child(v_flex().px_2().py_1().gap_0p5().children(
@@ -1189,6 +1263,15 @@ mod tests {
         assert_eq!(row.host.as_deref(), Some("host"));
         assert_eq!(row.tooltip, SharedString::from("ssh://host/srv/api"));
         assert_eq!(row.color, Color::Default);
+
+        assert!(row.uses_ssh);
+        assert!(!project_row(&ProjectEntry::new("api", "/work/api")).uses_ssh);
+        for uri in ["wsl://Ubuntu/home/me", "docker://dev/srv"] {
+            assert!(
+                !project_row(&ProjectEntry::new("api", uri)).uses_ssh,
+                "{uri} is not governed by the server's ssh setting"
+            );
+        }
 
         let row = project_row(&ProjectEntry::new("api", "vscode-remote://host/p"));
         assert_eq!(
