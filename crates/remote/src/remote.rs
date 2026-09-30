@@ -8,6 +8,7 @@ pub mod remote_client;
 pub mod remote_identity;
 pub mod tmux_sessions;
 mod transport;
+pub mod web_relay_core;
 
 pub use listening_ports::{ListeningPort, ScanTimings, is_forwardable_host, scan_listening_ports};
 pub use port_forward::{
@@ -25,10 +26,17 @@ pub use remote_identity::{
     RemoteConnectionIdentity, remote_connection_identity, same_remote_connection_identity,
 };
 pub use transport::docker::DockerConnectionOptions;
-pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
+pub use transport::ssh::{
+    RecipePathStyle, SshCommandRecipe, SshConnectionOptions, SshPortForwardOption,
+    build_ssh_command,
+};
+#[cfg(target_family = "wasm")]
+pub use transport::web_relay::set_web_rpc_client;
 pub use transport::wsl::WslConnectionOptions;
 #[cfg(target_os = "windows")]
 pub use transport::wsl::wsl_path_to_windows_path;
+#[cfg(not(target_family = "wasm"))]
+pub use transport::{BundledRemoteServer, set_bundled_remote_server_provider};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use transport::mock::{

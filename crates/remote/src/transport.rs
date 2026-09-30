@@ -14,11 +14,57 @@ use gpui::{AppContext as _, AsyncApp, Task};
 use rpc::proto::Envelope;
 use util::command::Child;
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub mod docker;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub mod ssh;
+#[cfg(target_family = "wasm")]
+pub mod web_relay;
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub mod wsl;
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug)]
+pub struct BundledRemoteServer {
+    pub path: std::path::PathBuf,
+    /// What the binary's `version` subcommand prints, trimmed.
+    pub version: String,
+    /// Identifies the binary's bytes (the manifest's sha256). The remote file is named after
+    /// it because one commit can be built from different working trees.
+    pub content_id: String,
+}
+
+#[cfg(not(target_family = "wasm"))]
+type BundledRemoteServerProvider =
+    dyn Fn(RemotePlatform) -> Option<Result<BundledRemoteServer>> + Send + Sync;
+
+#[cfg(not(target_family = "wasm"))]
+static BUNDLED_REMOTE_SERVER_PROVIDER: parking_lot::RwLock<
+    Option<std::sync::Arc<BundledRemoteServerProvider>>,
+> = parking_lot::RwLock::new(None);
+
+/// Makes ssh connections install the binary the provider returns for a platform, instead of
+/// resolving one from the release channel. A host whose release channel cannot deploy
+/// (a dev build) still gets a server this way.
+///
+/// `None` means there is no bundle and the release channel flow runs. `Some(Err)` means a
+/// bundle exists but cannot serve this platform, and the connection fails with that error
+/// instead of falling back to a flow that cannot work for a bundled build.
+#[cfg(not(target_family = "wasm"))]
+pub fn set_bundled_remote_server_provider(
+    provider: impl Fn(RemotePlatform) -> Option<Result<BundledRemoteServer>> + Send + Sync + 'static,
+) {
+    *BUNDLED_REMOTE_SERVER_PROVIDER.write() = Some(std::sync::Arc::new(provider));
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn bundled_remote_server(platform: RemotePlatform) -> Option<Result<BundledRemoteServer>> {
+    // Cloned out so the provider runs without the lock held.
+    let provider = BUNDLED_REMOTE_SERVER_PROVIDER.read().clone()?;
+    provider(platform)
+}
 
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
