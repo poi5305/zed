@@ -7,10 +7,11 @@ use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::{
-    AsyncReadExt as _, FutureExt as _,
+    AsyncReadExt as _,
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
-    select_biased,
 };
+#[cfg(not(target_family = "wasm"))]
+use futures::{FutureExt as _, select_biased};
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
@@ -287,6 +288,24 @@ impl MasterProcess {
     }
 }
 
+/// How long a master that closed its stdout gets to exit before it counts as connected.
+#[cfg(not(target_family = "wasm"))]
+const MASTER_EXIT_GRACE: Duration = Duration::from_millis(200);
+
+/// The master closes its stdout both once it has authenticated and when it exits, and a
+/// master that exits right after (a wrong password) is often not reaped yet when stdout
+/// reaches EOF, so its status is awaited for `grace` instead of only polled.
+#[cfg(not(target_family = "wasm"))]
+async fn master_exit_status(
+    process: &mut Child,
+    grace: impl std::future::Future<Output = ()>,
+) -> Result<Option<std::process::ExitStatus>> {
+    select_biased! {
+        status = process.status().fuse() => Ok(Some(status?)),
+        _ = grace.fuse() => Ok(None),
+    }
+}
+
 impl AsRef<Child> for MasterProcess {
     fn as_ref(&self) -> &Child {
         &self.process
@@ -337,46 +356,19 @@ impl RemoteConnection for SshRemoteConnection {
         port_forward: Option<(u16, String, u16)>,
         interactive: Interactive,
     ) -> Result<CommandTemplate> {
-        let Self {
-            ssh_path_style,
-            socket,
-            ssh_shell_kind,
-            ssh_shell,
-            ..
-        } = self;
-        let env = socket.envs.clone();
+        build_ssh_command(
+            &self.recipe(),
+            input_program,
+            input_args,
+            input_env,
+            working_dir,
+            port_forward,
+            interactive,
+        )
+    }
 
-        if self.ssh_platform.os.is_windows() {
-            build_command_windows(
-                input_program,
-                input_args,
-                input_env,
-                working_dir,
-                port_forward,
-                env,
-                *ssh_path_style,
-                ssh_shell,
-                *ssh_shell_kind,
-                socket.ssh_command_options(),
-                &socket.connection_options.ssh_destination(),
-                interactive,
-            )
-        } else {
-            build_command_posix(
-                input_program,
-                input_args,
-                input_env,
-                working_dir,
-                port_forward,
-                env,
-                *ssh_path_style,
-                ssh_shell,
-                *ssh_shell_kind,
-                socket.ssh_command_options(),
-                &socket.connection_options.ssh_destination(),
-                interactive,
-            )
-        }
+    fn command_recipe(&self) -> Option<SshCommandRecipe> {
+        Some(self.recipe())
     }
 
     fn build_forward_ports_command(
@@ -632,6 +624,9 @@ async fn find_existing_control_master(
 }
 
 impl SshRemoteConnection {
+    /// Not on wasm: the browser reaches ssh through `transport::web_relay`, and the binary
+    /// deployment this leads to calls `std::process::id()`, which panics there.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn new(
         connection_options: SshConnectionOptions,
         delegate: Arc<dyn RemoteClientDelegate>,
@@ -703,7 +698,13 @@ impl SshRemoteConnection {
                 return Err(e.context("Failed to connect to host"));
             }
 
-            if master_process.as_mut().try_status()?.is_some() {
+            if master_exit_status(
+                master_process.as_mut(),
+                cx.background_executor().timer(MASTER_EXIT_GRACE),
+            )
+            .await?
+            .is_some()
+            {
                 let mut output = Vec::new();
                 let mut stderr = master_process.as_mut().stderr.take().unwrap();
                 stderr.read_to_end(&mut output).await?;
@@ -763,7 +764,13 @@ impl SshRemoteConnection {
                 return Err(e.context("Failed to connect to host"));
             }
 
-            if master_process.as_mut().try_status()?.is_some() {
+            if master_exit_status(
+                master_process.as_mut(),
+                cx.background_executor().timer(MASTER_EXIT_GRACE),
+            )
+            .await?
+            .is_some()
+            {
                 let mut output = Vec::new();
                 let mut stderr = master_process.as_mut().stderr.take().unwrap();
                 stderr.read_to_end(&mut output).await?;
@@ -831,6 +838,17 @@ impl SshRemoteConnection {
         Ok(this)
     }
 
+    fn recipe(&self) -> SshCommandRecipe {
+        SshCommandRecipe {
+            ssh_options: self.socket.ssh_command_options(),
+            destination: self.socket.connection_options.ssh_destination(),
+            env: self.socket.envs.clone(),
+            shell: self.ssh_shell.clone(),
+            is_windows: self.ssh_platform.os.is_windows(),
+            path_style: self.ssh_path_style.into(),
+        }
+    }
+
     async fn ensure_server_binary(
         &self,
         delegate: &Arc<dyn RemoteClientDelegate>,
@@ -838,6 +856,13 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(bundle) = super::bundled_remote_server(self.ssh_platform) {
+            return self
+                .ensure_bundled_server_binary(bundle, delegate, cx)
+                .await;
+        }
+
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
@@ -961,6 +986,57 @@ impl SshRemoteConnection {
         self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("extracting server binary")?;
+        Ok(dst_path.into())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn ensure_bundled_server_binary(
+        &self,
+        bundle: Result<super::BundledRemoteServer>,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<Arc<RelPath>> {
+        let bundle = bundle?;
+        let binary_name = bundled_server_binary_name(&bundle.content_id, self.ssh_platform.os)?;
+        let dst_path = remote_server_dir_relative().join(RelPath::from_unix_str(&binary_name)?);
+        let dst_display = dst_path.display(self.path_style()).into_owned();
+
+        let installed_version = self
+            .socket
+            .run_command(self.ssh_shell_kind, &dst_display, &["version"], true)
+            .await;
+        if let Ok(output) = &installed_version
+            && bundled_version_matches(output, &bundle.version)
+        {
+            return Ok(dst_path.into());
+        }
+
+        // The pid alone is not enough: one web server can run two connects to the same host at
+        // once, and both would upload to the same temporary file.
+        let tmp_name = format!(
+            "{binary_name}-upload-{}-{:016x}",
+            std::process::id(),
+            upload_nonce()
+        );
+        let tmp_path = remote_server_dir_relative().join(RelPath::from_unix_str(&tmp_name)?);
+        self.upload_local_server_binary(&bundle.path, &tmp_path, delegate, cx)
+            .await
+            .context("uploading bundled server binary")?;
+        self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+            .await
+            .context("installing bundled server binary")?;
+
+        let uploaded_version = self
+            .socket
+            .run_command(self.ssh_shell_kind, &dst_display, &["version"], true)
+            .await
+            .context("running the uploaded remote server binary")?;
+        anyhow::ensure!(
+            bundled_version_matches(&uploaded_version, &bundle.version),
+            "the uploaded remote server reports version {:?}, expected {:?}",
+            uploaded_version.trim(),
+            bundle.version
+        );
         Ok(dst_path.into())
     }
 
@@ -1848,6 +1924,107 @@ impl SshConnectionOptions {
     }
 }
 
+/// The pieces `build_command` uses, for a transport that must rebuild commands elsewhere
+/// (the browser cannot reach the ControlMaster's connection object, only its facts).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshCommandRecipe {
+    pub ssh_options: Vec<String>,
+    pub destination: String,
+    pub env: HashMap<String, String>,
+    pub shell: String,
+    pub is_windows: bool,
+    pub path_style: RecipePathStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipePathStyle {
+    Unix,
+    Windows,
+}
+
+impl From<PathStyle> for RecipePathStyle {
+    fn from(path_style: PathStyle) -> Self {
+        match path_style {
+            PathStyle::Unix => Self::Unix,
+            PathStyle::Windows => Self::Windows,
+        }
+    }
+}
+
+impl From<RecipePathStyle> for PathStyle {
+    fn from(path_style: RecipePathStyle) -> Self {
+        match path_style {
+            RecipePathStyle::Unix => Self::Unix,
+            RecipePathStyle::Windows => Self::Windows,
+        }
+    }
+}
+
+pub fn build_ssh_command(
+    recipe: &SshCommandRecipe,
+    program: Option<String>,
+    args: &[String],
+    env: &HashMap<String, String>,
+    working_dir: Option<String>,
+    port_forward: Option<(u16, String, u16)>,
+    interactive: Interactive,
+) -> Result<CommandTemplate> {
+    // Recomputed rather than carried in the recipe: `SshRemoteConnection::new` derives it the
+    // same way, and the platform's `is_windows` always agrees with the probe that fed it.
+    let shell_kind = ShellKind::new(&recipe.shell, recipe.is_windows);
+    let build = if recipe.is_windows {
+        build_command_windows
+    } else {
+        build_command_posix
+    };
+    build(
+        program,
+        args,
+        env,
+        working_dir,
+        port_forward,
+        recipe.env.clone(),
+        recipe.path_style.into(),
+        &recipe.shell,
+        shell_kind,
+        recipe.ssh_options.clone(),
+        &recipe.destination,
+        interactive,
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn bundled_server_binary_name(content_id: &str, os: RemoteOs) -> Result<String> {
+    const CONTENT_ID_PREFIX_LEN: usize = 16;
+    anyhow::ensure!(
+        content_id.len() >= CONTENT_ID_PREFIX_LEN
+            && content_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the bundled remote server content id {content_id:?} is not a hex digest"
+    );
+    let content_prefix = &content_id[..CONTENT_ID_PREFIX_LEN];
+    let extension = if os.is_windows() { ".exe" } else { "" };
+    Ok(format!("zed-remote-server-web-{content_prefix}{extension}"))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn bundled_version_matches(version_output: &str, expected_version: &str) -> bool {
+    // Same reason `parse_platform` reads the last line: a login shell may print noise first.
+    version_output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .is_some_and(|line| line == expected_version)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn upload_nonce() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
 fn build_command_posix(
     input_program: Option<String>,
     input_args: &[String],
@@ -2002,8 +2179,7 @@ fn build_command_windows(
     // Windows OpenSSH has an 8K character limit for command lines. The full
     // environment blows past it, so the only variable forwarded is the one port
     // attribution matches: this window's connection id.
-    if let Some(connection_id) =
-        input_env.get(crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR)
+    if let Some(connection_id) = input_env.get(crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR)
     {
         let quoted = shell_kind
             .try_quote(connection_id)
@@ -2238,8 +2414,7 @@ mod tests {
 
         let script = decode_powershell_encoded_command(&command)?;
         assert_eq!(
-            script,
-            "$env:ZED_REMOTE_CONNECTION_ID=workspace-7 ; powershell.exe",
+            script, "$env:ZED_REMOTE_CONNECTION_ID=workspace-7 ; powershell.exe",
             "windows remote shell must inherit this window's connection id without copying the rest of the environment"
         );
         Ok(())
@@ -2259,10 +2434,7 @@ mod tests {
             .decode(encoded)
             .context("powershell command is not base64")?;
         if !bytes.len().is_multiple_of(2) {
-            anyhow::bail!(
-                "powershell command byte length {} is odd",
-                bytes.len()
-            );
+            anyhow::bail!("powershell command byte length {} is odd", bytes.len());
         }
         let units = bytes
             .chunks_exact(2)
@@ -2473,5 +2645,393 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn test_connection(
+        os: RemoteOs,
+        shell: &str,
+        path_style: PathStyle,
+    ) -> Result<SshRemoteConnection> {
+        let temp_dir = tempfile::tempdir()?;
+        let socket = SshSocket {
+            connection_options: SshConnectionOptions {
+                host: "example.com".into(),
+                username: Some("user".to_string()),
+                port: Some(2222),
+                args: Some(vec!["-i".to_string(), "/keys/id_ed25519".to_string()]),
+                ..Default::default()
+            },
+            socket_path: temp_dir.path().join("ssh.sock"),
+            envs: HashMap::default(),
+        };
+        Ok(SshRemoteConnection {
+            socket,
+            master_process: Mutex::new(None),
+            killed: AtomicBool::new(false),
+            remote_binary_path: None,
+            ssh_platform: RemotePlatform {
+                os,
+                arch: RemoteArch::X86_64,
+            },
+            ssh_os_version: None,
+            ssh_path_style: path_style,
+            ssh_shell: shell.to_string(),
+            ssh_shell_kind: ShellKind::new(shell, os.is_windows()),
+            ssh_default_system_shell: shell.to_string(),
+            _temp_dir: temp_dir,
+        })
+    }
+
+    /// What `SshRemoteConnection::build_command` computed before it went through the recipe.
+    #[cfg(not(windows))]
+    fn build_command_from_connection_fields(
+        connection: &SshRemoteConnection,
+        program: Option<String>,
+        args: &[String],
+        env: &HashMap<String, String>,
+        working_dir: Option<String>,
+        port_forward: Option<(u16, String, u16)>,
+        interactive: Interactive,
+    ) -> Result<CommandTemplate> {
+        let build = if connection.ssh_platform.os.is_windows() {
+            build_command_windows
+        } else {
+            build_command_posix
+        };
+        build(
+            program,
+            args,
+            env,
+            working_dir,
+            port_forward,
+            connection.socket.envs.clone(),
+            connection.ssh_path_style,
+            &connection.ssh_shell,
+            connection.ssh_shell_kind,
+            connection.socket.ssh_command_options(),
+            &connection.socket.connection_options.ssh_destination(),
+            interactive,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn assert_same_command(actual: &CommandTemplate, expected: &CommandTemplate) {
+        assert_eq!(actual.program, expected.program);
+        assert_eq!(actual.args, expected.args);
+        assert_eq!(actual.env, expected.env);
+    }
+
+    #[cfg(not(windows))]
+    fn assert_recipe_rebuilds_connection_commands(connection: &SshRemoteConnection) -> Result<()> {
+        let recipe = connection
+            .command_recipe()
+            .context("an ssh connection must expose its recipe")?;
+        // The browser only ever sees the recipe after it crossed the wire as JSON.
+        let recipe: SshCommandRecipe = serde_json::from_str(&serde_json::to_string(&recipe)?)?;
+
+        let mut env = HashMap::default();
+        env.insert("INPUT_VAR".to_string(), "value with space".to_string());
+        env.insert(
+            crate::listening_ports::REMOTE_CONNECTION_ID_ENV_VAR.to_string(),
+            "connection-7".to_string(),
+        );
+        let cases: Vec<(
+            Option<String>,
+            Vec<String>,
+            Option<String>,
+            Option<(u16, String, u16)>,
+            Interactive,
+        )> = vec![
+            (None, vec![], None, None, Interactive::Yes),
+            (
+                Some("cargo".to_string()),
+                vec!["test".to_string(), "it's quoted".to_string()],
+                Some("~/work/project".to_string()),
+                None,
+                Interactive::No,
+            ),
+            (
+                Some("/usr/bin/env".to_string()),
+                vec![],
+                Some("/srv/app".to_string()),
+                Some((8080, "::1".to_string(), 80)),
+                Interactive::Yes,
+            ),
+        ];
+        for (program, args, working_dir, port_forward, interactive) in cases {
+            let expected = build_command_from_connection_fields(
+                connection,
+                program.clone(),
+                &args,
+                &env,
+                working_dir.clone(),
+                port_forward.clone(),
+                interactive,
+            )?;
+            let from_connection = connection.build_command(
+                program.clone(),
+                &args,
+                &env,
+                working_dir.clone(),
+                port_forward.clone(),
+                interactive,
+            )?;
+            let from_recipe = build_ssh_command(
+                &recipe,
+                program,
+                &args,
+                &env,
+                working_dir,
+                port_forward,
+                interactive,
+            )?;
+            assert_same_command(&from_connection, &expected);
+            assert_same_command(&from_recipe, &expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_posix_recipe_builds_the_same_command_as_the_connection() -> Result<()> {
+        let connection = test_connection(RemoteOs::Linux, "/bin/zsh", PathStyle::Unix)?;
+        assert_recipe_rebuilds_connection_commands(&connection)?;
+
+        let command = connection.build_command(
+            None,
+            &[],
+            &HashMap::default(),
+            None,
+            None,
+            Interactive::Yes,
+        )?;
+        let control_path = format!("ControlPath={}", connection.socket.socket_path.display());
+        assert_eq!(
+            command.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "-i",
+                "/keys/id_ed25519",
+                "-p",
+                "2222",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                control_path.as_str(),
+                "-o",
+                "LogLevel=ERROR",
+                "-t",
+                "user@example.com",
+                "cd && exec env /bin/zsh -l",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_windows_recipe_builds_the_same_command_as_the_connection() -> Result<()> {
+        let connection = test_connection(RemoteOs::Windows, "powershell.exe", PathStyle::Windows)?;
+        assert_recipe_rebuilds_connection_commands(&connection)?;
+
+        let recipe = connection
+            .command_recipe()
+            .context("an ssh connection must expose its recipe")?;
+        assert!(recipe.is_windows);
+        assert_eq!(recipe.path_style, RecipePathStyle::Windows);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_recipe_round_trips_through_json() -> Result<()> {
+        let connection = test_connection(RemoteOs::MacOs, "/bin/bash", PathStyle::Unix)?;
+        let mut recipe = connection
+            .command_recipe()
+            .context("an ssh connection must expose its recipe")?;
+        recipe
+            .env
+            .insert("SSH_ASKPASS".to_string(), "/tmp/askpass.sh".to_string());
+
+        let json = serde_json::to_value(&recipe)?;
+        assert_eq!(json["path_style"], "unix");
+        assert_eq!(json["destination"], "user@example.com");
+        assert_eq!(json["is_windows"], false);
+        let round_tripped: SshCommandRecipe = serde_json::from_value(json)?;
+        assert_eq!(round_tripped, recipe);
+
+        let windows: RecipePathStyle = serde_json::from_str("\"windows\"")?;
+        assert_eq!(PathStyle::from(windows), PathStyle::Windows);
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_bundled_server_without_a_provider() {
+        // No test in this crate registers a provider, so the desktop path is what runs.
+        for os in [RemoteOs::Linux, RemoteOs::MacOs, RemoteOs::Windows] {
+            for arch in [RemoteArch::X86_64, RemoteArch::Aarch64] {
+                assert!(
+                    crate::transport::bundled_remote_server(RemotePlatform { os, arch }).is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bundled_version_uses_the_last_non_empty_line() {
+        // A login shell can print a banner before the command's own output.
+        assert!(bundled_version_matches("abc123\n", "abc123"));
+        assert!(bundled_version_matches(
+            "Welcome to devbox\nlast login: yesterday\nabc123\n\n",
+            "abc123"
+        ));
+        assert!(bundled_version_matches("  abc123  \r\n", "abc123"));
+        assert!(!bundled_version_matches("abc123\nnoise after\n", "abc123"));
+        assert!(!bundled_version_matches("abc1234\n", "abc123"));
+        assert!(!bundled_version_matches("", "abc123"));
+        assert!(!bundled_version_matches("\n  \n", "abc123"));
+    }
+
+    #[test]
+    fn test_bundled_server_file_name_is_decided_by_content() -> Result<()> {
+        // Two builds of one commit differ in content, so the name must differ with it.
+        let first = "0123456789abcdef".to_string() + &"0".repeat(48);
+        let second = "0123456789abcdef".to_string() + &"f".repeat(48);
+        assert_eq!(
+            bundled_server_binary_name(&first, RemoteOs::Linux)?,
+            "zed-remote-server-web-0123456789abcdef"
+        );
+        assert_eq!(
+            bundled_server_binary_name(&first, RemoteOs::Windows)?,
+            "zed-remote-server-web-0123456789abcdef.exe"
+        );
+        // Only the first 16 hex characters take part.
+        assert_eq!(
+            bundled_server_binary_name(&second, RemoteOs::MacOs)?,
+            bundled_server_binary_name(&first, RemoteOs::MacOs)?
+        );
+        let other = "fedcba9876543210".to_string() + &"0".repeat(48);
+        assert_ne!(
+            bundled_server_binary_name(&other, RemoteOs::Linux)?,
+            bundled_server_binary_name(&first, RemoteOs::Linux)?
+        );
+        // A real sha256 is 64 hex characters and must not be refused.
+        let real = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            bundled_server_binary_name(real, RemoteOs::Linux)?,
+            "zed-remote-server-web-e3b0c44298fc1c14"
+        );
+        assert!(bundled_server_binary_name("", RemoteOs::Linux).is_err());
+        assert!(bundled_server_binary_name("0123456789abcde", RemoteOs::Linux).is_err());
+        assert!(bundled_server_binary_name("../../evil0123456789", RemoteOs::Linux).is_err());
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn test_bundle_error_fails_the_install_without_a_desktop_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // gpui::test drops a returned Result, so failures here must panic.
+        let connection = match test_connection(RemoteOs::Linux, "/bin/bash", PathStyle::Unix) {
+            Ok(connection) => connection,
+            Err(error) => panic!("building the test connection failed: {error:#}"),
+        };
+        let delegate: Arc<dyn RemoteClientDelegate> =
+            Arc::new(crate::transport::mock::MockDelegate);
+        let mut async_cx = cx.to_async();
+
+        // The connection's ssh socket does not exist, and MockDelegate panics if it is asked
+        // to download anything, so only an early return can produce this exact error.
+        let result = connection
+            .ensure_bundled_server_binary(
+                Err(anyhow::anyhow!(
+                    "no remote server for linux-x86_64: run import-remote-server.sh"
+                )),
+                &delegate,
+                &mut async_cx,
+            )
+            .await;
+        match result {
+            Ok(path) => panic!("a bundle error must fail the install, got {path:?}"),
+            Err(error) => assert_eq!(
+                format!("{error:#}"),
+                "no remote server for linux-x86_64: run import-remote-server.sh"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_upload_nonces_differ() {
+        assert_ne!(upload_nonce(), upload_nonce());
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_fake_master(script: &str) -> Result<Child> {
+        Ok(util::command::new_command("sh")
+            .arg("-c")
+            .arg(script)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+
+    // A plain thread rather than a gpui timer: the fake master is a real process, which a
+    // test dispatcher's virtual clock knows nothing about.
+    #[cfg(not(windows))]
+    fn elapsed_after(duration: Duration) -> impl std::future::Future<Output = ()> {
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            sender.send(()).ok();
+        });
+        receiver.map(|_| ())
+    }
+
+    #[cfg(not(windows))]
+    async fn read_stdout_to_end(process: &mut Child) -> Result<()> {
+        let mut stdout = process.stdout.take().context("fake master has no stdout")?;
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await?;
+        Ok(())
+    }
+
+    // The sleep between closing stdout and exiting widens the window a real master that
+    // rejected a password leaves between its stdout EOF and its reaping.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_master_exit_status_sees_a_master_that_exits_after_closing_stdout() -> Result<()> {
+        smol::block_on(async {
+            let mut process = spawn_fake_master("exec 1>&-; sleep 0.1; exit 7")?;
+            read_stdout_to_end(&mut process).await?;
+            let status =
+                master_exit_status(&mut process, elapsed_after(Duration::from_secs(10))).await?;
+            assert_eq!(status.and_then(|status| status.code()), Some(7));
+            Ok(())
+        })
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_master_exit_status_keeps_a_live_master_connected() -> Result<()> {
+        smol::block_on(async {
+            let mut process = spawn_fake_master("exec 1>&-; exec sleep 30")?;
+            read_stdout_to_end(&mut process).await?;
+            let started = Instant::now();
+            let status = master_exit_status(&mut process, elapsed_after(MASTER_EXIT_GRACE)).await?;
+            assert_eq!(status, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a live master must be reported after the grace period, took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                process.try_status()?,
+                None,
+                "the master must be left running"
+            );
+            Ok(())
+        })
     }
 }

@@ -1,14 +1,14 @@
 #[cfg(any(test, feature = "test-support"))]
 use crate::transport::mock::ConnectGuard;
+#[cfg(not(target_family = "wasm"))]
+use crate::transport::{
+    docker::DockerExecConnection, ssh::SshRemoteConnection, wsl::WslRemoteConnection,
+};
 use crate::{
     SshConnectionOptions,
     protocol::MessageId,
     proxy::ProxyLaunchError,
-    transport::{
-        docker::{DockerConnectionOptions, DockerExecConnection},
-        ssh::SshRemoteConnection,
-        wsl::{WslConnectionOptions, WslRemoteConnection},
-    },
+    transport::{docker::DockerConnectionOptions, wsl::WslConnectionOptions},
 };
 use anyhow::{Context as _, Result, anyhow};
 use askpass::EncryptedPassword;
@@ -1277,16 +1277,32 @@ impl ConnectionPool {
                 let delegate = delegate.clone();
                 async move |cx| {
                     let connection = match opts.clone() {
+                        // The browser cannot run ssh; zed_web_server runs it and relays the proxy.
+                        #[cfg(target_family = "wasm")]
+                        RemoteConnectionOptions::Ssh(opts) => {
+                            crate::transport::web_relay::WebRelayConnection::new(opts, delegate, cx)
+                                .await
+                                .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
+                        }
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Ssh(opts) => {
                             SshRemoteConnection::new(opts, delegate, cx)
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        #[cfg(target_family = "wasm")]
+                        RemoteConnectionOptions::Wsl(_) | RemoteConnectionOptions::Docker(_) => {
+                            Err(anyhow!(
+                                "WSL/dev container connections are not available from the browser"
+                            ))
+                        }
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Wsl(opts) => {
                             WslRemoteConnection::new(opts, delegate, cx)
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        #[cfg(not(target_family = "wasm"))]
                         RemoteConnectionOptions::Docker(opts) => {
                             DockerExecConnection::new(opts, delegate, cx)
                                 .await
@@ -2086,6 +2102,10 @@ pub trait RemoteConnection: Send + Sync {
     fn shell(&self) -> String;
     fn default_system_shell(&self) -> String;
     fn has_wsl_interop(&self) -> bool;
+    /// The pieces `build_command` uses, for a transport that must rebuild commands elsewhere.
+    fn command_recipe(&self) -> Option<crate::SshCommandRecipe> {
+        None
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn simulate_disconnect(&self, _: &AsyncApp) {}
