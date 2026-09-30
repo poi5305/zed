@@ -99,6 +99,19 @@ export function zedSyncWorkspaceProjectGroups(groupsJson) {
 export function zedOpenExternalUrl(url) {
     return self.__zedOpenExternalUrl?.(url) ?? false;
 }
+
+export function zedOpenWorkspaceInNewTab(pathsJson) {
+    const paths = JSON.parse(pathsJson);
+    if (!Array.isArray(paths) || !paths.length) return false;
+    const url = new URL(self.location.href);
+    url.searchParams.delete("path");
+    url.searchParams.delete("projects");
+    for (const path of paths) url.searchParams.append("path", path);
+    // `searchParams` writes a space as `+`, which only a form decoder reads back as a
+    // space; the server's `/workspace` rewrite decodes with plain percent-decoding.
+    url.search = url.searchParams.toString().replaceAll("+", "%20");
+    return self.__zedOpenExternalUrl?.(url.href) ?? false;
+}
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = zedFetchAssetPack)]
@@ -118,6 +131,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = zedOpenExternalUrl)]
     fn open_external_url(url: &str) -> bool;
+
+    #[wasm_bindgen(js_name = zedOpenWorkspaceInNewTab)]
+    fn open_workspace_in_new_tab(paths_json: &str) -> bool;
 }
 
 #[cfg(target_family = "wasm")]
@@ -1412,6 +1428,18 @@ fn init_app_state(
     // word. Leaving these out left all three panels loaded, drawn in the status bar and
     // impossible to open. web/check-panel-actions.sh is what notices next time.
     project_manager::init(cx);
+    project_manager::set_open_in_new_tab(|paths| {
+        let paths = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        // `false` also covers a blocked pop-up, for which `__zedOpenExternalUrl` has
+        // already put an "Open" link on the page.
+        if !open_workspace_in_new_tab(&serde_json::to_string(&paths)?) {
+            log::warn!("zed_web_workspace: the browser did not open a new tab for {paths:?}");
+        }
+        Ok(())
+    });
     tmux_sessions::init(cx);
     claude_sessions::init(cx);
     search::init(cx);

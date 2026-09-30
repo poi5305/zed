@@ -188,6 +188,19 @@ impl ProjectManagerPanel {
                 if open_paths.is_empty() {
                     return;
                 }
+                // A browser tab cannot hold a second GPUI window, so asking for one fails
+                // with "GPUI web supports only one top-level window". Another project gets
+                // a tab of its own; one this tab already shows is switched to instead.
+                #[cfg(target_family = "wasm")]
+                let new_window = {
+                    if new_window && !is_open_in_this_window(&open_paths, window, cx) {
+                        if let Err(error) = crate::open_in_new_tab(&open_paths) {
+                            self.report_error(error, cx);
+                        }
+                        return;
+                    }
+                    false
+                };
                 self.workspace
                     .update(cx, |workspace, cx| {
                         workspace
@@ -609,6 +622,29 @@ fn open_mode_for_window(new_window: bool) -> OpenMode {
     } else {
         OpenMode::Activate
     }
+}
+
+/// Whether any workspace in this window — the browser tab, whose sidebar can hold several
+/// — shows exactly `open_paths`.
+#[cfg(target_family = "wasm")]
+fn is_open_in_this_window(open_paths: &[PathBuf], window: &Window, cx: &App) -> bool {
+    let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
+        return false;
+    };
+    multi_workspace
+        .read(cx)
+        .workspaces()
+        .any(|workspace| same_folders(&workspace.read(cx).root_paths(cx), open_paths))
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+fn same_folders(roots: &[Arc<Path>], open_paths: &[PathBuf]) -> bool {
+    open_paths
+        .iter()
+        .all(|path| roots.iter().any(|root| root.as_ref() == path.as_path()))
+        && roots
+            .iter()
+            .all(|root| open_paths.iter().any(|path| root.as_ref() == path.as_path()))
 }
 
 /// The `projects.json` entry recording the folders currently open: the first
@@ -1105,6 +1141,39 @@ mod tests {
             open_mode_for_window(CLICK_OPENS_A_NEW_WINDOW),
             OpenMode::NewWindow
         );
+    }
+
+    /// In the browser a project counts as already open in this tab only when a workspace
+    /// shows exactly its folders; anything else must go to a new tab.
+    #[test]
+    fn test_same_folders_is_an_exact_order_insensitive_match() {
+        let roots: Vec<Arc<Path>> = vec![
+            Arc::from(Path::new("/home/coder/my proj/中文")),
+            Arc::from(Path::new("/work/api")),
+        ];
+        let open = |paths: &[&str]| paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        assert!(same_folders(
+            &roots,
+            &open(&["/work/api", "/home/coder/my proj/中文"])
+        ));
+        assert!(
+            same_folders(&roots, &open(&["/home/coder/my proj/中文/", "/work/api/"])),
+            "a trailing slash in projects.json names the same folder"
+        );
+        assert!(
+            !same_folders(&roots, &open(&["/work/api"])),
+            "one folder of a multi-root workspace is a different project"
+        );
+        assert!(
+            !same_folders(&roots[1..], &open(&["/work/api", "/work/web"])),
+            "a project with a folder this workspace lacks is a different project"
+        );
+        assert!(
+            !same_folders(&roots[1..], &open(&["/work"])),
+            "the parent folder is a different project"
+        );
+        assert!(!same_folders(&roots[1..], &open(&["/work/api/src"])));
     }
 
     #[test]
