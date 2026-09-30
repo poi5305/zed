@@ -16,6 +16,7 @@ use crate::fs_rpc::FsRpc;
 const ZED_API: &str = "https://api.zed.dev";
 const RESPONSE_PREFIX: &str = "ZED_EXTENSION_RESPONSE ";
 const STDERR_TAIL_LINES: usize = 50;
+const EXTENSION_STAGING_DIRECTORY: &str = "zed-web-extension-staging";
 static EXTENSION_LIFECYCLE_LOCK: RwLock<()> = RwLock::new(());
 static RUNTIME_WORKERS: LazyLock<Mutex<HashMap<RuntimeWorkerKey, Arc<Mutex<RuntimeWorker>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -214,8 +215,117 @@ pub fn dispatch(fs_rpc: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "Extensions::rebuild_dev" => {
             with_extension_write_lock(|| host.rebuild_dev(extension_id(params)))
         }
+        "Extensions::stage_for_remote" => {
+            host.stage_for_remote(extension_id(params), &extension_staging_root())
+        }
+        "Extensions::release_staging" => {
+            release_staging(&extension_staging_root(), text(params, "staging_path"))
+        }
         _ => bail!("unknown extension method: {method}"),
     }
+}
+
+/// Where `Extensions::stage_for_remote` puts payloads; `RemoteSsh::upload_directory` only
+/// uploads from under here (spec §8.1.1, G3).
+pub fn extension_staging_root() -> PathBuf {
+    std::env::temp_dir().join(EXTENSION_STAGING_DIRECTORY)
+}
+
+fn release_staging(staging_root: &Path, staging_path: &str) -> Result<Value> {
+    let refusal = || anyhow!("{staging_path:?} is not an extension staging directory");
+    let path = Path::new(staging_path);
+    if !path.is_absolute() {
+        return Err(refusal());
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refusal());
+    };
+    let root = staging_root
+        .canonicalize()
+        .context("extension staging root is missing")?;
+    // Only direct children: that is all stage_for_remote creates, and it keeps the root itself
+    // and anything above it out of reach.
+    if parent.canonicalize().ok().as_deref() != Some(root.as_path()) {
+        return Err(refusal());
+    }
+    let path = root.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"removed": false}));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting staging directory {path:?}"));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(refusal());
+    }
+    fs::remove_dir_all(&path).with_context(|| format!("removing staging directory {path:?}"))?;
+    Ok(json!({"removed": true}))
+}
+
+/// The files `prepare_remote_extension` (extension_host.rs) uploads, relative to the extension.
+fn remote_extension_files(extension: &Path, manifest: &toml::Value) -> Result<Vec<PathBuf>> {
+    let mut files = vec![PathBuf::from("extension.toml")];
+    if extension.join("extension.wasm").is_file() {
+        files.push(PathBuf::from("extension.wasm"));
+    }
+
+    // Desktop adds every directory under languages/ to the manifest's list when it loads an
+    // extension, so most manifests never list their languages at all.
+    let mut languages = std::collections::BTreeSet::new();
+    for language in manifest_paths(Some(manifest), "languages") {
+        languages.insert(relative_extension_path(&language)?);
+    }
+    if let Ok(entries) = fs::read_dir(extension.join("languages")) {
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                languages.insert(PathBuf::from("languages").join(entry.file_name()));
+            }
+        }
+    }
+    for language in languages {
+        let config = language.join("config.toml");
+        if extension.join(&config).is_file() {
+            files.push(config);
+        }
+    }
+
+    if let Some(adapters) = manifest
+        .get("debug_adapters")
+        .and_then(toml::Value::as_table)
+    {
+        for (adapter_name, entry) in adapters {
+            let schema_path = match entry.get("schema_path").and_then(toml::Value::as_str) {
+                Some(schema_path) => relative_extension_path(schema_path)?,
+                None => relative_extension_path(
+                    &Path::new("debug_adapter_schemas")
+                        .join(Path::new(adapter_name).with_extension("json"))
+                        .to_string_lossy(),
+                )?,
+            };
+            if extension.join(&schema_path).is_file() {
+                files.push(schema_path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn relative_extension_path(value: &str) -> Result<PathBuf> {
+    let path = Path::new(value);
+    let stays_inside = path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    if value.is_empty() || !stays_inside {
+        bail!("extension path {value:?} leaves the extension directory");
+    }
+    Ok(path.to_path_buf())
 }
 
 fn with_extension_write_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -784,6 +894,55 @@ impl ExtensionHost {
         };
         self.install_dev(&json!({"path": source}))
     }
+
+    fn stage_for_remote(&self, id: &str, staging_root: &Path) -> Result<Value> {
+        let _lifecycle_guard = EXTENSION_LIFECYCLE_LOCK
+            .read()
+            .map_err(|_| anyhow!("extension lifecycle lock poisoned"))?;
+        validate_id(id)?;
+        let is_dev = self
+            .index()
+            .get(id)
+            .and_then(|metadata| metadata.get("dev"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_dev {
+            bail!("dev extension {id} is not supported on remote projects yet");
+        }
+        if !self.directory.join(id).join("extension.toml").is_file() {
+            bail!("extension {id} is not installed");
+        }
+        let extension = checked_extension_path(&self.directory, id)?;
+        let manifest_path = extension.join("extension.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {manifest_path:?}"))?
+            .parse::<toml::Value>()
+            .with_context(|| format!("parsing {manifest_path:?}"))?;
+        let files = remote_extension_files(&extension, &manifest)?
+            .into_iter()
+            .map(|relative_path| {
+                let source = checked_extension_path(&extension, &relative_path.to_string_lossy())?;
+                Ok((relative_path, source))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        fs::create_dir_all(staging_root)
+            .with_context(|| format!("creating staging root {staging_root:?}"))?;
+        let staging_root = staging_root.canonicalize()?;
+        // Dropped on any error below, which deletes the partial copy.
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("{id}-"))
+            .tempdir_in(&staging_root)?;
+        for (relative_path, source) in files {
+            let destination = staging.path().join(&relative_path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &destination)
+                .with_context(|| format!("staging {source:?} to {destination:?}"))?;
+        }
+        Ok(json!({"staging_path": staging.keep(), "dev": false}))
+    }
 }
 
 fn extension_id(params: &Value) -> &str {
@@ -1204,6 +1363,344 @@ exit 1
         assert_eq!(first["result"]["generation"], 1);
         assert_eq!(second["result"]["generation"], 2);
         worker.stop();
+        Ok(())
+    }
+
+    fn write_file(path: &Path, contents: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    fn files_under(root: &Path) -> Result<std::collections::BTreeSet<String>> {
+        let mut files = std::collections::BTreeSet::new();
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry?;
+            if !entry.file_type().is_dir() {
+                files.insert(
+                    entry
+                        .path()
+                        .strip_prefix(root)?
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        Ok(files)
+    }
+
+    fn staging_path(staged: &Value) -> Result<PathBuf> {
+        staged["staging_path"]
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("stage_for_remote returned no staging_path: {staged}"))
+    }
+
+    fn installed_extension(workspace: &Path, id: &str, manifest: &str) -> Result<PathBuf> {
+        let directory = workspace.join(".zed/extensions").join(id);
+        write_file(&directory.join("extension.toml"), manifest)?;
+        Ok(directory)
+    }
+
+    #[test]
+    fn staging_copies_exactly_what_desktop_uploads() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        let extension = installed_extension(
+            workspace.path(),
+            "rich",
+            r#"
+id = "rich"
+name = "Rich"
+version = "1.0.0"
+languages = ["declared/Custom Lang"]
+
+[debug_adapters.my-adapter]
+
+[debug_adapters.other]
+schema_path = "schemas/other.json"
+"#,
+        )?;
+        write_file(&extension.join("extension.wasm"), "wasm")?;
+        write_file(
+            &extension.join("declared/Custom Lang/config.toml"),
+            "name = 'c'",
+        )?;
+        write_file(&extension.join("languages/foo/config.toml"), "name = 'foo'")?;
+        write_file(&extension.join("languages/foo/highlights.scm"), "(x) @y")?;
+        write_file(&extension.join("languages/no-config/injections.scm"), "")?;
+        write_file(&extension.join("shared/config.toml"), "name = 'linked'")?;
+        fs::create_dir_all(extension.join("languages/linked"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            extension.join("shared/config.toml"),
+            extension.join("languages/linked/config.toml"),
+        )?;
+        write_file(
+            &extension.join("debug_adapter_schemas/my-adapter.json"),
+            "{}",
+        )?;
+        write_file(&extension.join("schemas/other.json"), "{}")?;
+        write_file(&extension.join("README.md"), "readme")?;
+        write_file(&extension.join("grammars/foo.wasm"), "grammar")?;
+        write_file(&extension.join("themes/dark.json"), "{}")?;
+
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        let staged = host.stage_for_remote("rich", staging_root.path())?;
+        let staged_path = staging_path(&staged)?;
+
+        let mut expected = vec![
+            "extension.toml",
+            "extension.wasm",
+            "declared/Custom Lang/config.toml",
+            "languages/foo/config.toml",
+            "debug_adapter_schemas/my-adapter.json",
+            "schemas/other.json",
+        ];
+        if cfg!(unix) {
+            expected.push("languages/linked/config.toml");
+        }
+        assert_eq!(
+            files_under(&staged_path)?,
+            expected.into_iter().map(ToOwned::to_owned).collect(),
+            "staged file set differs from prepare_remote_extension's"
+        );
+        assert_eq!(staged["dev"], json!(false));
+        assert_eq!(
+            staged_path.parent().map(Path::to_path_buf),
+            Some(staging_root.path().canonicalize()?),
+            "staging directory must be a direct child of the staging root"
+        );
+        assert_eq!(
+            fs::read_to_string(staged_path.join("languages/foo/config.toml"))?,
+            "name = 'foo'"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_accepts_an_extension_without_wasm() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        installed_extension(
+            workspace.path(),
+            "plain",
+            "id = \"plain\"\nname = \"Plain\"\nversion = \"0.1.0\"\n",
+        )?;
+
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        let staged = host.stage_for_remote("plain", staging_root.path())?;
+
+        assert_eq!(
+            files_under(&staging_path(&staged)?)?,
+            ["extension.toml".to_string()].into_iter().collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_gives_each_call_its_own_directory() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        installed_extension(workspace.path(), "plain", "id = \"plain\"\n")?;
+
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        let first = staging_path(&host.stage_for_remote("plain", staging_root.path())?)?;
+        let second = staging_path(&host.stage_for_remote("plain", staging_root.path())?)?;
+
+        assert_ne!(first, second, "two stagings shared one directory");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_refuses_invalid_and_unknown_ids() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+
+        for id in ["", "..", ".", "a/b", "../escape", "/etc", "missing"] {
+            let result = host.stage_for_remote(id, staging_root.path());
+            assert!(
+                result.is_err(),
+                "stage_for_remote({id:?}) should fail, got {result:?}"
+            );
+        }
+        assert_eq!(
+            files_under(staging_root.path())?,
+            Default::default(),
+            "a refused staging left files behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_refuses_paths_that_escape_the_extension() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        write_file(&outside.path().join("config.toml"), "secret")?;
+        write_file(&outside.path().join("schema.json"), "{}")?;
+        let staging_root = tempfile::tempdir()?;
+
+        let dotdot = installed_extension(
+            workspace.path(),
+            "dotdot",
+            "id = \"dotdot\"\nlanguages = [\"../plain\"]\n",
+        )?;
+        installed_extension(workspace.path(), "plain", "id = \"plain\"\n")?;
+        write_file(
+            &dotdot.join("../plain/config.toml"),
+            "a sibling extension's file",
+        )?;
+        installed_extension(
+            workspace.path(),
+            "absolute",
+            &format!(
+                "id = \"absolute\"\n[debug_adapters.x]\nschema_path = {:?}\n",
+                outside.path().join("schema.json")
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            let linked = installed_extension(workspace.path(), "linked", "id = \"linked\"\n")?;
+            fs::create_dir_all(linked.join("languages"))?;
+            std::os::unix::fs::symlink(outside.path(), linked.join("languages/evil"))?;
+
+            // Resolves inside the extension, but joined onto the staging directory the same
+            // text climbs out of it.
+            let climbing = installed_extension(
+                workspace.path(),
+                "climbing",
+                "id = \"climbing\"\nlanguages = [\"deep/../../lang\"]\n",
+            )?;
+            fs::create_dir_all(climbing.join("a/b"))?;
+            std::os::unix::fs::symlink(climbing.join("a/b"), climbing.join("deep"))?;
+            write_file(&climbing.join("lang/config.toml"), "name = 'lang'")?;
+        }
+
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        let mut ids = vec!["dotdot", "absolute"];
+        if cfg!(unix) {
+            ids.extend(["linked", "climbing"]);
+        }
+        for id in ids {
+            let result = host.stage_for_remote(id, staging_root.path());
+            assert!(
+                result.is_err(),
+                "stage_for_remote({id:?}) copied a file from outside the extension: {result:?}"
+            );
+        }
+        assert_eq!(
+            files_under(staging_root.path())?,
+            Default::default(),
+            "a refused staging left files behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_refuses_dev_extensions() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        let source = workspace.path().join("my-dev-extension");
+        write_file(
+            &source.join("extension.toml"),
+            "id = \"devext\"\nname = \"Dev\"\nversion = \"0.0.1\"\n",
+        )?;
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        host.install_dev(&json!({"path": source}))?;
+
+        let error = match host.stage_for_remote("devext", staging_root.path()) {
+            Ok(staged) => bail!("a dev extension was staged: {staged}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("dev"),
+            "the refusal should say it is about dev extensions: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_removes_a_staged_directory() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let staging_root = tempfile::tempdir()?;
+        installed_extension(workspace.path(), "plain", "id = \"plain\"\n")?;
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+        let staged = staging_path(&host.stage_for_remote("plain", staging_root.path())?)?;
+
+        release_staging(staging_root.path(), &staged.to_string_lossy())?;
+        assert!(!staged.exists(), "released staging directory still exists");
+        release_staging(staging_root.path(), &staged.to_string_lossy())
+            .context("releasing an already released staging directory")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_and_release_work_through_a_symlinked_staging_root() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let real_root = tempfile::tempdir()?;
+        let links = tempfile::tempdir()?;
+        let linked_root = links.path().join("staging");
+        std::os::unix::fs::symlink(real_root.path(), &linked_root)?;
+        installed_extension(workspace.path(), "plain", "id = \"plain\"\n")?;
+        let host = ExtensionHost::new(workspace.path().to_path_buf())?;
+
+        let first = staging_path(&host.stage_for_remote("plain", &linked_root)?)?;
+        release_staging(&linked_root, &first.to_string_lossy())?;
+        assert!(!first.exists());
+
+        let second = staging_path(&host.stage_for_remote("plain", &linked_root)?)?;
+        let name = second
+            .file_name()
+            .ok_or_else(|| anyhow!("staging path has no name"))?;
+        let through_link = linked_root.join(name);
+        release_staging(&linked_root, &through_link.to_string_lossy())?;
+        assert!(!second.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn release_refuses_paths_outside_the_staging_root() -> Result<()> {
+        let staging_root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        write_file(&outside.path().join("keep.txt"), "keep")?;
+        let root = staging_root.path();
+        let mut refused = vec![
+            String::new(),
+            root.to_string_lossy().to_string(),
+            outside.path().to_string_lossy().to_string(),
+            root.join("..").to_string_lossy().to_string(),
+            root.join("../outside-sibling")
+                .to_string_lossy()
+                .to_string(),
+            "relative/path".to_string(),
+        ];
+        fs::create_dir_all(root.join("nested/deeper"))?;
+        refused.push(root.join("nested/deeper").to_string_lossy().to_string());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.join("escape"))?;
+            refused.push(root.join("escape").to_string_lossy().to_string());
+        }
+
+        for path in refused {
+            let result = release_staging(root, &path);
+            assert!(
+                result.is_err(),
+                "release_staging({path:?}) should be refused, got {result:?}"
+            );
+        }
+        assert!(
+            outside.path().join("keep.txt").is_file(),
+            "a refused release deleted a file outside the staging root"
+        );
+        assert!(
+            root.join("nested/deeper").is_dir(),
+            "a refused release deleted a nested directory"
+        );
         Ok(())
     }
 }

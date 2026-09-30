@@ -18,16 +18,23 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+askpass.workspace = true
 base64.workspace = true
 clap = { workspace = true, features = ["env"] }
 futures.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui_tokio.workspace = true
 hex.workspace = true
 paths.workspace = true
 remote.workspace = true
 smol.workspace = true
 portable-pty.workspace = true
 rand.workspace = true
+release_channel.workspace = true
 reqwest.workspace = true
+rpc.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -54,3 +61,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+# The version axum 0.6 already pulls in, so the lock gains no package.
+tokio-tungstenite = "0.20"
