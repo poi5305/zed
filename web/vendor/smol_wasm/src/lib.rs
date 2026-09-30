@@ -40,7 +40,7 @@ pub use spawn::spawn;
 #[cfg(target_family = "wasm")]
 mod rpc;
 #[cfg(target_family = "wasm")]
-pub use rpc::RpcClient;
+pub use rpc::{ByteChannel, ByteChannelClose, RpcClient};
 
 #[cfg(target_family = "wasm")]
 mod wasm {

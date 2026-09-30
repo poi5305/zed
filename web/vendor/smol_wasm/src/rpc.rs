@@ -5,4 +5,4 @@
 //! stand-in's `call` returned `Err("smol wasm RPC is not wired yet")`, so every
 //! remote filesystem and process operation in the browser failed until now.
 
-pub use wasm_rpc::RpcClient;
+pub use wasm_rpc::{ByteChannel, ByteChannelClose, RpcClient};
