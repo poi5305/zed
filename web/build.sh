@@ -202,6 +202,75 @@ if [[ ! -x "${web_dir}/scripts/patch-wasm-bindgen-memory.sh" ]]; then
         "Copy it from the zed-web reference; the bindgen JS must import a 128 MiB shared memory."
 fi
 
+# The browser's font database holds only the fonts in zed-assets.tar -- wasm cannot reach the
+# system's -- so without a CJK face every Han character is drawn as a missing-glyph box.
+# `Assets::load_fonts` loads every .ttf under fonts/, and cosmic-text falls back to any face in
+# the database, so shipping the file is the whole fix. It is the static Regular instance: the
+# variable font's default instance is Thin, and GPUI never applies a variation.
+# The terminal's status glyphs (braille spinner, U+23F5, U+2714, ...) are in neither Lilex nor
+# Noto Sans TC, so two more static Regular faces are shipped for them. Both contain 'm', which
+# `load_family` requires before it keeps a face loaded by name (the "Noto Sans Symbols 2"
+# font_fallbacks entry would otherwise be removed).
+cjk_font_root="${ZED_WEB_FONT_CACHE:-${repo_dir}/target/web-fonts}"
+cjk_font_dir="${cjk_font_root}/fonts/noto-sans-tc"
+cjk_font_url="https://fonts.gstatic.com/s/notosanstc/v39/-nFuOG829Oofr2wohFbTp9ifNAn722rq0MXz76Cy_Co.ttf"
+cjk_font_sha256="619662a0583f38311e92666927e5edbfd30f2a1fbe8593685660bd11bdd46a10"
+cjk_license_url="https://raw.githubusercontent.com/google/fonts/23e54b51ddffbc7713c583748e3bd86f62b1fa4a/ofl/notosanstc/OFL.txt"
+symbols_font_dir="${cjk_font_root}/fonts/noto-sans-symbols-2"
+symbols_font_url="https://raw.githubusercontent.com/google/fonts/23e54b51ddffbc7713c583748e3bd86f62b1fa4a/ofl/notosanssymbols2/NotoSansSymbols2-Regular.ttf"
+symbols_font_sha256="7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21"
+symbols_license_url="https://raw.githubusercontent.com/google/fonts/23e54b51ddffbc7713c583748e3bd86f62b1fa4a/ofl/notosanssymbols2/OFL.txt"
+math_font_dir="${cjk_font_root}/fonts/noto-sans-math"
+math_font_url="https://raw.githubusercontent.com/google/fonts/23e54b51ddffbc7713c583748e3bd86f62b1fa4a/ofl/notosansmath/NotoSansMath-Regular.ttf"
+math_font_sha256="3f495fe933c06786e4d5f6d86b8ee70b6753a68ee3b9d87528726de0f6e2c47d"
+math_license_url="https://raw.githubusercontent.com/google/fonts/23e54b51ddffbc7713c583748e3bd86f62b1fa4a/ofl/notosansmath/OFL.txt"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+# ensure_font <label> <dir> <file name> <url> <sha256> <license url>
+ensure_font() {
+    local label="$1" dir="$2" name="$3" url="$4" expected="$5" license_url="$6"
+    local font="${dir}/${name}"
+    mkdir -p "${dir}"
+    # The whole directory is tarred, so a .partial from an interrupted run must not survive.
+    rm -f "${font}.partial" "${dir}/OFL.txt.partial"
+    if [[ ! -f "${font}" || "$(sha256_of "${font}")" != "${expected}" ]]; then
+        if ! curl -fsSL -o "${font}.partial" "${url}"; then
+            rm -f "${font}.partial"
+            die "error: downloading ${label} from ${url} failed."
+        fi
+        local actual
+        actual="$(sha256_of "${font}.partial")"
+        if [[ "${actual}" != "${expected}" ]]; then
+            rm -f "${font}.partial"
+            die \
+                "error: ${label} checksum mismatch: expected ${expected}, got ${actual}." \
+                "If the pin moved on purpose, update the url and sha256 together."
+        fi
+        mv "${font}.partial" "${font}"
+    fi
+    if [[ ! -f "${dir}/OFL.txt" ]]; then
+        if ! curl -fsSL -o "${dir}/OFL.txt.partial" "${license_url}"; then
+            rm -f "${dir}/OFL.txt.partial"
+            die "error: downloading the ${label} license from ${license_url} failed."
+        fi
+        mv "${dir}/OFL.txt.partial" "${dir}/OFL.txt"
+    fi
+}
+
+ensure_font "Noto Sans TC" "${cjk_font_dir}" NotoSansTC-Regular.ttf \
+    "${cjk_font_url}" "${cjk_font_sha256}" "${cjk_license_url}"
+ensure_font "Noto Sans Symbols 2" "${symbols_font_dir}" NotoSansSymbols2-Regular.ttf \
+    "${symbols_font_url}" "${symbols_font_sha256}" "${symbols_license_url}"
+ensure_font "Noto Sans Math" "${math_font_dir}" NotoSansMath-Regular.ttf \
+    "${math_font_url}" "${math_font_sha256}" "${math_license_url}"
+
 web_revision="$(revision "${WEB_REVISION:-unknown}" rev-parse HEAD)"
 if [[ -f "${web_dir}/upstream-revision" ]]; then
     recorded_upstream_revision="$(tr -d '[:space:]' < "${web_dir}/upstream-revision")"
@@ -279,7 +348,8 @@ COPYFILE_DISABLE=1 tar -C "${repo_dir}/assets" \
     --exclude='._*' \
     --exclude='.DS_Store' \
     -cf "${static_dir}/zed-assets.tar" \
-    fonts icons images themes sounds prompts
+    fonts icons images themes sounds prompts \
+    -C "${cjk_font_root}" fonts
 
 printf '{\n  "web_revision": "%s",\n  "upstream_revision": "%s"\n}\n' \
     "${web_revision}" \
