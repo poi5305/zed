@@ -15145,6 +15145,7 @@ dependencies = [
  "thiserror 2.0.17",
  "urlencoding",
  "util",
+ "uuid",
  "web-time",
  "which",
 ]
