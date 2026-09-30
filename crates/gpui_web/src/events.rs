@@ -693,6 +693,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
+            this.flush_pending_paste_keystroke();
 
             let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
             let capslock = capslock_from_keyboard_event(&event);
@@ -702,6 +703,19 @@ impl WebWindowInner {
                     modifiers,
                     capslock,
                 }));
+            }
+
+            // The IME owns keys it processes (keyCode 229), including the
+            // first key of a macOS composition, which arrives with its
+            // physical `key` and `isComposing == false` just before
+            // `compositionstart`. Neither dispatching nor inserting it, and
+            // leaving its default alone, lets the composition events deliver
+            // the text exactly once.
+            if is_ime_key_event(&event, this.is_composing.get()) {
+                if !this.is_composing.get() && !event.is_composing() {
+                    this.schedule_ime_mirror_sync();
+                }
+                return;
             }
 
             let key = dom_key_to_gpui_key(&event);
@@ -719,11 +733,21 @@ impl WebWindowInner {
                 key_char: key_char.clone(),
             };
 
-            let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+            let key_down = KeyDownEvent {
                 keystroke,
                 is_held,
                 prefer_character_input: false,
-            }));
+            };
+
+            // Paste actions read the clipboard synchronously, but the browser
+            // only reveals it in the `paste` event this keystroke's default
+            // action fires next; that event dispatches the keystroke instead.
+            if is_paste_keystroke(&key_down.keystroke, this.is_mac) {
+                this.defer_paste_keystroke(key_down);
+                return;
+            }
+
+            let result = this.dispatch_input(PlatformInput::KeyDown(key_down));
 
             if let Some(result) = result {
                 if !result.propagate {
@@ -731,11 +755,6 @@ impl WebWindowInner {
                     this.schedule_ime_mirror_sync();
                     return;
                 }
-            }
-
-            if this.is_composing.get() || event.is_composing() {
-                event.prevent_default();
-                return;
             }
 
             if keystroke_inserts_text(&modifiers, this.is_mac)
@@ -758,6 +777,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("keyup", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
+            this.flush_pending_paste_keystroke();
 
             let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
             let capslock = capslock_from_keyboard_event(&event);
@@ -767,6 +787,10 @@ impl WebWindowInner {
                     modifiers,
                     capslock,
                 }));
+            }
+
+            if is_ime_key_event(&event, this.is_composing.get()) {
+                return;
             }
 
             let key = dom_key_to_gpui_key(&event);
@@ -790,6 +814,65 @@ impl WebWindowInner {
                 }
             }
         })
+    }
+
+    /// Holds a paste keystroke back until the `paste` event it causes. The
+    /// zero-delay timeout covers keystrokes whose `paste` never comes (e.g.
+    /// the browser has nothing to paste), and the next key event flushes it
+    /// first if that runs sooner, so keystrokes stay in order.
+    fn defer_paste_keystroke(self: &Rc<Self>, key_down: KeyDownEvent) {
+        self.pending_paste_keystroke.set(Some(key_down));
+        let callback = wasm_bindgen::closure::Closure::once_into_js({
+            let this = Rc::clone(self);
+            move || this.flush_pending_paste_keystroke()
+        });
+        if let Err(error) = self
+            .browser_window
+            .set_timeout_with_callback(callback.unchecked_ref())
+        {
+            log::warn!("failed to schedule the deferred paste keystroke: {error:?}");
+        }
+    }
+
+    fn flush_pending_paste_keystroke(self: &Rc<Self>) {
+        if let Some(key_down) = self.pending_paste_keystroke.take() {
+            self.dispatch_input(PlatformInput::KeyDown(key_down));
+            self.schedule_ime_mirror_sync();
+        }
+    }
+
+    /// Makes `item` the clipboard, then runs the paste keystroke that caused
+    /// it, if any, so the keymap's paste action reads `item`. The input
+    /// handler receives the item directly when no keystroke did (menu or
+    /// context-menu pastes) or nothing handled it.
+    fn deliver_paste(self: &Rc<Self>, item: ClipboardItem, key_down: Option<KeyDownEvent>) {
+        {
+            let mut clipboard = self.clipboard.borrow_mut();
+            // Pasting back what the app copied keeps the copied item, whose
+            // metadata (e.g. an editor's whole-line copy) plain text lacks.
+            let is_text_only = |item: &ClipboardItem| {
+                item.entries()
+                    .iter()
+                    .all(|entry| matches!(entry, ClipboardEntry::String(_)))
+            };
+            let pasted_back_own_copy = is_text_only(&item)
+                && clipboard.as_ref().is_some_and(|cached| {
+                    is_text_only(cached) && cached.text().is_some() && cached.text() == item.text()
+                });
+            if !pasted_back_own_copy {
+                *clipboard = Some(item.clone());
+            }
+        }
+        let handled = key_down.is_some_and(|key_down| {
+            let result = self.dispatch_input(PlatformInput::KeyDown(key_down));
+            self.schedule_ime_mirror_sync();
+            result.is_some_and(|result| !result.propagate)
+        });
+        if !handled {
+            self.with_input_handler(|handler| {
+                handler.paste(item);
+            });
+        }
     }
 
     /// Imports IME edits from the hidden input into the app.
@@ -1059,16 +1142,19 @@ impl WebWindowInner {
                 }
             }
 
+            // An empty paste leaves any deferred keystroke to its timeout,
+            // which runs it against the clipboard as it stands.
             if text.is_none() && image_files.is_empty() {
                 return;
             }
             event.prevent_default();
+            // Taken now, not once the image reads resolve: the keystroke's
+            // timeout would otherwise dispatch it a second time meanwhile.
+            let key_down = this.pending_paste_keystroke.take();
 
             if image_files.is_empty() {
                 if let Some(text) = text {
-                    this.with_input_handler(|handler| {
-                        handler.paste(ClipboardItem::new_string(text));
-                    });
+                    this.deliver_paste(ClipboardItem::new_string(text), key_down);
                 }
                 return;
             }
@@ -1093,11 +1179,13 @@ impl WebWindowInner {
                     }
                 }
                 if entries.is_empty() {
+                    if let Some(key_down) = key_down {
+                        this.dispatch_input(PlatformInput::KeyDown(key_down));
+                        this.schedule_ime_mirror_sync();
+                    }
                     return;
                 }
-                this.with_input_handler(|handler| {
-                    handler.paste(ClipboardItem { entries });
-                });
+                this.deliver_paste(ClipboardItem { entries }, key_down);
             });
         })
     }
@@ -1168,6 +1256,10 @@ impl WebWindowInner {
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("blur", move |_event: JsValue| {
+            // A blur ends the composition, but not every browser follows it with a
+            // `compositionend`, and while the flag is set `is_ime_key_event` drops every key.
+            // A `compositionend` that does arrive later still commits through its own handler.
+            this.is_composing.set(false);
             if this.suppress_focus_status_events.get() {
                 return;
             }
@@ -1307,6 +1399,34 @@ pub(crate) fn is_mac_platform(browser_window: &web_sys::Window) -> bool {
     }
 
     false
+}
+
+/// Whether an IME is processing this key event. `keyCode` is deprecated,
+/// but 229 is the only signal for the first key of a composition, which
+/// precedes `compositionstart` without `isComposing` set.
+#[allow(deprecated)]
+fn is_ime_key_event(event: &web_sys::KeyboardEvent, composing: bool) -> bool {
+    composing || event.is_composing() || event.key_code() == 229
+}
+
+/// Whether the browser pastes on this keystroke: ⌘V and ⌘⇧V on macOS, where
+/// ⌃V does not paste; Ctrl+V, Ctrl+Shift+V and Shift+Insert elsewhere.
+fn is_paste_keystroke(keystroke: &Keystroke, is_mac: bool) -> bool {
+    let modifiers = keystroke.modifiers;
+    let (paste, paste_shift) = if is_mac {
+        let command = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        (command, Modifiers::command_shift())
+    } else {
+        (Modifiers::control(), Modifiers::control_shift())
+    };
+    match keystroke.key.as_str() {
+        "v" => modifiers == paste || modifiers == paste_shift,
+        "insert" => !is_mac && modifiers == Modifiers::shift(),
+        _ => false,
+    }
 }
 
 fn is_modifier_only_key(key: &str) -> bool {

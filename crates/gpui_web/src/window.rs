@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowParams, px,
+    AnyWindowHandle, Bounds, Capslock, ClipboardItem, Decorations, DevicePixels,
+    DispatchEventResult, GpuSpecs, KeyDownEvent, Modifiers, MouseButton, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, TextInputConfiguration,
+    TextInputStateChange, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -83,6 +83,13 @@ pub(crate) struct WebWindowInner {
     /// pans must leave them untouched, or scrolling over editable content
     /// flickers the keyboard and drags the caret around.
     pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
+    /// The platform's in-app clipboard, which DOM `paste` events refresh so
+    /// that paste actions reading the clipboard synchronously see the
+    /// browser's clipboard contents.
+    pub(crate) clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    /// A paste keystroke held back from GPUI until the browser's `paste`
+    /// event has refreshed `clipboard`. Whoever takes it dispatches it.
+    pub(crate) pending_paste_keystroke: Cell<Option<KeyDownEvent>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -148,6 +155,7 @@ impl WebWindow {
         browser_window: web_sys::Window,
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
+        clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -212,6 +220,8 @@ impl WebWindow {
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
+            clipboard,
+            pending_paste_keystroke: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
