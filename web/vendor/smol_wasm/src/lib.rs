@@ -26,6 +26,9 @@ pub mod process;
 #[cfg(target_family = "wasm")]
 pub use process::set_remote_client;
 
+#[cfg(any(target_family = "wasm", test))]
+mod remote_error;
+
 #[cfg(target_family = "wasm")]
 pub use wasm::{Async, Timer, Unblock, block_on, unblock};
 
