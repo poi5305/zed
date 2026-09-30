@@ -9,9 +9,13 @@ mod git_rpc;
 mod highlight_rpc;
 mod home_rpc;
 mod process_rpc;
+mod remote_server_bundle;
 mod rpc;
 mod shell_env_rpc;
 mod sql_rpc;
+pub mod ssh_host;
+pub mod ssh_relay;
+pub mod ssh_rpc;
 mod terminal_rpc;
 mod workspace_state;
 
@@ -25,7 +29,7 @@ use anyhow::{Context as _, Result};
 use axum::{
     Router,
     body::{Body, Bytes, boxed},
-    extract::{ConnectInfo, Form, OriginalUri, Path as AxumPath, State, WebSocketUpgrade},
+    extract::{ConnectInfo, Form, FromRef, OriginalUri, Path as AxumPath, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -58,6 +62,9 @@ struct Args {
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]
     printenv: bool,
+    /// Let the browser open ssh:// projects through this server
+    #[arg(long)]
+    allow_ssh: bool,
 }
 
 #[derive(Clone)]
@@ -75,20 +82,105 @@ pub struct AppState {
     sql: Arc<sql_rpc::SqlRpc>,
     workspace_state: Arc<workspace_state::WorkspaceState>,
     http: reqwest::Client,
+    ssh: Arc<ssh_rpc::SshRpc>,
+}
+
+impl FromRef<AppState> for Arc<ssh_rpc::SshRpc> {
+    fn from_ref(state: &AppState) -> Self {
+        state.ssh.clone()
+    }
 }
 
 pub async fn run() -> Result<()> {
+    run_inner(None).await
+}
+
+pub async fn run_with_ssh_host(host: ssh_host::SshHostHandle) -> Result<()> {
+    run_inner(Some(host)).await
+}
+
+/// The socket the askpass script passes when it execs this binary as `--askpass=<socket>`.
+pub fn askpass_socket(args: impl IntoIterator<Item = String>) -> Option<String> {
+    args.into_iter()
+        .find_map(|argument| argument.strip_prefix("--askpass=").map(str::to_owned))
+}
+
+/// Decided before any runtime starts, because enabling ssh moves gpui onto the main thread.
+pub fn ssh_enabled() -> Result<bool> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if is_open_url_shim(&raw_args) || is_debug_adapter_proxy(&raw_args) {
+        return Ok(false);
+    }
+    // `run` reports a malformed command line itself, with clap's usual output.
+    let Ok(args) = Args::try_parse_from(&raw_args) else {
+        return Ok(false);
+    };
+    if args.printenv {
+        return Ok(false);
+    }
+    resolve_ssh_enabled(
+        args.allow_ssh,
+        std::env::var_os("ZED_WEB_ALLOW_SSH"),
+        || match args.root.as_deref().map(Path::canonicalize) {
+            // An unparsable file must not stop a server that never asked for ssh: when
+            // restrict_paths is decided elsewhere nothing else reads it. ssh stays off, and
+            // `run` still reports the error whenever it does need the file.
+            Some(Ok(root)) => Ok(read_web_json(&root).unwrap_or_else(|error| {
+                eprintln!("Warning: ssh stays disabled: {error:#}");
+                serde_json::Value::Null
+            })),
+            // `run` rejects a missing or invalid root with its own message.
+            Some(Err(_)) | None => Ok(serde_json::Value::Null),
+        },
+    )
+}
+
+fn resolve_ssh_enabled(
+    cli_allow_ssh: bool,
+    env_value: Option<std::ffi::OsString>,
+    web_json: impl FnOnce() -> Result<serde_json::Value>,
+) -> Result<bool> {
+    if cli_allow_ssh {
+        return Ok(true);
+    }
+    if let Some(raw) = env_value {
+        return parse_env_bool("ZED_WEB_ALLOW_SSH", &raw);
+    }
+    let config = web_json()?;
+    // On by default: the token already grants a shell on this machine, so ssh adds no access.
+    let Some(ssh) = config.get("ssh") else {
+        return Ok(true);
+    };
+    let Some(ssh) = ssh.as_object() else {
+        anyhow::bail!(".zed/web.json: ssh must be an object");
+    };
+    match ssh.get("enabled") {
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => anyhow::bail!(".zed/web.json: ssh.enabled must be true or false"),
+        None => Ok(true),
+    }
+}
+
+fn is_open_url_shim(raw_args: &[String]) -> bool {
+    cfg!(unix)
+        && raw_args
+            .first()
+            .and_then(|argument| Path::new(argument).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "open" || name == "xdg-open")
+}
+
+fn is_debug_adapter_proxy(raw_args: &[String]) -> bool {
+    raw_args.get(1).map(String::as_str) == Some("__debug-adapter-proxy")
+}
+
+async fn run_inner(ssh: Option<ssh_host::SshHostHandle>) -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
     #[cfg(unix)]
-    if raw_args
-        .first()
-        .and_then(|argument| Path::new(argument).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "open" || name == "xdg-open")
-    {
+    if is_open_url_shim(&raw_args) {
         return process_rpc::run_open_url_shim(&raw_args[1..]);
     }
-    if raw_args.get(1).map(String::as_str) == Some("__debug-adapter-proxy") {
+    if is_debug_adapter_proxy(&raw_args) {
         return debug_adapter::run_proxy(&raw_args[2..]).await;
     }
     tracing_subscriber::fmt()
@@ -118,6 +210,7 @@ pub async fn run() -> Result<()> {
     initialize_config(&root).await?;
     let (auth_token, token_path, created) = load_auth_token(&root, args.auth_token).await?;
     let sql = Arc::new(sql_rpc::SqlRpc::new(&root)?);
+    let ssh = ssh_rpc::SshRpc::new(ssh, load_ssh_config(&root));
     let workspace_state = Arc::new(workspace_state::WorkspaceState::load(&root)?);
     let server_instance_id = {
         let mut bytes = [0_u8; 32];
@@ -142,10 +235,12 @@ pub async fn run() -> Result<()> {
         http: reqwest::Client::builder()
             .user_agent("ZedRemoteRust/0.1")
             .build()?,
+        ssh,
     };
 
     let protected = Router::new()
         .route("/rpc", get(websocket))
+        .route("/remote/channel", get(ssh_relay::channel))
         .route("/sql", axum::routing::post(sql_http))
         .route("/proxy/:provider/*rest", any(proxy_http))
         .route("/", get(index))
@@ -283,23 +378,46 @@ async fn load_restrict_paths(
         return Ok(value);
     }
     if let Some(raw) = std::env::var_os("ZED_WEB_RESTRICT_PATHS") {
-        return match raw.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => anyhow::bail!("ZED_WEB_RESTRICT_PATHS must be true/false or 1/0"),
-        };
+        return parse_env_bool("ZED_WEB_RESTRICT_PATHS", &raw);
     }
     let path = root.join(".zed/web.json");
-    let Ok(content) = fs::read(&path).await else {
-        return Ok(false);
-    };
-    let config: serde_json::Value = serde_json::from_slice(&content)
-        .with_context(|| format!("invalid web config {}", path.display()))?;
+    let config = read_web_json(root)?;
     match config.get("restrict_paths") {
         Some(serde_json::Value::Bool(value)) => Ok(*value),
         Some(_) => anyhow::bail!("{}: restrict_paths must be true or false", path.display()),
         None => Ok(false),
     }
+}
+
+/// restrict_paths plays no part: it limits this server's filesystem, and ssh reaches others.
+fn load_ssh_config(root: &Path) -> ssh_rpc::SshConfig {
+    let ssh_agent = std::env::var_os("SSH_AUTH_SOCK").is_some_and(|socket| !socket.is_empty());
+    match read_web_json(root) {
+        Ok(config) => ssh_rpc::SshConfig::from_web_json(&config, ssh_agent),
+        Err(error) => ssh_rpc::SshConfig {
+            disabled_reason: Some(format!("ssh is disabled: {error:#}")),
+            allowed_hosts: None,
+            ssh_agent,
+        },
+    }
+}
+
+fn parse_env_bool(name: &str, raw: &std::ffi::OsStr) -> Result<bool> {
+    match raw.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{name} must be true/false or 1/0"),
+    }
+}
+
+/// `.zed/web.json` under the project root, or `Null` when it cannot be read.
+fn read_web_json(root: &Path) -> Result<serde_json::Value> {
+    let path = root.join(".zed/web.json");
+    let Ok(content) = std::fs::read(&path) else {
+        return Ok(serde_json::Value::Null);
+    };
+    serde_json::from_slice(&content)
+        .with_context(|| format!("invalid web config {}", path.display()))
 }
 
 #[derive(Deserialize)]
@@ -923,6 +1041,28 @@ mod tests {
     }
 
     #[test]
+    fn leaves_ssh_addresses_alone_even_when_the_remote_path_starts_with_workspace() -> Result<()> {
+        let uri = "/?path=ssh%3A%2F%2Fa%40h%2Fworkspace%2Fx".parse::<axum::http::Uri>()?;
+
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/srv/project")),
+            None,
+            "a remote /workspace path is not the server's virtual root"
+        );
+
+        let uri = "/?path=ssh%3A%2F%2Fa%40h%2Fworkspace%2Fx&path=%2Fworkspace%2Fsrc"
+            .parse::<axum::http::Uri>()?;
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/srv/project")),
+            Some(
+                "/?path=ssh%3A%2F%2Fa%40h%2Fworkspace%2Fx&path=%2Fsrv%2Fproject%2Fsrc".to_string()
+            ),
+            "a local /workspace path beside it is still rewritten"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn printenv_is_accepted_without_project_roots() {
         assert_eq!(
             Args::try_parse_from(["zed-web-server", "--printenv"])
@@ -938,6 +1078,168 @@ mod tests {
         assert!(
             Args::try_parse_from(["zed-web-server"]).is_err(),
             "omitting --printenv must still require the project and static roots"
+        );
+    }
+
+    fn ssh_enabled_with(
+        cli_allow_ssh: bool,
+        env_value: Option<&str>,
+        web_json: serde_json::Value,
+    ) -> Result<bool> {
+        resolve_ssh_enabled(cli_allow_ssh, env_value.map(Into::into), move || {
+            Ok(web_json)
+        })
+    }
+
+    #[test]
+    fn ssh_is_on_unless_a_source_turns_it_off() -> Result<()> {
+        assert!(ssh_enabled_with(false, None, serde_json::Value::Null)?);
+        assert!(ssh_enabled_with(false, None, serde_json::json!({}))?);
+        assert!(ssh_enabled_with(
+            false,
+            None,
+            serde_json::json!({"ssh": {"allowed_hosts": ["devbox"]}})
+        )?);
+        assert!(!ssh_enabled_with(
+            false,
+            None,
+            serde_json::json!({"ssh": {"enabled": false}})
+        )?);
+        for value in ["0", "false", "NO", " off "] {
+            assert!(
+                !ssh_enabled_with(false, Some(value), serde_json::Value::Null)?,
+                "ZED_WEB_ALLOW_SSH={value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_source_can_turn_ssh_on() -> Result<()> {
+        assert!(ssh_enabled_with(true, None, serde_json::Value::Null)?);
+        for value in ["1", "true", "YES", " on "] {
+            assert!(
+                ssh_enabled_with(false, Some(value), serde_json::Value::Null)?,
+                "ZED_WEB_ALLOW_SSH={value:?}"
+            );
+        }
+        assert!(ssh_enabled_with(
+            false,
+            None,
+            serde_json::json!({"ssh": {"enabled": true}})
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_sources_resolve_conflicts_in_cli_env_file_order() -> Result<()> {
+        let file_on = serde_json::json!({"ssh": {"enabled": true}});
+        let file_off = serde_json::json!({"ssh": {"enabled": false}});
+        assert!(ssh_enabled_with(true, Some("0"), file_off.clone())?);
+        assert!(ssh_enabled_with(
+            true,
+            Some("not a bool"),
+            file_off.clone()
+        )?);
+        assert!(ssh_enabled_with(false, Some("1"), file_off)?);
+        assert!(!ssh_enabled_with(false, Some("0"), file_on.clone())?);
+        assert!(!ssh_enabled_with(false, Some("off"), file_on)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_decided_ssh_source_does_not_read_the_file() -> Result<()> {
+        let unreadable = || -> Result<serde_json::Value> { anyhow::bail!("must not be read") };
+        assert!(resolve_ssh_enabled(true, None, unreadable)?);
+        assert!(!resolve_ssh_enabled(false, Some("0".into()), unreadable)?);
+        assert!(resolve_ssh_enabled(false, None, unreadable).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_ssh_settings_are_errors() {
+        let error = ssh_enabled_with(false, Some("maybe"), serde_json::Value::Null)
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            error,
+            Err("ZED_WEB_ALLOW_SSH must be true/false or 1/0".to_string())
+        );
+        assert!(ssh_enabled_with(false, None, serde_json::json!({"ssh": true})).is_err());
+        assert!(
+            ssh_enabled_with(false, None, serde_json::json!({"ssh": {"enabled": "yes"}})).is_err()
+        );
+    }
+
+    #[test]
+    fn web_json_is_shared_by_restrict_paths_and_ssh() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        assert_eq!(read_web_json(root.path())?, serde_json::Value::Null);
+
+        std::fs::create_dir_all(root.path().join(".zed"))?;
+        std::fs::write(
+            root.path().join(".zed/web.json"),
+            r#"{"restrict_paths": true, "ssh": {"enabled": true}}"#,
+        )?;
+        let config = read_web_json(root.path())?;
+        assert_eq!(config["restrict_paths"], true);
+        assert!(resolve_ssh_enabled(false, None, || Ok(config))?);
+
+        std::fs::write(root.path().join(".zed/web.json"), "{not json")?;
+        let error = read_web_json(root.path()).map_err(|error| error.to_string());
+        assert_eq!(
+            error,
+            Err(format!(
+                "invalid web config {}",
+                root.path().join(".zed/web.json").display()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allow_ssh_is_a_command_line_flag() -> Result<()> {
+        let args = Args::try_parse_from(["zed-web-server", "root", "static", "--allow-ssh"])?;
+        assert!(args.allow_ssh);
+        let args = Args::try_parse_from(["zed-web-server", "root", "static"])?;
+        assert!(!args.allow_ssh);
+        Ok(())
+    }
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn askpass_socket_is_found_only_with_an_equals_sign() {
+        assert_eq!(
+            askpass_socket(arguments(&[
+                "zed-web-server",
+                "--askpass=/tmp/askpass.sock"
+            ])),
+            Some("/tmp/askpass.sock".to_string())
+        );
+        assert_eq!(
+            askpass_socket(arguments(&[
+                "zed-web-server",
+                "--askpass",
+                "/tmp/askpass.sock"
+            ])),
+            None
+        );
+        assert_eq!(
+            askpass_socket(arguments(&[
+                "zed-web-server",
+                "root",
+                "static",
+                "--port",
+                "8090",
+                "--askpass=/tmp/askpass.sock",
+            ])),
+            Some("/tmp/askpass.sock".to_string())
+        );
+        assert_eq!(
+            askpass_socket(arguments(&["zed-web-server", "root", "static"])),
+            None
         );
     }
 }

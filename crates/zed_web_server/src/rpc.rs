@@ -30,25 +30,79 @@ use crate::{
     fs_rpc::{FsRpc, is_server_owned_workspace_path},
 };
 
+/// Long enough that a page reload or a flapping socket re-binds well inside it; short enough
+/// that a closed tab's terminals and processes do not outlive it for long (spec §8.1.1, WP15).
+const SESSION_REAP_GRACE: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Default)]
 pub struct SessionRegistry {
-    sessions: Mutex<HashMap<String, Arc<Mutex<RpcSession>>>>,
+    sessions: Mutex<HashMap<String, SessionEntry>>,
     next_legacy_id: AtomicU64,
 }
 
+struct SessionEntry {
+    session: Arc<Mutex<RpcSession>>,
+    connections: usize,
+    // Bumped on every bind, so a reaper armed by an older release can tell it is stale.
+    binds: u64,
+}
+
 impl SessionRegistry {
-    async fn get_or_create(
-        &self,
-        session_id: &str,
-        state: &AppState,
-    ) -> Result<Arc<Mutex<RpcSession>>> {
+    async fn bind(&self, session_id: &str, state: &AppState) -> Result<Arc<Mutex<RpcSession>>> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(session_id) {
-            return Ok(session.clone());
+        if let Some(entry) = sessions.get_mut(session_id) {
+            entry.connections += 1;
+            entry.binds = entry.binds.wrapping_add(1);
+            return Ok(entry.session.clone());
         }
         let session = Arc::new(Mutex::new(RpcSession::new(state)?));
-        sessions.insert(session_id.to_string(), session.clone());
+        sessions.insert(
+            session_id.to_string(),
+            SessionEntry {
+                session: session.clone(),
+                connections: 1,
+                binds: 1,
+            },
+        );
         Ok(session)
+    }
+
+    async fn release(self: &Arc<Self>, session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return;
+        };
+        entry.connections = entry.connections.saturating_sub(1);
+        if entry.connections > 0 {
+            return;
+        }
+        let binds_at_release = entry.binds;
+        drop(sessions);
+        let registry = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(SESSION_REAP_GRACE).await;
+            let reaped = {
+                let mut sessions = registry.sessions.lock().await;
+                let expired = sessions
+                    .get(&session_id)
+                    .is_some_and(|entry| entry.connections == 0 && entry.binds == binds_at_release);
+                if expired {
+                    sessions.remove(&session_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(entry) = reaped {
+                tracing::info!(%session_id, "reaping RPC session with no connection");
+                entry.session.lock().await.shutdown().await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    async fn contains(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
     }
 
     fn legacy_id(&self) -> String {
@@ -63,7 +117,7 @@ impl SessionRegistry {
             let mut sessions = self.sessions.lock().await;
             sessions
                 .drain()
-                .map(|(_, session)| session)
+                .map(|(_, entry)| entry.session)
                 .collect::<Vec<_>>()
         };
         for session in sessions {
@@ -295,6 +349,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
     });
     let mut shutdown = state.shutdown.subscribe();
     let mut bound_session: Option<(String, Arc<Mutex<RpcSession>>, u64)> = None;
+    let ssh = state.ssh.connection(outgoing.clone());
     tracing::info!("rpc client connected");
 
     loop {
@@ -343,7 +398,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             session.clone()
         } else {
             let session_id = requested_session_id.unwrap_or_else(|| state.rpc_sessions.legacy_id());
-            let session = match state.rpc_sessions.get_or_create(&session_id, &state).await {
+            let session = match state.rpc_sessions.bind(&session_id, &state).await {
                 Ok(session) => session,
                 Err(error) => {
                     tracing::error!(?error, "failed to initialize RPC session");
@@ -396,6 +451,25 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                         .is_err()
                 {
                     tracing::debug!("no RPC sessions subscribed to extension changes");
+                }
+            });
+            continue;
+        }
+        if crate::ssh_rpc::handles(&method) {
+            let ssh = ssh.clone();
+            let outgoing = outgoing.clone();
+            // Spawned: a connect waits for as long as the user takes to answer its prompts.
+            tokio::spawn(async move {
+                let response = match ssh.dispatch(&method, params).await {
+                    Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                    Err(error) => {
+                        tracing::warn!(?error, %method, "rpc request failed");
+                        // The whole chain: remote::connect's cause is what the user can act on.
+                        json!({"id": request_id, "result": null, "error": format!("{error:#}")})
+                    }
+                };
+                if outgoing.send(Message::Text(response.to_string())).is_err() {
+                    tracing::debug!(%method, "RPC connection closed before response");
                 }
             });
             continue;
@@ -646,7 +720,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             }
         }
     }
-    if let Some((_, session, generation)) = bound_session {
+    if let Some((session_id, session, generation)) = bound_session {
         let processes = {
             let session = session.lock().await;
             let notification_target = session.notification_target.clone();
@@ -654,38 +728,62 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             session.processes.clone()
         };
         processes.lock().await.detach_generation(generation);
-        let processes_for_cleanup = processes.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            session
-                .lock()
-                .await
-                .remove_watches_for_generation(generation);
-            loop {
-                let reaped = processes_for_cleanup
-                    .lock()
-                    .await
-                    .reap_orphaned_processes(generation);
-                if reaped.acp_agents > 0 || reaped.language_servers > 0 || reaped.mcp_servers > 0 {
-                    tracing::info!(
-                        generation,
-                        acp_agents = reaped.acp_agents,
-                        language_servers = reaped.language_servers,
-                        mcp_servers = reaped.mcp_servers,
-                        "reaped orphaned processes"
-                    );
-                }
-                if !reaped.acp_waiting_for_prompt && !reaped.mcp_waiting_for_agent {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        });
+        spawn_generation_cleanup(&session, &processes, generation);
+        drop(processes);
+        drop(session);
+        state.rpc_sessions.release(&session_id).await;
     }
+    ssh.close();
+    drop(ssh);
     drop(outgoing);
     heartbeat.abort();
     writer.await.ok();
     tracing::info!("rpc client disconnected");
+}
+
+// Weak, because an agent that stays mid-prompt keeps this loop alive indefinitely, and a
+// strong handle would then keep a reaped session's terminals and processes alive with it.
+fn spawn_generation_cleanup(
+    session: &Arc<Mutex<RpcSession>>,
+    processes: &Arc<Mutex<crate::process_rpc::ProcessManager>>,
+    generation: u64,
+) -> JoinHandle<()> {
+    let session = Arc::downgrade(session);
+    let processes = Arc::downgrade(processes);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let Some(live_session) = session.upgrade() else {
+            return;
+        };
+        live_session
+            .lock()
+            .await
+            .remove_watches_for_generation(generation);
+        drop(live_session);
+        loop {
+            let Some(live_processes) = processes.upgrade() else {
+                break;
+            };
+            let reaped = live_processes
+                .lock()
+                .await
+                .reap_orphaned_processes(generation);
+            drop(live_processes);
+            if reaped.acp_agents > 0 || reaped.language_servers > 0 || reaped.mcp_servers > 0 {
+                tracing::info!(
+                    generation,
+                    acp_agents = reaped.acp_agents,
+                    language_servers = reaped.language_servers,
+                    mcp_servers = reaped.mcp_servers,
+                    "reaped orphaned processes"
+                );
+            }
+            if !reaped.acp_waiting_for_prompt && !reaped.mcp_waiting_for_agent {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    })
 }
 
 fn canonical_workspace_paths(fs: &FsRpc, params: &Value) -> Result<Vec<String>> {
@@ -1635,5 +1733,228 @@ mod tests {
             true,
             "browser capture must be a one-shot RPC; handles_stateless currently returns false so dispatch falls through to unknown method"
         );
+    }
+
+    fn test_state(root: &Path) -> Result<AppState> {
+        let root = root.canonicalize()?;
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        Ok(AppState {
+            static_root: Arc::new(root.clone()),
+            auth_token: Arc::new("test-token".to_string()),
+            server_instance_id: Arc::new("test-instance".to_string()),
+            secure_cookie: false,
+            restrict_paths: false,
+            login_limiter: Arc::new(crate::auth::LoginLimiter::default()),
+            events,
+            shutdown,
+            rpc_sessions: Arc::new(SessionRegistry::default()),
+            sql: Arc::new(crate::sql_rpc::SqlRpc::new(&root)?),
+            workspace_state: Arc::new(crate::workspace_state::WorkspaceState::load(&root)?),
+            http: reqwest::Client::new(),
+            ssh: crate::ssh_rpc::SshRpc::new(None, crate::load_ssh_config(&root)),
+            root: Arc::new(root),
+        })
+    }
+
+    // The returned receiver errors once the watch task is aborted, which only the
+    // session's teardown (or an explicit unwatch) does.
+    fn insert_test_watch(
+        session: &mut RpcSession,
+        subscription_id: u64,
+        generation: u64,
+        path: PathBuf,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (alive, aborted) = tokio::sync::oneshot::channel::<()>();
+        let key = WatchKey {
+            path: path.clone(),
+            latency: Duration::from_millis(100),
+        };
+        let task = tokio::spawn(async move {
+            let _alive = alive;
+            futures::future::pending::<()>().await;
+        });
+        session.watch_groups.insert(
+            key.clone(),
+            WatchGroup {
+                subscription_paths: Arc::new(StdMutex::new(HashMap::from([(
+                    subscription_id,
+                    path,
+                )]))),
+                task,
+            },
+        );
+        session.watches.insert(
+            subscription_id,
+            WatchHandle {
+                owner_generation: generation,
+                key,
+            },
+        );
+        aborted
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_is_reaped_after_the_grace_without_a_rebind() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let registry = Arc::new(SessionRegistry::default());
+
+        let session = registry.bind("tab-a", &state).await?;
+        let watch_aborted =
+            insert_test_watch(&mut *session.lock().await, 1, 1, root.path().to_path_buf());
+        let weak_session = Arc::downgrade(&session);
+        drop(session);
+        registry.release("tab-a").await;
+
+        tokio::time::sleep(SESSION_REAP_GRACE - Duration::from_secs(1)).await;
+        assert!(
+            registry.contains("tab-a").await,
+            "session was reaped before the {SESSION_REAP_GRACE:?} grace elapsed"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !registry.contains("tab-a").await,
+            "session with no connection is still registered {SESSION_REAP_GRACE:?} + 1s after its last release"
+        );
+        assert!(
+            weak_session.upgrade().is_none(),
+            "reaped session is still alive: something kept a strong handle to it"
+        );
+        let watch_result = tokio::time::timeout(Duration::from_secs(1), watch_aborted).await;
+        assert!(
+            matches!(watch_result, Ok(Err(_))),
+            "reaped session's watch task was not aborted: {watch_result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebind_inside_the_grace_keeps_the_session() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let registry = Arc::new(SessionRegistry::default());
+
+        let first = registry.bind("tab-a", &state).await?;
+        registry.release("tab-a").await;
+        // A page reload reconnects within seconds.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let second = registry.bind("tab-a", &state).await?;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a reload inside the grace got a fresh session instead of its own"
+        );
+        drop(first);
+
+        tokio::time::sleep(SESSION_REAP_GRACE * 6).await;
+        assert!(
+            registry.contains("tab-a").await,
+            "a session with a live connection was reaped after an hour"
+        );
+        drop(second);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flapping_socket_is_measured_from_its_last_release() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let registry = Arc::new(SessionRegistry::default());
+
+        drop(registry.bind("tab-a", &state).await?);
+        registry.release("tab-a").await;
+        tokio::time::sleep(SESSION_REAP_GRACE / 2).await;
+        drop(registry.bind("tab-a", &state).await?);
+        registry.release("tab-a").await;
+
+        // The first release's grace ends here; the second one's is only half over.
+        tokio::time::sleep(SESSION_REAP_GRACE / 2 + Duration::from_secs(1)).await;
+        assert!(
+            registry.contains("tab-a").await,
+            "session was reaped {:?} after its last release, before the {SESSION_REAP_GRACE:?} grace",
+            SESSION_REAP_GRACE / 2 + Duration::from_secs(1)
+        );
+
+        tokio::time::sleep(SESSION_REAP_GRACE / 2).await;
+        assert!(
+            !registry.contains("tab-a").await,
+            "session is still registered {:?} after its last release",
+            SESSION_REAP_GRACE + Duration::from_secs(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_live_connection_keeps_the_session() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let registry = Arc::new(SessionRegistry::default());
+
+        drop(registry.bind("tab-a", &state).await?);
+        drop(registry.bind("tab-a", &state).await?);
+        registry.release("tab-a").await;
+
+        tokio::time::sleep(SESSION_REAP_GRACE * 2).await;
+        assert!(
+            registry.contains("tab-a").await,
+            "session was reaped while a second connection was still bound"
+        );
+
+        registry.release("tab-a").await;
+        tokio::time::sleep(SESSION_REAP_GRACE + Duration::from_secs(1)).await;
+        assert!(
+            !registry.contains("tab-a").await,
+            "session is still registered after its last connection released"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn generation_cleanup_still_runs_at_thirty_seconds() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let registry = Arc::new(SessionRegistry::default());
+
+        let session = registry.bind("tab-a", &state).await?;
+        let (processes, _gone_watch, _kept_watch) = {
+            let mut locked = session.lock().await;
+            let gone = insert_test_watch(&mut locked, 1, 7, root.path().join("gone"));
+            let kept = insert_test_watch(&mut locked, 2, 8, root.path().join("kept"));
+            (locked.processes.clone(), gone, kept)
+        };
+        let cleanup = spawn_generation_cleanup(&session, &processes, 7);
+        drop(processes);
+        registry.release("tab-a").await;
+
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        {
+            let locked = session.lock().await;
+            assert_eq!(
+                locked.watches.keys().copied().collect::<HashSet<_>>(),
+                HashSet::from([1, 2]),
+                "generation cleanup ran before 30s"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        {
+            let locked = session.lock().await;
+            assert_eq!(
+                locked.watches.keys().copied().collect::<HashSet<_>>(),
+                HashSet::from([2]),
+                "after 30s only the detached generation's watch should be gone"
+            );
+        }
+        assert!(
+            cleanup.is_finished(),
+            "cleanup loop kept running with no process waiting"
+        );
+        assert!(
+            registry.contains("tab-a").await,
+            "the 30s generation cleanup must not remove the session"
+        );
+        drop(session);
+        Ok(())
     }
 }
