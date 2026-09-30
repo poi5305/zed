@@ -1722,36 +1722,53 @@ impl Element for TerminalElement {
                             wavy: false,
                         });
 
-                        let shaped_line = window.text_system().shape_line(
-                            text_to_mark.clone().into(),
-                            ime_style.font_size.to_pixels(window.rem_size()),
-                            &[TextRun {
-                                len: text_to_mark.len(),
-                                font: ime_style.font(),
-                                color: ime_style.color,
-                                underline: ime_style.underline,
-                                ..Default::default()
-                            }],
-                            None,
-                        );
+                        // Laid out on the cell grid, as the text will be once committed: shaped
+                        // proportionally, a CJK preedit is narrower than the two cells each of
+                        // its characters then occupies, so it visibly jumps on commit.
+                        let font_size = ime_style.font_size.to_pixels(window.rem_size());
+                        let cell_width = layout.dimensions.cell_width;
+                        let mut shaped_characters = Vec::new();
+                        let mut columns = 0;
+                        for cell in preedit_cells(text_to_mark) {
+                            let shaped = window.text_system().shape_line(
+                                cell.text.clone().into(),
+                                font_size,
+                                &[TextRun {
+                                    len: cell.text.len(),
+                                    font: ime_style.font(),
+                                    color: ime_style.color,
+                                    underline: ime_style.underline,
+                                    ..Default::default()
+                                }],
+                                Some(cell_width * cell.width as f32),
+                            );
+                            shaped_characters.push((cell.column, shaped));
+                            columns = cell.column + cell.width;
+                        }
 
                         // Paint background to cover terminal text behind marked text
                         let ime_background_bounds = Bounds::new(
                             ime_position,
-                            size(shaped_line.width, layout.dimensions.line_height),
+                            size(cell_width * columns as f32, layout.dimensions.line_height),
                         );
                         window.paint_quad(fill(ime_background_bounds, layout.background_color));
 
-                        shaped_line
-                            .paint(
-                                ime_position,
-                                layout.dimensions.line_height,
-                                gpui::TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            )
-                            .log_err();
+                        for (column, shaped) in shaped_characters {
+                            let position = GpuiPoint::new(
+                                ime_position.x + cell_width * column as f32,
+                                ime_position.y,
+                            );
+                            shaped
+                                .paint(
+                                    position,
+                                    layout.dimensions.line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .log_err();
+                        }
                     }
 
                     if self.cursor_visible
@@ -2028,11 +2045,84 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
+/// One character of the IME preedit, with the zero-width characters that follow it, and the
+/// columns it occupies on the terminal grid.
+struct PreeditCell {
+    column: usize,
+    width: usize,
+    text: String,
+}
+
+fn preedit_cells(text: &str) -> Vec<PreeditCell> {
+    let mut cells: Vec<PreeditCell> = Vec::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        // Controls have no width at all and are dropped. A zero-width character is a
+        // combining mark that the committed cell keeps beside its base, so it joins the
+        // previous cell; one with no base before it has nothing to join.
+        let Some(width) = unicode_width::UnicodeWidthChar::width(character) else {
+            continue;
+        };
+        if width == 0 {
+            if let Some(cell) = cells.last_mut() {
+                cell.text.push(character);
+            }
+            continue;
+        }
+        cells.push(PreeditCell {
+            column: columns,
+            width,
+            text: character.to_string(),
+        });
+        columns += width;
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};
     use ui::utils::apca_contrast;
+
+    #[test]
+    fn test_preedit_keeps_combining_marks_with_their_base() {
+        let cells = preedit_cells("e\u{301}");
+        assert_eq!(
+            cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+            vec!["e\u{301}"],
+            "a combining mark is drawn with its base, as the committed cell draws it"
+        );
+        assert_eq!(cells.iter().map(|cell| cell.width).sum::<usize>(), 1);
+
+        let cells = preedit_cells("\u{e01}\u{e34}\u{e49}");
+        assert_eq!(
+            cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+            vec!["\u{e01}\u{e34}\u{e49}"],
+            "Thai vowel and tone marks stay on their consonant"
+        );
+    }
+
+    #[test]
+    fn test_preedit_lays_characters_out_on_the_cell_grid() {
+        let cells = preedit_cells("a\u{4e2d}b");
+        let layout = cells
+            .iter()
+            .map(|cell| (cell.column, cell.width, cell.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(layout, vec![(0, 1, "a"), (1, 2, "\u{4e2d}"), (3, 1, "b")]);
+    }
+
+    #[test]
+    fn test_preedit_skips_controls_and_a_mark_with_no_base() {
+        assert!(preedit_cells("\n\t").is_empty());
+        let cells = preedit_cells("\u{301}a");
+        assert_eq!(
+            cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "a mark with nothing before it has no cell to join"
+        );
+    }
 
     #[test]
     fn test_is_decorative_character() {
