@@ -392,7 +392,7 @@ impl ProcessManager {
         }
         let mut child = command
             .spawn()
-            .with_context(|| format!("spawning {}", program.display()))?;
+            .map_err(|error| spawn_error(error, format!("spawning {}", program.display())))?;
         #[cfg(target_os = "linux")]
         let process_group_id = child.id();
         #[cfg(target_os = "linux")]
@@ -901,6 +901,20 @@ impl Drop for ProcessManager {
     }
 }
 
+// The RPC error payload is a bare string, so a missing program is signalled by this
+// prefix. The browser maps it back to `io::ErrorKind::NotFound`, which callers such as
+// direnv loading rely on to tell "binary not installed" from a real failure. Must match
+// `NOT_FOUND_MARKER` in web/vendor/smol_wasm/src/remote_error.rs.
+const NOT_FOUND_MARKER: &str = "zed-web-io-error:NotFound: ";
+
+fn spawn_error(error: std::io::Error, context: String) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("{NOT_FOUND_MARKER}{context}: {error}")
+    } else {
+        anyhow::Error::new(error).context(context)
+    }
+}
+
 pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
     let program = params
         .get("program")
@@ -932,9 +946,9 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
     }
     match method {
         "Process::output" => {
-            let output = command
-                .output()
-                .with_context(|| format!("running {program} in {}", cwd.display()))?;
+            let output = command.output().map_err(|error| {
+                spawn_error(error, format!("running {program} in {}", cwd.display()))
+            })?;
             Ok(json!({
                 "status_code": output.status.code().unwrap_or(-1),
                 "stdout": BASE64.encode(output.stdout),
@@ -942,9 +956,9 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
             }))
         }
         "Process::status" => {
-            let status = command
-                .status()
-                .with_context(|| format!("running {program} in {}", cwd.display()))?;
+            let status = command.status().map_err(|error| {
+                spawn_error(error, format!("running {program} in {}", cwd.display()))
+            })?;
             Ok(json!({"status_code": status.code().unwrap_or(-1)}))
         }
         _ => bail!("unknown process method: {method}"),
@@ -1314,8 +1328,8 @@ mod tests {
     use tokio::{io::AsyncWriteExt as _, sync::mpsc};
 
     use super::{
-        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, notify_process_output,
-        pump_output, rewrite_process_value, sanitize_lldb_frame,
+        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, dispatch,
+        notify_process_output, pump_output, rewrite_process_value, sanitize_lldb_frame,
     };
     use crate::fs_rpc::FsRpc;
 
@@ -1921,5 +1935,78 @@ mod tests {
         let output = String::from_utf8(sanitize_lldb_frame(frame)).unwrap();
         assert!(!output.contains("supportsFoo"));
         assert!(output.contains("supportsBar"));
+    }
+
+    const NOT_FOUND_MARKER: &str = "zed-web-io-error:NotFound: ";
+
+    #[test]
+    fn missing_program_is_reported_with_the_not_found_marker() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = FsRpc::new(root.path().to_path_buf(), false)?;
+        for method in ["Process::output", "Process::status"] {
+            let error = dispatch(
+                &fs,
+                method,
+                &json!({"program": "zed-web-test-no-such-program"}),
+            )
+            .expect_err("a program that does not exist must fail");
+            let message = error.to_string();
+            assert!(
+                message.starts_with(NOT_FOUND_MARKER),
+                "{method}: expected the message to start with {NOT_FOUND_MARKER:?}, got {message:?}"
+            );
+            assert!(
+                message.contains("zed-web-test-no-such-program"),
+                "{message:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_failure_other_than_not_found_is_not_marked() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = FsRpc::new(root.path().to_path_buf(), false)?;
+        let directory = root.path().join("not-a-program");
+        std::fs::create_dir(&directory)?;
+        let error = dispatch(
+            &fs,
+            "Process::output",
+            &json!({"program": directory.to_string_lossy()}),
+        )
+        .expect_err("a directory cannot be executed");
+        let message = error.to_string();
+        assert!(
+            !message.contains(NOT_FOUND_MARKER),
+            "a non-NotFound failure must not carry the marker: {message:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_spawn_of_missing_program_uses_the_not_found_marker() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let error = processes
+            .dispatch(
+                "Process::spawn",
+                &json!({
+                    "proc_id": 91,
+                    "program": "zed-web-test-no-such-program",
+                    "stdout_pipe": true,
+                }),
+                1,
+            )
+            .await
+            .expect_err("a program that does not exist must fail");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(NOT_FOUND_MARKER),
+            "expected the message to start with {NOT_FOUND_MARKER:?}, got {message:?}"
+        );
+        Ok(())
     }
 }

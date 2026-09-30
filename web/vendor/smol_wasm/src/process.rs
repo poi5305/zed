@@ -573,7 +573,7 @@ impl Command {
             let response: OutputResponse = client
                 .call("Process::output", &request)
                 .await
-                .map_err(|e| io_error(&e.to_string()))?;
+                .map_err(|e| crate::remote_error::io_error_from_remote(&e.to_string()))?;
 
             let stdout = base64::engine::general_purpose::STANDARD
                 .decode(response.stdout)
@@ -630,7 +630,7 @@ impl Command {
             let _response: StatusResponse = client
                 .call("Process::status", &request)
                 .await
-                .map_err(|e| io_error(&e.to_string()))?;
+                .map_err(|e| crate::remote_error::io_error_from_remote(&e.to_string()))?;
 
             Ok(ExitStatus::default())
         }
