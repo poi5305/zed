@@ -53,6 +53,7 @@ const DEFAULT_SWEEP = [
       directory: null,
     },
   ],
+  ["RemoteSsh::capabilities", {}],
 ];
 
 function parseArguments(argv) {

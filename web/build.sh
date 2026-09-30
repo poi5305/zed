@@ -297,11 +297,378 @@ install -m 0755 \
     "${native_target}/release/zed-web-server" \
     "${dist_dir}/bin/zed-web-server"
 
+# ---------------------------------------------------------------------------
+# remote_server for ssh projects (docs/web-zed-remote-spec.md §4.8 and Q4 in §8.1.1)
+# ---------------------------------------------------------------------------
+# The server deploys these to the ssh host (dev builds cannot download one), so the remote
+# must run this fork's build. Linux binaries are static musl: a glibc build fails on a
+# remote whose glibc is older ("version GLIBC_2.xx not found"). The other linux arch is
+# musl via cargo-zigbuild when that is installed. A macOS host also builds the other apple
+# arch when the rustup target is installed. Windows is best-effort (cargo-zigbuild or
+# mingw); otherwise build it on Windows and import it. The layout is read by
+# remote_server_bundle.rs from <dir of zed-web-server>/remote/.
+# web/scripts/import-remote-server.sh is the only writer of manifest.json.
+remote_server_commit_sha="$(git -C "${repo_dir}" rev-parse HEAD 2>/dev/null || true)"
+import_remote_server="${web_dir}/scripts/import-remote-server.sh"
+
+host_triple() {
+    rustup run "${stable_toolchain}" rustc -vV | sed -n 's/^host: //p'
+}
+
+# triple_platform <triple> -> "<os> <arch>", the strings RemoteOs/RemoteArch::as_str use.
+triple_platform() {
+    case "$1" in
+        x86_64-unknown-linux-*) echo "linux x86_64" ;;
+        aarch64-unknown-linux-*) echo "linux aarch64" ;;
+        x86_64-apple-darwin) echo "macos x86_64" ;;
+        aarch64-apple-darwin) echo "macos aarch64" ;;
+        x86_64-pc-windows-*) echo "windows x86_64" ;;
+        aarch64-pc-windows-*) echo "windows aarch64" ;;
+        *) return 1 ;;
+    esac
+}
+
+# The binary tells its own commit; the manifest must agree with `version` or the server
+# would redeploy on every connection.
+remote_server_version() {
+    "$1" version | awk 'NF { line = $0 } END { print line }' | tr -d '[:space:]'
+}
+
+# A glibc-linked remote_server dies on a remote whose glibc is older than this machine's.
+# ldd prints "statically linked" for the musl crt-static binary. A cross binary ldd cannot
+# load is accepted only when readelf shows no NEEDED library; static-pie musl has a dynamic
+# section and still no NEEDED, which is not a glibc dependency.
+require_static_linux_binary() {
+    local binary="$1" ldd_output readelf_dynamic readelf_bin=""
+    if command -v readelf >/dev/null 2>&1; then
+        readelf_bin="readelf"
+    elif command -v llvm-readelf >/dev/null 2>&1; then
+        readelf_bin="llvm-readelf"
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+        ldd_output="$(ldd "${binary}" 2>&1 || true)"
+        if printf '%s\n' "${ldd_output}" | grep -q '\.so'; then
+            die "error: ${binary} is dynamically linked, so it is not bundled." \
+                "${ldd_output}" \
+                "A linux remote_server must be a static musl binary. A glibc-linked binary fails on older remotes (GLIBC_x.xx not found)."
+        fi
+        if printf '%s\n' "${ldd_output}" | grep -q 'statically linked'; then
+            return 0
+        fi
+    fi
+
+    if [[ -z "${readelf_bin}" ]] || ! "${readelf_bin}" -h "${binary}" >/dev/null 2>&1; then
+        if ! command -v ldd >/dev/null 2>&1; then
+            die "error: neither readelf nor ldd was found, so ${binary} cannot be checked for glibc linkage."
+        fi
+        die "error: ${binary} is not a static ELF executable, so it is not bundled." \
+            "ldd said: ${ldd_output:-<no ldd output>}"
+    fi
+
+    local readelf_headers
+    readelf_headers="$("${readelf_bin}" -l "${binary}" 2>&1 || true)"
+    if printf '%s\n' "${readelf_headers}" | grep -q 'INTERP'; then
+        die "error: ${binary} is dynamically linked (has INTERP header), so it is not bundled." \
+            "${readelf_headers}" \
+            "A linux remote_server must be a static musl binary. A glibc-linked binary fails on older remotes (GLIBC_x.xx not found)."
+    fi
+
+    readelf_dynamic="$("${readelf_bin}" -d "${binary}" 2>&1 || true)"
+    if printf '%s\n' "${readelf_dynamic}" | grep -q '(NEEDED)'; then
+        die "error: ${binary} is dynamically linked (readelf lists NEEDED), so it is not bundled." \
+            "${readelf_dynamic}" \
+            "A linux remote_server must be a static musl binary. A glibc-linked binary fails on older remotes (GLIBC_x.xx not found)."
+    fi
+}
+
+# The release profile keeps debuginfo, which makes remote_server ~740 MB; the server uploads
+# it over ssh, and without debuginfo it is ~125 MB. Strips a copy so the cargo target keeps
+# its symbols. Prints the path to use: the copy, or the original when no strip tool fits.
+# strip_debug_info <triple> <native triple> <binary>
+strip_debug_info() {
+    local triple="$1" native_triple="$2" binary="$3"
+    local copy_dir="${native_target}/remote-server-stripped/${triple}"
+    local copy
+    copy="${copy_dir}/${binary##*/}"
+    local -a strip_command
+    strip_command=()
+    case "${triple}" in
+        *-apple-darwin)
+            # Apple's strip cross-strips the other apple arch; both slices are bundled.
+            if command -v strip >/dev/null 2>&1; then
+                strip_command=(strip -S)
+            fi
+            ;;
+        *)
+            if command -v "${triple%%-*}-linux-gnu-strip" >/dev/null 2>&1; then
+                strip_command=("${triple%%-*}-linux-gnu-strip" --strip-debug)
+            elif command -v llvm-strip >/dev/null 2>&1; then
+                strip_command=(llvm-strip --strip-debug)
+            elif [[ "${triple%%-*}" == "${native_triple%%-*}" ]] && command -v strip >/dev/null 2>&1; then
+                # The host-arch musl binary runs here, so the host strip can see it.
+                strip_command=(strip --strip-debug)
+            fi
+            ;;
+    esac
+    if [[ ${#strip_command[@]} -eq 0 ]]; then
+        echo "warning: no strip tool for ${triple}; bundling ${binary} with its debuginfo." >&2
+        echo "${binary}"
+        return 0
+    fi
+    mkdir -p "${copy_dir}"
+    cp "${binary}" "${copy}"
+    if ! "${strip_command[@]}" "${copy}" >&2; then
+        echo "warning: ${strip_command[0]} failed on ${triple}; bundling ${binary} with its debuginfo." >&2
+        echo "${binary}"
+        return 0
+    fi
+    echo "${copy}"
+}
+
+# build_remote_server <triple> [cargo subcommand]: prints the binary's path on success.
+build_remote_server() {
+    local triple="$1" subcommand="${2:-build}" native_triple="$3"
+    local -a target_args
+    target_args=()
+    if [[ "${triple}" != "${native_triple}" ]]; then
+        target_args=(--target "${triple}")
+    fi
+    (
+        cd "${repo_dir}"
+        # shellcheck disable=SC2030 # scoped to this subshell on purpose
+        if [[ -n "${remote_server_commit_sha}" ]]; then
+            export ZED_COMMIT_SHA="${remote_server_commit_sha}"
+        fi
+        # remote_server prefixes its `version` with these, and the manifest records the bare sha.
+        unset GITHUB_RUN_NUMBER ZED_BUILD_ID
+        if [[ "${triple}" == *-unknown-linux-musl ]]; then
+            # This subshell is the only place RUSTFLAGS is set. The wasm build refuses it,
+            # because Cargo replaces web/.cargo/config.toml's rustflags instead of appending.
+            # The cc crate reads CC_<triple with '-' as '_'>, lowercase, not CARGO_TARGET_*_LINKER.
+            # shellcheck disable=SC2030 # scoped to this subshell on purpose
+            export RUSTFLAGS="-C target-feature=+crt-static"
+            if [[ "${subcommand}" == build ]]; then
+                if ! command -v musl-gcc >/dev/null 2>&1; then
+                    printf '%s\n' \
+                        "error: musl-gcc was not found. Building a static remote_server requires it; install the musl-tools package." >&2
+                    exit 1
+                fi
+                local musl_cc_var
+                musl_cc_var="CC_$(printf '%s' "${triple}" | tr '-' '_')"
+                export "${musl_cc_var}=musl-gcc"
+            fi
+        fi
+        # cargo links a foreign windows-gnu target with the host cc unless told otherwise.
+        # zigbuild brings its own linker. A linux-gnu gcc is not used: it produces a glibc binary.
+        local linker_variable linker_gcc=""
+        case "${triple}" in
+            x86_64-pc-windows-gnu) linker_gcc="x86_64-w64-mingw32-gcc" ;;
+            aarch64-pc-windows-gnu) linker_gcc="aarch64-w64-mingw32-gcc" ;;
+        esac
+        if [[ -n "${linker_gcc}" && "${triple}" != "${native_triple}" && "${subcommand}" == build ]]; then
+            linker_variable="CARGO_TARGET_$(printf '%s' "${triple}" | tr 'a-z-' 'A-Z_')_LINKER"
+            if [[ -z "${!linker_variable:-}" ]] && command -v "${linker_gcc}" >/dev/null 2>&1; then
+                export "${linker_variable}=${linker_gcc}"
+            fi
+        fi
+        rustup run "${stable_toolchain}" "${cargo_bin}" "${subcommand}" \
+            --manifest-path "${repo_dir}/Cargo.toml" \
+            --target-dir "${native_target}" \
+            --release \
+            -p remote_server \
+            ${target_args[@]+"${target_args[@]}"} >&2
+    ) || return 1
+    local output
+    if [[ "${triple}" == "${native_triple}" ]]; then
+        output="${native_target}/release/remote_server"
+    else
+        output="${native_target}/${triple}/release/remote_server"
+    fi
+    if [[ -f "${output}.exe" || "${triple}" == *-pc-windows-* ]]; then
+        output="${output}.exe"
+    fi
+    echo "${output}"
+}
+
+# cross_subcommand <triple>: which cargo subcommand can build for a foreign triple here,
+# or nothing when no toolchain is installed. Linux gnu is not a result: that binary is
+# dynamically linked against this machine's glibc.
+cross_subcommand() {
+    local triple="$1" linker_gcc="" linker_variable linker_ready
+    case "${triple}" in
+        *-apple-darwin)
+            # Apple's toolchain cross-links the other apple arch; no separate linker.
+            local host_os=""
+            if platform="$(triple_platform "$(host_triple)")"; then
+                read -r host_os _ <<<"${platform}"
+            fi
+            if [[ "${host_os}" != "macos" ]]; then
+                return 1
+            fi
+            if rustup target list --installed --toolchain "${stable_toolchain}" 2>/dev/null | grep -qx "${triple}"; then
+                echo build
+                return 0
+            fi
+            return 1
+            ;;
+        *-unknown-linux-musl)
+            if command -v zig >/dev/null 2>&1 && "${cargo_bin}" zigbuild --help >/dev/null 2>&1; then
+                echo zigbuild
+                return 0
+            fi
+            return 1
+            ;;
+        *-pc-windows-gnu)
+            if command -v zig >/dev/null 2>&1 && "${cargo_bin}" zigbuild --help >/dev/null 2>&1; then
+                echo zigbuild
+                return 0
+            fi
+            case "${triple}" in
+                x86_64-pc-windows-gnu) linker_gcc="x86_64-w64-mingw32-gcc" ;;
+                aarch64-pc-windows-gnu) linker_gcc="aarch64-w64-mingw32-gcc" ;;
+            esac
+            linker_variable="CARGO_TARGET_$(printf '%s' "${triple}" | tr 'a-z-' 'A-Z_')_LINKER"
+            linker_ready=0
+            if [[ -n "${!linker_variable:-}" ]]; then
+                linker_ready=1
+            elif [[ -n "${linker_gcc}" ]] && command -v "${linker_gcc}" >/dev/null 2>&1; then
+                linker_ready=1
+            fi
+            if [[ "${linker_ready}" -eq 1 ]] &&
+                rustup target list --installed --toolchain "${stable_toolchain}" 2>/dev/null | grep -qx "${triple}"; then
+                echo build
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+build_remote_servers() {
+    local native_triple platform os arch binary commit musl_triple native_build_triple
+    native_triple="$(host_triple)"
+    platform="$(triple_platform "${native_triple}")" ||
+        die "error: cannot bundle a remote_server for host triple '${native_triple}'."
+    read -r os arch <<<"${platform}"
+
+    native_build_triple="${native_triple}"
+    if [[ "${os}" == "linux" ]]; then
+        musl_triple="${arch}-unknown-linux-musl"
+        if ! command -v musl-gcc >/dev/null 2>&1; then
+            die "error: musl-gcc was not found. Building a static remote_server requires it; install the musl-tools package."
+        fi
+        if ! rustup target list --installed --toolchain "${stable_toolchain}" 2>/dev/null | grep -qx "${musl_triple}"; then
+            die "error: rustup target ${musl_triple} is not installed." \
+                "A static remote_server is built for that target. Install it with 'rustup target add ${musl_triple}' and rerun; this script does not install targets."
+        fi
+        native_build_triple="${musl_triple}"
+    fi
+
+    echo "Building remote_server for ${native_build_triple}"
+    binary="$(build_remote_server "${native_build_triple}" build "${native_triple}")" ||
+        die "error: building remote_server for ${native_build_triple} failed."
+    binary="$(strip_debug_info "${native_build_triple}" "${native_triple}" "${binary}")"
+    commit="$(remote_server_version "${binary}")"
+    [[ -n "${commit}" ]] || die "error: '${binary} version' printed nothing."
+    if [[ "${os}" == "linux" ]]; then
+        require_static_linux_binary "${binary}"
+    fi
+    ZED_WEB_DIST_DIR="${dist_dir}" "${import_remote_server}" --commit "${commit}" "${binary}" "${os}" "${arch}"
+
+    # The other linux arch is musl via cargo-zigbuild. The other apple arch is a plain
+    # cargo --target when that rustup target is installed. A cross binary is imported
+    # under the native binary's commit; both are built from the same checkout.
+    local extra_triples=""
+    if [[ "${os}" == "linux" ]]; then
+        if [[ "${arch}" == "x86_64" ]]; then
+            extra_triples="aarch64-unknown-linux-musl"
+        else
+            extra_triples="x86_64-unknown-linux-musl"
+        fi
+    elif [[ "${os}" == "macos" ]]; then
+        if [[ "${arch}" == "x86_64" ]]; then
+            extra_triples="aarch64-apple-darwin"
+        else
+            extra_triples="x86_64-apple-darwin"
+        fi
+    fi
+    extra_triples="${ZED_WEB_REMOTE_SERVER_TARGETS-${extra_triples}}"
+
+    local windows_triple="x86_64-pc-windows-gnu"
+    local -a triples
+    triples=()
+    local triple existing seen
+    for triple in ${extra_triples} ${windows_triple}; do
+        seen=0
+        for existing in "${triples[@]+"${triples[@]}"}"; do
+            if [[ "${existing}" == "${triple}" ]]; then
+                seen=1
+            fi
+        done
+        if [[ "${seen}" -eq 0 && "${triple}" != "${native_build_triple}" && "${triple}" != "${native_triple}" ]]; then
+            triples+=("${triple}")
+        fi
+    done
+
+    local subcommand cross_binary cross_os cross_arch
+    for triple in "${triples[@]+"${triples[@]}"}"; do
+        if ! platform="$(triple_platform "${triple}")"; then
+            echo "warning: skipping remote_server for ${triple}: not a platform the bundle lists." >&2
+            continue
+        fi
+        read -r cross_os cross_arch <<<"${platform}"
+        if ! subcommand="$(cross_subcommand "${triple}")"; then
+            case "${triple}" in
+                *-unknown-linux-musl)
+                    echo "warning: skipping remote_server for ${triple}: cargo-zigbuild and zig are not available." >&2
+                    echo "         A glibc cross toolchain is not used: that binary fails on a remote with an older glibc." >&2
+                    echo "         The bundle will not list ${cross_os}-${cross_arch} until you build it elsewhere and run web/scripts/import-remote-server.sh." >&2
+                    ;;
+                *-pc-windows-*)
+                    echo "warning: skipping remote_server for ${triple}: no cargo-zigbuild/zig or mingw (${triple%%-*}-w64-mingw32-gcc)." >&2
+                    echo "         Build remote_server on Windows and import it with web/scripts/import-remote-server.sh." >&2
+                    ;;
+                *-apple-darwin)
+                    echo "warning: skipping remote_server for ${triple}: the rustup target is not installed." >&2
+                    echo "         Install it with 'rustup target add ${triple}' (this script does not install targets), or build it on a Mac and run web/scripts/import-remote-server.sh." >&2
+                    ;;
+                *)
+                    echo "warning: skipping remote_server for ${triple}: no cross toolchain." >&2
+                    echo "         The bundle will not list ${cross_os}-${cross_arch} until you build it elsewhere and run web/scripts/import-remote-server.sh." >&2
+                    ;;
+            esac
+            continue
+        fi
+        echo "Building remote_server for ${triple} (cargo ${subcommand})"
+        if ! cross_binary="$(build_remote_server "${triple}" "${subcommand}" "${native_triple}")"; then
+            echo "warning: skipping remote_server for ${triple}: the cross build failed (output above)." >&2
+            continue
+        fi
+        cross_binary="$(strip_debug_info "${triple}" "${native_triple}" "${cross_binary}")"
+        if [[ "${cross_os}" == "linux" ]]; then
+            require_static_linux_binary "${cross_binary}"
+        fi
+        ZED_WEB_DIST_DIR="${dist_dir}" "${import_remote_server}" --commit "${commit}" "${cross_binary}" "${cross_os}" "${cross_arch}"
+    done
+}
+
+build_remote_servers
+
 # Wasm app: web workspace. Subshell so the rest of the script is not stuck in web/.
 (
     enter_web_cwd_for_wasm
     require_unset_rustflags
     export CARGO_TARGET_DIR="${wasm_target}"
+    # The same commit the bundled remote_server reports, so the browser can tell a stale
+    # tab from the server it is talking to (§4.8 point 4).
+    # shellcheck disable=SC2031 # a different subshell from the remote_server one
+    if [[ -n "${remote_server_commit_sha}" ]]; then
+        export ZED_COMMIT_SHA="${remote_server_commit_sha}"
+    fi
     export CC_wasm32_unknown_unknown="${wasi_sdk}/bin/clang"
     # Headers: tree-sitter's own, not the WASI sysroot's. The sysroot's <wasi/api.h>
     # refuses any target that is not WASI proper, and wasm32-unknown-unknown is not, so
