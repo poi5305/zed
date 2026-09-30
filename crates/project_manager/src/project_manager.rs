@@ -241,6 +241,28 @@ pub fn set_server_os(os: impl Into<String>) {
     let _ = SERVER_OS.set(os.into());
 }
 
+/// How the browser opens another project: a browser tab holds a single GPUI window, so
+/// the "new window" a click asks for has to be a new tab, and only the web entry point
+/// can build that tab's URL and call `window.open`.
+#[cfg(target_family = "wasm")]
+static OPEN_IN_NEW_TAB: std::sync::OnceLock<fn(&[PathBuf]) -> anyhow::Result<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_family = "wasm")]
+pub fn set_open_in_new_tab(open: fn(&[PathBuf]) -> anyhow::Result<()>) {
+    if OPEN_IN_NEW_TAB.set(open).is_err() {
+        log::warn!("project manager: the new-tab opener was already set");
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn open_in_new_tab(paths: &[PathBuf]) -> anyhow::Result<()> {
+    let open = OPEN_IN_NEW_TAB
+        .get()
+        .context("this build cannot open a project in a new browser tab")?;
+    open(paths)
+}
+
 fn host_os() -> &'static str {
     #[cfg(target_family = "wasm")]
     {
