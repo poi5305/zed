@@ -11595,7 +11595,12 @@ fn deserialize_remote_project(
             .get_or_create_remote_connection(connection_options)
             .await?;
 
+        #[cfg(not(target_family = "wasm"))]
         let serialized_workspace = db.remote_workspace_for_roots(&paths, remote_connection_id);
+        #[cfg(target_family = "wasm")]
+        let serialized_workspace = db
+            .remote_workspace_for_roots(&paths, remote_connection_id)
+            .await?;
 
         let workspace_id = if let Some(workspace_id) =
             serialized_workspace.as_ref().map(|workspace| workspace.id)
@@ -12303,7 +12308,12 @@ pub fn remote_workspace_position_from_db(
             .get_or_create_remote_connection(connection_options)
             .await
             .context("fetching serialized ssh project")?;
+        #[cfg(not(target_family = "wasm"))]
         let serialized_workspace = db.remote_workspace_for_roots(&paths, remote_connection_id);
+        #[cfg(target_family = "wasm")]
+        let serialized_workspace = db
+            .remote_workspace_for_roots(&paths, remote_connection_id)
+            .await?;
 
         let (window_bounds, display) = if let Some(bounds) = window_bounds_env_override() {
             (Some(WindowBounds::Windowed(bounds)), None)

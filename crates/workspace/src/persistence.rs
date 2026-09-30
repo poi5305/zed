@@ -1128,6 +1128,133 @@ fn batch_parent_param(parent_query: Option<usize>) -> Value {
     }
 }
 
+/// Matches on the same seven identity columns, with the same null-safe `IS`, as the
+/// native lookup in `get_or_create_remote_connection_query`; `use_podman` and
+/// `remote_env` are stored but are not part of the identity there either.
+#[cfg(any(target_family = "wasm", test))]
+const GET_OR_CREATE_REMOTE_CONNECTION_SQL: &str = sql!(
+    INSERT INTO remote_connections (
+        kind,
+        host,
+        port,
+        user,
+        distro,
+        name,
+        container_id,
+        use_podman,
+        remote_env
+    )
+    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM remote_connections
+        WHERE
+            kind IS ?1 AND
+            host IS ?2 AND
+            port IS ?3 AND
+            user IS ?4 AND
+            distro IS ?5 AND
+            name IS ?6 AND
+            container_id IS ?7
+    );
+    SELECT id
+    FROM remote_connections
+    WHERE
+        kind IS ?1 AND
+        host IS ?2 AND
+        port IS ?3 AND
+        user IS ?4 AND
+        distro IS ?5 AND
+        name IS ?6 AND
+        container_id IS ?7
+    LIMIT 1
+);
+
+/// `(kind, host, port, user, distro, name, container_id, use_podman, remote_env)`,
+/// bound as `?1..?9` of `GET_OR_CREATE_REMOTE_CONNECTION_SQL`.
+#[cfg(any(target_family = "wasm", test))]
+type RemoteConnectionColumns = (
+    &'static str,
+    Option<String>,
+    Option<u16>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+);
+
+/// Mirrors the column extraction in `get_or_create_remote_connection_internal`, which
+/// cannot be reused here because it is tied to a synchronous sqlite `Connection`.
+#[cfg(any(target_family = "wasm", test))]
+fn remote_connection_columns(options: RemoteConnectionOptions) -> RemoteConnectionColumns {
+    let identity = remote_connection_identity(&options);
+    let kind;
+    let user: Option<String>;
+    let mut host = None;
+    let mut port = None;
+    let mut distro = None;
+    let mut name = None;
+    let mut container_id = None;
+    let mut use_podman = None;
+    let mut remote_env = None;
+
+    match identity {
+        RemoteConnectionIdentity::Ssh {
+            host: identity_host,
+            username,
+            port: identity_port,
+        } => {
+            kind = RemoteConnectionKind::Ssh;
+            host = Some(identity_host);
+            port = identity_port;
+            user = username;
+        }
+        RemoteConnectionIdentity::Wsl {
+            distro_name,
+            user: identity_user,
+        } => {
+            kind = RemoteConnectionKind::Wsl;
+            distro = Some(distro_name);
+            user = identity_user;
+        }
+        RemoteConnectionIdentity::Docker {
+            container_id: identity_container_id,
+            name: identity_name,
+            remote_user,
+        } => {
+            kind = RemoteConnectionKind::Docker;
+            container_id = Some(identity_container_id);
+            name = Some(identity_name);
+            user = Some(remote_user);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        RemoteConnectionIdentity::Mock { id } => {
+            kind = RemoteConnectionKind::Ssh;
+            host = Some(format!("mock-{}", id));
+            user = Some(format!("mock-user-{}", id));
+        }
+    }
+
+    if let RemoteConnectionOptions::Docker(options) = options {
+        use_podman = Some(options.use_podman);
+        remote_env = serde_json::to_string(&options.remote_env).ok();
+    }
+
+    (
+        kind.serialize(),
+        host,
+        port,
+        user,
+        distro,
+        name,
+        container_id,
+        use_podman,
+        remote_env,
+    )
+}
+
 impl WorkspaceDb {
     /// Returns a serialized workspace for the given worktree_roots. If the passed array
     /// is empty, the most recent workspace is returned instead. If no workspace for the
@@ -1146,9 +1273,10 @@ impl WorkspaceDb {
         &self,
         worktree_roots: &[P],
     ) -> Result<Option<SerializedWorkspace>> {
-        self.workspace_for_roots_remote(worktree_roots).await
+        self.workspace_for_roots_remote(worktree_roots, None).await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn remote_workspace_for_roots<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
@@ -1157,6 +1285,18 @@ impl WorkspaceDb {
         self.workspace_for_roots_internal(worktree_roots, Some(remote_project_id))
     }
 
+    /// SQL errors are `Err`, not `None`, so a failed read cannot look like a new workspace.
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn remote_workspace_for_roots<P: AsRef<Path>>(
+        &self,
+        worktree_roots: &[P],
+        remote_project_id: RemoteConnectionId,
+    ) -> Result<Option<SerializedWorkspace>> {
+        self.workspace_for_roots_remote(worktree_roots, Some(remote_project_id))
+            .await
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn workspace_for_roots_internal<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
@@ -1753,16 +1893,21 @@ impl WorkspaceDb {
 
     #[cfg(target_family = "wasm")]
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) -> Result<()> {
-        let _ = self;
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
-        if !matches!(workspace.location, SerializedWorkspaceLocation::Local) {
-            bail!(
-                "web workspace persistence only supports SerializedWorkspaceLocation::Local; got {:?}",
-                workspace.location
-            );
-        }
+        // A separate round trip from the batch below rather than part of its savepoint;
+        // that is safe because get-or-create is idempotent, so a failed batch leaves at
+        // most a connection row that the next save reuses.
+        let remote_connection_id = match workspace.location.clone() {
+            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Remote(connection_options) => Some(
+                self.get_or_create_remote_connection(connection_options)
+                    .await
+                    .context("Getting remote connection for workspace save")?
+                    .0,
+            ),
+        };
 
         let mut batch = SqlBatch::new();
         batch
@@ -1794,7 +1939,7 @@ impl WorkspaceDb {
                             paths IS ?2 AND
                             remote_connection_id IS ?3
                     ),
-                    (workspace.id, paths.paths.clone(), None::<u64>),
+                    (workspace.id, paths.paths.clone(), remote_connection_id),
                 )
                 .context("clearing out old locations")?;
         }
@@ -1847,7 +1992,7 @@ impl WorkspaceDb {
             paths.order.clone(),
             identity_paths.as_ref().map(|paths| paths.paths.clone()),
             identity_paths.as_ref().map(|paths| paths.order.clone()),
-            None::<u64>,
+            remote_connection_id,
             workspace.docks,
             workspace.session_id,
             workspace.window_id,
@@ -1980,10 +2125,11 @@ impl WorkspaceDb {
     async fn workspace_for_roots_remote<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
+        remote_connection_id: Option<RemoteConnectionId>,
     ) -> Result<Option<SerializedWorkspace>> {
         let root_paths = PathList::new(worktree_roots);
 
-        if root_paths.is_empty() {
+        if root_paths.is_empty() && remote_connection_id.is_none() {
             return Ok(None);
         }
 
@@ -2032,7 +2178,10 @@ impl WorkspaceDb {
                     remote_connection_id IS ?
                 LIMIT 1
             },
-            (root_paths.serialize().paths, None::<i32>),
+            (
+                root_paths.serialize().paths,
+                remote_connection_id.map(|id| id.0 as i32),
+            ),
         )
         .await
         .context("Loading workspace for roots")?;
@@ -2064,9 +2213,18 @@ impl WorkspaceDb {
             })
         });
 
+        let location = match remote_connection_id {
+            Some(remote_connection_id) => SerializedWorkspaceLocation::Remote(
+                self.remote_connection_remote(remote_connection_id)
+                    .await
+                    .context("Get remote connection")?,
+            ),
+            None => SerializedWorkspaceLocation::Local,
+        };
+
         Ok(Some(SerializedWorkspace {
             id: workspace_id,
-            location: SerializedWorkspaceLocation::Local,
+            location,
             paths,
             identity_paths,
             center_group: self
@@ -2106,7 +2264,8 @@ impl WorkspaceDb {
     }
 
     #[cfg(target_family = "wasm")]
-    #[async_recursion(?Send)]
+    // Send, because remote workspace lookups await this inside `background_spawn`.
+    #[async_recursion]
     async fn get_pane_group_remote(
         &self,
         workspace_id: WorkspaceId,
@@ -2205,6 +2364,7 @@ impl WorkspaceDb {
         .await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn get_or_create_remote_connection(
         &self,
         options: RemoteConnectionOptions,
@@ -2213,6 +2373,24 @@ impl WorkspaceDb {
             .await
     }
 
+    /// One `Sql::query` round trip, so two tabs opening the same host cannot both
+    /// miss the lookup and insert duplicate rows.
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn get_or_create_remote_connection(
+        &self,
+        options: RemoteConnectionOptions,
+    ) -> Result<RemoteConnectionId> {
+        let id = remote_sql::select_row_bound::<_, u64>(
+            GET_OR_CREATE_REMOTE_CONNECTION_SQL,
+            remote_connection_columns(options),
+        )
+        .await
+        .context("get or create remote connection")?
+        .context("remote_connections row missing after insert")?;
+        Ok(RemoteConnectionId(id))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn get_or_create_remote_connection_internal(
         this: &Connection,
         options: RemoteConnectionOptions,
@@ -2284,6 +2462,7 @@ impl WorkspaceDb {
         )
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn get_or_create_remote_connection_query(
         this: &Connection,
         kind: RemoteConnectionKind,
@@ -2499,6 +2678,49 @@ impl WorkspaceDb {
                 FROM remote_connections
                 WHERE id = ?
             ))?(id.0)?
+            .context("no such remote connection")?;
+        Self::remote_connection_from_row(
+            kind,
+            host,
+            port,
+            user,
+            distro,
+            container_id,
+            name,
+            use_podman,
+            remote_env,
+        )
+        .context("invalid remote_connection row")
+    }
+
+    #[cfg(target_family = "wasm")]
+    async fn remote_connection_remote(
+        &self,
+        id: RemoteConnectionId,
+    ) -> Result<RemoteConnectionOptions> {
+        let (kind, host, port, user, distro, container_id, name, use_podman, remote_env) =
+            remote_sql::select_row_bound::<
+                _,
+                (
+                    String,
+                    Option<String>,
+                    Option<u16>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<bool>,
+                    Option<String>,
+                ),
+            >(
+                sql!(
+                    SELECT kind, host, port, user, distro, container_id, name, use_podman, remote_env
+                    FROM remote_connections
+                    WHERE id = ?
+                ),
+                id.0,
+            )
+            .await?
             .context("no such remote connection")?;
         Self::remote_connection_from_row(
             kind,
@@ -4893,6 +5115,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(connection_id, same_connection_id);
+    }
+
+    #[gpui::test]
+    async fn test_get_or_create_remote_connection_sql_reuses_matching_row() {
+        let db = WorkspaceDb::open_test_db(
+            "test_get_or_create_remote_connection_sql_reuses_matching_row",
+        )
+        .await;
+
+        let get_or_create = |options: RemoteConnectionOptions| {
+            let columns = remote_connection_columns(options);
+            db.write(move |conn| {
+                conn.select_row_bound::<_, u64>(GET_OR_CREATE_REMOTE_CONNECTION_SQL)?(columns)
+            })
+        };
+        let row_count = || {
+            db.write(|conn| {
+                conn.select_row::<i64>(sql!(SELECT COUNT(*) FROM remote_connections))?()
+            })
+        };
+
+        let host_only = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.com".into(),
+            port: None,
+            username: None,
+            ..Default::default()
+        });
+
+        let first_id = get_or_create(host_only.clone()).await.unwrap();
+        let second_id = get_or_create(host_only.clone()).await.unwrap();
+        assert!(first_id.is_some());
+        assert_eq!(first_id, second_id);
+        assert_eq!(row_count().await.unwrap(), Some(1));
+
+        let other_host = get_or_create(RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "other.example.com".into(),
+            port: None,
+            username: None,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(other_host.is_some());
+        assert_ne!(first_id, other_host);
+
+        let with_port = get_or_create(RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.com".into(),
+            port: Some(2222),
+            username: None,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(with_port.is_some());
+        assert_ne!(first_id, with_port);
+        assert_ne!(other_host, with_port);
+        assert_eq!(row_count().await.unwrap(), Some(3));
+
+        let wsl = RemoteConnectionOptions::Wsl(WslConnectionOptions {
+            distro_name: "Ubuntu".into(),
+            user: None,
+        });
+        let wsl_id = get_or_create(wsl.clone()).await.unwrap();
+        assert_eq!(get_or_create(wsl).await.unwrap(), wsl_id);
+        assert_eq!(row_count().await.unwrap(), Some(4));
+
+        let docker = RemoteConnectionOptions::Docker(DockerConnectionOptions {
+            container_id: "container".into(),
+            name: "dev".into(),
+            remote_user: "root".into(),
+            upload_binary_over_docker_exec: false,
+            use_podman: true,
+            remote_env: BTreeMap::from([("KEY".to_string(), "value".to_string())]),
+        });
+        let docker_id = get_or_create(docker.clone()).await.unwrap();
+        assert_eq!(get_or_create(docker.clone()).await.unwrap(), docker_id);
+        assert_eq!(row_count().await.unwrap(), Some(5));
+        let docker_id = RemoteConnectionId(docker_id.unwrap());
+        assert_eq!(db.remote_connection(docker_id).unwrap(), docker);
+
+        let native_id = db.get_or_create_remote_connection(host_only).await.unwrap();
+        assert_eq!(Some(native_id.0), first_id);
+        assert_eq!(row_count().await.unwrap(), Some(5));
     }
 
     #[gpui::test]
