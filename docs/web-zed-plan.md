@@ -871,6 +871,12 @@ axum, it conflicts with `zed-web`'s whole trait-substitution approach, and it **
 `forward_ports`**, whose missing half is the client-side bind. The cheaper path is to call the same
 `remote::*` functions from the server over the JSON RPC.
 
+> **Note (2026-09-30, `docs/web-zed-remote-spec.md` §8.1.1 Q7):** this rejection is about the
+> server *being* the `HeadlessProject` for its own disk. It does not cover real remote hosts. In the
+> remote spec's option A, the `HeadlessProject` runs on the remote host, and `zed_web_server` only
+> relays the proto byte stream between the browser and `ssh`. The argument above about reusing
+> `remote::*` over the JSON RPC applies only to the server's local workspace.
+
 ### 6.7 Ruling — `ZED_WEB_RESTRICT_PATHS` binds every RPC, including `ClaudeSessions::`
 
 Escalated by the Phase 6 implementation and decided here. The inconsistency: `Home::dirs` refuses

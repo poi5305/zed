@@ -308,3 +308,78 @@ drift, and nothing will notice.** A hard-coded wasm-bindgen version against the 
 manifest gate against its `use`; a build script's feature branch against the feature it was
 renamed from; a check script's CFLAGS against `build.sh`'s. Every one of those cost a debugging
 session. Derive the second copy, or delete it.
+
+## 7. Fallback: run the web build on the remote host
+
+`web/scripts/deploy-remote.sh <ssh-destination> <remote-project-path> [--port N] [--restart]`
+copies `web/dist/` to `~/.zed-web/dist/` on the remote host and starts `zed-web-server` there,
+bound to the remote's `127.0.0.1`. Nothing else is exposed: you reach it through the `ssh -N -L`
+tunnel the script prints, and sign in with the token in `<remote-project-path>/.zed/web-auth-token`
+on that host. It is the fallback for the ssh-project work in `web-zed-remote-spec.md` — the whole
+editor runs next to the files instead of the browser reaching them through a relay.
+
+Things that are easy to get wrong:
+
+- **The binary must match the remote's platform.** `web/build.sh` builds `zed-web-server` for the
+  machine it runs on only. The script compares `file` on the binary with `ssh <dest> uname -sm`
+  and stops on a mismatch; build `web/dist` on (or for) a host of the same OS and architecture.
+- **Authenticate with a public key or ssh-agent.** The script makes several ssh/rsync calls, so a
+  password prompt repeats for each one.
+- **A second run refuses while the first server is alive** (pid in `~/.zed-web/server.pid`); pass
+  `--restart` to replace it. The log is `~/.zed-web/server.log`.
+- **Acceptance status:** `shellcheck` is clean, and the script was exercised against a stand-in
+  `ssh`/`rsync`/`file` on one machine (start, second run, `--restart`, missing path, architecture
+  mismatch, path with a space). It has **not** been run against a real ssh server or driven from a
+  browser, because the build machine had no sshd.
+
+## 8. End-to-end check of the ssh relay without an sshd
+
+`web/test-support/remote-e2e.mjs` starts the real `zed-web-server --allow-ssh` with
+`web/test-support/fake-ssh` first on `PATH` (as `ssh`, `scp`, `sftp`), so "connecting to
+localhost" runs everything on this machine. It speaks the wasm client's wire protocol by hand
+(`/login` → `/rpc` `RemoteSsh::connect` → `open_channel` → `/remote/channel`) and needs no npm
+packages.
+
+```
+cargo build -p zed_web_server
+node web/test-support/remote-e2e.mjs                                # real remote_server
+node web/test-support/remote-e2e.mjs --stub-remote --proxy-exit 37  # shell stub, exit status only
+```
+
+The real run takes ~20 s and needs a remote_server for this machine: it picks
+`target/release/remote_server` or `target/web-native/remote-server-stripped/<triple>/remote_server`
+(`web/build.sh` produces the latter), or `--remote-server <path>`. It checks: connect result
+shape, upload under the content-addressed name, identifier validation, `Ping` split across two
+WebSocket messages answered by `Ack`, the server's own `RemoteStarted`, no text frames, `proxy
+--reconnect` on a dead identifier closing `1000 {"exit_code":90}`, and the askpass round trip
+(right password, reuse within `HOST_GRACE` without a prompt, wrong password, cancel). It prints
+`PASS` and exits 0, or `FAIL: <check>: <actual>` plus the tails of `fake-ssh.log`, `server.log` and
+the remote_server logs, exits 1, and keeps the sandbox. Every wait is bounded (30 s for relay
+events, 120 s for a connect, 5 min overall), so it never hangs.
+
+Traps, all hit once:
+
+- **The fake remote home must be short.** remote_server binds its stdio sockets at
+  `$HOME/.local/share/zed/server_state/<identifier>/stdout.sock`; `sun_path` holds 108 bytes (104 on
+  macOS). A home under `target/` gave 141-byte paths, `bind` failed with "path must be shorter than
+  SUN_LEN" on the daemon's `/dev/null` stderr, and all anyone saw was the proxy's "failed to spawn
+  server" ten seconds later. The harness now puts the remote home in `/tmp/zed-e2e-XXXXXX` and
+  refuses to start if the longest possible socket path (40-byte identifier) would not fit. The
+  same limit applies to real hosts: a home longer than ~24 bytes plus a 40-byte identifier fails.
+- **fake-ssh models the master's liveness.** The ControlPath file holds the master's pid;
+  `-O check` exits 255 when it is gone, and a command whose master is dead falls back to a direct
+  login that cannot answer a password. Without that, a wrong password "connected": see the
+  `ssh.rs` race below.
+- **Everything the fake host starts outlives the server.** The proxy daemonizes remote_server and
+  `kill_on_drop` kills only the `sh` fake-ssh became. Cleanup kills every process whose environment
+  has `FAKE_SSH_HOME=<this run's home>` (Linux `/proc`), plus pid files and fake masters.
+- **A second connect to the same options within `HOST_GRACE` (30 s) does not prompt**, by design
+  (spec §4.12). Scenarios that need a fresh login use a different `port`, which fake-ssh ignores but
+  which changes the host pool key.
+
+Known, not fixed here: `SshRemoteConnection::new` (crates/remote/src/transport/ssh.rs) treats the
+master's stdout EOF as "connected" and then calls `try_status()`, which often still sees the
+master as running although it has just exited on a wrong password. The connect then fails at the
+next command (`Failed to run 'uname -sm' …: Permission denied`) instead of with `failed to
+connect: Permission denied`. The e2e accepts both; a fix belongs in ssh.rs (wait for the status
+with a short bound instead of `try_status`).
