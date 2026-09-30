@@ -17126,6 +17126,7 @@ dependencies = [
  "prompt_store",
  "recent_projects",
  "release_channel",
+ "remote",
  "search",
  "semver",
  "serde",

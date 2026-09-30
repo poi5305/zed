@@ -32,7 +32,22 @@ pub struct RemoteConnectionPrompt {
     cancellation: Option<oneshot::Sender<()>>,
     editor: Arc<dyn ErasedEditor>,
     is_password_prompt: bool,
+    is_login_password_prompt: bool,
     is_masked: bool,
+}
+
+/// Whether `prompt` asks for the account password of the host, as opposed to a key
+/// passphrase, a yes/no host-key question, or a one-time code. Only the account
+/// password can be avoided by setting up a public key, so only it gets the hint.
+fn is_login_password_prompt(prompt: &str) -> bool {
+    let prompt = prompt.to_lowercase();
+    // "otp" is not its own check: it occurs inside a user name (`otpuser@host's password`).
+    // OpenSSH's account prompt is `user@host's password:` and does not contain these phrases.
+    prompt.contains("password")
+        && !prompt.contains("passphrase")
+        && !prompt.contains("yes/no")
+        && !prompt.contains("one-time")
+        && !prompt.contains("one time")
 }
 
 impl Drop for RemoteConnectionPrompt {
@@ -75,6 +90,7 @@ impl RemoteConnectionPrompt {
             prompt: None,
             prompt_cancellation_task: None,
             is_password_prompt: false,
+            is_login_password_prompt: false,
             is_masked: true,
         }
     }
@@ -93,6 +109,7 @@ impl RemoteConnectionPrompt {
     ) {
         let is_yes_no = prompt.contains("yes/no");
         self.is_password_prompt = !is_yes_no;
+        self.is_login_password_prompt = is_login_password_prompt(&prompt);
         self.is_masked = !is_yes_no;
         self.editor.set_masked(self.is_masked, window, cx);
 
@@ -152,6 +169,7 @@ impl Render for RemoteConnectionPrompt {
         };
 
         let is_password_prompt = self.is_password_prompt;
+        let is_login_password_prompt = self.is_login_password_prompt;
         let is_masked = self.is_masked;
         let (masked_password_icon, masked_password_tooltip) = if is_masked {
             (IconName::Eye, "Toggle to Unmask Password")
@@ -190,6 +208,16 @@ impl Render for RemoteConnectionPrompt {
                         )
                         .child(div().flex_1().child(self.editor.render(window, cx))),
                 )
+                .when(is_login_password_prompt, |this| {
+                    this.child(
+                        Label::new(
+                            "This host uses password login. \
+                            Set up an SSH public key to skip this prompt.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                })
                 .when(window.capslock().on, |this| {
                     this.child(
                         h_flex()
@@ -748,6 +776,41 @@ mod tests {
     use settings::SettingsStore;
 
     use super::*;
+
+    #[test]
+    fn detects_only_login_password_prompts() {
+        assert!(is_login_password_prompt("andy@example.com's password:"));
+        assert!(is_login_password_prompt("Password: "));
+        assert!(is_login_password_prompt("(andy@example.com) Password:"));
+        assert!(!is_login_password_prompt(
+            "Enter passphrase for key '/home/andy/.ssh/id_ed25519':"
+        ));
+        assert!(!is_login_password_prompt(
+            "The authenticity of host 'example.com' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?"
+        ));
+        assert!(!is_login_password_prompt("Verification code:"));
+        assert!(!is_login_password_prompt("Confirm user presence"));
+        assert!(!is_login_password_prompt(""));
+    }
+
+    #[test]
+    fn test_one_time_password_is_not_an_account_password() {
+        assert_eq!(
+            is_login_password_prompt("One-time password:"),
+            false,
+            "a second factor is not skipped by installing a public key"
+        );
+        assert_eq!(
+            is_login_password_prompt("One time password for user:"),
+            false
+        );
+        assert_eq!(
+            is_login_password_prompt("otpuser@host's password:"),
+            true,
+            "the letters otp inside a user name are still an account password"
+        );
+        assert_eq!(is_login_password_prompt("andy@host's password:"), true);
+    }
 
     #[gpui::test]
     fn clears_prompt_when_password_request_is_cancelled(cx: &mut TestAppContext) {

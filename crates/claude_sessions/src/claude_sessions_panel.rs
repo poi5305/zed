@@ -54,10 +54,11 @@ use workspace::{
     item::SerializableItem,
 };
 
+#[cfg(not(target_family = "wasm"))]
+use crate::session_source::LocalSource;
+use crate::session_source::RemoteSource;
 #[cfg(target_family = "wasm")]
 use crate::session_source::WebSource;
-#[cfg(not(target_family = "wasm"))]
-use crate::session_source::{LocalSource, RemoteSource};
 use crate::{
     COMPACT_AFTER_PINGS, CacheTtl, ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings,
     EndedReason, EndedSession, HookInstallOutcome, KeepAliveConfig, KeepAliveState,
@@ -2874,19 +2875,19 @@ impl ClaudeSessionsPanel {
         // connection, and the panel is otherwise the same on both. In the browser
         // there is no local filesystem, so every method is one JSON-RPC to the
         // server, which calls the same functions LocalSource calls directly.
-        let source: Arc<dyn SessionSource> = {
-            #[cfg(target_family = "wasm")]
-            {
-                Arc::new(WebSource::new(cx.background_executor().clone()))
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                match project.read(cx).remote_client() {
-                    Some(remote_client) => Arc::new(RemoteSource::new(
-                        remote_client.read(cx).proto_client(),
-                        cx.background_executor().clone(),
-                    )),
-                    None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+        let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
+            Some(remote_client) => Arc::new(RemoteSource::new(
+                remote_client.read(cx).proto_client(),
+                cx.background_executor().clone(),
+            )),
+            None => {
+                #[cfg(target_family = "wasm")]
+                {
+                    Arc::new(WebSource::new(cx.background_executor().clone()))
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Arc::new(LocalSource::new(cx.background_executor().clone()))
                 }
             }
         };

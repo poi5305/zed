@@ -106,6 +106,9 @@ export function zedOpenWorkspaceInNewTab(pathsJson) {
     const url = new URL(self.location.href);
     url.searchParams.delete("path");
     url.searchParams.delete("projects");
+    // The new tab mints its own RPC session; sharing this one would send it all of this
+    // tab's process and terminal notifications.
+    url.searchParams.delete("workspace_id");
     for (const path of paths) url.searchParams.append("path", path);
     // `searchParams` writes a space as `+`, which only a form decoder reads back as a
     // space; the server's `/workspace` rewrite decodes with plain percent-decoding.
@@ -209,18 +212,45 @@ fn workspace_project_groups_from_url() -> Vec<Vec<std::path::PathBuf>> {
 
 #[cfg(target_family = "wasm")]
 fn sync_project_paths_url(project: &Entity<project::Project>, cx: &App) {
-    let paths = project
-        .read(cx)
+    let project = project.read(cx);
+    let roots = project
         .visible_worktrees(cx)
-        .map(|worktree| worktree.read(cx).abs_path().display().to_string())
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
         .collect::<Vec<_>>();
-    if paths.is_empty() {
+    if roots.is_empty() {
         return;
     }
+    let remote_options = project
+        .remote_client()
+        .map(|client| client.read(cx).connection_options());
+    let paths = match &remote_options {
+        Some(options) => roots
+            .iter()
+            .map(|root| project_manager::remote_project_uri(options, root))
+            .collect::<Option<Vec<_>>>(),
+        None => Some(
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    // An address that dropped the `ssh://` would reopen this project on the server
+    // itself, so a remote root that cannot be written as one leaves the address alone.
+    let Some(paths) = paths else {
+        log::warn!(
+            "zed_web_workspace: a remote root has no ssh:// form; leaving the address as it is"
+        );
+        return;
+    };
     if let Ok(paths) = serde_json::to_string(&paths) {
         sync_workspace_paths_json(&paths);
     }
-    save_active_workspace(paths);
+    // `Workspace::activate` canonicalizes on the server's own disk, where a remote
+    // path means nothing.
+    if remote_options.is_none() {
+        save_active_workspace(paths);
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -1303,6 +1333,7 @@ fn init_app_state(
     });
     smol::set_remote_client(remote_client.clone());
     terminal::set_remote_client(remote_client.clone());
+    remote::set_web_rpc_client(remote_client.clone());
     claude_sessions::set_remote_client(remote_client.clone());
     util::shell_env::set_remote_client(remote_client.clone());
     web_agent_panel::set_remote_client(remote_client.clone());
@@ -1428,6 +1459,18 @@ fn init_app_state(
     // word. Leaving these out left all three panels loaded, drawn in the status bar and
     // impossible to open. web/check-panel-actions.sh is what notices next time.
     project_manager::init(cx);
+    project_manager::set_ssh_capabilities_loader(|| {
+        Box::pin(async {
+            let client = wasm_remote::remote_client()
+                .ok_or_else(|| anyhow::anyhow!("the browser is not connected to the server"))?;
+            client
+                .call::<_, project_manager::SshCapabilities>(
+                    "RemoteSsh::capabilities",
+                    &serde_json::json!({}),
+                )
+                .await
+        })
+    });
     project_manager::set_open_in_new_tab(|paths| {
         let paths = paths
             .iter()
@@ -1895,6 +1938,9 @@ impl gpui::Render for WebTitleBar {
             .first()
             .map(|wt| wt.read(cx).abs_path().display().to_string())
             .unwrap_or_default();
+        let remote_host_name = project
+            .remote_client()
+            .map(|client| client.read(cx).connection_options().display_name());
         let display_name = worktrees
             .first()
             .and_then(|wt| {
@@ -1957,7 +2003,7 @@ impl gpui::Render for WebTitleBar {
                 .when(!compact, |title_bar| {
                     title_bar.child(
                         Label::new(if path_hint.is_empty() {
-                            "remote".to_string()
+                            remote_host_name.unwrap_or_else(|| "remote".to_string())
                         } else {
                             path_hint
                         })
@@ -2367,7 +2413,31 @@ fn launch(
                 .map(std::path::PathBuf::from),
         );
     }
-    if paths.is_empty() {
+    let mut remote_target = None;
+    let mut refusal = None;
+    match project_manager::launch_location(
+        &paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    ) {
+        project_manager::LaunchLocation::Local(local_paths) => paths = local_paths,
+        project_manager::LaunchLocation::Remote {
+            options,
+            paths: remote_paths,
+        } => {
+            paths.clear();
+            remote_target = Some((options, remote_paths));
+        }
+        project_manager::LaunchLocation::Refused(message) => {
+            web_sys::console::error_1(
+                &format!("zed_web_workspace: cannot open the address: {message}").into(),
+            );
+            paths.clear();
+            refusal = Some(message);
+        }
+    }
+    if paths.is_empty() && remote_target.is_none() {
         paths.push(workspace_root);
     }
     // Bundle fonts/icons/themes so SVG icons and keymaps assets resolve.
@@ -2407,8 +2477,42 @@ fn launch(
                 remote_client.clone(),
                 &prefetch_roots,
             );
-            let open_task =
-                workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx);
+            let open_task = match remote_target {
+                Some((options, remote_paths)) => cx.spawn(async move |cx| {
+                    let window = recent_projects::open_remote_project(
+                        options,
+                        remote_paths,
+                        app_state,
+                        workspace::OpenOptions::default(),
+                        cx,
+                    )
+                    .await?;
+                    let workspace = window.update(cx, |multi_workspace, _, _| {
+                        multi_workspace.workspace().clone()
+                    })?;
+                    anyhow::Ok(workspace::OpenResult {
+                        window,
+                        workspace,
+                        opened_items: Vec::new(),
+                    })
+                }),
+                None => {
+                    workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx)
+                }
+            };
+            let open_task = match refusal {
+                Some(message) => cx.spawn(async move |cx| {
+                    let result = open_task.await?;
+                    result.workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            format!("{message}; opened the server's workspace instead"),
+                            cx,
+                        );
+                    });
+                    anyhow::Ok(result)
+                }),
+                None => open_task,
+            };
             log_open_result(open_task, project_groups, ui_state, cx);
             cx.activate(true);
         });
