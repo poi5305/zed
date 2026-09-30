@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# Emulates just enough of OpenSSH for zed_web_server's ssh host to "connect" to a host by
+# running everything on this machine. Installed under the names ssh, scp and sftp (a temp
+# directory of symlinks that remote-e2e.mjs builds), and told apart by $0.
+#
+# stdout is the remote command's stdout and nothing else: for the proxy call it is the
+# envelope frame stream, so one stray byte would corrupt framing. Diagnostics go to
+# $FAKE_SSH_LOG, never to stdout.
+#
+# Environment:
+#   FAKE_SSH_HOME          required for anything that runs a command or copies a file; the
+#                          directory that stands in for the remote user's home
+#   FAKE_SSH_LOG           append one line per invocation and per decision
+#   FAKE_SSH_PROMPT=1      the master asks $SSH_ASKPASS for a password first
+#   FAKE_SSH_PASSWORD      the password the master accepts when FAKE_SSH_PROMPT=1
+#   FAKE_SSH_PROMPT_TEXT   the prompt text handed to askpass (default "<destination> password: ")
+#   FAKE_SSH_SHELL         what `echo $SHELL` reports on the "remote" (default /bin/bash)
+#   FAKE_SSH_PROXY_EXIT    when set, a command containing " proxy " exits with this code
+#                          instead of running, for hosts that have no usable remote_server
+#
+# The ControlPath "socket" is a plain file holding the master's pid, so a master that failed
+# or was killed is noticed the way real ssh notices it: `-O check` exits 255, and a command
+# with ControlMaster=no falls back to a direct login, which cannot answer a password prompt
+# (only the master is given SSH_ASKPASS).
+
+set -u
+
+program=${0##*/}
+
+log() {
+  if [ -n "${FAKE_SSH_LOG:-}" ]; then
+    printf '%s\n' "[$program $$] $*" >>"$FAKE_SSH_LOG"
+  fi
+  return 0
+}
+
+fail() {
+  log "error: $*"
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 255
+}
+
+require_home() {
+  if [ -z "${FAKE_SSH_HOME:-}" ]; then
+    fail "FAKE_SSH_HOME is not set"
+  fi
+  if [ ! -d "$FAKE_SSH_HOME" ]; then
+    fail "FAKE_SSH_HOME $FAKE_SSH_HOME is not a directory"
+  fi
+}
+
+# XDG_* would point the remote_server's state at the real home.
+enter_remote_environment() {
+  require_home
+  unset XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR
+  export HOME="$FAKE_SSH_HOME"
+  export SHELL="${FAKE_SSH_SHELL:-/bin/bash}"
+  export USER="${USER:-fake-ssh}"
+  cd "$HOME" || fail "cannot cd to $HOME"
+}
+
+master_alive() {
+  local path=$1 pid
+  [ -n "$path" ] && [ "$path" != none ] && [ -f "$path" ] || return 1
+  pid=$(cat -- "$path" 2>/dev/null) || return 1
+  case $pid in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+resolve_remote_path() {
+  case $1 in
+    /*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$FAKE_SSH_HOME" "$1" ;;
+  esac
+}
+
+log "argv: $(printf '%q ' "$@")"
+
+# ssh, scp and sftp all take these with a separate value.
+takes_value() {
+  case $1 in
+    -o|-p|-P|-O|-i|-F|-l|-b|-c|-S|-J|-B|-D|-E|-e|-I|-m|-Q|-W|-w|-B|-R|-L|-s|-X|-Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_option_value() {
+  local option=$1 value=$2
+  case $option in
+    -o)
+      case $value in
+        ControlMaster=yes|ControlMaster=ask|ControlMaster=autoask) control_master=yes ;;
+        ControlPath=*) control_path=${value#ControlPath=} ;;
+      esac
+      ;;
+    -O) control_operation=$value ;;
+    -p|-P) port=$value ;;
+  esac
+}
+
+run_ssh() {
+  local control_master=no control_path='' control_operation='' get_config=no no_command=no
+  local port='' destination='' command_seen=no
+  local -a command_words=()
+
+  while [ $# -gt 0 ]; do
+    local arg=$1
+    shift
+    if [ "$command_seen" = yes ]; then
+      command_words+=("$arg")
+      continue
+    fi
+    case $arg in
+      -G) get_config=yes ;;
+      -N) no_command=yes ;;
+      -T|-t|-tt|-q|-v|-vv|-vvv|-C|-r|-4|-6|-f|-a|-A|-x|-k|-K|-n|-y|-g|-M) ;;
+      -L|-R)
+        # Alone, the forward spec is the next argument; glued (-Lspec) it is part of this one.
+        if [ $# -gt 0 ]; then shift; fi
+        ;;
+      -L*|-R*) ;;
+      -o?*) parse_option_value -o "${arg#-o}" ;;
+      -[pPOoiFlbcSJBDEeImQWwsXY]?*) ;;
+      -*)
+        if takes_value "$arg"; then
+          [ $# -gt 0 ] || fail "option $arg needs a value"
+          parse_option_value "$arg" "$1"
+          shift
+        else
+          fail "unsupported ssh option $arg"
+        fi
+        ;;
+      *)
+        if [ -z "$destination" ]; then
+          destination=$arg
+        else
+          command_seen=yes
+          command_words+=("$arg")
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$destination" ] || fail "no destination"
+
+  if [ "$get_config" = yes ]; then
+    # `none` makes find_existing_control_master return before `-O check`. A missing
+    # socket has to be a real path so that check runs and fails, the way OpenSSH fails
+    # it; otherwise a bug that ignores the failure never executes.
+    log "branch: -G $destination"
+    printf 'hostname %s\ncontrolpath /nonexistent\n' "$destination"
+    exit 0
+  fi
+
+  if [ -n "$control_operation" ]; then
+    log "branch: -O $control_operation"
+    if ! master_alive "$control_path"; then
+      log "-O $control_operation: no master at $control_path"
+      printf 'Control socket connect(%s): No such file or directory\n' "$control_path" >&2
+      exit 255
+    fi
+    case $control_operation in
+      exit|stop)
+        kill "$(cat -- "$control_path")" 2>/dev/null
+        rm -f -- "$control_path"
+        printf 'Exit request sent.\r\n' >&2
+        ;;
+      check) printf 'Master running (pid=%s)\r\n' "$(cat -- "$control_path")" >&2 ;;
+    esac
+    exit 0
+  fi
+
+  if [ "$control_master" = yes ] && [ "$no_command" = yes ]; then
+    log "branch: master control_path=$control_path destination=$destination"
+    if [ "${FAKE_SSH_PROMPT:-}" = 1 ]; then
+      [ -n "${SSH_ASKPASS:-}" ] || fail "FAKE_SSH_PROMPT=1 but SSH_ASKPASS is not set"
+      local reply prompt_text
+      prompt_text=${FAKE_SSH_PROMPT_TEXT:-"$destination password: "}
+      reply=$("$SSH_ASKPASS" "$prompt_text" </dev/null) || {
+        log "master: askpass failed"
+        printf 'Permission denied (askpass cancelled).\n' >&2
+        exit 255
+      }
+      if [ "$reply" != "${FAKE_SSH_PASSWORD:-}" ]; then
+        log "master: wrong password"
+        printf 'Permission denied (publickey,password).\n' >&2
+        exit 255
+      fi
+      log "master: password accepted"
+    fi
+    [ -n "$control_path" ] || fail "master without a ControlPath"
+    # exec keeps the pid, so this is the pid of the sleep below.
+    printf '%s\n' "$$" >"$control_path" || fail "cannot create $control_path"
+    log "master: connected"
+    exec 1>&-
+    exec sleep 2147483647
+  fi
+
+  if [ ${#command_words[@]} -eq 0 ]; then
+    if [ "$no_command" = yes ]; then
+      log "branch: -N without a command, holding open"
+      exec sleep 2147483647
+    fi
+    fail "interactive sessions are not supported"
+  fi
+
+  if [ -n "$control_path" ] && [ "$control_path" != none ] && ! master_alive "$control_path"; then
+    log "no master at $control_path; direct login"
+    if [ "${FAKE_SSH_PROMPT:-}" = 1 ]; then
+      printf 'Permission denied (publickey,password).\n' >&2
+      exit 255
+    fi
+  fi
+
+  # ssh joins the remaining words with spaces and hands them to the remote shell.
+  local remote_command="${command_words[*]}"
+  case $remote_command in
+    *" proxy "*)
+      if [ -n "${FAKE_SSH_PROXY_EXIT:-}" ]; then
+        log "branch: proxy stubbed to exit ${FAKE_SSH_PROXY_EXIT}: $remote_command"
+        exit "$FAKE_SSH_PROXY_EXIT"
+      fi
+      log "branch: proxy: $remote_command"
+      ;;
+    *) log "branch: command: $remote_command" ;;
+  esac
+  enter_remote_environment
+  exec sh -c "$remote_command"
+}
+
+run_scp() {
+  local -a positional=()
+  local recursive=no
+  while [ $# -gt 0 ]; do
+    local arg=$1
+    shift
+    case $arg in
+      -r) recursive=yes ;;
+      -C|-q|-p|-B|-3|-T|-v|-4|-6) ;;
+      -o|-P|-i|-F|-c|-l|-S|-J|-D)
+        [ $# -gt 0 ] || fail "option $arg needs a value"
+        shift
+        ;;
+      -o?*|-P?*|-i?*|-F?*|-c?*|-l?*|-S?*|-J?*|-D?*) ;;
+      -*) fail "unsupported scp option $arg" ;;
+      *) positional+=("$arg") ;;
+    esac
+  done
+  [ ${#positional[@]} -ge 2 ] || fail "scp needs a source and a destination"
+  local destination=${positional[$((${#positional[@]} - 1))]}
+  unset 'positional[${#positional[@]}-1]'
+  case $destination in
+    *:*) destination=${destination#*:} ;;
+    *) fail "scp destination $destination has no host:" ;;
+  esac
+  require_home
+  local target
+  target=$(resolve_remote_path "$destination")
+  local -a flags=()
+  [ "$recursive" = yes ] && flags+=(-R)
+  log "branch: scp ${positional[*]} -> $target"
+  cp ${flags[@]+"${flags[@]}"} -- "${positional[@]}" "$target"
+}
+
+parse_sftp_words() {
+  local line=$1 word='' quoted=0 have=0 index=0 character
+  local length=${#line}
+  sftp_words=()
+  while [ $index -lt $length ]; do
+    character=${line:$index:1}
+    if [ "$character" = '\' ] && [ $((index + 1)) -lt $length ]; then
+      index=$((index + 1))
+      word+=${line:$index:1}
+      have=1
+    elif [ "$character" = '"' ]; then
+      quoted=$((1 - quoted))
+      have=1
+    elif [ "$character" = ' ' ] && [ $quoted -eq 0 ]; then
+      if [ $have -eq 1 ]; then
+        sftp_words+=("$word")
+        word=''
+        have=0
+      fi
+    else
+      word+=$character
+      have=1
+    fi
+    index=$((index + 1))
+  done
+  if [ $have -eq 1 ]; then
+    sftp_words+=("$word")
+  fi
+  return 0
+}
+
+run_sftp() {
+  local batch=''
+  local destination=''
+  while [ $# -gt 0 ]; do
+    local arg=$1
+    shift
+    case $arg in
+      -b)
+        [ $# -gt 0 ] || fail "option -b needs a value"
+        batch=$1
+        shift
+        ;;
+      -o|-P|-i|-F|-c|-l|-S|-J|-D)
+        [ $# -gt 0 ] || fail "option $arg needs a value"
+        shift
+        ;;
+      -o?*|-P?*|-i?*|-F?*|-c?*|-l?*|-S?*|-J?*|-D?*) ;;
+      -C|-q|-v|-4|-6|-r) ;;
+      -*) fail "unsupported sftp option $arg" ;;
+      *) destination=$arg ;;
+    esac
+  done
+  [ "$batch" = - ] || fail "only 'sftp -b -' is supported"
+  [ -n "$destination" ] || fail "sftp without a destination"
+  require_home
+  local status=0 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    parse_sftp_words "$line"
+    case ${sftp_words[0]:-} in
+      put)
+        local -a flags=()
+        local -a operands=("${sftp_words[@]:1}")
+        if [ "${operands[0]:-}" = -r ]; then
+          flags+=(-R)
+          operands=("${operands[@]:1}")
+        fi
+        [ ${#operands[@]} -eq 2 ] || fail "malformed sftp command: $line"
+        local target
+        target=$(resolve_remote_path "${operands[1]}")
+        log "branch: sftp put ${operands[0]} -> $target"
+        cp ${flags[@]+"${flags[@]}"} -- "${operands[0]}" "$target" || status=1
+        ;;
+      *) fail "unsupported sftp command: $line" ;;
+    esac
+  done
+  exit $status
+}
+
+case $program in
+  ssh|fake-ssh) run_ssh "$@" ;;
+  scp) run_scp "$@" ;;
+  sftp) run_sftp "$@" ;;
+  *) fail "unknown program name $program" ;;
+esac
