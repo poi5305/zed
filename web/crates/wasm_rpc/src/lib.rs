@@ -27,12 +27,53 @@ fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
-    let workspaceSession = "default";
+// Processes, terminals and watches live in a server session, and a session's notifications
+// go to every connection bound to it, so each tab needs a session of its own. The id is kept
+// in the URL so that a reload attaches to the same session again.
+// Not crypto.randomUUID: it only exists in secure contexts, and plain http is served too.
+// A shared "default" would put every tab that cannot use crypto, or cannot read its
+// URL, into one RPC session. The timestamp separates two realms whose Math.random
+// sequences start the same.
+function newWorkspaceId() {
+    const bytes = new Uint8Array(16);
     try {
-        const pageUrl = new URL(self.location.href);
-        workspaceSession = pageUrl.searchParams.get("workspace_id") || "default";
+        self.crypto.getRandomValues(bytes);
+    } catch (_) {
+        const stamp = Date.now();
+        for (let index = 0; index < bytes.length; index++) {
+            bytes[index] = (Math.floor(Math.random() * 256) ^ (stamp >>> ((index % 4) * 8))) & 0xff;
+        }
+    }
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function tabWorkspaceSession() {
+    let pageUrl;
+    try {
+        pageUrl = new URL(self.location.href);
+    } catch (_) {
+        return newWorkspaceId();
+    }
+    const existing = pageUrl.searchParams.get("workspace_id");
+    if (existing) return existing;
+    const workspaceId = newWorkspaceId();
+    // Appended to the raw query rather than set through searchParams, which would re-encode
+    // every `path` (a space as `+`, which the server's percent-decoding reads as a plus).
+    // An empty `workspace_id=` goes, or every reload would append another one after it.
+    const query = pageUrl.search
+        .slice(1)
+        .split("&")
+        .filter(parameter => parameter && !/^workspace_id(=|$)/.test(parameter))
+        .join("&");
+    pageUrl.search = `${query}${query ? "&" : ""}workspace_id=${workspaceId}`;
+    try {
+        self.history.replaceState(self.history.state, "", pageUrl.href);
     } catch (_) {}
+    return workspaceId;
+}
+
+export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
+    const workspaceSession = tabWorkspaceSession();
     // The URL's path parameters select the active project; they must not select
     // the server process session. A project switch updates the URL without
     // replacing this socket, and a reload must attach to that same session.
@@ -209,6 +250,105 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
 export function zedRpcSend(client, message) {
     client.send(message);
 }
+
+export function zedRpcOpenBytes(url, onMessage, onClose, onError) {
+    const highWater = 8 * 1024 * 1024;
+    const state = { closeRequested: false, closed: false, pendingClose: null, queue: [], queuedBytes: 0 };
+    // No auto-reconnect: a byte stream carries protocol state, so a silent new
+    // socket would splice two unrelated streams together.
+    // Resolved here rather than handed to WebSocket as is: relative and http(s) URLs are
+    // too recent an addition to the WebSocket constructor to rely on.
+    const resolved = new URL(url, self.location?.href);
+    if (resolved.protocol === "http:") resolved.protocol = "ws:";
+    if (resolved.protocol === "https:") resolved.protocol = "wss:";
+    const socket = new WebSocket(resolved.href);
+    socket.binaryType = "arraybuffer";
+
+    const closeSocket = (code, reason) => {
+        if (state.closeRequested || state.closed) return;
+        state.closeRequested = true;
+        state.queue.length = 0;
+        state.queuedBytes = 0;
+        try {
+            socket.close(code, reason);
+        } catch (_) {
+            // Browsers only accept 1000 and 3000-4999 from script; 1003 lands here.
+            const fallbackCode = code >= 1000 && code < 3000 && code !== 1000 ? code + 3000 : 1000;
+            socket.close(fallbackCode, reason);
+        }
+    };
+
+    socket.onopen = () => {
+        while (state.queue.length && socket.readyState === WebSocket.OPEN) {
+            const queued = state.queue.shift();
+            state.queuedBytes -= queued.byteLength;
+            socket.send(queued);
+        }
+        if (state.pendingClose) {
+            const { code, reason } = state.pendingClose;
+            state.pendingClose = null;
+            closeSocket(code, reason);
+        }
+    };
+    socket.onmessage = event => {
+        if (typeof event.data === "string") {
+            onError("byte channel received a text frame");
+            // 1003 is what the RFC names, but browsers refuse it from script (only 1000 and
+            // 3000-4999), so the browser's side of this close is 4003.
+            closeSocket(4003, "text frames are not supported");
+            return;
+        }
+        if (onMessage(event.data) === false) {
+            closeSocket(1000, "receiver dropped");
+        }
+    };
+    socket.onerror = () => onError("WebSocket transport error");
+    socket.onclose = event => {
+        state.closed = true;
+        state.queue.length = 0;
+        state.queuedBytes = 0;
+        onClose(event.code, event.reason || "", event.wasClean);
+    };
+
+    return {
+        send(bytes) {
+            if (state.closeRequested || state.closed) {
+                throw new Error("byte channel is closed");
+            }
+            // Copy: `bytes` views wasm shared memory, which WebSocket.send rejects.
+            const copy = new Uint8Array(bytes);
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(copy);
+            } else if (socket.readyState === WebSocket.CONNECTING) {
+                state.queue.push(copy);
+                state.queuedBytes += copy.byteLength;
+            } else {
+                // CLOSING: the peer started the close and nothing will flush a queue any more.
+                throw new Error("byte channel is closed");
+            }
+        },
+        // Resolves true when the caller may pull another message, false once the socket is gone.
+        waitWritable() {
+            return new Promise(resolve => {
+                const check = () => {
+                    if (state.closeRequested || state.closed) return resolve(false);
+                    // bufferedAmount stays 0 while CONNECTING, so the pre-open queue is added in.
+                    if (socket.bufferedAmount + state.queuedBytes <= highWater) return resolve(true);
+                    self.setTimeout(check, 10);
+                };
+                check();
+            });
+        },
+        // Unlike a protocol-error close, this must not discard data queued before onopen.
+        close(code, reason) {
+            if (socket.readyState === WebSocket.CONNECTING) {
+                state.pendingClose = { code, reason };
+            } else {
+                closeSocket(code, reason);
+            }
+        },
+    };
+}
 "#)]
 extern "C" {
     type ReconnectingSocket;
@@ -226,6 +366,32 @@ extern "C" {
     fn send_reconnecting_socket(
         socket: &ReconnectingSocket,
         message: &str,
+    ) -> std::result::Result<(), wasm_bindgen::JsValue>;
+
+    type ByteSocket;
+
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = zedRpcOpenBytes)]
+    fn open_byte_socket(
+        url: &str,
+        on_message: &js_sys::Function,
+        on_close: &js_sys::Function,
+        on_error: &js_sys::Function,
+    ) -> std::result::Result<ByteSocket, wasm_bindgen::JsValue>;
+
+    #[wasm_bindgen::prelude::wasm_bindgen(method, catch, js_name = send)]
+    fn send_bytes(
+        this: &ByteSocket,
+        bytes: &[u8],
+    ) -> std::result::Result<(), wasm_bindgen::JsValue>;
+
+    #[wasm_bindgen::prelude::wasm_bindgen(method, js_name = waitWritable)]
+    fn wait_writable(this: &ByteSocket) -> js_sys::Promise;
+
+    #[wasm_bindgen::prelude::wasm_bindgen(method, catch, js_name = close)]
+    fn close_byte_socket(
+        this: &ByteSocket,
+        code: u16,
+        reason: &str,
     ) -> std::result::Result<(), wasm_bindgen::JsValue>;
 }
 
@@ -254,6 +420,20 @@ struct NotificationEnvelope {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct ByteChannelClose {
+    pub code: u16,
+    pub reason: String,
+    pub was_clean: bool,
+}
+
+/// A binary-only WebSocket. Dropping `sender` closes the socket with code 1000.
+pub struct ByteChannel {
+    pub sender: mpsc::UnboundedSender<Vec<u8>>,
+    pub receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub closed: oneshot::Receiver<ByteChannelClose>,
 }
 
 /// A JSON-RPC-over-WebSocket client that works in the browser.
@@ -458,6 +638,103 @@ impl RpcClient {
     #[cfg(not(target_family = "wasm"))]
     pub fn connect(_url: &str) -> Result<Self> {
         Err(anyhow!("RpcClient is only available on WASM"))
+    }
+
+    /// Open a separate binary WebSocket to `url`, resolved against the page's location (so
+    /// `/remote/channel?…` reaches the server that served the page) with http(s) mapped to
+    /// ws(s). `receiver` ends once the socket has closed and `closed` has the reason.
+    #[cfg(target_family = "wasm")]
+    pub fn open_byte_channel(&self, url: &str) -> Result<ByteChannel> {
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::prelude::*;
+
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Vec<u8>>();
+        let (closed_tx, closed_rx) = oneshot::channel::<ByteChannelClose>();
+        // Shared so onclose can drop it: otherwise `receiver` never yields None, and a reader
+        // draining it would wait forever on a socket that is already gone.
+        let incoming_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_tx)));
+
+        let onmessage = Closure::<dyn FnMut(JsValue) -> bool>::new({
+            let incoming_tx = incoming_tx.clone();
+            move |data: JsValue| {
+                let Ok(buffer) = data.dyn_into::<js_sys::ArrayBuffer>() else {
+                    web_sys::console::error_1(
+                        &"wasm_rpc: byte channel got a non-binary frame".into(),
+                    );
+                    return true;
+                };
+                match incoming_tx.borrow().as_ref() {
+                    Some(incoming_tx) => incoming_tx
+                        .unbounded_send(js_sys::Uint8Array::new(&buffer).to_vec())
+                        .is_ok(),
+                    None => false,
+                }
+            }
+        });
+        let onclose =
+            Closure::<dyn FnMut(u16, String, bool)>::once(move |code, reason, was_clean| {
+                incoming_tx.borrow_mut().take();
+                closed_tx
+                    .send(ByteChannelClose {
+                        code,
+                        reason,
+                        was_clean,
+                    })
+                    .ok();
+            });
+        let onerror = Closure::<dyn FnMut(String)>::new(move |message| {
+            web_sys::console::error_1(&format!("wasm_rpc: {message}").into());
+        });
+
+        let socket = open_byte_socket(
+            url,
+            onmessage.as_ref().unchecked_ref(),
+            onclose.as_ref().unchecked_ref(),
+            onerror.as_ref().unchecked_ref(),
+        )
+        .map_err(|error| anyhow!("failed to create WebSocket: {error:?}"))?;
+        onmessage.forget();
+        onclose.forget();
+        onerror.forget();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                let writable = wasm_bindgen_futures::JsFuture::from(socket.wait_writable())
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !writable {
+                    return;
+                }
+                let Some(bytes) = outgoing_rx.next().await else {
+                    if let Err(error) = socket.close_byte_socket(1000, "client closed") {
+                        web_sys::console::error_1(
+                            &format!("wasm_rpc: byte channel close failed: {error:?}").into(),
+                        );
+                    }
+                    return;
+                };
+                if let Err(error) = socket.send_bytes(&bytes) {
+                    web_sys::console::error_1(
+                        &format!("wasm_rpc: byte channel send failed: {error:?}").into(),
+                    );
+                    return;
+                }
+            }
+        });
+
+        Ok(ByteChannel {
+            sender: outgoing_tx,
+            receiver: incoming_rx,
+            closed: closed_rx,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn open_byte_channel(&self, _url: &str) -> Result<ByteChannel> {
+        Err(anyhow!("ByteChannel is only available on WASM"))
     }
 
     async fn wait_until_open(&self) {
