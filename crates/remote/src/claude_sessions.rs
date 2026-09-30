@@ -3534,10 +3534,38 @@ pub fn attach_arguments(tmux_field: &str) -> Option<Vec<String>> {
 
     let mirror_name = format!(
         "{MIRROR_SESSION_PREFIX}{}-{}",
-        std::process::id(),
+        mirror_owner(),
         MIRROR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     Some(mirror_arguments(session_name, &window_target, &mirror_name))
+}
+
+/// Keeps the mirrors of two Zed instances attached to one tmux server apart, since each
+/// instance's sequence starts at zero.
+#[cfg(not(target_family = "wasm"))]
+fn mirror_owner() -> String {
+    std::process::id().to_string()
+}
+
+/// A browser tab has no process id (`std::process::id` panics on wasm), and several tabs can
+/// share one server's tmux, so each tab is told apart by the moment it first attached plus a
+/// random part: the browser clock only has millisecond resolution, so two tabs can share it.
+#[cfg(target_family = "wasm")]
+fn mirror_owner() -> String {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let elapsed = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .unwrap_or_default();
+            owner_token(elapsed, uuid::Uuid::new_v4().as_u128())
+        })
+        .clone()
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+fn owner_token(elapsed: std::time::Duration, entropy: u128) -> String {
+    format!("{}x{entropy:032x}", elapsed.as_millis())
 }
 
 /// tmux ends a command and starts the next one at any argument that ends in a semicolon,
@@ -3906,6 +3934,25 @@ mod tests {
     /// The mirror is grouped with the user's session and so is listed beside it. A name
     /// the user chose must never be mistaken for one, or their own session disappears
     /// from the tmux panel.
+    /// `web_time`'s clock is `Date.now()`, whole milliseconds, so two tabs that first attach
+    /// in the same millisecond have equal clocks and only the entropy can tell them apart.
+    #[test]
+    fn wasm_mirror_owners_differ_for_tabs_that_attach_in_the_same_millisecond() {
+        let same_millisecond = std::time::Duration::from_millis(1_780_000_000_123);
+        let first_tab = owner_token(same_millisecond, 0x1111_2222_3333_4444);
+        let second_tab = owner_token(same_millisecond, 0x5555_6666_7777_8888);
+        assert_ne!(
+            first_tab, second_tab,
+            "two tabs attaching in one millisecond must not build the same mirror name"
+        );
+        for token in [&first_tab, &second_tab] {
+            assert!(
+                token.chars().all(|character| character.is_ascii_alphanumeric()),
+                "`{token}` must be a tmux-safe session-name fragment"
+            );
+        }
+    }
+
     #[test]
     fn only_zeds_own_mirrors_are_recognized_as_mirrors() {
         let mirror = attach_arguments("zed:@6.%8").expect("a pane field attaches");

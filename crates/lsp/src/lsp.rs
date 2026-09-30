@@ -903,7 +903,13 @@ impl LanguageServer {
 
         #[allow(deprecated)]
         InitializeParams {
-            process_id: Some(std::process::id()),
+            // The browser has no process id (`std::process::id` panics on wasm), and the
+            // server spawns the language server anyway, so no parent pid is the truthful answer.
+            process_id: if cfg!(target_family = "wasm") {
+                None
+            } else {
+                Some(std::process::id())
+            },
             root_path: Some(
                 self.root_uri
                     .to_file_path()
