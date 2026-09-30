@@ -1066,6 +1066,64 @@ impl RpcClient {
 7. **Q7 — plan §6.6 的否決理由要不要改寫？** 它否決的是「伺服器當 HeadlessProject」。本 spec 的 A 方案不是那樣（伺服器只是 transport；HeadlessProject 在遠端主機上），但 plan 裡「reuse remote::* over JSON RPC」那段論述需要補一條註記，說明它不適用於真正的遠端主機。大腦決定要不要修改 plan。
 8. **規格上的張力（已記錄，不自行解決）**：handoff §5 說 `get_or_create_remote_connection` 在 web 上是「dead code」，但本 spec 會讓它變成必經之路；plan §5.7 Revision 1 規定「workspace layout 不走 SQL」，但遠端專案的 layout 要依賴 `remote_connections` 表。→ WP9 的第一步就是回報這件事，由大腦裁決。
 
+### 8.1.1 裁決（2026-09-30，repo owner）
+
+以下裁決取代 §8.1 裡各題的「建議」。WP 的內容跟這裡衝突時，以這裡為準。
+
+- **Q1 → 不禁止。** `ZED_WEB_RESTRICT_PATHS` 只限制這台伺服器的檔案系統，SSH 照樣開放。§4.11 裡「restrict_paths 開啟時拒絕」那條閘門**刪除**；WP5 的驗收改成「restrict_paths 開啟時 connect 仍然成功」。
+- **Q2 → 保留 30 秒（§4.12 的設計照做）。** 預設走 public key：ssh 用伺服器帳號的 `~/.ssh` 金鑰與 ssh-agent。密碼提示保留，只當作 fallback。UI 要求：
+  - 連線 modal 收到密碼類的 prompt 時，在輸入框下方顯示一行提示，說明「這台主機是用密碼登入；設定 public key 之後就不用每次輸入」。
+  - `RemoteSsh::capabilities` 多回一個欄位 `ssh_agent: bool`（伺服器行程有沒有 `SSH_AUTH_SOCK`），讓入口可以顯示同樣的提示。
+- **Q3 → 採用 `command_recipe()`。** 沒有它，遠端專案的 terminal 在瀏覽器裡開不起來；UIUX 最重要。trait 上的新方法有預設實作，是純新增。
+- **Q4 → 都要支援。** manifest 至少要能列出 `linux-x86_64`、`linux-aarch64`、`macos-x86_64`、`macos-aarch64`。
+  - `web/build.sh` build 本機的 triple；linux 的另一個架構用 cross build。
+  - macOS 的 binary 在 Linux 上做不出來，所以另外提供匯入腳本，把在 Mac 上 build 好的 binary 放進 `dist/bin/remote/` 並更新 manifest。
+  - manifest 裡沒有的平台：connect 時回清楚的錯誤，錯誤訊息要指出匯入腳本。
+  - 細節由 WP7 決定，要先回報再動手。
+- **Q5 → 改走遠端。** 遠端專案上的 agent 面板與 extensions 走 proto（`AgentServerStore::init_remote`，project.rs:1718），不在 zed_web_server 本機跑。新增 **WP14**，依賴 WP10。模型：`Opus 5.5 high`，先調查、再回報，然後才動手。
+- **Q6 → 一起修。** `workspace_id` URL 參數要由瀏覽器實際寫入，讓每個分頁有自己的 RPC session。新增 **WP15**，依賴 WP8。模型：`Opus 5.5 high`。
+- **Q7 → 補註記。** plan §6.6 最後加一段 note，說明 §6.6 否決的是「伺服器自己當 HeadlessProject」；本 spec 的方案 A 裡，HeadlessProject 在遠端主機上，伺服器只當 transport，所以 §6.6 的否決不適用。§6.6 原本的內容不改。
+- **實作期間的補充裁決（第一批之後）**：
+  - **text frame 的關閉碼**：瀏覽器的 `WebSocket.close()` 只接受 1000 和 3000–4999，所以瀏覽器端收到 text frame 時用 **4003** 關閉，不用 1003。伺服器端（WP6）可以照 RFC 用 1003，但任何一端都**不准**依賴對方送的是 1003。
+  - **`version` 的比對**（§4.8 第 2 點）：取 stdout 最後一個非空行，trim 之後再比，理由跟 desktop 的 `parse_platform` 一樣——遠端 shell 初始化時可能多印雜訊。
+  - **`ByteChannel.receiver` 要能結束**：socket 關閉時，receiver 必須收到 `None`。做法是 `onclose` 把 incoming sender `take()` 掉。這條歸 WP8 做，因為 WP8 是第一個需要它的呼叫端。
+  - **web.json 格式錯誤**：`ssh_enabled` 當作 SSH 關閉，並印出警告（fail closed）。
+  - **web.json 放在 served root 底下，瀏覽器可以改它**：不修。拿著 token 的人本來就能透過 terminal 在伺服器上執行任何指令，改這個檔案不會多拿到權限。
+  - **ssh 開關的優先順序**：CLI > env > web.json，跟 restrict_paths 一樣。
+- **第二批 review 之後的補充裁決**：
+  - **bundle 缺平台或缺 manifest 時，要回清楚的錯誤，不准退回 desktop 流程**：provider 的簽名改成 `Fn(RemotePlatform) -> Option<Result<BundledRemoteServer>>`。
+    - `None`：沒有 bundle（desktop），照原本的流程。
+    - `Some(Err)`：有 bundle，但沒有這個平台，或 sha256 對不上。connect 失敗，錯誤訊息點名 `web/scripts/import-remote-server.sh`。
+    - 開了 SSH 但 manifest 不存在：`RemoteSsh::connect` 直接拒絕，錯誤訊息點名 `web/build.sh`。
+  - **遠端 binary 的檔名用內容決定，不用版本號**：檔名是 `zed-remote-server-web-<sha256 前 16 字>`，sha256 來自 manifest。`BundledRemoteServer` 多一個 `content_id` 欄位。
+    - 原因：這個 fork 常在還沒 commit 的 working tree 上 build，同一個 HEAD 可能 build 出內容不同的 binary。只看版本號的話，遠端會一直留著舊的。
+    - 上傳後的 `version` 檢查照樣做，但比的是 manifest 的 commit。
+  - **build id 前綴**：`build.sh` build remote_server 時要 unset `GITHUB_RUN_NUMBER` 和 `ZED_BUILD_ID`，讓 `version` 永遠是純 sha。
+  - **`-F`**：`allowed_hosts` 有設時拒絕（已實作）；沒設時允許，跟 desktop 一致。拿著 token 的人本來就能在伺服器上執行指令，允許 `-F` 不會多給權限。
+  - **relay 沒有背壓、`port_forwards` 沒有驗證**：拿著 token 的人本來就能在伺服器上執行指令，這兩點不會多給權限，這次不修，記在 §8.2。
+- **第五批之後的補充裁決（WP14、WP15）**：
+  - **WP14 的調查結果**：
+    - 瀏覽器裡的 agent 面板用的其實就是桌面版的 `agent_ui::AgentPanel`。遠端專案上它已經走 proto（`AgentServerStore::init_remote`），agent 本來就在遠端跑，所以 agent 這一半不用移植。
+    - `WebAgentPanel` 在 wasm 上是死碼。這次先不刪，要刪之前先問 owner。
+    - 要做的是 extension 這一半：`extension_host` 不在 wasm 的依賴圖裡，所以瀏覽器不會送 `SyncExtensions`。
+  - **G1 extension 放在哪裡**：以伺服器預設 workspace 的已安裝清單（`<root>/.zed/extensions`）為準，同步到遠端主機。安裝和解除安裝照舊只在伺服器端做。
+    - 注意 `SyncExtensions` 送出去的必須是完整清單，空清單會把遠端的 extension 全部移除。
+  - **G2 `Agent::*` RPC 和 web_agent_panel**：先不動（見上一點）。
+  - **G3 上傳的來源**：`RemoteSsh::upload_directory` 的 `src_path` 只能是伺服器 staging 根目錄底下的路徑。staging 根目錄是伺服器 tempdir 底下的 `zed-web-extension-staging/`。
+  - **G4 dev extension**：遠端專案上先不支援，要回清楚的錯誤訊息。
+  - **G5 NativeAgent**：跟 desktop 一樣，在 client（瀏覽器）裡跑，工具透過 proto 作用在遠端。遠端專案的 custom agent 讀的是遠端主機的 settings，要在 UI 上提示。
+  - **上傳逾時**：`upload_directory` 不套 30 秒的 RPC 逾時，改用 1 小時，跟 desktop 一樣（extension_host.rs:84）。
+  - **WP15 的 session 回收**：每個分頁有自己的 session 之後，`SessionRegistry` 會一直累積下去。
+    - 規則：session 的最後一條連線斷開之後，**10 分鐘**內沒有重新連上，就移除這個 session。移除時會一起清掉它的 terminal、process 和 watch，效果跟關掉 desktop 的視窗一樣。
+    - 重新整理頁面會在幾秒內重連，不受影響。
+  - **`MASTER_EXIT_GRACE = 200ms`**：可以接受。desktop 每次連線成功會多等 200ms，但整個 ssh 連線本來就要好幾秒。
+  - **複製出來的分頁共用同一個 session**：可以接受，不另外偵測。
+- **SSH 預設開啟（owner，2026-09-30）**：取代 §4.11 第 1 點的「預設關閉」。
+  - 只有 `ZED_WEB_ALLOW_SSH=0` 或 `.zed/web.json` 的 `ssh.enabled: false` 會把它關掉。`--allow-ssh` 照舊保留，而且優先權最高。
+  - 理由跟 Q1 一樣：拿到 token 的人本來就能在伺服器上執行指令。
+  - Linux 的 remote_server 一律用 musl 靜態連結 build（跟 upstream `script/bundle-linux` 一樣）。之前 build 出來的版本動態連結到 glibc 2.39，在 glibc 2.35 的主機上跑不起來。
+- **§8.1 第 8 點（layout 不走 SQL 的張力）→ 已解決。** WP9 的調查發現，web 上本機專案的 layout 本來就存在 SQL 裡，所以這個張力不存在。WP9 已經讓遠端專案也走同一套：`get_or_create_remote_connection` 用一趟 SQL 完成，`remote_workspace_for_roots` 改成 async，`save_workspace` 寫入真正的 remote_connection_id。
+
 ### 8.2 未驗證事項
 
 - **這份文件裡的所有東西都沒有編譯過，也沒有執行過。** 標了 [verified] 的只代表原始碼是這樣寫的。
