@@ -43,6 +43,15 @@ pub struct WebPlatform {
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
     gestures: Rc<WebGestures>,
+    /// What the app last wrote to or pasted from the clipboard. `Platform::read_from_clipboard`
+    /// is synchronous, while the browser only exposes the OS clipboard asynchronously (and
+    /// not at all outside secure contexts), so synchronous readers are answered from here.
+    clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    /// Text `write_to_clipboard` wants the document `copy` listener to place on the OS
+    /// clipboard. It stays set only while `execCommand("copy")` is on the stack, and the
+    /// listener clears it once the text is delivered.
+    pending_copy_text: Rc<RefCell<Option<String>>>,
+    _copy_listener: Option<EventListenerHandle>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
 }
 
@@ -175,6 +184,8 @@ impl WebPlatform {
         let gestures = Rc::new(WebGestures::from_user_agent(
             &browser_window.navigator().user_agent().unwrap_or_default(),
         ));
+        let pending_copy_text = Rc::new(RefCell::new(None));
+        let copy_listener = copy_listener(&browser_window, pending_copy_text.clone());
 
         Self {
             browser_window,
@@ -192,6 +203,9 @@ impl WebPlatform {
             cursor_visible,
             last_cursor_css,
             gestures,
+            clipboard: Rc::new(RefCell::new(None)),
+            pending_copy_text,
+            _copy_listener: copy_listener,
             _cursor_restore_listeners: cursor_restore_listeners,
         }
     }
@@ -407,6 +421,7 @@ impl Platform for WebPlatform {
             self.browser_window.clone(),
             self.window_lifecycle.clone(),
             self.active_window.clone(),
+            self.clipboard.clone(),
         );
         match window {
             Ok(window) => {
@@ -586,7 +601,7 @@ impl Platform for WebPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        self.clipboard.borrow().clone()
     }
 
     fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
@@ -651,12 +666,25 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
-            && let Some(window) = web_sys::window()
-        {
-            // Fire-and-forget; called synchronously inside the user's input
-            // event, which satisfies the browser's user-activation requirement.
-            drop(window.navigator().clipboard().write_text(&text));
+        let text = item.text();
+        *self.clipboard.borrow_mut() = Some(item);
+        let Some(text) = text else {
+            return;
+        };
+        // `execCommand("copy")` works without `navigator.clipboard` (which
+        // plain-http pages lack), but only within the user activation of the
+        // input event that led here, and it dispatches `copy` synchronously.
+        *self.pending_copy_text.borrow_mut() = Some(text);
+        let command_succeeded = exec_copy_command(&self.browser_window);
+        // Cleared unconditionally: a leftover value would hijack the user's
+        // next browser-initiated copy.
+        let Some(undelivered_text) = self.pending_copy_text.borrow_mut().take() else {
+            return;
+        };
+        if !write_text_with_async_clipboard(&self.browser_window, &undelivered_text) {
+            log::warn!(
+                "copied text reached only the in-app clipboard: execCommand(\"copy\") returned {command_succeeded} and navigator.clipboard is unavailable"
+            );
         }
     }
 
@@ -754,6 +782,85 @@ fn log_clipboard_entry_error(mime_type: &str, error: &JsValue) {
         "failed to read clipboard entry with type {mime_type}: {}",
         js_error_message(error)
     );
+}
+
+/// Places the text `write_to_clipboard` left in `pending_copy_text` on the
+/// clipboard of the `copy` event its `execCommand("copy")` dispatches.
+/// Copies the browser starts itself find nothing pending and keep their
+/// default behavior.
+fn copy_listener(
+    browser_window: &web_sys::Window,
+    pending_copy_text: Rc<RefCell<Option<String>>>,
+) -> Option<EventListenerHandle> {
+    let document = browser_window.document()?;
+    Some(EventListenerHandle::add(
+        document.as_ref(),
+        "copy",
+        move |event: JsValue| {
+            let text = pending_copy_text.borrow().clone();
+            let Some(text) = text else {
+                return;
+            };
+            let event: web_sys::ClipboardEvent = event.unchecked_into();
+            let Some(clipboard_data) = event.clipboard_data() else {
+                return;
+            };
+            match clipboard_data.set_data("text/plain", &text) {
+                Ok(()) => {
+                    event.prevent_default();
+                    pending_copy_text.borrow_mut().take();
+                }
+                Err(error) => {
+                    log::warn!(
+                        "failed to set copied text on the clipboard event: {}",
+                        js_error_message(&error)
+                    );
+                }
+            }
+        },
+    ))
+}
+
+/// Calls `document.execCommand("copy")` through `Reflect`, so a browser that
+/// lacks it or throws reports failure instead of aborting the wasm module.
+fn exec_copy_command(browser_window: &web_sys::Window) -> bool {
+    let Some(document) = browser_window.document() else {
+        return false;
+    };
+    let Ok(exec_command) = js_sys::Reflect::get(document.as_ref(), &"execCommand".into()) else {
+        return false;
+    };
+    let Some(exec_command) = exec_command.dyn_ref::<js_sys::Function>() else {
+        return false;
+    };
+    match exec_command.call1(document.as_ref(), &"copy".into()) {
+        Ok(result) => result.as_bool().unwrap_or(false),
+        Err(error) => {
+            log::warn!("execCommand(\"copy\") failed: {}", js_error_message(&error));
+            false
+        }
+    }
+}
+
+/// Starts a `navigator.clipboard.writeText`, returning false when the API is
+/// missing (it is undefined outside secure contexts).
+fn write_text_with_async_clipboard(browser_window: &web_sys::Window, text: &str) -> bool {
+    let navigator = browser_window.navigator();
+    let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
+        .is_ok_and(|clipboard| !clipboard.is_undefined() && !clipboard.is_null());
+    if !clipboard_available {
+        return false;
+    }
+    let write = navigator.clipboard().write_text(text);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(error) = wasm_bindgen_futures::JsFuture::from(write).await {
+            log::warn!(
+                "navigator.clipboard.writeText failed: {}",
+                js_error_message(&error)
+            );
+        }
+    });
+    true
 }
 
 fn cursor_restore_listeners(

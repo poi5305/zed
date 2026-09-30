@@ -701,7 +701,15 @@ fn load_keymaps(cx: &mut App) {
     // appear "broken"). Partial load still registers editor/workspace chords.
     let mut total = 0usize;
 
-    let default_keymap_path = default_keymap_path();
+    // `settings` picks these paths with `cfg!(target_os = ...)`, which on wasm answers for
+    // wasm32-unknown-unknown and so always yields Linux. The keyboard is the browser's, so a
+    // Mac browser gets the macOS keymaps, or none of its ⌘ chords are bound.
+    let browser_is_mac = browser_is_mac();
+    let default_keymap_path = if browser_is_mac {
+        "keymaps/default-macos.json"
+    } else {
+        default_keymap_path()
+    };
     match KeymapFile::load_asset_allow_partial_failure(default_keymap_path, cx) {
         Ok(mut bindings) => {
             for b in &mut bindings {
@@ -716,7 +724,12 @@ fn load_keymaps(cx: &mut App) {
     }
 
     let base = *BaseKeymap::get_global(cx);
-    if let Some(asset_path) = base.asset_path() {
+    let base_asset_path = if browser_is_mac {
+        macos_base_keymap_path(base)
+    } else {
+        base.asset_path()
+    };
+    if let Some(asset_path) = base_asset_path {
         match KeymapFile::load_asset_allow_partial_failure(asset_path, cx) {
             Ok(mut bindings) => {
                 for b in &mut bindings {
@@ -731,7 +744,11 @@ fn load_keymaps(cx: &mut App) {
         }
     }
 
-    let overrides_keymap_path = specific_overrides_keymap_path();
+    let overrides_keymap_path = if browser_is_mac {
+        "keymaps/specific-overrides-macos.json"
+    } else {
+        specific_overrides_keymap_path()
+    };
     match KeymapFile::load_asset_allow_partial_failure(overrides_keymap_path, cx) {
         Ok(mut bindings) => {
             for b in &mut bindings {
@@ -746,8 +763,42 @@ fn load_keymaps(cx: &mut App) {
     }
 
     web_sys::console::log_1(
-        &format!("zed_web_workspace: keymaps loaded ({total} bindings)").into(),
+        &format!(
+            "zed_web_workspace: keymaps loaded ({total} bindings, {} layout)",
+            if browser_is_mac { "macOS" } else { "Linux" }
+        )
+        .into(),
     );
+}
+
+#[cfg(target_family = "wasm")]
+/// Mirrors `BaseKeymap::asset_path`'s macOS arm, which wasm never compiles.
+fn macos_base_keymap_path(base: settings::BaseKeymap) -> Option<&'static str> {
+    use settings::BaseKeymap;
+    match base {
+        BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+        BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+        BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+        BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+        BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+        BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+        BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+        BaseKeymap::Zed => None,
+        BaseKeymap::None => None,
+    }
+}
+
+#[cfg(target_family = "wasm")]
+/// The same test gpui_web uses to map ⌘ to the `platform` modifier, so the keymap and the
+/// keystrokes agree on which modifier is the command key.
+fn browser_is_mac() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let navigator = window.navigator();
+    #[allow(deprecated)]
+    let platform = navigator.platform().unwrap_or_default();
+    platform.contains("Mac") || navigator.user_agent().unwrap_or_default().contains("Mac")
 }
 
 #[cfg(target_family = "wasm")]

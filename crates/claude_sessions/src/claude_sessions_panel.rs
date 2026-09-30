@@ -7804,10 +7804,12 @@ impl ClaudeSessionsPanel {
     /// Writes a pasted image onto the session's machine and pastes that path into the
     /// embedded terminal. Local projects and text pastes are left to `TerminalView`.
     fn paste_remote_image(&mut self, cx: &mut Context<Self>) {
-        let is_remote = self
-            .workspace
-            .upgrade()
-            .is_some_and(|workspace| workspace.read(cx).project().read(cx).is_via_remote_server());
+        // The browser build's project looks local, but the session runs on the server, which
+        // TerminalView's text-only paste cannot hand an image to.
+        let is_remote = cfg!(target_family = "wasm")
+            || self.workspace.upgrade().is_some_and(|workspace| {
+                workspace.read(cx).project().read(cx).is_via_remote_server()
+            });
         // A local paste is TerminalView's alone, so the clipboard is not even read for it.
         let image = if is_remote { clipboard_image(cx) } else { None };
         if !intercepts_image_paste(is_remote, image.is_some()) {
@@ -7878,7 +7880,16 @@ impl ClaudeSessionsPanel {
                     },
                 ))
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                    if is_ctrl_v(&event.keystroke) {
+                    // A Mac browser sends its paste chord, ⌘V, as platform-v, which the
+                    // server-OS keymap the browser build loads leaves unbound.
+                    let is_browser_command_v = cfg!(target_family = "wasm")
+                        && event.keystroke.key == "v"
+                        && event.keystroke.modifiers
+                            == gpui::Modifiers {
+                                platform: true,
+                                ..gpui::Modifiers::default()
+                            };
+                    if is_ctrl_v(&event.keystroke) || is_browser_command_v {
                         this.paste_remote_image(cx);
                     }
                 }))
