@@ -87,8 +87,21 @@ pub(crate) struct ImeMirror {
 /// distinction drives virtual-keyboard policy: touch-first browsers summon
 /// the keyboard for any focused editable element on a user gesture.
 fn primary_pointer_is_coarse() -> bool {
+    media_query_matches("(pointer: coarse)")
+}
+
+/// Whether a touch-first device also has a trackpad or mouse attached, such
+/// as an iPad with a Magic Keyboard. Such a device has a hardware keyboard,
+/// so there is no software keyboard to keep away, and a read-only hidden
+/// input makes iPadOS deliver keys raw: no IME composition, and ctrl-space
+/// never switches the input source.
+pub(crate) fn touch_device_has_fine_pointer() -> bool {
+    primary_pointer_is_coarse() && media_query_matches("(any-pointer: fine)")
+}
+
+fn media_query_matches(query: &str) -> bool {
     web_sys::window()
-        .and_then(|window| window.match_media("(pointer: coarse)").ok().flatten())
+        .and_then(|window| window.match_media(query).ok().flatten())
         .is_some_and(|media_query_list| media_query_list.matches())
 }
 
@@ -124,7 +137,7 @@ impl ImeMirror {
         // invites the browser to summon the virtual keyboard on the next
         // user gesture — including a scroll. Start read-only there; only a
         // recognized tap on text input lifts it (`sync_virtual_keyboard`).
-        if primary_pointer_is_coarse() {
+        if primary_pointer_is_coarse() && !touch_device_has_fine_pointer() {
             element.set_read_only(true);
         }
 
@@ -219,6 +232,31 @@ impl ImeMirror {
 
     pub(crate) fn value(&self) -> String {
         self.element.value()
+    }
+
+    /// Copies `text` to the OS clipboard by selecting it in the element and
+    /// running `execCommand("copy")`, then restores the element. WebKit
+    /// disables the copy command while nothing is selected, so a copy
+    /// without a selection silently does nothing there. Rewriting the value
+    /// restarts the IME connection; callers avoid running it mid-composition.
+    pub(crate) fn copy_text_via_selection(
+        &self,
+        browser_window: &web_sys::Window,
+        text: &str,
+    ) -> bool {
+        let previous_value = self.element.value();
+        let previous_start = self.element.selection_start().ok().flatten();
+        let previous_end = self.element.selection_end().ok().flatten();
+        self.element.set_value(text);
+        self.element
+            .set_selection_range(0, text.encode_utf16().count() as u32)
+            .ok();
+        let copied = crate::platform::exec_copy_command(browser_window);
+        self.element.set_value(&previous_value);
+        if let (Some(start), Some(end)) = (previous_start, previous_end) {
+            self.element.set_selection_range(start, end).ok();
+        }
+        copied
     }
 
     pub(crate) fn selection_start(&self) -> Option<u32> {

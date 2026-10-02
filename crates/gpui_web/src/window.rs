@@ -67,6 +67,9 @@ pub(crate) struct WebWindowInner {
     /// synchronously from inside an input dispatch, and a `RefCell`
     /// double-borrow panic on wasm never unwinds, wedging the app.
     pub(crate) suppress_focus_status_events: Cell<bool>,
+    /// Whether a trackpad press on a touch-first device has focused the
+    /// hidden input since its last blur (see `register_pointer_down`).
+    pub(crate) ime_focused_by_gesture: Cell<bool>,
     /// The visual viewport's width and greatest height seen at that width,
     /// in layout pixels. The keyboard-visibility probe compares the current
     /// height against this maximum; the width detects rotation, which must
@@ -87,9 +90,16 @@ pub(crate) struct WebWindowInner {
     /// that paste actions reading the clipboard synchronously see the
     /// browser's clipboard contents.
     pub(crate) clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    /// The platform's copy that has not reached the OS clipboard yet (see
+    /// `WebPlatform::deferred_copy_text`). While it is set, the browser's
+    /// clipboard is older than `clipboard`.
+    pub(crate) deferred_copy_text: Rc<RefCell<Option<String>>>,
     /// A paste keystroke held back from GPUI until the browser's `paste`
     /// event has refreshed `clipboard`. Whoever takes it dispatches it.
     pub(crate) pending_paste_keystroke: Cell<Option<KeyDownEvent>>,
+    /// When a paste keystroke last ran without waiting for its `paste`
+    /// event (see `deliver_paste`).
+    pub(crate) paste_keystroke_flushed_at: Cell<Option<f64>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -156,6 +166,7 @@ impl WebWindow {
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
         clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+        deferred_copy_text: Rc<RefCell<Option<String>>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -217,11 +228,14 @@ impl WebWindow {
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
             suppress_focus_status_events: Cell::new(false),
+            ime_focused_by_gesture: Cell::new(false),
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
             clipboard,
+            deferred_copy_text,
             pending_paste_keystroke: Cell::new(None),
+            paste_keystroke_flushed_at: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),

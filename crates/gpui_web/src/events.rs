@@ -220,6 +220,7 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+            this.flush_deferred_copy();
 
             let pointer_type = event.pointer_type();
             let position = pointer_position_in_element(&event);
@@ -278,7 +279,21 @@ impl WebWindowInner {
                 first_mouse: false,
             }));
 
-            this.ime_mirror.focus();
+            // iPadOS attaches its IME only to an input that is editable when
+            // a user gesture focuses it, and nothing else lifts the read-only
+            // state for a trackpad click. Cycle the focus from this press
+            // once per focus; not mid-composition, which a blur would drop.
+            if !this.ime_focused_by_gesture.get()
+                && !this.is_composing.get()
+                && crate::ime_mirror::touch_device_has_fine_pointer()
+            {
+                this.ime_mirror.set_read_only(false);
+                this.refocus_ime_mirror(true);
+                this.ime_focused_by_gesture
+                    .set(this.ime_mirror.is_focused());
+            } else {
+                this.ime_mirror.focus();
+            }
         })
     }
 
@@ -481,6 +496,17 @@ impl WebWindowInner {
     /// We don't use `navigator.virtualKeyboard` here because it's
     /// Chromium-only.
     pub(crate) fn sync_virtual_keyboard(self: &Rc<Self>, editable: bool) {
+        // With a trackpad attached there is a hardware keyboard and no
+        // software keyboard to summon or hide. Read-only or blurred, the
+        // input would stop receiving IME input and keys. Lifting read-only
+        // inside a finger tap is enough for iPadOS to attach the IME; a
+        // trackpad press reattaches it otherwise.
+        if crate::ime_mirror::touch_device_has_fine_pointer() {
+            if editable {
+                self.ime_mirror.set_read_only(false);
+            }
+            return;
+        }
         let was_editable = !self.ime_mirror.read_only();
         self.ime_mirror.set_read_only(!editable);
         // Trigger a focus event only when the keyboard actually needs
@@ -493,37 +519,45 @@ impl WebWindowInner {
         let editable_needs_focus_event = editable
             && (!was_editable || !self.ime_mirror.is_focused() || self.keyboard_likely_dismissed());
         if editable_needs_focus_event || (!editable && was_editable) {
-            self.suppress_focus_status_events.set(true);
-            if editable {
-                // A same-task blur/focus cycle may be coalesced by iOS, but
-                // this branch only runs when the keyboard is already gone,
-                // so a coalesced cycle loses nothing.
-                if self.ime_mirror.is_focused() {
-                    self.ime_mirror.blur();
-                }
-                self.ime_mirror.focus();
-            } else {
+            self.refocus_ime_mirror(editable);
+        }
+    }
+
+    /// Blur/focus-cycles the hidden input (or only blurs it when
+    /// `editable` is false) without reporting the cycle as an activity
+    /// change, then reports the window active once the focus has settled.
+    fn refocus_ime_mirror(self: &Rc<Self>, editable: bool) {
+        self.suppress_focus_status_events.set(true);
+        if editable {
+            // A same-task blur/focus cycle may be coalesced by iOS, but
+            // callers only cycle when the keyboard is already gone or the
+            // current focus has no IME attached, so a coalesced cycle loses
+            // nothing.
+            if self.ime_mirror.is_focused() {
                 self.ime_mirror.blur();
             }
-            self.suppress_focus_status_events.set(false);
+            self.ime_mirror.focus();
+        } else {
+            self.ime_mirror.blur();
+        }
+        self.suppress_focus_status_events.set(false);
 
-            if editable {
-                let callback = wasm_bindgen::closure::Closure::once_into_js({
-                    let this = Rc::clone(self);
-                    move || {
-                        this.state.borrow_mut().is_active = true;
-                        this.with_callback(
-                            |callbacks| &mut callbacks.active_status_change,
-                            |callback| callback(true),
-                        );
-                    }
-                });
-                if let Err(error) = self
-                    .browser_window
-                    .set_timeout_with_callback(callback.unchecked_ref())
-                {
-                    log::warn!("failed to defer web window activation: {error:?}");
+        if editable {
+            let callback = wasm_bindgen::closure::Closure::once_into_js({
+                let this = Rc::clone(self);
+                move || {
+                    this.state.borrow_mut().is_active = true;
+                    this.with_callback(
+                        |callbacks| &mut callbacks.active_status_change,
+                        |callback| callback(true),
+                    );
                 }
+            });
+            if let Err(error) = self
+                .browser_window
+                .set_timeout_with_callback(callback.unchecked_ref())
+            {
+                log::warn!("failed to defer web window activation: {error:?}");
             }
         }
     }
@@ -694,6 +728,12 @@ impl WebWindowInner {
         self.listen_input("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
             this.flush_pending_paste_keystroke();
+            // Command keys only: they start the shortcuts that use a copy
+            // (paste, switching apps), while flushing on a typing key would
+            // rewrite the IME element under the keyboard.
+            if event.meta_key() || event.ctrl_key() {
+                this.flush_deferred_copy();
+            }
 
             let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
             let capslock = capslock_from_keyboard_event(&event);
@@ -834,8 +874,29 @@ impl WebWindowInner {
         }
     }
 
+    /// Places a copy that could not reach the OS clipboard outside a user
+    /// activation (see `WebPlatform::deferred_copy_text`) on it from within
+    /// the current input event. A copy that still fails waits for the next.
+    fn flush_deferred_copy(&self) {
+        if self.is_composing.get() {
+            return;
+        }
+        let Some(text) = self.deferred_copy_text.borrow_mut().take() else {
+            return;
+        };
+        if !self
+            .ime_mirror
+            .copy_text_via_selection(&self.browser_window, &text)
+        {
+            log::info!("deferred copy still waiting: execCommand(\"copy\") failed");
+            *self.deferred_copy_text.borrow_mut() = Some(text);
+        }
+    }
+
     fn flush_pending_paste_keystroke(self: &Rc<Self>) {
         if let Some(key_down) = self.pending_paste_keystroke.take() {
+            self.paste_keystroke_flushed_at
+                .set(Some(js_sys::Date::now()));
             self.dispatch_input(PlatformInput::KeyDown(key_down));
             self.schedule_ime_mirror_sync();
         }
@@ -862,6 +923,17 @@ impl WebWindowInner {
             if !pasted_back_own_copy {
                 *clipboard = Some(item.clone());
             }
+        }
+        // iPadOS can deliver a paste shortcut's `paste` event after the
+        // keyup or timeout that already ran the keystroke against the in-app
+        // clipboard. That late event belongs to the paste that already
+        // happened; pasting it again would insert the text twice.
+        let flushed_at = self.paste_keystroke_flushed_at.take();
+        if key_down.is_none()
+            && flushed_at
+                .is_some_and(|flushed_at| js_sys::Date::now() - flushed_at < LATE_PASTE_EVENT_MS)
+        {
+            return;
         }
         let handled = key_down.is_some_and(|key_down| {
             let result = self.dispatch_input(PlatformInput::KeyDown(key_down));
@@ -1114,6 +1186,19 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("paste", move |event: JsValue| {
             let event: web_sys::ClipboardEvent = event.unchecked_into();
+            // An app copy still waiting for a user activation is newer than
+            // anything the browser's clipboard holds, so paste that instead.
+            let newer_app_copy = if this.deferred_copy_text.borrow().is_some() {
+                this.clipboard.borrow().clone()
+            } else {
+                None
+            };
+            if let Some(item) = newer_app_copy {
+                event.prevent_default();
+                let key_down = this.pending_paste_keystroke.take();
+                this.deliver_paste(item, key_down);
+                return;
+            }
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
@@ -1260,6 +1345,7 @@ impl WebWindowInner {
             // `compositionend`, and while the flag is set `is_ime_key_event` drops every key.
             // A `compositionend` that does arrive later still commits through its own handler.
             this.is_composing.set(false);
+            this.ime_focused_by_gesture.set(false);
             if this.suppress_focus_status_events.get() {
                 return;
             }
@@ -1493,6 +1579,10 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
 /// variation; AOSP similarly caps touch resampling extrapolation at 8ms
 /// (`RESAMPLE_MAX_PREDICTION` in `InputTransport.cpp`).
 const MAX_PREDICTION_LEAD_MS: f64 = 10.;
+
+/// How long after a paste keystroke ran without its `paste` event a
+/// keystroke-less `paste` event is still taken to be that one, arriving late.
+const LATE_PASTE_EVENT_MS: f64 = 1000.;
 
 /// The predicted pointer position closest to [`MAX_PREDICTION_LEAD_MS`]
 /// ahead of `event`, from `getPredictedEvents()`, or `None` when the browser
