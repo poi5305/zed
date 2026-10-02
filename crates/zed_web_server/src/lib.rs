@@ -460,8 +460,12 @@ async fn login(
     state.login_limiter.record_success(address.ip());
     let mut response = Redirect::to("/").into_response();
     let secure = if state.secure_cookie { "; Secure" } else { "" };
+    // Lax, not Strict: a browser restoring its tabs or opening a bookmark or a link from
+    // another app navigates cross-site, and Strict withholds the cookie there, which sent
+    // users back to the login page on every relaunch. Lax still withholds it from
+    // cross-site subresources (the /rpc WebSocket included) and cross-site POSTs.
     let cookie = format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         auth::AUTH_COOKIE,
         auth::new_session(&state.auth_token),
         30 * 24 * 60 * 60,
@@ -480,7 +484,7 @@ async fn logout(State(state): State<AppState>) -> Response {
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "zed_web_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}"
+            "zed_web_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}"
         ))
         .expect("generated cookie is valid"),
     );
