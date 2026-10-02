@@ -51,7 +51,14 @@ pub struct WebPlatform {
     /// clipboard. It stays set only while `execCommand("copy")` is on the stack, and the
     /// listener clears it once the text is delivered.
     pending_copy_text: Rc<RefCell<Option<String>>>,
+    /// Text a copy could not place on the OS clipboard because it ran outside a user
+    /// activation, e.g. an OSC 52 copy a terminal program sends back after the mouse release
+    /// that selected the text. The window delivers it from the next pointer press or command
+    /// key press (`flush_deferred_copy`); leaving the page drops it, so it never overwrites
+    /// what was copied elsewhere meanwhile.
+    deferred_copy_text: Rc<RefCell<Option<String>>>,
     _copy_listener: Option<EventListenerHandle>,
+    _deferred_copy_listeners: Vec<EventListenerHandle>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
 }
 
@@ -186,6 +193,9 @@ impl WebPlatform {
         ));
         let pending_copy_text = Rc::new(RefCell::new(None));
         let copy_listener = copy_listener(&browser_window, pending_copy_text.clone());
+        let deferred_copy_text = Rc::new(RefCell::new(None));
+        let deferred_copy_listeners =
+            deferred_copy_drop_listeners(&browser_window, deferred_copy_text.clone());
 
         Self {
             browser_window,
@@ -205,7 +215,9 @@ impl WebPlatform {
             gestures,
             clipboard: Rc::new(RefCell::new(None)),
             pending_copy_text,
+            deferred_copy_text,
             _copy_listener: copy_listener,
+            _deferred_copy_listeners: deferred_copy_listeners,
             _cursor_restore_listeners: cursor_restore_listeners,
         }
     }
@@ -422,6 +434,7 @@ impl Platform for WebPlatform {
             self.window_lifecycle.clone(),
             self.active_window.clone(),
             self.clipboard.clone(),
+            self.deferred_copy_text.clone(),
         );
         match window {
             Ok(window) => {
@@ -679,12 +692,18 @@ impl Platform for WebPlatform {
         // Cleared unconditionally: a leftover value would hijack the user's
         // next browser-initiated copy.
         let Some(undelivered_text) = self.pending_copy_text.borrow_mut().take() else {
+            self.deferred_copy_text.borrow_mut().take();
             return;
         };
-        if !write_text_with_async_clipboard(&self.browser_window, &undelivered_text) {
-            log::warn!(
-                "copied text reached only the in-app clipboard: execCommand(\"copy\") returned {command_succeeded} and navigator.clipboard is unavailable"
+        if !write_text_with_async_clipboard(
+            &self.browser_window,
+            &undelivered_text,
+            self.deferred_copy_text.clone(),
+        ) {
+            log::info!(
+                "copy deferred to the next pointer or command key press: execCommand(\"copy\") returned {command_succeeded} and navigator.clipboard is unavailable"
             );
+            *self.deferred_copy_text.borrow_mut() = Some(undelivered_text);
         }
     }
 
@@ -823,7 +842,7 @@ fn copy_listener(
 
 /// Calls `document.execCommand("copy")` through `Reflect`, so a browser that
 /// lacks it or throws reports failure instead of aborting the wasm module.
-fn exec_copy_command(browser_window: &web_sys::Window) -> bool {
+pub(crate) fn exec_copy_command(browser_window: &web_sys::Window) -> bool {
     let Some(document) = browser_window.document() else {
         return false;
     };
@@ -843,8 +862,13 @@ fn exec_copy_command(browser_window: &web_sys::Window) -> bool {
 }
 
 /// Starts a `navigator.clipboard.writeText`, returning false when the API is
-/// missing (it is undefined outside secure contexts).
-fn write_text_with_async_clipboard(browser_window: &web_sys::Window, text: &str) -> bool {
+/// missing (it is undefined outside secure contexts). A write the browser
+/// rejects for lack of user activation is deferred like a failed copy.
+fn write_text_with_async_clipboard(
+    browser_window: &web_sys::Window,
+    text: &str,
+    deferred_copy_text: Rc<RefCell<Option<String>>>,
+) -> bool {
     let navigator = browser_window.navigator();
     let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
         .is_ok_and(|clipboard| !clipboard.is_undefined() && !clipboard.is_null());
@@ -852,15 +876,42 @@ fn write_text_with_async_clipboard(browser_window: &web_sys::Window, text: &str)
         return false;
     }
     let write = navigator.clipboard().write_text(text);
+    let text = text.to_string();
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(error) = wasm_bindgen_futures::JsFuture::from(write).await {
-            log::warn!(
-                "navigator.clipboard.writeText failed: {}",
-                js_error_message(&error)
-            );
+            if js_error_name(&error).as_deref() == Some("NotAllowedError") {
+                log::info!(
+                    "copy deferred to the next pointer or command key press: {}",
+                    js_error_message(&error)
+                );
+                *deferred_copy_text.borrow_mut() = Some(text);
+            } else {
+                log::warn!(
+                    "navigator.clipboard.writeText failed: {}",
+                    js_error_message(&error)
+                );
+            }
         }
     });
     true
+}
+
+/// Drops `deferred_copy_text` when the page loses focus or is hidden, so a
+/// later press never overwrites what was copied in another app meanwhile.
+fn deferred_copy_drop_listeners(
+    browser_window: &web_sys::Window,
+    deferred_copy_text: Rc<RefCell<Option<String>>>,
+) -> Vec<EventListenerHandle> {
+    let Some(document) = browser_window.document() else {
+        return Vec::new();
+    };
+    let drop_deferred_copy = move |_event: JsValue| {
+        deferred_copy_text.borrow_mut().take();
+    };
+    vec![
+        EventListenerHandle::add(browser_window.as_ref(), "blur", drop_deferred_copy.clone()),
+        EventListenerHandle::add(document.as_ref(), "visibilitychange", drop_deferred_copy),
+    ]
 }
 
 fn cursor_restore_listeners(
