@@ -15,9 +15,13 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
+pub use persistence::REATTACHABLE_TASK_ID_PREFIX;
 #[cfg(target_family = "wasm")]
 use persistence::delete_unloaded_terminals_sql;
-use persistence::{TerminalDb, resolve_custom_title, resolve_working_directory};
+use persistence::{
+    SerializedReattachTask, TerminalDb, is_reattachable_task, resolve_custom_title,
+    resolve_working_directory,
+};
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -1836,7 +1840,17 @@ impl Item for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal().read(cx).task().is_none() {
+        let reattachable = match self.terminal().read(cx).task() {
+            None => Some(false),
+            Some(task) if is_reattachable_task(&task.spawned_task) => Some(true),
+            Some(_) => None,
+        };
+        if let Some(reattachable) = reattachable {
+            // Saved as soon as it is placed rather than once its working directory is
+            // first reported, which is what marks a shell as changed.
+            if reattachable {
+                self.needs_serialize = true;
+            }
             if let Some((new_id, old_id)) = workspace.database_id().zip(self.workspace_id) {
                 log::debug!(
                     "Updating workspace id for the terminal, old: {old_id:?}, new: {new_id:?}",
@@ -1895,9 +1909,10 @@ impl SerializableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let terminal = self.terminal().read(cx);
-        if terminal.task().is_some() {
-            return None;
-        }
+        let reattach_task = match terminal.task() {
+            None => None,
+            Some(task) => Some(SerializedReattachTask::from_spawn(&task.spawned_task)?),
+        };
 
         if !self.needs_serialize {
             return None;
@@ -1906,6 +1921,11 @@ impl SerializableItem for TerminalView {
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
+        let reattach_task = match reattach_task.map(|task| serde_json::to_string(&task)) {
+            None => None,
+            Some(Ok(task)) => Some(task),
+            Some(Err(error)) => return Some(Task::ready(Err(error.into()))),
+        };
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
@@ -1915,6 +1935,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_reattach_task(item_id, workspace_id, reattach_task)
                 .await?;
             Ok(())
         }))
@@ -1933,6 +1955,17 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
+            let reattach_task = match cx.update(|_window, cx| TerminalDb::global(cx)) {
+                Ok(db) => db
+                    .get_reattach_task(item_id, workspace_id)
+                    .await
+                    .log_err()
+                    .flatten()
+                    .and_then(|task| {
+                        serde_json::from_str::<SerializedReattachTask>(&task).log_err()
+                    }),
+                Err(_) => None,
+            };
             let (cwd, custom_title) = match cx.update(|_window, cx| TerminalDb::global(cx)) {
                 Ok(db) => {
                     let from_database = db
@@ -1961,9 +1994,20 @@ impl SerializableItem for TerminalView {
                 Err(_) => (None, None),
             };
 
-            let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
-                .await?;
+            let terminal = match reattach_task {
+                Some(task) => {
+                    project
+                        .update(cx, |project, cx| {
+                            project.create_terminal_task(task.to_spawn(cwd), cx)
+                        })
+                        .await?
+                }
+                None => {
+                    project
+                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                        .await?
+                }
+            };
             cx.update(|window, cx| {
                 cx.new(|cx| {
                     let mut view = TerminalView::new(

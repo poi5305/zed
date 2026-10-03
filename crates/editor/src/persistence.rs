@@ -242,6 +242,13 @@ impl EditorDb {
     }
 
     query! {
+        pub async fn load_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
+            SELECT path, buffer_path, contents, language, mtime_seconds, mtime_nanos FROM editors
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    query! {
         pub async fn save_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId, serialized_editor: SerializedEditor) -> Result<()> {
             INSERT INTO editors
                 (item_id, workspace_id, path, buffer_path, contents, language, mtime_seconds, mtime_nanos)

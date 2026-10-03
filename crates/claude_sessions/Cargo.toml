@@ -16,6 +16,7 @@ doctest = false
 anyhow.workspace = true
 chrono.workspace = true
 collections.workspace = true
+db.workspace = true
 fs.workspace = true
 gpui.workspace = true
 log.workspace = true

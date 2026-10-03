@@ -30,10 +30,12 @@ use util::ResultExt as _;
 
 use crate::session_registry::{
     self, AgentListing, CacheTtl, ChannelStatus, HookInstallOutcome, RegisteredSession,
-    SessionSummary, SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress,
-    TailState, TranscriptSpend, channel_answer_permission, channel_interrupt, channel_send_message,
-    channel_status, now_millis, read_channel_inbox_tail, read_events_tail, read_session_status,
-    read_subagent_transcript_tail, read_transcript_tail,
+    SessionSummary, SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary,
+    TAIL_FIRST_READ_WINDOW_BYTES, TailProgress, TailState, TranscriptSpend,
+    channel_answer_permission, channel_interrupt, channel_send_message, channel_status, now_millis,
+    read_channel_inbox_tail_within, read_events_tail_within, read_session_status,
+    read_subagent_transcript_tail, read_subagent_transcript_tail_within, read_transcript_tail,
+    read_transcript_tail_within,
 };
 
 /// The prefix of a file that was read, and whether the file went on past it.
@@ -59,6 +61,18 @@ pub trait SessionSource: Send + Sync + 'static {
     fn list_sessions(&self, project_root: Option<PathBuf>) -> Task<Result<SessionListing>>;
 
     fn tail_transcript(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>>;
+
+    /// Like [`Self::tail_transcript`], with a first read that delivers only the lines in
+    /// the last `window` bytes of the file and reports how much it skipped. A source whose
+    /// far end has no way to report that reads the whole file instead.
+    fn tail_transcript_within(
+        &self,
+        session_id: String,
+        state: TailState,
+        _window: u64,
+    ) -> Task<Result<TailProgress>> {
+        self.tail_transcript(session_id, state)
+    }
 
     /// Every subagent conversation the session has spawned.
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>>;
@@ -114,6 +128,18 @@ pub trait SessionSource: Send + Sync + 'static {
         workflow_run_id: Option<String>,
         state: TailState,
     ) -> Task<Result<TailProgress>>;
+
+    /// Like [`Self::tail_subagent`], bounded the way [`Self::tail_transcript_within`] is.
+    fn tail_subagent_within(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+        _window: u64,
+    ) -> Task<Result<TailProgress>> {
+        self.tail_subagent(session_id, agent_id, workflow_run_id, state)
+    }
 
     /// Reads at most `max_bytes` of `path`, reporting whether the file continued past
     /// them.
@@ -233,6 +259,18 @@ impl SessionSource for LocalSource {
             .spawn(async move { read_transcript_tail(&home_directory, &session_id, state) })
     }
 
+    fn tail_transcript_within(
+        &self,
+        session_id: String,
+        state: TailState,
+        window: u64,
+    ) -> Task<Result<TailProgress>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            read_transcript_tail_within(&home_directory, &session_id, state, window)
+        })
+    }
+
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
         let home_directory = self.home_directory.clone();
         self.executor.spawn(async move {
@@ -252,8 +290,14 @@ impl SessionSource for LocalSource {
 
     fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
         let home_directory = self.home_directory.clone();
-        self.executor
-            .spawn(async move { read_events_tail(&home_directory, &session_id, state) })
+        self.executor.spawn(async move {
+            read_events_tail_within(
+                &home_directory,
+                &session_id,
+                state,
+                TAIL_FIRST_READ_WINDOW_BYTES,
+            )
+        })
     }
 
     fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
@@ -324,6 +368,27 @@ impl SessionSource for LocalSource {
         })
     }
 
+    fn tail_subagent_within(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+        window: u64,
+    ) -> Task<Result<TailProgress>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            read_subagent_transcript_tail_within(
+                &home_directory,
+                &session_id,
+                &agent_id,
+                workflow_run_id.as_deref(),
+                state,
+                window,
+            )
+        })
+    }
+
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
         self.executor
             .spawn(async move { read_file_prefix(&path, max_bytes) })
@@ -383,8 +448,14 @@ impl SessionSource for LocalSource {
 
     fn tail_channel_inbox(&self, claude_pid: u32, state: TailState) -> Task<Result<TailProgress>> {
         let home_directory = self.home_directory.clone();
-        self.executor
-            .spawn(async move { read_channel_inbox_tail(&home_directory, claude_pid, state) })
+        self.executor.spawn(async move {
+            read_channel_inbox_tail_within(
+                &home_directory,
+                claude_pid,
+                state,
+                TAIL_FIRST_READ_WINDOW_BYTES,
+            )
+        })
     }
 
     fn list_agents(&self) -> Task<Result<Vec<AgentListing>>> {
@@ -991,6 +1062,24 @@ impl SessionSource for WebSource {
         )
     }
 
+    fn tail_transcript_within(
+        &self,
+        session_id: String,
+        state: TailState,
+        window: u64,
+    ) -> Task<Result<TailProgress>> {
+        self.tail(
+            "ClaudeSessions::read_transcript_tail",
+            json!({
+                "session_id": session_id,
+                "path": state.path.as_deref().map(path_to_wire),
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+                "window": window,
+            }),
+        )
+    }
+
     fn list_subagents(&self, session_id: String) -> Task<Result<Vec<SubagentSummary>>> {
         let response = self.call::<ListSubagentsJson>(
             "ClaudeSessions::list_subagents",
@@ -1045,6 +1134,7 @@ impl SessionSource for WebSource {
                 "session_id": session_id,
                 "offset": state.offset,
                 "pending": encode_bytes(&state.pending),
+                "window": TAIL_FIRST_READ_WINDOW_BYTES,
             }),
         )
     }
@@ -1165,6 +1255,27 @@ impl SessionSource for WebSource {
         )
     }
 
+    fn tail_subagent_within(
+        &self,
+        session_id: String,
+        agent_id: String,
+        workflow_run_id: Option<String>,
+        state: TailState,
+        window: u64,
+    ) -> Task<Result<TailProgress>> {
+        self.tail(
+            "ClaudeSessions::read_subagent_transcript_tail",
+            json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "workflow_run_id": workflow_run_id,
+                "offset": state.offset,
+                "pending": encode_bytes(&state.pending),
+                "window": window,
+            }),
+        )
+    }
+
     fn read_file(&self, path: PathBuf, max_bytes: u64) -> Task<Result<FileContents>> {
         self.read_claude_file(path, max_bytes, None)
     }
@@ -1231,6 +1342,7 @@ impl SessionSource for WebSource {
                 "claude_pid": claude_pid,
                 "offset": state.offset,
                 "pending": encode_bytes(&state.pending),
+                "window": TAIL_FIRST_READ_WINDOW_BYTES,
             }),
         )
     }
@@ -1302,6 +1414,10 @@ struct TailProgressJson {
     pending: String,
     lines: Vec<String>,
     restarted: bool,
+    /// Absent from a server that predates the windowed first read, which always sent the
+    /// whole file.
+    #[serde(default)]
+    skipped_bytes: u64,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1421,16 +1537,17 @@ fn subagent_summary_from_json(subagent: ClaudeSubagentJson) -> SubagentSummary {
 
 #[cfg(target_family = "wasm")]
 fn tail_progress_from_json(response: TailProgressJson) -> Result<TailProgress> {
-    Ok(tail_progress_from_proto(
-        proto::TailClaudeTranscriptResponse {
-            path: response.path,
-            start_offset: response.start_offset,
-            offset: response.offset,
-            pending: decode_bytes(&response.pending)?,
-            lines: response.lines,
-            restarted: response.restarted,
-        },
-    ))
+    let skipped_bytes = response.skipped_bytes;
+    let mut progress = tail_progress_from_proto(proto::TailClaudeTranscriptResponse {
+        path: response.path,
+        start_offset: response.start_offset,
+        offset: response.offset,
+        pending: decode_bytes(&response.pending)?,
+        lines: response.lines,
+        restarted: response.restarted,
+    });
+    progress.skipped_bytes = skipped_bytes;
+    Ok(progress)
 }
 
 #[cfg(target_family = "wasm")]
@@ -1581,6 +1698,9 @@ fn events_progress_from_proto(response: proto::TailClaudeEventsResponse) -> Tail
         pending: response.pending,
         lines: response.lines,
         restarted: response.restarted,
+        // The remote server's reads are unwindowed, and its protocol has no field to
+        // say otherwise.
+        skipped_bytes: 0,
     }
 }
 
@@ -1594,6 +1714,9 @@ fn channel_inbox_progress_from_proto(
         pending: response.pending,
         lines: response.lines,
         restarted: response.restarted,
+        // The remote server's reads are unwindowed, and its protocol has no field to
+        // say otherwise.
+        skipped_bytes: 0,
     }
 }
 
@@ -1619,6 +1742,9 @@ fn tail_progress_from_proto(response: proto::TailClaudeTranscriptResponse) -> Ta
         pending: response.pending,
         lines: response.lines,
         restarted: response.restarted,
+        // The remote server's reads are unwindowed, and its protocol has no field to
+        // say otherwise.
+        skipped_bytes: 0,
     }
 }
 

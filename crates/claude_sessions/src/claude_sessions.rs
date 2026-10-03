@@ -13,6 +13,7 @@ mod keep_alive;
 mod live_state;
 mod session_source;
 mod session_store;
+mod tab_persistence;
 mod terminal_anchors;
 mod transcript;
 mod usage;
@@ -132,6 +133,7 @@ actions!(
 pub fn init(cx: &mut App) {
     keep_alive_registry(cx);
     claude_sessions_panel::install_tmux_session_links(cx);
+    workspace::register_serializable_item::<ClaudeSessionsPanel>(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ClaudeSessionsPanel>(window, cx);

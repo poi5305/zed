@@ -168,7 +168,17 @@ fn tail_json(progress: remote::claude_sessions::TailProgress) -> Value {
         "pending": BASE64.encode(&progress.pending),
         "lines": progress.lines,
         "restarted": progress.restarted,
+        "skipped_bytes": progress.skipped_bytes,
     })
+}
+
+/// How much of the end of a file a first read may deliver. A client that sends none is
+/// one that cannot be told what was skipped, so it is given the whole file.
+fn window_param(params: &Value) -> u64 {
+    params
+        .get("window")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX)
 }
 
 fn list_sessions(params: &Value) -> Result<Value> {
@@ -198,8 +208,12 @@ fn read_transcript_tail(params: &Value) -> Result<Value> {
         offset: u64_param(params, "offset"),
         pending: optional_base64(params, "pending")?,
     };
-    let progress =
-        remote::claude_sessions::read_transcript_tail(&home_directory, &session_id, state)?;
+    let progress = remote::claude_sessions::read_transcript_tail_within(
+        &home_directory,
+        &session_id,
+        state,
+        window_param(params),
+    )?;
     Ok(tail_json(progress))
 }
 
@@ -281,7 +295,12 @@ fn read_events_tail(params: &Value) -> Result<Value> {
         offset: u64_param(params, "offset"),
         pending: optional_base64(params, "pending")?,
     };
-    let progress = remote::claude_sessions::read_events_tail(&home_directory, &session_id, state)?;
+    let progress = remote::claude_sessions::read_events_tail_within(
+        &home_directory,
+        &session_id,
+        state,
+        window_param(params),
+    )?;
     Ok(tail_json(progress))
 }
 
@@ -384,8 +403,12 @@ fn read_channel_inbox_tail(params: &Value) -> Result<Value> {
         offset: u64_param(params, "offset"),
         pending: optional_base64(params, "pending")?,
     };
-    let progress =
-        remote::claude_sessions::read_channel_inbox_tail(&home_directory(), claude_pid, state)?;
+    let progress = remote::claude_sessions::read_channel_inbox_tail_within(
+        &home_directory(),
+        claude_pid,
+        state,
+        window_param(params),
+    )?;
     Ok(tail_json(progress))
 }
 
@@ -399,12 +422,13 @@ fn read_subagent_transcript_tail(params: &Value) -> Result<Value> {
         offset: u64_param(params, "offset"),
         pending: optional_base64(params, "pending")?,
     };
-    let progress = remote::claude_sessions::read_subagent_transcript_tail(
+    let progress = remote::claude_sessions::read_subagent_transcript_tail_within(
         &home_directory,
         &session_id,
         &agent_id,
         workflow_run_id.as_deref(),
         state,
+        window_param(params),
     )?;
     Ok(tail_json(progress))
 }
@@ -670,5 +694,49 @@ mod tests {
             },
             "serving the user's home with ZED_WEB_RESTRICT_PATHS must still list ~/.claude, which lives inside that root; got {outcome:?}"
         );
+    }
+
+    /// The browser decides from this whether there is earlier history to offer, so a
+    /// first read that skipped the start of a file has to say so on the wire.
+    #[test]
+    fn a_tail_answer_reports_the_bytes_it_skipped() {
+        let answer = tail_json(remote::claude_sessions::TailProgress {
+            path: None,
+            start_offset: 0,
+            offset: 100,
+            pending: Vec::new(),
+            lines: vec!["{}".to_string()],
+            restarted: false,
+            skipped_bytes: 97,
+        });
+        assert_eq!(answer["skipped_bytes"], json!(97), "answer was {answer}");
+    }
+
+    /// Prints how large the first answer for a real session is. Run by hand with
+    /// `ZED_MEASURE_SESSION_ID=<id> cargo test -p zed_web_server measure_first_transcript_read -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_first_transcript_read() {
+        let Ok(session_id) = std::env::var("ZED_MEASURE_SESSION_ID") else {
+            return;
+        };
+        for window in [
+            None,
+            Some(remote::claude_sessions::TAIL_FIRST_READ_WINDOW_BYTES),
+        ] {
+            let answer = read_transcript_tail(
+                &json!({ "session_id": session_id, "offset": 0, "window": window }),
+            )
+            .expect("reading the transcript");
+            let text = answer.to_string();
+            println!(
+                "first answer with window {window:?}: {} chars, start_offset={} offset={} skipped_bytes={} lines={}",
+                text.len(),
+                answer["start_offset"],
+                answer["offset"],
+                answer["skipped_bytes"],
+                answer["lines"].as_array().map_or(0, Vec::len)
+            );
+        }
     }
 }

@@ -6,12 +6,15 @@ use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use task::{SpawnInTerminal, TaskId};
 use ui::{App, Context, Window};
 use util::ResultExt as _;
 
+#[cfg(not(target_family = "wasm"))]
+use db::sqlez::statement::Statement;
 use db::{
     query,
-    sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
+    sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
 use workspace::{
@@ -64,7 +67,13 @@ fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &mut App) -> Serialized
         .items()
         .filter_map(|item| {
             let terminal_view = item.act_as::<TerminalView>(cx)?;
-            if terminal_view.read(cx).terminal().read(cx).task().is_some() {
+            if terminal_view
+                .read(cx)
+                .terminal()
+                .read(cx)
+                .task()
+                .is_some_and(|task| !is_reattachable_task(&task.spawned_task))
+            {
                 None
             } else {
                 let id = item.item_id().as_u64();
@@ -450,6 +459,9 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN reattach_task TEXT;
+        ),
     ];
 }
 
@@ -486,6 +498,23 @@ impl TerminalDb {
                 working_directory = ?3,
                 working_directory_path = ?4"
         ;
+        // There is no connection to write through in the browser; `write` would fail
+        // and take the rest of the terminal's save down with it.
+        #[cfg(target_family = "wasm")]
+        {
+            let working_directory_path = working_directory.to_string_lossy().into_owned();
+            return db::sqlez::remote_sql::exec_bound(
+                query,
+                (
+                    item_id,
+                    workspace_id,
+                    working_directory,
+                    working_directory_path,
+                ),
+            )
+            .await;
+        }
+        #[cfg(not(target_family = "wasm"))]
         self.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;
             let mut next_index = statement.bind(&item_id, 1)?;
@@ -520,11 +549,17 @@ impl TerminalDb {
             item_id,
             workspace_id
         );
-        self.write(move |conn| {
-            let query = "INSERT INTO terminals (item_id, workspace_id, custom_title)
+        let query = "INSERT INTO terminals (item_id, workspace_id, custom_title)
                 VALUES (?1, ?2, ?3)
                 ON CONFLICT (workspace_id, item_id) DO UPDATE SET
                     custom_title = excluded.custom_title";
+        #[cfg(target_family = "wasm")]
+        {
+            return db::sqlez::remote_sql::exec_bound(query, (item_id, workspace_id, custom_title))
+                .await;
+        }
+        #[cfg(not(target_family = "wasm"))]
+        self.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;
             let mut next_index = statement.bind(&item_id, 1)?;
             next_index = statement.bind(&workspace_id, next_index)?;
@@ -534,11 +569,87 @@ impl TerminalDb {
         .await
     }
 
+    // Written for every terminal, `None` included: item ids start over with each launch,
+    // so a row left behind by an earlier terminal under the same id must not turn a
+    // plain shell into a task when it is restored.
+    query! {
+        pub async fn save_reattach_task(item_id: ItemId, workspace_id: WorkspaceId, reattach_task: Option<String>) -> Result<()> {
+            INSERT INTO terminals (item_id, workspace_id, reattach_task)
+            VALUES (?, ?, ?)
+            ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                reattach_task = excluded.reattach_task
+        }
+    }
+
+    query! {
+        pub async fn get_reattach_task(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
+            SELECT reattach_task
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ? AND reattach_task IS NOT NULL
+        }
+    }
+
     query! {
         pub async fn get_custom_title(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
             SELECT custom_title
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+}
+
+/// Task ids starting with this mark a task that is safe to start again when its terminal
+/// is restored, such as attaching to a tmux session. Any other task is left out of the
+/// restored layout, because running it again could repeat whatever it did.
+pub const REATTACHABLE_TASK_ID_PREFIX: &str = "reattach:";
+
+pub(crate) fn is_reattachable_task(task: &SpawnInTerminal) -> bool {
+    task.id.0.starts_with(REATTACHABLE_TASK_ID_PREFIX)
+}
+
+/// The part of a reattachable task that is needed to start it again. The environment is
+/// left out so that nothing a task was handed is written to the database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SerializedReattachTask {
+    pub id: String,
+    pub label: String,
+    pub full_label: String,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub command_label: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+}
+
+impl SerializedReattachTask {
+    pub fn from_spawn(task: &SpawnInTerminal) -> Option<Self> {
+        if !is_reattachable_task(task) {
+            return None;
+        }
+        Some(Self {
+            id: task.id.0.clone(),
+            label: task.label.clone(),
+            full_label: task.full_label.clone(),
+            command: task.command.clone(),
+            args: task.args.clone(),
+            command_label: task.command_label.clone(),
+            cwd: task.cwd.clone(),
+        })
+    }
+
+    pub fn to_spawn(&self, fallback_cwd: Option<PathBuf>) -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId(self.id.clone()),
+            label: self.label.clone(),
+            full_label: self.full_label.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            command_label: self.command_label.clone(),
+            cwd: self.cwd.clone().or(fallback_cwd),
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            ..SpawnInTerminal::default()
         }
     }
 }
@@ -619,6 +730,63 @@ mod tests {
         assert_eq!(resolve_custom_title(None), None);
     }
 
+    fn tmux_attach_task() -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId(format!(
+                "{REATTACHABLE_TASK_ID_PREFIX}tmux-attach-tmux: poi"
+            )),
+            full_label: "tmux: poi".into(),
+            label: "tmux: poi".into(),
+            command: Some("tmux attach -t '=poi'".into()),
+            command_label: "tmux attach -t '=poi'".into(),
+            env: [("SECRET".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            ..SpawnInTerminal::default()
+        }
+    }
+
+    #[test]
+    fn a_reattachable_task_round_trips_without_its_environment() {
+        let task = tmux_attach_task();
+        let saved = SerializedReattachTask::from_spawn(&task).expect("reattachable");
+        let json = serde_json::to_string(&saved).expect("serializing");
+        assert!(
+            !json.contains("SECRET"),
+            "env must not be stored, got {json}"
+        );
+        let restored: SerializedReattachTask = serde_json::from_str(&json).expect("parsing");
+        let spawn = restored.to_spawn(None);
+        let mut expected = task.clone();
+        expected.env.clear();
+        assert_eq!(spawn, expected);
+    }
+
+    #[test]
+    fn a_task_without_the_prefix_is_not_reattached() {
+        let mut task = tmux_attach_task();
+        task.id = TaskId("cargo-build".into());
+        assert!(!is_reattachable_task(&task));
+        assert_eq!(SerializedReattachTask::from_spawn(&task), None);
+    }
+
+    #[test]
+    fn a_reattached_task_without_a_cwd_uses_the_fallback() {
+        let saved = SerializedReattachTask::from_spawn(&tmux_attach_task()).expect("reattachable");
+        let fallback = PathBuf::from("/work/project");
+        assert_eq!(saved.to_spawn(Some(fallback.clone())).cwd, Some(fallback));
+
+        let mut with_cwd = tmux_attach_task();
+        with_cwd.cwd = Some(PathBuf::from("/own"));
+        let saved = SerializedReattachTask::from_spawn(&with_cwd).expect("reattachable");
+        assert_eq!(
+            saved.to_spawn(Some(PathBuf::from("/work/project"))).cwd,
+            Some(PathBuf::from("/own"))
+        );
+    }
+
     #[test]
     fn delete_unloaded_with_no_alive_items_does_not_emit_empty_in_list() {
         let sql = delete_unloaded_terminals_sql(0);
@@ -630,6 +798,59 @@ mod tests {
             !sql.contains("NOT IN ()"),
             "NOT IN () is invalid SQL and would refuse a legitimate empty panel, got {sql}"
         );
+    }
+
+    #[test]
+    fn a_plain_terminal_row_has_no_reattach_task() {
+        futures::executor::block_on(async {
+            let db = TerminalDb(
+                db::open_test_db::<(WorkspaceDb, TerminalDb)>(
+                    "a_plain_terminal_row_has_no_reattach_task",
+                )
+                .await,
+            );
+            db.write(|connection| {
+                connection.exec("INSERT INTO workspaces(workspace_id) VALUES (1)")?()
+            })
+            .await
+            .expect("creating the workspace row");
+            let workspace_id = WorkspaceId::from_i64(1);
+
+            db.save_custom_title(7, workspace_id, Some("shell".to_string()))
+                .await
+                .expect("saving a plain terminal");
+            let stored = db
+                .get_reattach_task(7, workspace_id)
+                .await
+                .expect("reading the reattach task");
+            assert_eq!(
+                stored, None,
+                "a NULL column must read as no task, got {stored:?}"
+            );
+
+            let task = serde_json::to_string(
+                &SerializedReattachTask::from_spawn(&tmux_attach_task()).expect("reattachable"),
+            )
+            .expect("serializing");
+            db.save_reattach_task(8, workspace_id, Some(task.clone()))
+                .await
+                .expect("saving a task");
+            assert_eq!(
+                db.get_reattach_task(8, workspace_id)
+                    .await
+                    .expect("reading"),
+                Some(task)
+            );
+            db.save_reattach_task(8, workspace_id, None)
+                .await
+                .expect("clearing the task");
+            assert_eq!(
+                db.get_reattach_task(8, workspace_id)
+                    .await
+                    .expect("reading"),
+                None
+            );
+        });
     }
 
     #[test]

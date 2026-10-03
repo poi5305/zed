@@ -8,7 +8,7 @@ use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
 use std::time::Duration;
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
-use terminal_view::terminal_panel::TerminalPanel;
+use terminal_view::{REATTACHABLE_TASK_ID_PREFIX, terminal_panel::TerminalPanel};
 use ui::{Disclosure, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
@@ -222,7 +222,9 @@ impl TmuxSessionsPanel {
         };
 
         let spawn = SpawnInTerminal {
-            id: TaskId(format!("tmux-attach-{label}")),
+            // Reattachable, so a restored workspace attaches to the session again
+            // instead of dropping the tab.
+            id: TaskId(format!("{REATTACHABLE_TASK_ID_PREFIX}tmux-attach-{label}")),
             full_label: label.clone(),
             label,
             command: Some(command.clone()),

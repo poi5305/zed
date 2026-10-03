@@ -771,12 +771,32 @@ pub struct TailProgress {
     pub lines: Vec<String>,
     /// The file was replaced or truncated, so everything absorbed so far is stale.
     pub restarted: bool,
+    /// How many bytes at the start of the file this read passed over without delivering.
+    /// Only a read that begins at the start of a file larger than its window skips
+    /// anything; every other read reports zero.
+    pub skipped_bytes: u64,
 }
+
+/// How much of the end of a file the first read of a tail delivers, unless the caller
+/// asks for more. A transcript runs to tens of megabytes, and the browser build holds
+/// every record it is given; the end of the file is what the conversation view shows.
+pub const TAIL_FIRST_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn read_transcript_tail(
     home_directory: &Path,
     session_id: &str,
+    state: TailState,
+) -> Result<TailProgress> {
+    read_transcript_tail_within(home_directory, session_id, state, u64::MAX)
+}
+
+/// [`read_transcript_tail`], with a first read that delivers only the lines in the last
+/// `window` bytes of the file; see [`TailProgress::skipped_bytes`].
+pub fn read_transcript_tail_within(
+    home_directory: &Path,
+    session_id: &str,
     mut state: TailState,
+    window: u64,
 ) -> Result<TailProgress> {
     let start_offset = state.offset;
     let mut restarted = false;
@@ -796,7 +816,7 @@ pub fn read_transcript_tail(
         }
     };
 
-    read_appended_lines(path, state, start_offset, restarted)
+    read_appended_lines(path, state, start_offset, restarted, window)
 }
 
 /// Follows one subagent's conversation, naming the file by the three ids on every read.
@@ -815,6 +835,26 @@ pub fn read_subagent_transcript_tail(
     workflow_run_id: Option<&str>,
     state: TailState,
 ) -> Result<TailProgress> {
+    read_subagent_transcript_tail_within(
+        home_directory,
+        session_id,
+        agent_id,
+        workflow_run_id,
+        state,
+        u64::MAX,
+    )
+}
+
+/// [`read_subagent_transcript_tail`], with a first read bounded the way
+/// [`read_transcript_tail_within`] bounds it.
+pub fn read_subagent_transcript_tail_within(
+    home_directory: &Path,
+    session_id: &str,
+    agent_id: &str,
+    workflow_run_id: Option<&str>,
+    state: TailState,
+    window: u64,
+) -> Result<TailProgress> {
     // Resolved here rather than taken from `state.path`, so that the three ids go through
     // the same boundary on every read and no path can be followed that they do not name.
     let Some(path) =
@@ -824,7 +864,7 @@ pub fn read_subagent_transcript_tail(
     };
 
     let start_offset = state.offset;
-    read_appended_lines(path, state, start_offset, false)
+    read_appended_lines(path, state, start_offset, false, window)
 }
 
 /// The answer to a read whose file cannot be named at all: nothing was read, and anything
@@ -837,15 +877,20 @@ fn tail_of_no_file(state: &TailState) -> TailProgress {
         pending: Vec::new(),
         lines: Vec::new(),
         restarted: state.offset > 0 || !state.pending.is_empty(),
+        skipped_bytes: 0,
     }
 }
 
 /// Reads whatever `path` has grown by since `state.offset` and splits it into whole lines.
+///
+/// A read from the start of the file delivers only the lines in its last `window` bytes,
+/// together with the line the window begins inside of, so that no line is ever cut.
 fn read_appended_lines(
     path: PathBuf,
     mut state: TailState,
     start_offset: u64,
     mut restarted: bool,
+    window: u64,
 ) -> Result<TailProgress> {
     let size = fs::metadata(&path)
         .with_context(|| format!("reading metadata of {}", path.display()))?
@@ -860,17 +905,32 @@ fn read_appended_lines(
     }
 
     let mut lines = Vec::new();
+    let mut skipped_bytes = 0;
     if size > state.offset {
         let mut file =
             fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        file.seek(SeekFrom::Start(state.offset))
+
+        let window_start =
+            (state.offset == 0 && state.pending.is_empty() && size > window).then(|| size - window);
+        // The line the window begins inside of is looked for no further back than the
+        // longest unfinished line a tail keeps, which is what keeps this read bounded.
+        let read_from = window_start.map_or(state.offset, |window_start| {
+            window_start.saturating_sub(TAIL_PENDING_CAP_BYTES as u64)
+        });
+        file.seek(SeekFrom::Start(read_from))
             .with_context(|| format!("seeking in {}", path.display()))?;
 
         let mut appended = Vec::new();
         file.read_to_end(&mut appended)
             .with_context(|| format!("reading {}", path.display()))?;
+        state.offset = read_from.saturating_add(appended.len() as u64);
 
-        state.offset = state.offset.saturating_add(appended.len() as u64);
+        if let Some(window_start) = window_start {
+            let line_start = first_line_start(&appended, read_from, window_start);
+            appended.drain(..line_start);
+            skipped_bytes = read_from.saturating_add(line_start as u64);
+        }
+
         state.pending.extend_from_slice(&appended);
         lines = split_complete_lines(&mut state.pending);
         cap_pending_buffer(&mut state.pending);
@@ -883,7 +943,30 @@ fn read_appended_lines(
         pending: state.pending,
         lines,
         restarted,
+        skipped_bytes,
     })
+}
+
+/// Where in `bytes`, read from `read_from` on, the first line to deliver begins: the start
+/// of the line that `window_start` falls inside of, or `window_start` itself when it is the
+/// start of a line.
+///
+/// A line that began before `read_from`, further back than this read looks, is dropped
+/// instead, all of it, and delivery begins at the next line. Dropping it is the same thing [`cap_pending_buffer`] does to a
+/// line that grows past the cap while it is being followed.
+fn first_line_start(bytes: &[u8], read_from: u64, window_start: u64) -> usize {
+    let cut = usize::try_from(window_start.saturating_sub(read_from))
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let (before_cut, after_cut) = bytes.split_at(cut);
+    match before_cut.iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => newline + 1,
+        None if read_from == 0 => 0,
+        None => after_cut
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |newline| cut + newline + 1),
+    }
 }
 
 /// Follows `~/.claude/zed-events/<session_id>.jsonl`. No file yet is progress with no
@@ -891,7 +974,18 @@ fn read_appended_lines(
 pub fn read_events_tail(
     home_directory: &Path,
     session_id: &str,
+    state: TailState,
+) -> Result<TailProgress> {
+    read_events_tail_within(home_directory, session_id, state, u64::MAX)
+}
+
+/// [`read_events_tail`], with a first read bounded the way [`read_transcript_tail_within`]
+/// bounds it.
+pub fn read_events_tail_within(
+    home_directory: &Path,
+    session_id: &str,
     mut state: TailState,
+    window: u64,
 ) -> Result<TailProgress> {
     let start_offset = state.offset;
     let Some(path) = events_file_path(home_directory, session_id) else {
@@ -913,7 +1007,7 @@ pub fn read_events_tail(
         state.pending.clear();
     }
 
-    read_appended_lines(path, state, start_offset, restarted)
+    read_appended_lines(path, state, start_offset, restarted, window)
 }
 
 /// The ceiling on the statusLine snapshot, which is read whole on every poll and framed
@@ -1194,7 +1288,18 @@ pub fn channel_answer_permission(
 pub fn read_channel_inbox_tail(
     home: &Path,
     claude_pid: u32,
+    state: TailState,
+) -> Result<TailProgress> {
+    read_channel_inbox_tail_within(home, claude_pid, state, u64::MAX)
+}
+
+/// [`read_channel_inbox_tail`], with a first read bounded the way
+/// [`read_transcript_tail_within`] bounds it.
+pub fn read_channel_inbox_tail_within(
+    home: &Path,
+    claude_pid: u32,
     mut state: TailState,
+    window: u64,
 ) -> Result<TailProgress> {
     ensure_nonzero_claude_pid(claude_pid)?;
     let start_offset = state.offset;
@@ -1212,7 +1317,7 @@ pub fn read_channel_inbox_tail(
         state.pending.clear();
     }
 
-    read_appended_lines(path, state, start_offset, restarted)
+    read_appended_lines(path, state, start_offset, restarted, window)
 }
 
 pub fn channel_setup_commands(home: &Path) -> String {
@@ -4951,6 +5056,322 @@ mod tests {
             "only the appended line should be returned"
         );
         assert!(!second.restarted);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    fn fresh_tail() -> TailState {
+        TailState {
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Ten lines of the same length, so that a window can be placed on or inside a line.
+    fn ten_equal_lines() -> Vec<String> {
+        (0..10)
+            .map(|index| format!("{{\"type\":\"user\",\"uuid\":\"{index}\",\"pad\":\"xxxxxxxx\"}}"))
+            .collect()
+    }
+
+    fn joined_lines(lines: &[String]) -> String {
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    #[test]
+    fn a_first_read_delivers_only_the_whole_lines_at_the_end_of_the_window() -> Result<()> {
+        let home_directory = temporary_directory("window-boundary");
+        let lines = ten_equal_lines();
+        let line_bytes = lines[0].len() as u64 + 1;
+        let size = line_bytes * 10;
+        write_transcript(&home_directory, "session-w", &joined_lines(&lines));
+
+        // The window starts exactly where line 7 does.
+        let on_boundary = read_transcript_tail_within(
+            &home_directory,
+            "session-w",
+            fresh_tail(),
+            line_bytes * 3,
+        )?;
+        assert_eq!(on_boundary.lines, lines[7..].to_vec());
+        assert_eq!(
+            (
+                on_boundary.skipped_bytes,
+                on_boundary.start_offset,
+                on_boundary.offset
+            ),
+            (line_bytes * 7, 0, size),
+            "(skipped_bytes, start_offset, offset) for a window that starts on a line"
+        );
+        assert!(on_boundary.pending.is_empty());
+        assert!(!on_boundary.restarted);
+
+        // Five bytes more puts the start of the window inside line 6, which is kept whole
+        // rather than cut.
+        let inside_a_line = read_transcript_tail_within(
+            &home_directory,
+            "session-w",
+            fresh_tail(),
+            line_bytes * 3 + 5,
+        )?;
+        assert_eq!(inside_a_line.lines, lines[6..].to_vec());
+        assert_eq!(inside_a_line.skipped_bytes, line_bytes * 6);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_no_larger_than_the_window_is_read_whole() -> Result<()> {
+        let home_directory = temporary_directory("window-exact");
+        let lines = ten_equal_lines();
+        let contents = joined_lines(&lines);
+        let size = contents.len() as u64;
+        write_transcript(&home_directory, "session-x", &contents);
+
+        for window in [size, size + 1, size - 1] {
+            let progress =
+                read_transcript_tail_within(&home_directory, "session-x", fresh_tail(), window)?;
+            assert_eq!(
+                (
+                    progress.lines.len(),
+                    progress.skipped_bytes,
+                    progress.offset
+                ),
+                (10, 0, size),
+                "(lines, skipped_bytes, offset) for a {size} byte file read with a {window} byte window"
+            );
+        }
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_longer_than_the_window_is_delivered_whole() -> Result<()> {
+        let home_directory = temporary_directory("window-long-line");
+        let first = "{\"type\":\"user\",\"uuid\":\"short\"}".to_string();
+        let long = format!(
+            "{{\"type\":\"assistant\",\"uuid\":\"long\",\"text\":\"{}\"}}",
+            "y".repeat(1000)
+        );
+        write_transcript(
+            &home_directory,
+            "session-l",
+            &joined_lines(&[first.clone(), long.clone()]),
+        );
+
+        let progress =
+            read_transcript_tail_within(&home_directory, "session-l", fresh_tail(), 100)?;
+        assert_eq!(progress.lines, vec![long]);
+        assert_eq!(progress.skipped_bytes, first.len() as u64 + 1);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_still_being_written_at_the_window_is_kept_for_the_next_read() -> Result<()> {
+        let home_directory = temporary_directory("window-partial");
+        let lines = ten_equal_lines();
+        let path = write_transcript(
+            &home_directory,
+            "session-p",
+            &format!("{}{{\"type\":\"user\",\"uuid\":\"par", joined_lines(&lines)),
+        );
+
+        let first = read_transcript_tail_within(&home_directory, "session-p", fresh_tail(), 10)?;
+        assert!(first.lines.is_empty(), "got {:?}", first.lines);
+        assert_eq!(first.pending, b"{\"type\":\"user\",\"uuid\":\"par".to_vec());
+
+        let mut contents = std::fs::read(&path)?;
+        contents.extend_from_slice(b"tial\"}\n");
+        std::fs::write(&path, contents)?;
+        let second = read_transcript_tail_within(
+            &home_directory,
+            "session-p",
+            TailState {
+                path: first.path,
+                offset: first.offset,
+                pending: first.pending,
+            },
+            10,
+        )?;
+        assert_eq!(
+            second.lines,
+            vec!["{\"type\":\"user\",\"uuid\":\"partial\"}"]
+        );
+        assert_eq!(second.skipped_bytes, 0);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn reads_after_a_bounded_first_read_follow_only_the_appended_lines() -> Result<()> {
+        let home_directory = temporary_directory("window-follow");
+        let lines = ten_equal_lines();
+        let line_bytes = lines[0].len() as u64 + 1;
+        let path = write_transcript(&home_directory, "session-f", &joined_lines(&lines));
+
+        let first = read_transcript_tail_within(
+            &home_directory,
+            "session-f",
+            fresh_tail(),
+            line_bytes * 2,
+        )?;
+        assert_eq!(first.lines, lines[8..].to_vec());
+
+        let appended = "{\"type\":\"assistant\",\"uuid\":\"new\"}";
+        std::fs::write(&path, format!("{}{appended}\n", joined_lines(&lines)))?;
+        let second = read_transcript_tail_within(
+            &home_directory,
+            "session-f",
+            TailState {
+                path: first.path,
+                offset: first.offset,
+                pending: first.pending,
+            },
+            line_bytes * 2,
+        )?;
+        assert_eq!(second.lines, vec![appended.to_string()]);
+        assert_eq!(
+            (second.start_offset, second.skipped_bytes),
+            (first.offset, 0)
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    /// A line that began further back than the longest line a tail keeps is not read
+    /// back to its start: the read would no longer be bounded by anything. It is
+    /// dropped, and none of its bytes are handed over as a line.
+    #[test]
+    fn a_line_starting_further_back_than_the_pending_cap_is_dropped_whole() -> Result<()> {
+        let home_directory = temporary_directory("window-huge-line");
+        let huge = format!(
+            "{{\"type\":\"assistant\",\"uuid\":\"huge\",\"text\":\"{}\"}}",
+            "z".repeat(TAIL_PENDING_CAP_BYTES + 100)
+        );
+        let last = "{\"type\":\"user\",\"uuid\":\"last\"}".to_string();
+        let first = "{\"type\":\"user\",\"uuid\":\"first\"}".to_string();
+        let contents = joined_lines(&[first, huge, last.clone()]);
+        write_transcript(&home_directory, "session-h", &contents);
+
+        let progress = read_transcript_tail_within(&home_directory, "session-h", fresh_tail(), 50)?;
+        assert_eq!(progress.lines, vec![last.clone()]);
+        assert_eq!(
+            progress.skipped_bytes,
+            (contents.len() - last.len() - 1) as u64
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_replaced_file_is_read_again_within_the_window() -> Result<()> {
+        let home_directory = temporary_directory("window-restart");
+        let lines = ten_equal_lines();
+        let line_bytes = lines[0].len() as u64 + 1;
+        let path = write_transcript(&home_directory, "session-r", &joined_lines(&lines));
+
+        let first = read_transcript_tail(&home_directory, "session-r", fresh_tail())?;
+        assert_eq!(first.lines.len(), 10);
+
+        std::fs::write(&path, joined_lines(&lines[..5]))?;
+        let restarted = read_transcript_tail_within(
+            &home_directory,
+            "session-r",
+            TailState {
+                path: first.path,
+                offset: first.offset,
+                pending: first.pending,
+            },
+            line_bytes * 2,
+        )?;
+        assert!(restarted.restarted);
+        assert_eq!(restarted.lines, lines[3..5].to_vec());
+        assert_eq!(restarted.skipped_bytes, line_bytes * 3);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    /// The remote server's protocol has no way to say that bytes were skipped, so the
+    /// unwindowed reads it uses still deliver the whole file.
+    #[test]
+    fn the_unwindowed_read_still_delivers_the_whole_file() -> Result<()> {
+        let home_directory = temporary_directory("window-none");
+        let lines = ten_equal_lines();
+        write_transcript(&home_directory, "session-n", &joined_lines(&lines));
+
+        let progress = read_transcript_tail(&home_directory, "session-n", fresh_tail())?;
+        assert_eq!(progress.lines, lines);
+        assert_eq!(progress.skipped_bytes, 0);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn the_events_and_channel_inbox_tails_bound_their_first_read() -> Result<()> {
+        let home_directory = temporary_directory("window-events");
+        let lines = ten_equal_lines();
+        let line_bytes = lines[0].len() as u64 + 1;
+        write_file(
+            home_directory
+                .join(".claude")
+                .join(EVENTS_DIRECTORY)
+                .join("session-e.jsonl"),
+            &joined_lines(&lines),
+        );
+        write_file(
+            channel_session_directory(&home_directory, 4242)?.join("inbox.jsonl"),
+            &joined_lines(&lines),
+        );
+
+        let events =
+            read_events_tail_within(&home_directory, "session-e", fresh_tail(), line_bytes * 2)?;
+        assert_eq!(events.lines, lines[8..].to_vec());
+        assert_eq!(events.skipped_bytes, line_bytes * 8);
+
+        let inbox =
+            read_channel_inbox_tail_within(&home_directory, 4242, fresh_tail(), line_bytes * 2)?;
+        assert_eq!(inbox.lines, lines[8..].to_vec());
+        assert_eq!(inbox.skipped_bytes, line_bytes * 8);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn the_subagent_tail_bounds_its_first_read() -> Result<()> {
+        let home_directory = temporary_directory("window-subagent");
+        let lines = ten_equal_lines();
+        let line_bytes = lines[0].len() as u64 + 1;
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            None,
+            REAL_AGENT_ID,
+            SUBAGENT_META_GENERAL_PURPOSE,
+            &joined_lines(&lines),
+        );
+
+        let progress = read_subagent_transcript_tail_within(
+            &home_directory,
+            REAL_SESSION_ID,
+            REAL_AGENT_ID,
+            None,
+            fresh_tail(),
+            line_bytes * 2,
+        )?;
+        assert_eq!(progress.lines, lines[8..].to_vec());
+        assert_eq!(progress.skipped_bytes, line_bytes * 8);
 
         std::fs::remove_dir_all(&home_directory).ok();
         Ok(())
