@@ -12,9 +12,11 @@ use task::{
 use ui::{App, Context, Window};
 use util::ResultExt as _;
 
+#[cfg(not(target_family = "wasm"))]
+use db::sqlez::statement::Statement;
 use db::{
     query,
-    sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
+    sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
 use workspace::{
@@ -492,6 +494,23 @@ impl TerminalDb {
                 working_directory = ?3,
                 working_directory_path = ?4"
         ;
+        // There is no connection to write through in the browser; `write` would fail
+        // and take the rest of the terminal's save down with it.
+        #[cfg(target_family = "wasm")]
+        {
+            let working_directory_path = working_directory.to_string_lossy().into_owned();
+            return db::sqlez::remote_sql::exec_bound(
+                query,
+                (
+                    item_id,
+                    workspace_id,
+                    working_directory,
+                    working_directory_path,
+                ),
+            )
+            .await;
+        }
+        #[cfg(not(target_family = "wasm"))]
         self.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;
             let mut next_index = statement.bind(&item_id, 1)?;
@@ -526,11 +545,17 @@ impl TerminalDb {
             item_id,
             workspace_id
         );
-        self.write(move |conn| {
-            let query = "INSERT INTO terminals (item_id, workspace_id, custom_title)
+        let query = "INSERT INTO terminals (item_id, workspace_id, custom_title)
                 VALUES (?1, ?2, ?3)
                 ON CONFLICT (workspace_id, item_id) DO UPDATE SET
                     custom_title = excluded.custom_title";
+        #[cfg(target_family = "wasm")]
+        {
+            return db::sqlez::remote_sql::exec_bound(query, (item_id, workspace_id, custom_title))
+                .await;
+        }
+        #[cfg(not(target_family = "wasm"))]
+        self.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;
             let mut next_index = statement.bind(&item_id, 1)?;
             next_index = statement.bind(&workspace_id, next_index)?;
@@ -554,11 +579,20 @@ impl TerminalDb {
         workspace_id: WorkspaceId,
         reattach_task: Option<String>,
     ) -> Result<()> {
-        self.write(move |conn| {
-            let query = "INSERT INTO terminals (item_id, workspace_id, reattach_task)
+        let query = "INSERT INTO terminals (item_id, workspace_id, reattach_task)
                 VALUES (?1, ?2, ?3)
                 ON CONFLICT (workspace_id, item_id) DO UPDATE SET
                     reattach_task = excluded.reattach_task";
+        #[cfg(target_family = "wasm")]
+        {
+            return db::sqlez::remote_sql::exec_bound(
+                query,
+                (item_id, workspace_id, reattach_task),
+            )
+            .await;
+        }
+        #[cfg(not(target_family = "wasm"))]
+        self.write(move |conn| {
             let mut statement = Statement::prepare(conn, query)?;
             let mut next_index = statement.bind(&item_id, 1)?;
             next_index = statement.bind(&workspace_id, next_index)?;
@@ -676,7 +710,7 @@ impl ReattachableTask {
 }
 
 #[cfg(test)]
-mod tests {
+mod reattach_tests {
     use super::*;
     use crate::REATTACHABLE_TASK_ID_PREFIX;
 
@@ -774,7 +808,7 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_reattach_task(1, workspace_id).await.unwrap(), Some(json));
         assert_eq!(
-            db.get_working_directory(1, workspace_id).unwrap(),
+            db.get_working_directory(1, workspace_id).await.unwrap(),
             Some(PathBuf::from("/home/user/project")),
             "saving the task must not clobber the rest of the row"
         );

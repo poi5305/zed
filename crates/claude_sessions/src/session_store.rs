@@ -31,7 +31,8 @@ use crate::{
     },
     session_registry::{
         AgentListing, ChannelStatus, HookInstallOutcome, KeepAliveRecord, KeepAliveWrite,
-        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend, now_millis,
+        RegisteredSession, SubagentSummary, TAIL_FIRST_READ_WINDOW_BYTES, TailProgress, TailState,
+        TranscriptSpend, now_millis,
     },
     session_source::{SessionListing, SessionSource},
     transcript::{Transcript, TranscriptRecord, parse_record},
@@ -332,6 +333,18 @@ struct FollowedConversation {
     /// Bytes read after the last newline. Kept as bytes because a read can stop in the
     /// middle of a multi-byte character, which cannot be held as a `String`.
     pending: Vec<u8>,
+    /// How much of the end of the file a read from its start delivers. Starts at one page
+    /// and grows by one each time earlier history is asked for.
+    window: u64,
+    /// The bytes at the start of the file that the read which began this conversation
+    /// passed over, none of which are in `transcript`.
+    skipped_bytes: u64,
+    /// The conversation is being read again from the start with a larger window. What is
+    /// on screen stays until that read lands, and is replaced by it then.
+    replace_on_next_read: bool,
+    /// While `replace_on_next_read` is set: where in the file the records already absorbed
+    /// end. Those were noted into the live state when they arrived.
+    noted_through: u64,
 }
 
 impl FollowedConversation {
@@ -342,6 +355,10 @@ impl FollowedConversation {
             path: None,
             offset: 0,
             pending: Vec::new(),
+            window: TAIL_FIRST_READ_WINDOW_BYTES,
+            skipped_bytes: 0,
+            replace_on_next_read: false,
+            noted_through: 0,
         }
     }
 
@@ -1078,6 +1095,44 @@ impl ClaudeSessionStore {
     /// [`FollowedConversation::generation`].
     pub fn transcript_generation(&self) -> u64 {
         self.viewed_conversation().generation
+    }
+
+    /// How many bytes at the start of the file behind the conversation on screen have not
+    /// been read; zero once it is all there.
+    pub fn transcript_skipped_bytes(&self) -> u64 {
+        self.viewed_conversation().skipped_bytes
+    }
+
+    /// Reads the conversation on screen again with one more page of its earlier history.
+    ///
+    /// Read again rather than prepended to: records are absorbed in file order, and the
+    /// last one absorbed is the leaf the conversation is drawn back from.
+    pub fn load_earlier_history(&mut self, cx: &mut Context<Self>) {
+        let target = self.transcript_target.clone();
+        let Some(conversation) = self.conversation_for_mut(&target) else {
+            return;
+        };
+        if conversation.skipped_bytes == 0 || conversation.replace_on_next_read {
+            return;
+        }
+        let delivered = conversation
+            .offset
+            .saturating_sub(conversation.skipped_bytes);
+        // Grown from the last window as well as from what it delivered: a line the read
+        // dropped delivered nothing, and a window sized from that alone would never move.
+        conversation.window = conversation
+            .window
+            .max(delivered)
+            .saturating_add(TAIL_FIRST_READ_WINDOW_BYTES);
+        conversation.noted_through = conversation
+            .offset
+            .saturating_sub(conversation.pending.len() as u64);
+        // A read already in flight began at the old offset, which is how it is told
+        // apart from the one this starts and dropped when it lands.
+        conversation.offset = 0;
+        conversation.pending.clear();
+        conversation.replace_on_next_read = true;
+        cx.notify();
     }
 
     /// The file the conversation on screen is being read from, or `None` while there is
@@ -2085,11 +2140,31 @@ impl ClaudeSessionStore {
             changed = true;
         }
 
+        let mut saw_turn_boundary = false;
+        let mut first_in_turn_event_ms = None;
         for line in &progress.lines {
             if let Some(event) = parse_hook_event(line) {
+                match event.name.as_str() {
+                    "UserPromptSubmit" | "Stop" | "SessionEnd" => saw_turn_boundary = true,
+                    "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PermissionDenied"
+                    | "MessageDisplay" => {
+                        first_in_turn_event_ms.get_or_insert(event.received_at_ms);
+                    }
+                    _ => {}
+                }
                 self.live.apply(&event);
                 changed = true;
             }
+        }
+        // A first read that skipped the start of the file can begin inside a long turn,
+        // after the prompt that started it. These events only happen inside a turn, so
+        // with nothing after them to end it, the turn is still running.
+        if progress.skipped_bytes > 0
+            && !saw_turn_boundary
+            && matches!(self.live.turn, Turn::Idle)
+            && let Some(since_ms) = first_in_turn_event_ms
+        {
+            self.live.turn = Turn::Running { since_ms };
         }
 
         self.events.path = progress.path;
@@ -2354,10 +2429,10 @@ impl ClaudeSessionStore {
                     break;
                 };
 
-                for (target, session_id, state) in requests {
+                for (target, session_id, state, window) in requests {
                     let progress = match &target {
                         TranscriptTarget::Main => source
-                            .tail_transcript(session_id.clone(), state)
+                            .tail_transcript_within(session_id.clone(), state, window)
                             .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
                             .await
                             .unwrap_or_else(|_| {
@@ -2367,11 +2442,12 @@ impl ClaudeSessionStore {
                             agent_id,
                             workflow_run_id,
                         } => source
-                            .tail_subagent(
+                            .tail_subagent_within(
                                 session_id.clone(),
                                 agent_id.clone(),
                                 workflow_run_id.clone(),
                                 state,
+                                window,
                             )
                             .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
                             .await
@@ -2421,7 +2497,7 @@ impl ClaudeSessionStore {
     /// target it belongs to, so a read is never issued for one conversation with the
     /// other's offset — both start at zero, and nothing further down could tell them
     /// apart afterwards.
-    fn tail_read_requests(&self) -> Vec<(TranscriptTarget, String, TailState)> {
+    fn tail_read_requests(&self) -> Vec<(TranscriptTarget, String, TailState, u64)> {
         let Some(session_id) = self.followed_session_id.clone() else {
             return Vec::new();
         };
@@ -2430,6 +2506,7 @@ impl ClaudeSessionStore {
             TranscriptTarget::Main,
             session_id.clone(),
             self.main_conversation.state(),
+            self.main_conversation.window,
         )];
         if let Some(conversation) = self
             .subagent_conversation
@@ -2440,6 +2517,7 @@ impl ClaudeSessionStore {
                 self.transcript_target.clone(),
                 session_id,
                 conversation.state(),
+                conversation.window,
             ));
         }
         requests
@@ -2507,12 +2585,18 @@ impl ClaudeSessionStore {
                 .or_default()
                 .insert(session.session.process_id);
         }
-        let previous_by_pid: HashMap<u32, String> = previous_live
+        // Keyed by pid but kept with the process start: a tab restored after a reboot is
+        // seeded with a pid that an unrelated process may own by now, and that is not
+        // a /clear of the restored session.
+        let previous_by_pid: HashMap<u32, (String, String)> = previous_live
             .iter()
             .map(|session| {
                 (
                     session.session.process_id,
-                    session.session.session_id.clone(),
+                    (
+                        session.session.session_id.clone(),
+                        session.session.process_start.clone(),
+                    ),
                 )
             })
             .collect();
@@ -2539,8 +2623,10 @@ impl ClaudeSessionStore {
                     Some(format!("Session rebound to pid {}", live.session.process_id).into());
                 changed = true;
             }
-            if let Some(old_session_id) = previous_by_pid.get(&live.session.process_id)
+            if let Some((old_session_id, old_process_start)) =
+                previous_by_pid.get(&live.session.process_id)
                 && old_session_id != &live.session.session_id
+                && same_process_start(old_process_start, &live.session.process_start)
             {
                 if let Some(old) = previous_live
                     .iter()
@@ -2564,10 +2650,10 @@ impl ClaudeSessionStore {
             if new_ids.contains(&old.session.session_id) {
                 continue;
             }
-            if new_live
-                .iter()
-                .any(|live| live.session.process_id == old.session.process_id)
-            {
+            if new_live.iter().any(|live| {
+                live.session.process_id == old.session.process_id
+                    && same_process_start(&live.session.process_start, &old.session.process_start)
+            }) {
                 continue;
             }
             self.push_ended(self.ended_from_live(old, EndedReason::ProcessGone));
@@ -2867,13 +2953,18 @@ impl ClaudeSessionStore {
         }
 
         let path_changed = conversation.path != progress.path;
+        let reloading = conversation.replace_on_next_read;
+        let window = conversation.window;
+        // A read that replaces the conversation on screen delivers its records again.
+        let noted_through =
+            (reloading && !progress.restarted).then_some(conversation.noted_through);
 
         // Cleared by a read that is actually absorbed rather than by any read that
         // succeeds, so that a stale one cannot report the transcript as readable again.
         let cleared_error = self.take_error_from(ErrorSource::Transcript);
         self.clock.last_transcript_ok_ms = Some(Self::clock_ms());
 
-        if progress.restarted {
+        if progress.restarted || reloading {
             // Counted before the transcript is borrowed: the counter is shared by both
             // conversations and lives beside them.
             let generation = self.start_transcript();
@@ -2883,17 +2974,29 @@ impl ClaudeSessionStore {
             };
             if let Some(conversation) = self.conversation_for_mut(target) {
                 *conversation = FollowedConversation::new(transcript, generation);
+                // A replaced file is another conversation, which starts from one page.
+                if !progress.restarted {
+                    conversation.window = window;
+                }
             }
         }
 
         // A line that cannot be parsed is logged and skipped: a transcript read while it
         // is being written can end in a line that never becomes valid, and the rest of the
         // batch is still worth absorbing.
-        let records: Vec<_> = progress
-            .lines
-            .iter()
-            .filter_map(|line| parse_record(line).log_err().flatten())
-            .collect();
+        let first_unnoted_line = noted_through.map_or(0, |noted_through| {
+            first_line_from_offset(&progress.lines, progress.skipped_bytes, noted_through)
+        });
+        let mut records = Vec::new();
+        let mut first_unnoted_record = None;
+        for (index, line) in progress.lines.iter().enumerate() {
+            if index >= first_unnoted_line {
+                first_unnoted_record.get_or_insert(records.len());
+            }
+            if let Some(record) = parse_record(line).log_err().flatten() {
+                records.push(record);
+            }
+        }
         let absorbed_any = !records.is_empty();
 
         {
@@ -2901,19 +3004,40 @@ impl ClaudeSessionStore {
                 return;
             };
             conversation.transcript.absorb(records.clone());
+            if progress.start_offset == 0 || progress.restarted {
+                conversation.skipped_bytes = progress.skipped_bytes;
+            }
             conversation.path = progress.path;
             conversation.offset = progress.offset;
             conversation.pending = progress.pending;
         }
 
         if matches!(target, TranscriptTarget::Main) {
-            note_transcript_into_live(&mut self.live, &records);
+            let unnoted = records
+                .get(first_unnoted_record.unwrap_or(records.len())..)
+                .unwrap_or_default();
+            note_transcript_into_live(&mut self.live, unnoted);
         }
 
-        if absorbed_any || progress.restarted || path_changed || cleared_error {
+        if absorbed_any || progress.restarted || reloading || path_changed || cleared_error {
             cx.notify();
         }
     }
+}
+
+/// The index of the first line of a read that begins at or after `boundary` in the file,
+/// given where the first of them begins; `lines.len()` when none does. Counted from each
+/// line's length, which is its length in the file unless the line held bytes that were
+/// not UTF-8 and were replaced.
+fn first_line_from_offset(lines: &[String], first_line_start: u64, boundary: u64) -> usize {
+    let mut line_start = first_line_start;
+    for (index, line) in lines.iter().enumerate() {
+        if line_start >= boundary {
+            return index;
+        }
+        line_start = line_start.saturating_add(line.len() as u64 + 1);
+    }
+    lines.len()
 }
 
 fn note_transcript_into_live(live: &mut LiveState, records: &[TranscriptRecord]) {
@@ -2979,6 +3103,13 @@ fn user_interrupt_text(raw: &Value) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+/// Whether two registrations under one pid are the same process. An empty start means
+/// the source could not tell, and is taken as the same process, as before starts were
+/// compared.
+fn same_process_start(left: &str, right: &str) -> bool {
+    left.is_empty() || right.is_empty() || left == right
 }
 
 #[cfg(test)]
@@ -3049,11 +3180,12 @@ mod tests {
 
     use crate::{
         session_registry::{
-            HEARTBEAT_CUTOFF_MILLIS, SessionSummary, channel_answer_permission, channel_interrupt,
-            channel_send_message, channel_status, find_transcript, install_zed_hooks,
-            list_subagents, list_subagents_for_sessions, normalize_whitespace, now_millis,
-            read_channel_inbox_tail, read_events_tail, read_registrations, read_session_status,
-            read_subagent_transcript_tail, read_transcript_tail, visible_sessions,
+            HEARTBEAT_CUTOFF_MILLIS, SessionSummary, TAIL_FIRST_READ_WINDOW_BYTES,
+            channel_answer_permission, channel_interrupt, channel_send_message, channel_status,
+            find_transcript, install_zed_hooks, list_subagents, list_subagents_for_sessions,
+            normalize_whitespace, now_millis, read_channel_inbox_tail, read_events_tail_within,
+            read_registrations, read_session_status, read_subagent_transcript_tail_within,
+            read_transcript_tail, read_transcript_tail_within, visible_sessions,
             zed_hooks_installed,
         },
         session_source::{FileContents, read_file_prefix},
@@ -3288,6 +3420,15 @@ mod tests {
             session_id: String,
             state: TailState,
         ) -> Task<Result<TailProgress>> {
+            self.tail_transcript_within(session_id, state, u64::MAX)
+        }
+
+        fn tail_transcript_within(
+            &self,
+            session_id: String,
+            state: TailState,
+            window: u64,
+        ) -> Task<Result<TailProgress>> {
             self.tailed_conversations().push(TailedConversation::Main {
                 session_id: session_id.clone(),
             });
@@ -3304,10 +3445,11 @@ mod tests {
                     }
                 });
             }
-            Task::ready(read_transcript_tail(
+            Task::ready(read_transcript_tail_within(
                 &self.home_directory,
                 &session_id,
                 state,
+                window,
             ))
         }
 
@@ -3340,23 +3482,41 @@ mod tests {
             workflow_run_id: Option<String>,
             state: TailState,
         ) -> Task<Result<TailProgress>> {
+            self.tail_subagent_within(session_id, agent_id, workflow_run_id, state, u64::MAX)
+        }
+
+        fn tail_subagent_within(
+            &self,
+            session_id: String,
+            agent_id: String,
+            workflow_run_id: Option<String>,
+            state: TailState,
+            window: u64,
+        ) -> Task<Result<TailProgress>> {
             self.tailed_conversations()
                 .push(TailedConversation::Subagent {
                     session_id: session_id.clone(),
                     agent_id: agent_id.clone(),
                     workflow_run_id: workflow_run_id.clone(),
                 });
-            Task::ready(read_subagent_transcript_tail(
+            Task::ready(read_subagent_transcript_tail_within(
                 &self.home_directory,
                 &session_id,
                 &agent_id,
                 workflow_run_id.as_deref(),
                 state,
+                window,
             ))
         }
 
+        // Bounded the way the local source bounds it.
         fn tail_events(&self, session_id: String, state: TailState) -> Task<Result<TailProgress>> {
-            Task::ready(read_events_tail(&self.home_directory, &session_id, state))
+            Task::ready(read_events_tail_within(
+                &self.home_directory,
+                &session_id,
+                state,
+                TAIL_FIRST_READ_WINDOW_BYTES,
+            ))
         }
 
         fn read_status(&self, session_id: String) -> Task<Result<Option<String>>> {
@@ -3639,6 +3799,334 @@ mod tests {
             "the process is running, so an hour-old status timestamp must not hide it"
         );
 
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A conversation of `count` records chained by `parentUuid`, padded so that a few
+    /// thousand of them run past the window of a first read.
+    fn long_conversation(count: usize) -> String {
+        (0..count)
+            .map(|index| {
+                let parent = match index {
+                    0 => "null".to_string(),
+                    _ => format!("\"m{}\"", index - 1),
+                };
+                format!(
+                    "{{\"type\":\"user\",\"uuid\":\"m{index}\",\"parentUuid\":{parent},\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n",
+                    "p".repeat(2000)
+                )
+            })
+            .collect()
+    }
+
+    fn active_uuids(store: &ClaudeSessionStore) -> Vec<String> {
+        store
+            .transcript()
+            .active_path()
+            .iter()
+            .filter_map(|record| record.uuid.clone())
+            .collect()
+    }
+
+    fn expected_uuids(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|index| format!("m{index}")).collect()
+    }
+
+    async fn store_following(
+        home_directory: &Path,
+        session_id: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<ClaudeSessionStore> {
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("sessions")
+                .join("31.json"),
+            &registration_json(31, session_id),
+        );
+        let store = cx.new(|cx| {
+            ClaudeSessionStore::new(
+                Arc::new(FakeSource::new(
+                    home_directory.to_path_buf(),
+                    fake_process_starts(vec![31]),
+                )),
+                None,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(REGISTRY_POLL_INTERVAL);
+        cx.run_until_parked();
+        select_listed(&store, 31, cx);
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        store
+    }
+
+    /// The first read of a long transcript delivers its end only, and the rest arrives
+    /// a page at a time when asked for, in file order, without the conversation on screen
+    /// losing its leaf.
+    #[gpui::test]
+    async fn a_long_transcript_is_read_from_its_end_and_earlier_history_on_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("long-transcript");
+        let contents = long_conversation(3000);
+        let record_bytes = contents.len() / 3000;
+        write_transcript(&home_directory, "long-session", &contents);
+        let store = store_following(&home_directory, "long-session", cx).await;
+
+        let (first_uuids, first_skipped, first_generation) = store.read_with(cx, |store, _| {
+            (
+                active_uuids(store),
+                store.transcript_skipped_bytes(),
+                store.transcript_generation(),
+            )
+        });
+        let delivered = first_uuids.len();
+        let first_delivered_at = contents
+            .find(&format!(
+                "{{\"type\":\"user\",\"uuid\":\"m{}\"",
+                3000_usize.saturating_sub(delivered)
+            ))
+            .unwrap_or(0) as u64;
+        assert!(
+            delivered < 3000
+                && delivered <= TAIL_FIRST_READ_WINDOW_BYTES as usize / record_bytes + 1
+                && first_skipped == first_delivered_at,
+            "the first read should deliver only the records in the last {TAIL_FIRST_READ_WINDOW_BYTES} bytes and report the rest as skipped; got {delivered} of 3000 records and skipped_bytes={first_skipped}"
+        );
+        assert_eq!(first_uuids, expected_uuids(3000 - delivered..3000));
+
+        store.update(cx, |store, cx| store.load_earlier_history(cx));
+        assert_eq!(
+            store.read_with(cx, |store, _| active_uuids(store).len()),
+            delivered,
+            "the conversation on screen stays until the larger read lands"
+        );
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        let (uuids, skipped, generation) = store.read_with(cx, |store, _| {
+            (
+                active_uuids(store),
+                store.transcript_skipped_bytes(),
+                store.transcript_generation(),
+            )
+        });
+        assert_eq!(
+            (uuids.len(), skipped),
+            (3000, 0),
+            "one more page reaches the start of a {} byte file; got {} records and skipped_bytes={skipped}",
+            contents.len(),
+            uuids.len()
+        );
+        assert_eq!(uuids, expected_uuids(0..3000));
+        assert_ne!(
+            generation, first_generation,
+            "the records were all read again, so anything cached from them must be dropped"
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// A line too long to be read back to its start from the cut is dropped by the first
+    /// read, and the window that dropped it must still grow with every request, or the
+    /// button offers history that no number of clicks will ever deliver.
+    #[gpui::test(iterations = 1)]
+    async fn earlier_history_still_arrives_past_a_line_longer_than_the_lookback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("long-transcript-huge-line");
+        let record = |uuid: String, parent: Option<String>, padding: usize| {
+            let parent = parent.map_or("null".to_string(), |parent| format!("\"{parent}\""));
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"parentUuid\":{parent},\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n",
+                "h".repeat(padding)
+            )
+        };
+        let mut contents = String::new();
+        let mut expected = Vec::new();
+        let mut parent = None;
+        let mut push = |uuid: String, padding: usize, contents: &mut String| {
+            contents.push_str(&record(uuid.clone(), parent.clone(), padding));
+            expected.push(uuid.clone());
+            parent = Some(uuid);
+        };
+        for index in 0..100 {
+            push(format!("a{index}"), 2000, &mut contents);
+        }
+        push("huge".to_string(), 10 * 1024 * 1024, &mut contents);
+        for index in 0..1500 {
+            push(format!("z{index}"), 2000, &mut contents);
+        }
+        write_transcript(&home_directory, "huge-line-session", &contents);
+        let store = store_following(&home_directory, "huge-line-session", cx).await;
+
+        let mut skipped_after_each_click = Vec::new();
+        for _ in 0..4 {
+            let skipped = store.read_with(cx, |store, _| store.transcript_skipped_bytes());
+            skipped_after_each_click.push(skipped);
+            if skipped == 0 {
+                break;
+            }
+            store.update(cx, |store, cx| store.load_earlier_history(cx));
+            cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            skipped_after_each_click.last().copied(),
+            Some(0),
+            "skipped_bytes before the first read and after each of up to 3 clicks: {skipped_after_each_click:?}; the file is {} bytes",
+            contents.len()
+        );
+        assert_eq!(
+            store.read_with(cx, |store, _| active_uuids(store)),
+            expected
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    /// Loading earlier history reads records the store has already seen. Those were
+    /// noted into the live state when they first arrived; noting an old interrupt again
+    /// would end the turn that is running now. Records appended since are noted.
+    #[gpui::test]
+    async fn loading_earlier_history_does_not_note_old_records_into_the_live_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("long-transcript-interrupt");
+        let interrupt = "{\"type\":\"user\",\"uuid\":\"interrupt\",\"parentUuid\":\"m9\",\"message\":{\"role\":\"user\",\"content\":\"[Request interrupted by user]\"}}\n";
+        let contents = long_conversation(3000).replacen(
+            "\"uuid\":\"m10\",\"parentUuid\":\"m9\"",
+            "\"uuid\":\"m10\",\"parentUuid\":\"interrupt\"",
+            1,
+        );
+        let split_at = contents
+            .find("{\"type\":\"user\",\"uuid\":\"m10\"")
+            .expect("record m10 is in the fixture");
+        let contents = format!(
+            "{}{interrupt}{}",
+            &contents[..split_at],
+            &contents[split_at..]
+        );
+        let transcript_path = write_transcript(&home_directory, "long-session", &contents);
+        let store = store_following(&home_directory, "long-session", cx).await;
+
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("zed-events")
+                .join("long-session.jsonl"),
+            "{\"received_at_ms\":1,\"event\":{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"long-session\"}}\n",
+        );
+        cx.executor().advance_clock(EVENTS_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        assert!(
+            store.read_with(cx, |store, _| store.transcript_skipped_bytes()) > 0,
+            "the interrupt must be in the history the first read skipped"
+        );
+        assert_eq!(
+            store.read_with(cx, |store, _| turn_name(&store.live().turn)),
+            "Running"
+        );
+
+        store.update(cx, |store, cx| store.load_earlier_history(cx));
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        let (turn, records) = store.read_with(cx, |store, _| {
+            (turn_name(&store.live().turn), active_uuids(store).len())
+        });
+        assert_eq!(
+            (turn, records),
+            ("Running", 3001),
+            "the interrupt is old history, so the turn running now must still read as running once it is loaded"
+        );
+
+        // A new interrupt that lands with the next read is still noted.
+        let mut appended = std::fs::read(&transcript_path).expect("reading the transcript");
+        appended.extend_from_slice(
+            b"{\"type\":\"user\",\"uuid\":\"interrupt-2\",\"parentUuid\":\"m2999\",\"message\":{\"role\":\"user\",\"content\":\"[Request interrupted by user]\"}}\n",
+        );
+        std::fs::write(&transcript_path, appended).expect("appending to the transcript");
+        cx.executor().advance_clock(TRANSCRIPT_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            store.read_with(cx, |store, _| turn_name(&store.live().turn)),
+            "Idle"
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+    }
+
+    fn padded_tool_events(pairs: usize) -> String {
+        (0..pairs)
+            .map(|index| {
+                let input = format!("{{\"file_path\":\"{}\"}}", "f".repeat(1000));
+                format!(
+                    "{{\"received_at_ms\":{at},\"event\":{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"long-events\",\"tool_use_id\":\"t{index}\",\"tool_name\":\"Read\",\"tool_input\":{input}}}}}\n{{\"received_at_ms\":{at},\"event\":{{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"long-events\",\"tool_use_id\":\"t{index}\",\"tool_name\":\"Read\",\"tool_input\":{input}}}}}\n",
+                    at = index + 2
+                )
+            })
+            .collect()
+    }
+
+    /// The events of one long turn can run past the window of a first read, which then
+    /// begins after the prompt that started the turn. The turn is still running: tool
+    /// events only happen inside one, and no Stop has followed them.
+    #[gpui::test]
+    async fn a_turn_whose_prompt_is_before_the_events_window_still_reads_as_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("long-events");
+        write_transcript(
+            &home_directory,
+            "long-events",
+            "{\"type\":\"user\",\"uuid\":\"a\"}\n",
+        );
+        let events_path = home_directory
+            .join(".claude")
+            .join("zed-events")
+            .join("long-events.jsonl");
+        let events = format!(
+            "{{\"received_at_ms\":1,\"event\":{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"long-events\"}}}}\n{}",
+            padded_tool_events(2500)
+        );
+        assert!(events.len() as u64 > TAIL_FIRST_READ_WINDOW_BYTES + 4 * 1024 * 1024 / 4);
+        write_file(events_path.clone(), &events);
+
+        let store = store_following(&home_directory, "long-events", cx).await;
+        cx.executor().advance_clock(EVENTS_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            store.read_with(cx, |store, _| turn_name(&store.live().turn)),
+            "Running",
+            "the prompt is in the bytes the first read skipped, and no Stop followed the tools"
+        );
+        std::fs::remove_dir_all(&home_directory).ok();
+
+        // The same events with the turn over by the end of the window read as idle.
+        let home_directory = temporary_directory("long-events-stopped");
+        write_transcript(
+            &home_directory,
+            "long-events",
+            "{\"type\":\"user\",\"uuid\":\"a\"}\n",
+        );
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("zed-events")
+                .join("long-events.jsonl"),
+            &format!(
+                "{events}{{\"received_at_ms\":9000,\"event\":{{\"hook_event_name\":\"Stop\",\"session_id\":\"long-events\"}}}}\n{{\"received_at_ms\":9001,\"event\":{{\"hook_event_name\":\"Notification\",\"session_id\":\"long-events\",\"notification_type\":\"idle_prompt\"}}}}\n"
+            ),
+        );
+        let store = store_following(&home_directory, "long-events", cx).await;
+        cx.executor().advance_clock(EVENTS_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            store.read_with(cx, |store, _| turn_name(&store.live().turn)),
+            "Idle"
+        );
         std::fs::remove_dir_all(&home_directory).ok();
     }
 
@@ -6940,9 +7428,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_busy_session_is_still_pinged_once_the_interval_is_up(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn a_busy_session_is_still_pinged_once_the_interval_is_up(cx: &mut gpui::TestAppContext) {
         let home_directory = temporary_directory("keep-alive-busy");
         write_file(
             home_directory

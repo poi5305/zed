@@ -49,7 +49,7 @@ use ui::{
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
-    Item, ItemId, Workspace, WorkspaceId, delete_unloaded_items,
+    Item, ItemId, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::SerializableItem,
 };
@@ -5729,6 +5729,7 @@ impl ClaudeSessionsPanel {
         let showing = self.show_tool_calls;
         let showing_costs = self.show_costs;
         let showing_history = self.show_full_history;
+        let unread_history_bytes = self.store.read(cx).transcript_skipped_bytes();
         let pending_agents = self.pending_background_agents();
         let narrow = panel_is_narrow(window);
 
@@ -5992,6 +5993,20 @@ impl ClaudeSessionsPanel {
                             .tooltip(Tooltip::text("Show full history"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_full_history(cx))),
                     )
+                    .when(unread_history_bytes > 0, |this| {
+                        this.child(
+                            Button::new("claude-session-earlier-history", "Load earlier history")
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(Tooltip::text(format!(
+                                    "{:.1} MB of older messages are not loaded",
+                                    unread_history_bytes as f64 / (1024.0 * 1024.0)
+                                )))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| store.load_earlier_history(cx));
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new("claude-session-costs", IconName::CurrencyDollar)
                             .icon_size(IconSize::Small)
@@ -8527,8 +8542,31 @@ impl SerializableItem for ClaudeSessionsPanel {
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
-        let db = ClaudeSessionsDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "claude_session_tabs", &db, cx)
+        // `delete_unloaded_items` writes through a local connection, which the browser
+        // does not have.
+        #[cfg(target_family = "wasm")]
+        {
+            use db::sqlez::remote_sql;
+            cx.spawn(async move |_| {
+                let sql = crate::persistence::delete_unloaded_tabs_sql(alive_items.len());
+                let mut params = remote_sql::bind_params(workspace_id)?;
+                for item_id in alive_items {
+                    params.extend(remote_sql::bind_params(item_id)?);
+                }
+                remote_sql::exec_params(&sql, params).await
+            })
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let db = ClaudeSessionsDb::global(cx);
+            workspace::delete_unloaded_items(
+                alive_items,
+                workspace_id,
+                "claude_session_tabs",
+                &db,
+                cx,
+            )
+        }
     }
 
     fn deserialize(
@@ -8539,33 +8577,33 @@ impl SerializableItem for ClaudeSessionsPanel {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
-        let saved_tab = match ClaudeSessionsDb::global(cx).get_tab(item_id, workspace_id) {
-            Ok(Some(saved_tab)) => saved_tab,
-            Ok(None) => {
-                return Task::ready(Err(anyhow::anyhow!(
-                    "no saved Claude session tab for item {item_id}"
-                )));
-            }
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let fs = project.read(cx).fs().clone();
-        let (source, project_root) = Self::source_and_project_root(&project, cx);
-        // The session keeps running in tmux while Zed is closed, so the tab is opened onto
-        // the same session id; it reads "no transcript yet" until its first scan lands.
-        let item = cx.new(|cx| {
-            Self::new_tab(
-                workspace,
-                fs,
-                source,
-                project_root,
-                saved_tab.session_id,
-                None,
-                saved_tab.target,
-                window,
-                cx,
-            )
-        });
-        Task::ready(Ok(item))
+        let db = ClaudeSessionsDb::global(cx);
+        window.spawn(cx, async move |cx| {
+            let saved_tab = db
+                .get_tab(item_id, workspace_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no saved Claude session tab for item {item_id}"))?;
+            cx.update(|window, cx| {
+                let fs = project.read(cx).fs().clone();
+                let (source, project_root) = Self::source_and_project_root(&project, cx);
+                // The session keeps running in tmux while Zed is closed, so the tab is opened
+                // onto the same session id; it reads "no transcript yet" until its first scan
+                // lands.
+                cx.new(|cx| {
+                    Self::new_tab(
+                        workspace,
+                        fs,
+                        source,
+                        project_root,
+                        saved_tab.session_id,
+                        None,
+                        saved_tab.target,
+                        window,
+                        cx,
+                    )
+                })
+            })
+        })
     }
 
     fn serialize(
@@ -15677,6 +15715,7 @@ mod tests {
                 pending: Vec::new(),
                 lines: delivered,
                 restarted: false,
+                skipped_bytes: 0,
             }))
         }
     }
@@ -15786,6 +15825,7 @@ mod tests {
                 pending: state.pending,
                 lines: Vec::new(),
                 restarted: false,
+                skipped_bytes: 0,
             }))
         }
 
@@ -15916,6 +15956,7 @@ mod tests {
                 pending: state.pending,
                 lines: Vec::new(),
                 restarted: false,
+                skipped_bytes: 0,
             }))
         }
     }
@@ -16162,6 +16203,43 @@ mod tests {
         assert!(
             rebinds.is_empty(),
             "the panel has to take /clear pairs or the store keeps every one; left {rebinds:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_restored_tab_does_not_follow_a_reused_pid(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let mut other_process = scripted_registered_session();
+        other_process.session_id = "unrelated-session".to_string();
+        other_process.process_start = format!("{} after a reboot", other_process.process_start);
+        let source = Arc::new(ScriptedSource::new(&[], &[]));
+        *source
+            .sessions
+            .lock()
+            .expect("replacing the scripted session") = vec![other_process];
+        let session_source: Arc<dyn SessionSource> = source.clone();
+
+        let store = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut store = ClaudeSessionStore::new(session_source.clone(), None, cx);
+                store.seed_session(scripted_registered_session(), None, cx);
+                store.select(SCRIPTED_SESSION_ID.to_string(), cx);
+                store
+            })
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(A_FEW_POLLS);
+        cx.run_until_parked();
+
+        let selected = store.read_with(cx, |store, _| store.selected().map(str::to_string));
+        assert_eq!(
+            selected.as_deref(),
+            Some(SCRIPTED_SESSION_ID),
+            "a different process that reuses the saved pid is not a /clear of the saved session"
         );
     }
 

@@ -2410,6 +2410,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "collections",
+ "db",
  "fs",
  "gpui",
  "log",

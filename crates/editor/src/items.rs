@@ -1260,38 +1260,16 @@ impl Item for Editor {
     }
 }
 
-impl SerializableItem for Editor {
-    fn serialized_item_kind() -> &'static str {
-        "Editor"
-    }
-
-    fn cleanup(
-        workspace_id: WorkspaceId,
-        alive_items: Vec<ItemId>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        workspace::delete_unloaded_items(
-            alive_items,
-            workspace_id,
-            "editors",
-            &EditorDb::global(cx),
-            cx,
-        )
-    }
-
-    fn deserialize(
+impl Editor {
+    fn deserialize_serialized_editor(
         project: Entity<Project>,
-        _workspace: WeakEntity<Workspace>,
+        serialized_editor: Result<Option<SerializedEditor>>,
         workspace_id: workspace::WorkspaceId,
         item_id: ItemId,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
-        let serialized_editor = match EditorDb::global(cx)
-            .get_serialized_editor(item_id, workspace_id)
-            .context("Failed to query editor state")
-        {
+        let serialized_editor = match serialized_editor {
             Ok(Some(serialized_editor)) => {
                 if ProjectSettings::get_global(cx)
                     .session
@@ -1467,6 +1445,71 @@ impl SerializableItem for Editor {
                 })
             }),
         }
+    }
+}
+
+impl SerializableItem for Editor {
+    fn serialized_item_kind() -> &'static str {
+        "Editor"
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        workspace::delete_unloaded_items(
+            alive_items,
+            workspace_id,
+            "editors",
+            &EditorDb::global(cx),
+            cx,
+        )
+    }
+
+    fn deserialize(
+        project: Entity<Project>,
+        _workspace: WeakEntity<Workspace>,
+        workspace_id: workspace::WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        // The browser has no connection for the synchronous read to run on, so the row is
+        // fetched from the server first.
+        #[cfg(target_family = "wasm")]
+        {
+            let db = EditorDb::global(cx);
+            return window.spawn(cx, async move |cx| {
+                let serialized_editor = db
+                    .load_serialized_editor(item_id, workspace_id)
+                    .await
+                    .context("Failed to query editor state");
+                cx.update(|window, cx| {
+                    Editor::deserialize_serialized_editor(
+                        project,
+                        serialized_editor,
+                        workspace_id,
+                        item_id,
+                        window,
+                        cx,
+                    )
+                })?
+                .await
+            });
+        }
+        #[cfg(not(target_family = "wasm"))]
+        Editor::deserialize_serialized_editor(
+            project,
+            EditorDb::global(cx)
+                .get_serialized_editor(item_id, workspace_id)
+                .context("Failed to query editor state"),
+            workspace_id,
+            item_id,
+            window,
+            cx,
+        )
     }
 
     fn serialize(

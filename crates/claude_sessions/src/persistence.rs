@@ -48,8 +48,9 @@ impl ClaudeSessionsDb {
         }
     }
 
+    // Async: a synchronous `query!` has no connection to read from in the browser.
     query! {
-        fn get_tab_row(
+        async fn get_tab_row(
             item_id: ItemId,
             workspace_id: WorkspaceId
         ) -> Result<Option<(Option<String>, Option<String>, Option<String>)>> {
@@ -82,8 +83,12 @@ impl ClaudeSessionsDb {
         .await
     }
 
-    pub fn get_tab(&self, item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SavedTab>> {
-        Ok(self.get_tab_row(item_id, workspace_id)?.map(
+    pub async fn get_tab(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SavedTab>> {
+        Ok(self.get_tab_row(item_id, workspace_id).await?.map(
             |(session_id, agent_id, workflow_run_id)| SavedTab {
                 session_id,
                 // A row without an agent id is the session's own conversation, whatever
@@ -106,6 +111,20 @@ impl ClaudeSessionsDb {
 pub struct SavedTab {
     pub session_id: Option<String>,
     pub target: TranscriptTarget,
+}
+
+/// SQL for dropping tab rows that are no longer in the restored pane.
+/// An empty alive set is a real workspace with no session tabs, not `NOT IN ()`.
+#[cfg_attr(not(any(test, target_family = "wasm")), allow(dead_code))]
+pub(crate) fn delete_unloaded_tabs_sql(alive_count: usize) -> String {
+    if alive_count == 0 {
+        "DELETE FROM claude_session_tabs WHERE workspace_id = ?".to_string()
+    } else {
+        let placeholders = (0..alive_count).map(|_| "?").collect::<Vec<_>>().join(", ");
+        format!(
+            "DELETE FROM claude_session_tabs WHERE workspace_id = ? AND item_id NOT IN ({placeholders})"
+        )
+    }
 }
 
 pub fn read_dock_selection(workspace_id: WorkspaceId, kvp: &KeyValueStore) -> Option<String> {
@@ -180,11 +199,11 @@ mod tests {
         }
         for (item_id, tab) in (1..).zip(tabs.iter()) {
             assert_eq!(
-                db.get_tab(item_id, workspace_id).unwrap().as_ref(),
+                db.get_tab(item_id, workspace_id).await.unwrap().as_ref(),
                 Some(tab)
             );
         }
-        assert_eq!(db.get_tab(99, workspace_id).unwrap(), None);
+        assert_eq!(db.get_tab(99, workspace_id).await.unwrap(), None);
     }
 
     #[gpui::test]
@@ -203,6 +222,19 @@ mod tests {
         };
         db.save_tab(5, workspace_id, first).await.unwrap();
         db.save_tab(5, workspace_id, second.clone()).await.unwrap();
-        assert_eq!(db.get_tab(5, workspace_id).unwrap(), Some(second));
+        assert_eq!(db.get_tab(5, workspace_id).await.unwrap(), Some(second));
+    }
+
+    #[test]
+    fn delete_unloaded_tabs_never_emits_an_empty_in_list() {
+        let sql = delete_unloaded_tabs_sql(0);
+        assert_eq!(
+            sql, "DELETE FROM claude_session_tabs WHERE workspace_id = ?",
+            "an empty alive set must delete by workspace only, got {sql}"
+        );
+        assert_eq!(
+            delete_unloaded_tabs_sql(2),
+            "DELETE FROM claude_session_tabs WHERE workspace_id = ? AND item_id NOT IN (?, ?)"
+        );
     }
 }
