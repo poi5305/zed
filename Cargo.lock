@@ -3092,6 +3092,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "collections",
+ "db",
  "fs",
  "futures 0.3.32",
  "gpui",

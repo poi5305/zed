@@ -22,6 +22,7 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
     AbsoluteLength, Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext,
@@ -36,7 +37,7 @@ use project::Project;
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use terminal_view::{REATTACHABLE_TASK_ID_PREFIX, TerminalView, terminal_panel::TerminalPanel};
 use theme::Appearance;
 use tmux_sessions::{
     BadgeTone, ClaudeActivity, ClaudeSessionLinks, KeepAliveBadge, LinkedClaudeSession,
@@ -48,8 +49,9 @@ use ui::{
 };
 use util::{ResultExt as _, truncate_and_trailoff};
 use workspace::{
-    Item, Workspace,
+    Item, ItemId, Workspace, WorkspaceId, delete_unloaded_items,
     dock::{DockPosition, Panel, PanelEvent},
+    item::SerializableItem,
 };
 
 use crate::{
@@ -59,6 +61,7 @@ use crate::{
     RegisteredSession, RunningTool, SessionFacts, SessionRow, StatusSnapshot, SubagentSummary,
     ToggleFocus, TranscriptRecord, TranscriptTarget, Turn, Usage, format_countdown,
     keep_alive::{TEN_MINUTES_MS, pause_reason_text},
+    persistence::{ClaudeSessionsDb, SavedTab, read_dock_selection, save_dock_selection},
     ping_and_rewrite_cost, rates_for_model,
     session_registry::{
         TranscriptSpend, attachment_is_readable, tmux_session_name, window_target,
@@ -899,6 +902,15 @@ pub struct ClaudeSessionsPanel {
     /// Last rail index a scroll-back followed. The same index on the next frame
     /// must not scroll again, or the reader can never move the rail themselves.
     followed_index: Option<usize>,
+    /// What this tab last wrote to the database, so that the store's frequent changes
+    /// only reach the database when the conversation the tab reads has changed.
+    saved_tab: Option<(WorkspaceId, SavedTab)>,
+    /// Set when the conversation this tab reads no longer matches `saved_tab`.
+    tab_needs_serialize: bool,
+    /// The workspace the dock's selection is saved under. `None` until the saved
+    /// selection has been read back, so that nothing selected before then overwrites it.
+    dock_workspace_id: Option<WorkspaceId>,
+    saved_dock_selection: Option<String>,
     _store_subscription: Subscription,
     _keep_alive_subscription: Subscription,
 }
@@ -2744,9 +2756,66 @@ impl ClaudeSessionsPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            ClaudeSessionsPanel::new(workspace, window, cx)
+        let (panel, workspace_id) = workspace.update_in(&mut cx, |workspace, window, cx| {
+            (
+                ClaudeSessionsPanel::new(workspace, window, cx),
+                workspace.database_id(),
+            )
+        })?;
+        if let Some(workspace_id) = workspace_id {
+            let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
+            let saved_selection = cx
+                .background_spawn(async move { read_dock_selection(workspace_id, &kvp) })
+                .await;
+            panel.update(&mut cx, |panel, cx| {
+                panel.restore_dock_selection(workspace_id, saved_selection, cx)
+            });
+        }
+        Ok(panel)
+    }
+
+    fn restore_dock_selection(
+        &mut self,
+        workspace_id: WorkspaceId,
+        saved_selection: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dock_workspace_id = Some(workspace_id);
+        self.saved_dock_selection = saved_selection.clone();
+        match saved_selection {
+            Some(session_id) => self.select_session(session_id, cx),
+            // Nothing was saved, so whatever was selected while it was being read is the
+            // selection to keep.
+            None => self.save_dock_selection(cx),
+        }
+    }
+
+    fn save_dock_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.dock_workspace_id else {
+            return;
+        };
+        let selected = self.store.read(cx).selected().map(str::to_string);
+        if selected == self.saved_dock_selection {
+            return;
+        }
+        self.saved_dock_selection = selected.clone();
+        let kvp = KeyValueStore::global(cx);
+        // Detached rather than held, so that a selection made just before quitting is
+        // still written once the panel is gone; the store's write queue keeps them in order.
+        cx.background_spawn(async move {
+            save_dock_selection(workspace_id, selected, kvp)
+                .await
+                .log_err();
         })
+        .detach();
+    }
+
+    fn tab(&self, cx: &App) -> SavedTab {
+        let store = self.store.read(cx);
+        SavedTab {
+            session_id: store.selected().map(str::to_string),
+            target: store.transcript_target().clone(),
+        }
     }
 
     pub fn new(
@@ -2759,21 +2828,7 @@ impl ClaudeSessionsPanel {
         let fs = workspace.app_state().fs.clone();
 
         cx.new(|cx| {
-            let project_root = project
-                .read(cx)
-                .visible_worktrees(cx)
-                .next()
-                .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
-            // The sessions worth showing are the ones on the machine the project is
-            // opened from: on a remote project they are read over that project's
-            // connection, and the panel is otherwise the same on both.
-            let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
-                Some(remote_client) => Arc::new(RemoteSource::new(
-                    remote_client.read(cx).proto_client(),
-                    cx.background_executor().clone(),
-                )),
-                None => Arc::new(LocalSource::new(cx.background_executor().clone())),
-            };
+            let (source, project_root) = Self::source_and_project_root(&project, cx);
             let store =
                 cx.new(|cx| ClaudeSessionStore::new(source.clone(), project_root.clone(), cx));
             Self::new_reading(
@@ -2786,6 +2841,28 @@ impl ClaudeSessionsPanel {
                 cx,
             )
         })
+    }
+
+    fn source_and_project_root(
+        project: &Entity<Project>,
+        cx: &App,
+    ) -> (Arc<dyn SessionSource>, Option<PathBuf>) {
+        let project_root = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+        // The sessions worth showing are the ones on the machine the project is
+        // opened from: on a remote project they are read over that project's
+        // connection, and the panel is otherwise the same on both.
+        let source: Arc<dyn SessionSource> = match project.read(cx).remote_client() {
+            Some(remote_client) => Arc::new(RemoteSource::new(
+                remote_client.read(cx).proto_client(),
+                cx.background_executor().clone(),
+            )),
+            None => Arc::new(LocalSource::new(cx.background_executor().clone())),
+        };
+        (source, project_root)
     }
 
     /// Opens the session selected in the dock as a tab in the editor area, for a
@@ -2924,37 +3001,53 @@ impl ClaudeSessionsPanel {
 
         let workspace_handle = workspace.weak_handle();
         let item = cx.new(|cx| {
-            let store = cx.new(|cx| {
-                let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
-                // Before selecting, which is what turns a session id into the
-                // conversation being followed: a tab handed only a session id has nothing
-                // to follow until a scan of its own lands, and draws "no transcript yet"
-                // over the conversation it was opened to read until one does.
-                if let Some((session, transcript_path)) = seed {
-                    store.seed_session(session, transcript_path, cx);
-                }
-                if let Some(session_id) = session_id {
-                    store.select(session_id, cx);
-                }
-                // After selecting, which follows the session's own conversation.
-                if target != TranscriptTarget::Main {
-                    store.select_transcript_target(target, cx);
-                }
-                store
-            });
-            let mut this = Self::new_reading(
+            Self::new_tab(
                 workspace_handle,
                 fs,
-                store,
                 source,
                 project_root,
+                session_id,
+                seed,
+                target,
                 window,
                 cx,
-            );
-            this.in_pane = true;
-            this
+            )
         });
         workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+    }
+
+    fn new_tab(
+        workspace: WeakEntity<Workspace>,
+        fs: Arc<dyn Fs>,
+        source: Arc<dyn SessionSource>,
+        project_root: Option<PathBuf>,
+        session_id: Option<String>,
+        seed: Option<(RegisteredSession, Option<PathBuf>)>,
+        target: TranscriptTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let store = cx.new(|cx| {
+            let mut store = ClaudeSessionStore::new(source.clone(), project_root.clone(), cx);
+            // Before selecting, which is what turns a session id into the
+            // conversation being followed: a tab handed only a session id has nothing
+            // to follow until a scan of its own lands, and draws "no transcript yet"
+            // over the conversation it was opened to read until one does.
+            if let Some((session, transcript_path)) = seed {
+                store.seed_session(session, transcript_path, cx);
+            }
+            if let Some(session_id) = session_id {
+                store.select(session_id, cx);
+            }
+            // After selecting, which follows the session's own conversation.
+            if target != TranscriptTarget::Main {
+                store.select_transcript_target(target, cx);
+            }
+            store
+        });
+        let mut this = Self::new_reading(workspace, fs, store, source, project_root, window, cx);
+        this.in_pane = true;
+        this
     }
 
     fn new_reading(
@@ -2970,7 +3063,12 @@ impl ClaudeSessionsPanel {
             this.rebuild_entries(cx);
             this.follow_the_live_message(cx);
             if this.in_pane {
+                if this.saved_tab.as_ref().map(|(_, saved)| saved) != Some(&this.tab(cx)) {
+                    this.tab_needs_serialize = true;
+                }
                 cx.emit(ItemNameChanged);
+            } else {
+                this.save_dock_selection(cx);
             }
             cx.notify();
         });
@@ -3045,6 +3143,10 @@ impl ClaudeSessionsPanel {
             anchored_on_screen: HashSet::default(),
             hovered_anchor: None,
             followed_index: None,
+            saved_tab: None,
+            tab_needs_serialize: false,
+            dock_workspace_id: None,
+            saved_dock_selection: None,
             _store_subscription: store_subscription,
             _keep_alive_subscription: keep_alive_subscription,
         }
@@ -4512,6 +4614,7 @@ impl ClaudeSessionsPanel {
                         format!("tmux: {name}"),
                         tmux_attach_command(&name, None),
                         None,
+                        true,
                         window,
                         cx,
                     );
@@ -4544,6 +4647,7 @@ impl ClaudeSessionsPanel {
                                         command.clone(),
                                         command,
                                         Some(cwd.clone()),
+                                        false,
                                         window,
                                         cx,
                                     );
@@ -4631,6 +4735,7 @@ impl ClaudeSessionsPanel {
                         format!("tmux: {name}"),
                         tmux_attach_command(&name, None),
                         None,
+                        true,
                         window,
                         cx,
                     );
@@ -4741,6 +4846,7 @@ impl ClaudeSessionsPanel {
         label: String,
         command: String,
         cwd: Option<PathBuf>,
+        reattachable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4755,8 +4861,15 @@ impl ClaudeSessionsPanel {
             return;
         };
 
+        // Only a tmux attach is restored on restart: re-running anything else (such as
+        // `claude attach`) would start a new process rather than reconnect to one.
+        let id = if reattachable {
+            format!("{REATTACHABLE_TASK_ID_PREFIX}{label}")
+        } else {
+            format!("claude-session-{label}")
+        };
         let spawn = SpawnInTerminal {
-            id: TaskId(format!("claude-session-{label}")),
+            id: TaskId(id),
             full_label: label.clone(),
             label,
             command: Some(command.clone()),
@@ -8359,6 +8472,98 @@ impl Item for ClaudeSessionsPanel {
 
     fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.set_store_visible(false, cx);
+    }
+}
+
+/// Saves the conversation a tab reads, so that the tab is opened onto it again after a
+/// restart. The dock's instance is never in a pane, so only tabs reach here.
+impl SerializableItem for ClaudeSessionsPanel {
+    fn serialized_item_kind() -> &'static str {
+        "ClaudeSession"
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = ClaudeSessionsDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, "claude_session_tabs", &db, cx)
+    }
+
+    fn deserialize(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let saved_tab = match ClaudeSessionsDb::global(cx).get_tab(item_id, workspace_id) {
+            Ok(Some(saved_tab)) => saved_tab,
+            Ok(None) => {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "no saved Claude session tab for item {item_id}"
+                )));
+            }
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let fs = project.read(cx).fs().clone();
+        let (source, project_root) = Self::source_and_project_root(&project, cx);
+        // The session keeps running in tmux while Zed is closed, so the tab is opened onto
+        // the same session id; it reads "no transcript yet" until its first scan lands.
+        let item = cx.new(|cx| {
+            Self::new_tab(
+                workspace,
+                fs,
+                source,
+                project_root,
+                saved_tab.session_id,
+                None,
+                saved_tab.target,
+                window,
+                cx,
+            )
+        });
+        Task::ready(Ok(item))
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        self.serialize_tab(workspace.database_id(), item_id, cx)
+    }
+
+    fn should_serialize(&self, _event: &Self::Event) -> bool {
+        self.in_pane && self.tab_needs_serialize
+    }
+}
+
+impl ClaudeSessionsPanel {
+    fn serialize_tab(
+        &mut self,
+        workspace_id: Option<WorkspaceId>,
+        item_id: ItemId,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        if !self.in_pane {
+            return None;
+        }
+        self.tab_needs_serialize = false;
+        let workspace_id = workspace_id?;
+        let tab = self.tab(cx);
+        let saved = (workspace_id, tab.clone());
+        if self.saved_tab.as_ref() == Some(&saved) {
+            return None;
+        }
+        self.saved_tab = Some(saved);
+        let db = ClaudeSessionsDb::global(cx);
+        Some(cx.background_spawn(async move { db.save_tab(item_id, workspace_id, tab).await }))
     }
 }
 
@@ -15796,6 +16001,10 @@ mod tests {
                         anchored_on_screen: HashSet::default(),
                         hovered_anchor: None,
                         followed_index: None,
+                        saved_tab: None,
+                        tab_needs_serialize: false,
+                        dock_workspace_id: None,
+                        saved_dock_selection: None,
                         _store_subscription: store_subscription,
                         _keep_alive_subscription: keep_alive_subscription,
                     }
@@ -21441,5 +21650,141 @@ mod tests {
         assert!(hover_anchor_changed(None, Some("alpha")));
         assert!(hover_anchor_changed(Some("alpha"), Some("beta")));
         assert!(hover_anchor_changed(Some("ab"), Some("a")));
+    }
+}
+
+#[cfg(test)]
+mod tab_persistence_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct NoUi;
+
+    impl Render for NoUi {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            cx.set_global(db::AppDatabase::test_new());
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    /// Serializes a tab opened onto `target` of `session_id`, then deserializes it the way
+    /// a restart does and returns what the restored tab reads.
+    async fn round_trip(
+        session_id: &str,
+        target: TranscriptTarget,
+        cx: &mut TestAppContext,
+    ) -> (Option<String>, TranscriptTarget, bool) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let db = cx.update(|cx| ClaudeSessionsDb::global(cx));
+        let workspace_id = db
+            .write(|connection| {
+                connection
+                    .select_row::<WorkspaceId>(
+                        "INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id",
+                    )
+                    .unwrap()()
+                .unwrap()
+            })
+            .await
+            .unwrap();
+
+        let window = cx.add_window(|_window, _cx| NoUi);
+        let session_id = session_id.to_string();
+        let (tab, item_id) = window
+            .update(cx, |_, window, cx| {
+                let (source, project_root) =
+                    ClaudeSessionsPanel::source_and_project_root(&project, cx);
+                let tab = cx.new(|cx| {
+                    ClaudeSessionsPanel::new_tab(
+                        WeakEntity::new_invalid(),
+                        fs.clone(),
+                        source,
+                        project_root,
+                        Some(session_id),
+                        None,
+                        target,
+                        window,
+                        cx,
+                    )
+                });
+                let item_id = tab.entity_id().as_u64();
+                (tab, item_id)
+            })
+            .unwrap();
+
+        let first_write = tab.update(cx, |tab, cx| {
+            tab.serialize_tab(Some(workspace_id), item_id, cx)
+        });
+        first_write
+            .expect("a new tab writes what it reads")
+            .await
+            .unwrap();
+        let second_write = tab.update(cx, |tab, cx| {
+            tab.serialize_tab(Some(workspace_id), item_id, cx)
+        });
+        let rewrote_unchanged_tab = second_write.is_some();
+
+        let restored = window
+            .update(cx, |_, window, cx| {
+                ClaudeSessionsPanel::deserialize(
+                    project.clone(),
+                    WeakEntity::new_invalid(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        restored.read_with(cx, |restored, cx| {
+            assert!(restored.in_pane, "a restored tab is a tab, not the dock");
+            let store = restored.store.read(cx);
+            (
+                store.selected().map(str::to_string),
+                store.transcript_target().clone(),
+                rewrote_unchanged_tab,
+            )
+        })
+    }
+
+    #[gpui::test]
+    async fn test_main_conversation_tab_is_restored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (session_id, target, rewrote_unchanged_tab) =
+            round_trip("session-main", TranscriptTarget::Main, cx).await;
+        assert_eq!(session_id.as_deref(), Some("session-main"));
+        assert_eq!(target, TranscriptTarget::Main);
+        assert!(
+            !rewrote_unchanged_tab,
+            "an unchanged tab must not be written again"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workflow_agent_tab_is_restored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let agent = TranscriptTarget::Subagent {
+            agent_id: "agent-1".to_string(),
+            workflow_run_id: Some("run-7".to_string()),
+        };
+        let (session_id, target, rewrote_unchanged_tab) =
+            round_trip("session-workflow", agent.clone(), cx).await;
+        assert_eq!(session_id.as_deref(), Some("session-workflow"));
+        assert_eq!(target, agent);
+        assert!(
+            !rewrote_unchanged_tab,
+            "an unchanged tab must not be written again"
+        );
     }
 }

@@ -15,7 +15,7 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
-use persistence::TerminalDb;
+use persistence::{ReattachableTask, TerminalDb};
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -49,8 +49,8 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, MultiWorkspace, NewCenterTerminal, NewTerminal,
+    Pane, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -113,6 +113,21 @@ pub fn init(cx: &mut App) {
         workspace.register_action(TerminalView::deploy);
     })
     .detach();
+}
+
+/// Task terminals whose id starts with this are restored on restart by running the same
+/// command again, because they only attach to something that outlives Zed (a tmux
+/// session). Every other task terminal is dropped from persistence.
+pub const REATTACHABLE_TASK_ID_PREFIX: &str = "tmux-attach-";
+
+pub fn is_reattachable_task_id(id: &TaskId) -> bool {
+    id.0.starts_with(REATTACHABLE_TASK_ID_PREFIX)
+}
+
+pub(crate) fn is_persisted_terminal(terminal: &Terminal) -> bool {
+    terminal
+        .task()
+        .is_none_or(|task| is_reattachable_task_id(&task.spawned_task.id))
 }
 
 pub struct BlockProperties {
@@ -239,6 +254,11 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let workspace_handle = workspace.clone();
+        // Saved up front rather than once a working directory is known: a re-attachable
+        // task may never report one (remote projects), and item ids repeat across launches,
+        // so a row an earlier terminal left under this id must be overwritten or cleared
+        // before a restart reads it as this terminal's.
+        let needs_serialize = true;
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, workspace, window, cx);
 
@@ -296,7 +316,7 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
+            needs_serialize,
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -1832,7 +1852,7 @@ impl Item for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal().read(cx).task().is_none() {
+        if is_persisted_terminal(self.terminal().read(cx)) {
             if let Some((new_id, old_id)) = workspace.database_id().zip(self.workspace_id) {
                 log::debug!(
                     "Updating workspace id for the terminal, old: {old_id:?}, new: {new_id:?}",
@@ -1861,11 +1881,40 @@ impl SerializableItem for TerminalView {
     fn cleanup(
         workspace_id: WorkspaceId,
         alive_items: Vec<workspace::ItemId>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
-        let db = TerminalDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        // The center and the terminal panel share this table, and each caller passes only
+        // the ids it restored itself, so every terminal still open in the workspace is
+        // kept. They are read once the caller is done with its workspace, which it is
+        // still updating when it asks for this cleanup.
+        window.spawn(cx, async move |cx| {
+            let cleanup = cx.update(|window, cx| {
+                let mut alive_items = alive_items;
+                if let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>() {
+                    for workspace in multi_workspace.read(cx).workspaces() {
+                        let workspace = workspace.read(cx);
+                        if workspace.database_id() != Some(workspace_id) {
+                            continue;
+                        }
+                        for pane in workspace.panes() {
+                            alive_items
+                                .extend(pane.read(cx).items().map(|item| item.item_id().as_u64()));
+                        }
+                        if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
+                            for pane in terminal_panel.read(cx).center.panes() {
+                                alive_items.extend(
+                                    pane.read(cx).items().map(|item| item.item_id().as_u64()),
+                                );
+                            }
+                        }
+                    }
+                }
+                let db = TerminalDb::global(cx);
+                delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+            })?;
+            cleanup.await
+        })
     }
 
     fn serialize(
@@ -1876,9 +1925,25 @@ impl SerializableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let terminal = self.terminal().read(cx);
-        if terminal.task().is_some() {
-            return None;
-        }
+        let reattach_task = match terminal.task() {
+            Some(task) => match ReattachableTask::from_spawned_task(&task.spawned_task) {
+                Some(reattach_task) => Some(reattach_task),
+                // Not restored, yet a center pane still lists it by item id, so whatever
+                // an earlier launch left under that id must not come back in its place.
+                None => {
+                    if !self.needs_serialize {
+                        return None;
+                    }
+                    let workspace_id = self.workspace_id?;
+                    self.needs_serialize = false;
+                    let db = TerminalDb::global(cx);
+                    return Some(cx.background_spawn(async move {
+                        db.delete_terminal(item_id, workspace_id).await
+                    }));
+                }
+            },
+            None => None,
+        };
 
         if !self.needs_serialize {
             return None;
@@ -1887,6 +1952,17 @@ impl SerializableItem for TerminalView {
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
+        let reattach_task = match reattach_task
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+        {
+            Ok(reattach_task) => reattach_task,
+            Err(error) => {
+                log::error!("Failed to encode a re-attachable terminal task: {error:#}");
+                return None;
+            }
+        };
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
@@ -1896,6 +1972,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_reattach_task(item_id, workspace_id, reattach_task)
                 .await?;
             Ok(())
         }))
@@ -1914,7 +1992,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, reattach_task) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -1936,13 +2014,21 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let reattach_task = db
+                        .get_reattach_task(item_id, workspace_id)
+                        .log_err()
+                        .flatten()
+                        .and_then(|task| serde_json::from_str::<ReattachableTask>(&task).log_err());
+                    (cwd, custom_title, reattach_task)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                .update(cx, |project, cx| match reattach_task {
+                    Some(task) => project.create_terminal_task(task.into_spawned_task(), cx),
+                    None => project.create_terminal_shell(cwd, cx),
+                })
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {
