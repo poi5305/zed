@@ -21,11 +21,12 @@ use gpui::{BackgroundExecutor, Task};
 use rpc::{AnyProtoClient, proto};
 
 use crate::session_registry::{
-    self, AgentListing, CacheTtl, ChannelStatus, HookInstallOutcome, RegisteredSession,
-    SessionSummary, SlashCommand, SlashCommandScope, SubagentMeta, SubagentSummary, TailProgress,
-    TailState, TranscriptSpend, channel_answer_permission, channel_interrupt, channel_send_message,
-    channel_status, now_millis, read_channel_inbox_tail, read_events_tail, read_session_status,
-    read_subagent_transcript_tail, read_transcript_tail,
+    self, AgentListing, CacheTtl, ChannelStatus, HookInstallOutcome, KeepAliveRecord,
+    KeepAliveWrite, RegisteredSession, SessionSummary, SlashCommand, SlashCommandScope,
+    SubagentMeta, SubagentSummary, TailProgress, TailState, TranscriptSpend,
+    channel_answer_permission, channel_interrupt, channel_send_message, channel_status, now_millis,
+    read_channel_inbox_tail, read_events_tail, read_session_status, read_subagent_transcript_tail,
+    read_transcript_tail,
 };
 
 /// The prefix of a file that was read, and whether the file went on past it.
@@ -165,6 +166,32 @@ pub trait SessionSource: Send + Sync + 'static {
     fn run_claude_agent_command(&self, _args: Vec<String>, _cwd: PathBuf) -> Task<Result<String>> {
         Task::ready(Err(anyhow::anyhow!(
             "this Claude agent command is not available"
+        )))
+    }
+
+    /// The keep-alive records the machine the sessions run on holds for `session_ids`, which
+    /// every Zed connected to it shares; only the sessions that have one are returned. An error
+    /// means that machine cannot share them (an older remote server), and keep-alive is then
+    /// this Zed's alone.
+    fn read_keep_alive(&self, _session_ids: Vec<String>) -> Task<Result<Vec<KeepAliveRecord>>> {
+        Task::ready(Err(anyhow::anyhow!("sharing keep-alive is not available")))
+    }
+
+    /// Replaces the shared keep-alive record of `session_id` if it is still at
+    /// `expected_revision`.
+    fn write_keep_alive(
+        &self,
+        _session_id: String,
+        _expected_revision: u64,
+        _state_json: String,
+    ) -> Task<Result<KeepAliveWrite>> {
+        Task::ready(Err(anyhow::anyhow!("sharing keep-alive is not available")))
+    }
+
+    /// Types `/compact` into the tmux pane the session runs in.
+    fn compact_session(&self, _session_id: String) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "compacting a session is not available"
         )))
     }
 
@@ -393,6 +420,38 @@ impl SessionSource for LocalSource {
         let executor = self.executor.clone();
         self.executor.spawn(async move {
             session_registry::resume_session_in_background(&session_id, &cwd, &executor).await
+        })
+    }
+
+    fn read_keep_alive(&self, session_ids: Vec<String>) -> Task<Result<Vec<KeepAliveRecord>>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            session_registry::read_keep_alive_records(&home_directory, &session_ids)
+        })
+    }
+
+    fn write_keep_alive(
+        &self,
+        session_id: String,
+        expected_revision: u64,
+        state_json: String,
+    ) -> Task<Result<KeepAliveWrite>> {
+        let home_directory = self.home_directory.clone();
+        self.executor.spawn(async move {
+            session_registry::write_keep_alive_record(
+                &home_directory,
+                &session_id,
+                expected_revision,
+                &state_json,
+            )
+        })
+    }
+
+    fn compact_session(&self, session_id: String) -> Task<Result<()>> {
+        let home_directory = self.home_directory.clone();
+        let executor = self.executor.clone();
+        self.executor.spawn(async move {
+            session_registry::compact_session(&home_directory, &session_id, &executor).await
         })
     }
 
@@ -746,6 +805,57 @@ impl SessionSource for RemoteSource {
         true
     }
 
+    fn read_keep_alive(&self, session_ids: Vec<String>) -> Task<Result<Vec<KeepAliveRecord>>> {
+        let request = self.client.request(proto::ReadClaudeKeepAlive {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_ids,
+        });
+        self.executor.spawn(async move {
+            Ok(request
+                .await?
+                .records
+                .into_iter()
+                .map(keep_alive_record_from_proto)
+                .collect())
+        })
+    }
+
+    fn write_keep_alive(
+        &self,
+        session_id: String,
+        expected_revision: u64,
+        state_json: String,
+    ) -> Task<Result<KeepAliveWrite>> {
+        let request = self.client.request(proto::WriteClaudeKeepAlive {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+            expected_revision,
+            state_json,
+        });
+        self.executor.spawn(async move {
+            let response = request.await?;
+            let record = response.record.map(keep_alive_record_from_proto);
+            if response.applied {
+                Ok(KeepAliveWrite::Applied(
+                    record.context("an applied keep-alive write named no record")?,
+                ))
+            } else {
+                Ok(KeepAliveWrite::Conflict(record))
+            }
+        })
+    }
+
+    fn compact_session(&self, session_id: String) -> Task<Result<()>> {
+        let request = self.client.request(proto::CompactClaudeSession {
+            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+            session_id,
+        });
+        self.executor.spawn(async move {
+            request.await?;
+            Ok(())
+        })
+    }
+
     fn channel_answer_permission(
         &self,
         claude_pid: u32,
@@ -873,6 +983,14 @@ fn session_listing_from_proto(response: proto::ListClaudeSessionsResponse) -> Se
     }
 }
 
+fn keep_alive_record_from_proto(record: proto::ClaudeKeepAliveRecord) -> KeepAliveRecord {
+    KeepAliveRecord {
+        session_id: record.session_id,
+        revision: record.revision,
+        state_json: record.state_json,
+    }
+}
+
 /// Rebuilds a listed session from what the far end sent.
 ///
 /// Two fields of [`RegisteredSession`] are deliberately absent from the wire message.
@@ -896,6 +1014,7 @@ fn session_summary_from_proto(session: proto::ClaudeSession) -> SessionSummary {
             updated_at: session.updated_at,
             tmux_target: session.tmux_target,
             bridge_session_id: session.bridge_session_id,
+            started_at: session.started_at,
         },
         transcript_path: session.transcript_path.map(PathBuf::from),
         // Zero context means the far end found no answer to read. An answer time with
@@ -1051,6 +1170,7 @@ mod tests {
             context_tokens: 0,
             total_cost_usd: None,
             bridge_session_id: Some("bridge-abc".to_string()),
+            started_at: None,
             last_answer_at_ms: None,
             cache_ttl: 0,
         }

@@ -324,6 +324,9 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_status);
         session.add_request_handler(cx.weak_entity(), Self::handle_install_claude_hooks);
         session.add_request_handler(cx.weak_entity(), Self::handle_uninstall_claude_hooks);
+        session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_keep_alive);
+        session.add_request_handler(cx.weak_entity(), Self::handle_write_claude_keep_alive);
+        session.add_request_handler(cx.weak_entity(), Self::handle_compact_claude_session);
         session.add_request_handler(cx.weak_entity(), Self::handle_claude_hooks_installed);
         session.add_request_handler(cx.weak_entity(), Self::handle_read_claude_file);
         session.add_request_handler(cx.weak_entity(), Self::handle_claude_channel_status);
@@ -1516,6 +1519,7 @@ impl HeadlessProject {
                         context_tokens: spend.map(|spend| spend.context_tokens).unwrap_or(0),
                         total_cost_usd: spend.and_then(|spend| spend.total_cost_usd),
                         bridge_session_id: summary.session.bridge_session_id,
+                        started_at: summary.session.started_at,
                         last_answer_at_ms: spend.and_then(|spend| spend.last_answer_at_ms),
                         cache_ttl: spend
                             .map(|spend| Self::cache_ttl_code(spend.cache_ttl))
@@ -1725,6 +1729,77 @@ impl HeadlessProject {
         cx.background_spawn(async move {
             remote::claude_sessions::uninstall_zed_hooks(&home_directory)?;
             Ok(proto::UninstallClaudeHooksResponse {})
+        })
+        .await
+    }
+
+    async fn handle_read_claude_keep_alive(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ReadClaudeKeepAlive>,
+        cx: AsyncApp,
+    ) -> Result<proto::ReadClaudeKeepAliveResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_ids = envelope.payload.session_ids;
+
+        cx.background_spawn(async move {
+            let records =
+                remote::claude_sessions::read_keep_alive_records(&home_directory, &session_ids)?;
+            Ok(proto::ReadClaudeKeepAliveResponse {
+                records: records
+                    .into_iter()
+                    .map(keep_alive_record_to_proto)
+                    .collect(),
+            })
+        })
+        .await
+    }
+
+    async fn handle_write_claude_keep_alive(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::WriteClaudeKeepAlive>,
+        cx: AsyncApp,
+    ) -> Result<proto::WriteClaudeKeepAliveResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let request = envelope.payload;
+
+        cx.background_spawn(async move {
+            let write = remote::claude_sessions::write_keep_alive_record(
+                &home_directory,
+                &request.session_id,
+                request.expected_revision,
+                &request.state_json,
+            )?;
+            Ok(match write {
+                remote::claude_sessions::KeepAliveWrite::Applied(record) => {
+                    proto::WriteClaudeKeepAliveResponse {
+                        applied: true,
+                        record: Some(keep_alive_record_to_proto(record)),
+                    }
+                }
+                remote::claude_sessions::KeepAliveWrite::Conflict(record) => {
+                    proto::WriteClaudeKeepAliveResponse {
+                        applied: false,
+                        record: record.map(keep_alive_record_to_proto),
+                    }
+                }
+            })
+        })
+        .await
+    }
+
+    async fn handle_compact_claude_session(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CompactClaudeSession>,
+        cx: AsyncApp,
+    ) -> Result<proto::CompactClaudeSessionResponse> {
+        let home_directory = paths::home_dir().to_path_buf();
+        let session_id = envelope.payload.session_id;
+        let executor = cx.background_executor().clone();
+
+        cx.background_spawn(async move {
+            remote::claude_sessions::compact_session(&home_directory, &session_id, &executor)
+                .await?;
+            Ok(proto::CompactClaudeSessionResponse {})
         })
         .await
     }
@@ -2360,6 +2435,16 @@ fn tail_target(
             &request.session_id,
             home_directory,
         ))
+    }
+}
+
+fn keep_alive_record_to_proto(
+    record: remote::claude_sessions::KeepAliveRecord,
+) -> proto::ClaudeKeepAliveRecord {
+    proto::ClaudeKeepAliveRecord {
+        session_id: record.session_id,
+        revision: record.revision,
+        state_json: record.state_json,
     }
 }
 

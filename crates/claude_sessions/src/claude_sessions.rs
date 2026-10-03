@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod blind_anchor_tests;
 #[cfg(test)]
+mod blind_keep_alive_sync_tests;
+#[cfg(test)]
 mod blind_live_state_tests;
 #[cfg(test)]
 mod blind_registry_tests;

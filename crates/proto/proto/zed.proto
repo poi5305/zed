@@ -574,7 +574,13 @@ message Envelope {
     RunClaudeAgentCommand run_claude_agent_command = 540;
     RunClaudeAgentCommandResponse run_claude_agent_command_response = 541;
     UninstallClaudeHooks uninstall_claude_hooks = 542;
-    UninstallClaudeHooksResponse uninstall_claude_hooks_response = 543; // current max
+    UninstallClaudeHooksResponse uninstall_claude_hooks_response = 543;
+    ReadClaudeKeepAlive read_claude_keep_alive = 544;
+    ReadClaudeKeepAliveResponse read_claude_keep_alive_response = 545;
+    WriteClaudeKeepAlive write_claude_keep_alive = 546;
+    WriteClaudeKeepAliveResponse write_claude_keep_alive_response = 547;
+    CompactClaudeSession compact_claude_session = 548;
+    CompactClaudeSessionResponse compact_claude_session_response = 549; // current max
   }
 
   reserved 87 to 88;

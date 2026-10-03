@@ -835,7 +835,7 @@ pub struct ClaudeSessionsSettingsContent {
 pub struct ClaudeSessionsKeepAliveContent {
     /// How often to send a keep-alive message while the session is idle, in minutes.
     ///
-    /// Default: 50
+    /// Default: 55
     ///
     /// Clamped to 5-55.
     pub interval_minutes: Option<u32>,

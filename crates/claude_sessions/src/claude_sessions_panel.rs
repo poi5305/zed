@@ -53,11 +53,11 @@ use workspace::{
 };
 
 use crate::{
-    CacheTtl, ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings, EndedReason,
-    EndedSession, HookInstallOutcome, KeepAliveConfig, KeepAliveState, KeepAliveStatus,
-    LiveSession, LiveState, ModelRates, ONE_HOUR_CACHE_MS, OpenInEditor, RegisteredSession,
-    RunningTool, SessionFacts, SessionRow, StatusSnapshot, SubagentSummary, ToggleFocus,
-    TranscriptRecord, TranscriptTarget, Turn, Usage, format_countdown,
+    COMPACT_AFTER_PINGS, CacheTtl, ChannelInboxEvent, ClaudeSessionStore, ClaudeSessionsSettings,
+    EndedReason, EndedSession, HookInstallOutcome, KeepAliveConfig, KeepAliveState,
+    KeepAliveStatus, LiveSession, LiveState, ModelRates, ONE_HOUR_CACHE_MS, OpenInEditor,
+    RegisteredSession, RunningTool, SessionFacts, SessionRow, StatusSnapshot, SubagentSummary,
+    ToggleFocus, TranscriptRecord, TranscriptTarget, Turn, Usage, format_countdown,
     keep_alive::{TEN_MINUTES_MS, pause_reason_text},
     ping_and_rewrite_cost, rates_for_model,
     session_registry::{
@@ -292,6 +292,10 @@ const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
 const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
 const TASK_NOTIFICATION_ID_OPEN: &str = "<task-id>";
 const TASK_NOTIFICATION_ID_CLOSE: &str = "</task-id>";
+
+/// The tools that end a background shell without any notification being queued for it:
+/// the shell is over once one of them has answered, whatever the answer said.
+const SHELL_STOP_TOOL_NAMES: [&str; 3] = ["TaskStop", "KillShell", "KillBash"];
 
 const PEER_MESSAGE_LEAD: &str = "Another Claude session sent a message:";
 const AGENT_MESSAGE_WRAPPER: &str = "agent-message";
@@ -2988,7 +2992,7 @@ impl ClaudeSessionsPanel {
             _terminal_attach: Task::ready(()),
             _pasting: Task::ready(()),
             rail_expanded: true,
-            rail_shows_everything: false,
+            rail_shows_everything: true,
             permission_answered: false,
             permission_answered_for: None,
             live_message_scroll: ScrollHandle::new(),
@@ -3887,7 +3891,12 @@ impl ClaudeSessionsPanel {
             let open_target = store.transcript_target().clone();
             let main_transcript = store.main_transcript();
             let main_path = main_transcript.active_path();
-            let shells = background_shells(&main_transcript.full_path());
+            let shells = background_shells(
+                &main_transcript.full_path(),
+                store
+                    .selected_session()
+                    .and_then(|session| session.started_at),
+            );
             rows.iter()
                 .map(|row| match row {
                     SessionRow::Live(live) => {
@@ -4805,10 +4814,15 @@ impl ClaudeSessionsPanel {
                 .iter()
                 .map(|summary| agent_state(summary, &main_path))
                 .collect();
-            let shells: Vec<BackgroundShell> = background_shells(&main_transcript.full_path())
-                .into_iter()
-                .filter(|shell| !shell.finished)
-                .collect();
+            let shells: Vec<BackgroundShell> = background_shells(
+                &main_transcript.full_path(),
+                store
+                    .selected_session()
+                    .and_then(|session| session.started_at),
+            )
+            .into_iter()
+            .filter(|shell| !shell.finished)
+            .collect();
             (subagents, target, states, shells)
         };
         let pending_agents = self.pending_background_agents().unwrap_or(0);
@@ -5501,8 +5515,7 @@ impl ClaudeSessionsPanel {
     fn toggle_keep_alive(&mut self, session_id: &str, cx: &mut Context<Self>) {
         let registry = crate::keep_alive_registry(cx);
         registry.update(cx, |registry, cx| {
-            registry.toggle(session_id);
-            cx.notify();
+            registry.toggle_shared(session_id, cx);
         });
     }
 
@@ -5532,7 +5545,7 @@ impl ClaudeSessionsPanel {
             )
             .toggle_state(chip.enabled)
             .tooltip(move |_, cx| {
-                Tooltip::with_meta("Keep prompt cache warm", None, tooltip_meta.clone(), cx)
+                Tooltip::with_meta(KEEP_ALIVE_TOOLTIP_TITLE, None, tooltip_meta.clone(), cx)
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_keep_alive(&session_for_click, cx);
@@ -5817,28 +5830,32 @@ impl ClaudeSessionsPanel {
                             ),
                     )
                     .children(claude_ai_url.map(|url| {
-                        Button::new("claude-session-open-claude-ai", "Open in claude.ai")
-                            .label_size(LabelSize::XSmall)
+                        IconButton::new("claude-session-open-claude-ai", IconName::ArrowUpRight)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open in claude.ai"))
                             .on_click(move |_, _, cx| {
                                 cx.open_url(&url);
                             })
                     }))
                     .child(
-                        Button::new("claude-session-tool-calls", "Expand all tool calls")
-                            .label_size(LabelSize::XSmall)
+                        IconButton::new("claude-session-tool-calls", IconName::ToolHammer)
+                            .icon_size(IconSize::Small)
                             .toggle_state(showing)
+                            .tooltip(Tooltip::text("Expand all tool calls"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_tool_calls(cx))),
                     )
                     .child(
-                        Button::new("claude-session-full-history", "Show full history")
-                            .label_size(LabelSize::XSmall)
+                        IconButton::new("claude-session-full-history", IconName::HistoryRerun)
+                            .icon_size(IconSize::Small)
                             .toggle_state(showing_history)
+                            .tooltip(Tooltip::text("Show full history"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_full_history(cx))),
                     )
                     .child(
-                        Button::new("claude-session-costs", "Show costs")
-                            .label_size(LabelSize::XSmall)
+                        IconButton::new("claude-session-costs", IconName::CurrencyDollar)
+                            .icon_size(IconSize::Small)
                             .toggle_state(showing_costs)
+                            .tooltip(Tooltip::text("Show costs"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_costs(cx))),
                     )
                     .when_some(keep_alive_button, |this, button| this.child(button)),
@@ -9725,11 +9742,19 @@ struct BackgroundShell {
 /// chain, and a shell started
 /// before one is still running after it — dropping it from the list would be the panel
 /// claiming a running command had stopped.
-fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<BackgroundShell> {
+///
+/// `process_started_ms` is when the Claude process now running the session started. A shell
+/// launched before it belonged to a process that has since exited, and took its shells with it.
+fn background_shells<'records>(
+    path: &[&'records TranscriptRecord],
+    process_started_ms: Option<i64>,
+) -> Vec<BackgroundShell> {
     // The `Bash` inputs seen so far, keyed by call id. A call is written before the result
     // announcing the shell it started, so one forward pass pairs the two.
     let mut bash_calls: HashMap<&'records str, (Option<&'records str>, Option<&'records str>)> =
         HashMap::default();
+    // The calls that stop a shell, keyed by call id, naming the shell each one stops.
+    let mut stop_calls: HashMap<&'records str, &'records str> = HashMap::default();
     let mut shells: Vec<BackgroundShell> = Vec::new();
 
     for record in path.iter().copied() {
@@ -9740,14 +9765,44 @@ fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<Backg
 
         if let Some(blocks) = content.and_then(Value::as_array) {
             for block in blocks {
-                if block.get("type").and_then(Value::as_str) != Some(TOOL_USE_BLOCK_TYPE)
-                    || block.get("name").and_then(Value::as_str) != Some(BASH_TOOL_NAME)
+                // Read by id alone rather than through `tool_result_texts`: this runs over
+                // every record on every draw, and a result's text can be a whole tool output.
+                if block.get("type").and_then(Value::as_str) == Some(TOOL_RESULT_BLOCK_TYPE)
+                    && let Some(stopped) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .and_then(|tool_use_id| stop_calls.get(tool_use_id))
                 {
+                    for shell in &mut shells {
+                        if shell.task_id.as_ref() == *stopped {
+                            shell.finished = true;
+                        }
+                    }
+                    continue;
+                }
+                if block.get("type").and_then(Value::as_str) != Some(TOOL_USE_BLOCK_TYPE) {
                     continue;
                 }
                 let Some(tool_use_id) = block.get("id").and_then(Value::as_str) else {
                     continue;
                 };
+                let name = block.get("name").and_then(Value::as_str);
+                if name.is_some_and(|name| SHELL_STOP_TOOL_NAMES.contains(&name)) {
+                    let input = block.get("input");
+                    if let Some(task_id) = ["task_id", "shell_id", "bash_id"]
+                        .iter()
+                        .find_map(|key| input.and_then(|input| input.get(key)))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|task_id| !task_id.is_empty())
+                    {
+                        stop_calls.insert(tool_use_id, task_id);
+                    }
+                    continue;
+                }
+                if name != Some(BASH_TOOL_NAME) {
+                    continue;
+                }
                 let argument = |key: &str| {
                     block
                         .get("input")
@@ -9787,6 +9842,14 @@ fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<Backg
                 .and_then(|(tool_use_id, _)| bash_calls.get(tool_use_id))
                 .copied()
                 .unwrap_or((None, None));
+            let launched_before_this_process = process_started_ms.is_some_and(|started| {
+                record
+                    .raw
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(crate::timestamp_ms)
+                    .is_some_and(|launched| launched < started)
+            });
             shells.push(BackgroundShell {
                 task_id: SharedString::from(task_id.to_string()),
                 label: background_shell_label(task_id, description, command),
@@ -9794,7 +9857,7 @@ fn background_shells<'records>(path: &[&'records TranscriptRecord]) -> Vec<Backg
                 output_path: chosen
                     .and_then(|(_, announcement)| background_output_path(announcement))
                     .map(SharedString::from),
-                finished: false,
+                finished: launched_before_this_process,
             });
         }
 
@@ -11820,16 +11883,26 @@ struct KeepAliveChip {
     tone: BadgeTone,
 }
 
+/// The click cycles three modes, so the title says what the next click does.
+const KEEP_ALIVE_TOOLTIP_TITLE: &str =
+    "Keep prompt cache warm (click: off → warm → warm + compact)";
+
 fn keep_alive_tooltip_meta(
     config: &KeepAliveConfig,
     context_tokens: u64,
     rates: Option<ModelRates>,
+    compact: bool,
     detail: Option<&str>,
     error: Option<&str>,
 ) -> SharedString {
     let mut lines = Vec::new();
     if let Some(detail) = detail {
         lines.push(detail.to_string());
+    }
+    if compact {
+        lines.push(format!(
+            "After {COMPACT_AFTER_PINGS} pings in a row with no reply from you, sends /compact and turns keep-alive off."
+        ));
     }
     let mut sentence = format!(
         "Sends a short message every {} min while idle, for up to {} h.",
@@ -11903,7 +11976,14 @@ fn keep_alive_chip_model(
             icon_color: Color::Muted,
             tmux_label: label.clone(),
             dock_tooltip: label.clone(),
-            tooltip_meta: keep_alive_tooltip_meta(config, context_tokens, rates, None, error),
+            tooltip_meta: keep_alive_tooltip_meta(
+                config,
+                context_tokens,
+                rates,
+                false,
+                None,
+                error,
+            ),
             tone: if label_color == Color::Warning {
                 BadgeTone::Warning
             } else {
@@ -11914,6 +11994,14 @@ fn keep_alive_chip_model(
         });
     }
 
+    let mode = if state.compact {
+        format!(
+            "warm+compact {}/{COMPACT_AFTER_PINGS}",
+            state.pings_sent.min(COMPACT_AFTER_PINGS)
+        )
+    } else {
+        "warm".to_string()
+    };
     let (icon_color, label, tmux_label, detail) =
         match keep_alive_status(state, facts, config, now_ms) {
             KeepAliveStatus::Off => return None,
@@ -11921,20 +12009,26 @@ fn keep_alive_chip_model(
                 let countdown = format_countdown(next_ping_ms.saturating_sub(now_ms));
                 (
                     Color::Accent,
-                    SharedString::from(format!("warm · ping in {countdown}")),
+                    SharedString::from(format!("{mode} · ping in {countdown}")),
                     SharedString::from(format!("ping in {countdown}")),
                     None,
                 )
             }
             KeepAliveStatus::SendNow | KeepAliveStatus::AwaitingReply { .. } => (
                 Color::Accent,
-                SharedString::from("warm · pinging…"),
+                SharedString::from(format!("{mode} · pinging…")),
                 SharedString::from("pinging…"),
+                None,
+            ),
+            KeepAliveStatus::CompactNow => (
+                Color::Accent,
+                SharedString::from(format!("{mode} · compacting…")),
+                SharedString::from("compacting…"),
                 None,
             ),
             KeepAliveStatus::Paused(reason) => (
                 Color::Warning,
-                SharedString::from("warm · paused"),
+                SharedString::from(format!("{mode} · paused")),
                 SharedString::from("paused"),
                 Some(pause_reason_text(reason).to_string()),
             ),
@@ -11943,7 +12037,7 @@ fn keep_alive_chip_model(
                 let max_hours = config.max_idle_ms / 3_600_000;
                 (
                     Color::Muted,
-                    SharedString::from("warm · stopped"),
+                    SharedString::from(format!("{mode} · stopped")),
                     SharedString::from("stopped"),
                     Some(format!(
                         "Idle for {idle_hours} h; keep-alive stops after {max_hours} h"
@@ -11960,10 +12054,21 @@ fn keep_alive_chip_model(
     let detail_text = detail.as_deref();
     Some(KeepAliveChip {
         enabled: true,
-        icon: IconName::Flame,
+        icon: if state.compact {
+            IconName::FoldVertical
+        } else {
+            IconName::Flame
+        },
         icon_color,
         label_color: icon_color,
-        tooltip_meta: keep_alive_tooltip_meta(config, context_tokens, rates, detail_text, error),
+        tooltip_meta: keep_alive_tooltip_meta(
+            config,
+            context_tokens,
+            rates,
+            state.compact,
+            detail_text,
+            error,
+        ),
         dock_tooltip: keep_alive_dock_tooltip(label.as_ref(), detail_text, error),
         tone: match icon_color {
             Color::Warning => BadgeTone::Warning,
@@ -12094,8 +12199,7 @@ impl ClaudeSessionLinks for TmuxClaudeSessionLinks {
     fn toggle_keep_alive(&self, session_id: &str, cx: &mut App) {
         let registry = crate::keep_alive_registry(cx);
         registry.update(cx, |registry, cx| {
-            registry.toggle(session_id);
-            cx.notify();
+            registry.toggle_shared(session_id, cx);
         });
     }
 
@@ -15349,6 +15453,7 @@ mod tests {
             // a send impossible rather than merely unused.
             tmux_target: None,
             bridge_session_id: None,
+            started_at: None,
         }
     }
 
@@ -16537,7 +16642,7 @@ mod tests {
             .map(|line| record(line.as_str()))
             .collect();
         let path: Vec<&TranscriptRecord> = records.iter().collect();
-        background_shells(&path)
+        background_shells(&path, None)
     }
 
     /// A backgrounded command writes to a file and says nothing more in the conversation,
@@ -16610,6 +16715,93 @@ mod tests {
                 note: SharedString::from("Running"),
             }],
             "only the shell still running is drawn"
+        );
+    }
+
+    /// `TaskStop` ends a shell without any notification being queued for it: its answer is
+    /// the only record, and a chip left pulsing for every stopped dev server piles up.
+    #[test]
+    fn a_shell_stopped_by_a_tool_call_is_over() {
+        let stop_result = serde_json::json!({
+            "type": "user",
+            "uuid": "m4",
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_stop",
+                "content": "{\"message\":\"Successfully stopped task: b1\"}",
+            }] },
+            "toolUseResult": { "message": "Successfully stopped task: b1", "task_id": "b1" },
+        })
+        .to_string();
+        let lines = [
+            tool_use_line(
+                "m1",
+                "toolu_01",
+                "Bash",
+                serde_json::json!({ "command": "pnpm dev", "description": "Start dev server" }),
+            ),
+            background_launch_line("m2", "toolu_01", "b1", "/tmp/tasks/b1.output"),
+            tool_use_line(
+                "m3",
+                "toolu_stop",
+                "TaskStop",
+                serde_json::json!({ "task_id": "b1" }),
+            ),
+            stop_result,
+        ];
+        let shells = shells_of(&lines);
+        assert_eq!(
+            shells
+                .iter()
+                .map(|shell| (shell.task_id.as_ref(), shell.finished))
+                .collect::<Vec<_>>(),
+            vec![("b1", true)],
+            "the stop's answer ends the shell it named"
+        );
+
+        // A stop that has not been answered yet has not stopped anything.
+        let shells = shells_of(&lines[..3]);
+        assert_eq!(shells.first().map(|shell| shell.finished), Some(false));
+    }
+
+    /// A shell belongs to the Claude process that started it and dies with it, so one launched
+    /// before the process now running the session started is over, notification or not.
+    #[test]
+    fn a_shell_launched_before_this_process_started_is_over() {
+        let launched_at = |line: String, timestamp: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&line).expect("parsing");
+            value["timestamp"] = serde_json::Value::from(timestamp);
+            value.to_string()
+        };
+        let lines = [
+            launched_at(
+                background_launch_line("m1", "toolu_01", "b-old", "/tmp/tasks/b-old.output"),
+                "2026-09-28T08:00:00.000Z",
+            ),
+            launched_at(
+                background_launch_line("m2", "toolu_02", "b-new", "/tmp/tasks/b-new.output"),
+                "2026-09-28T09:00:00.000Z",
+            ),
+        ];
+        let records: Vec<TranscriptRecord> =
+            lines.iter().map(|line| record(line.as_str())).collect();
+        let path: Vec<&TranscriptRecord> = records.iter().collect();
+        let process_started_ms = crate::timestamp_ms("2026-09-28T08:30:00.000Z");
+
+        let finished = |process_started_ms: Option<i64>| {
+            background_shells(&path, process_started_ms)
+                .iter()
+                .map(|shell| (shell.task_id.to_string(), shell.finished))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            finished(process_started_ms),
+            vec![("b-old".to_string(), true), ("b-new".to_string(), false)]
+        );
+        assert_eq!(
+            finished(None),
+            vec![("b-old".to_string(), false), ("b-new".to_string(), false)],
+            "with no process start known, nothing is assumed over"
         );
     }
 

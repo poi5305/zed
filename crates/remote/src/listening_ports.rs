@@ -1223,6 +1223,7 @@ python3   99999 user    3u  IPv4 0x000000000000beef      0t0  TCP *:8000 (LISTEN
             updated_at: None,
             tmux_target: None,
             bridge_session_id: None,
+            started_at: None,
         }
     }
 
