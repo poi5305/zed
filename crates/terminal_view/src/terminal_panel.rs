@@ -3367,4 +3367,250 @@ mod tests {
             crate::init(cx);
         });
     }
+
+    async fn workspace_with_database_id(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<MultiWorkspace>,
+        Entity<TerminalPanel>,
+        Entity<Workspace>,
+        WorkspaceId,
+    ) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("Failed to read workspace");
+        let workspace_id = workspace.update(cx, |workspace, _| {
+            workspace.set_random_database_id();
+            workspace.database_id().expect("a database id was just set")
+        });
+        let db = cx.update(|cx| crate::persistence::TerminalDb::global(cx));
+        db.write(move |connection| {
+            connection
+                .exec_bound::<WorkspaceId>("INSERT INTO workspaces (workspace_id) VALUES (?)")?(
+                workspace_id,
+            )
+        })
+        .await
+        .expect("Failed to insert the workspace row");
+        (window_handle, terminal_panel, workspace, workspace_id)
+    }
+
+    fn stale_reattach_json() -> String {
+        let stale = crate::persistence::ReattachableTask::from_spawned_task(&SpawnInTerminal {
+            id: TaskId(format!("{}tmux: old", crate::REATTACHABLE_TASK_ID_PREFIX)),
+            command: Some("tmux".to_string()),
+            ..SpawnInTerminal::default()
+        })
+        .expect("a tmux-attach task is re-attachable");
+        serde_json::to_string(&stale).expect("the task encodes")
+    }
+
+    #[gpui::test]
+    async fn test_terminal_without_reattach_task_clears_stale_row_under_its_id(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, _terminal_panel, workspace, workspace_id) =
+            workspace_with_database_id(cx).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let db = cx.update(|cx| crate::persistence::TerminalDb::global(cx));
+
+        let ordinary_task = SpawnInTerminal {
+            id: TaskId("cargo build".to_string()),
+            ..echo_task()
+        };
+        let task_terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_task(ordinary_task, cx)
+            })
+            .await
+            .expect("Failed to create a task terminal");
+        let shell_terminal = project
+            .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+            .await
+            .expect("Failed to create a shell terminal");
+
+        for (kind, terminal) in [("task", task_terminal), ("shell", shell_terminal)] {
+            let view = window_handle
+                .update(cx, |_, window, cx| {
+                    cx.new(|cx| {
+                        TerminalView::new(
+                            terminal,
+                            workspace.downgrade(),
+                            Some(workspace_id),
+                            project.downgrade(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .expect("Failed to create a terminal view");
+            let item_id = view.entity_id().as_u64();
+            db.save_reattach_task(item_id, workspace_id, Some(stale_reattach_json()))
+                .await
+                .expect("Failed to write the stale row");
+
+            let write = workspace.update(cx, |workspace, cx| {
+                view.update(cx, |view, cx| {
+                    workspace::item::SerializableItem::serialize(
+                        view, workspace, item_id, false, cx,
+                    )
+                })
+            });
+            if let Some(write) = write {
+                write.await.expect("Failed to serialize the terminal");
+            }
+
+            let actual = db
+                .get_reattach_task(item_id, workspace_id)
+                .expect("Failed to read the row");
+            assert_eq!(
+                actual, None,
+                "a {kind} terminal must not leave a stale re-attach task under its item id \
+                 (actual: {actual:?}, expected: None)"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_keeps_rows_of_terminal_panel_items(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, terminal_panel, _workspace, workspace_id) =
+            workspace_with_database_id(cx).await;
+        let db = cx.update(|cx| crate::persistence::TerminalDb::global(cx));
+
+        let attach_task = SpawnInTerminal {
+            id: TaskId(format!("{}tmux: work", crate::REATTACHABLE_TASK_ID_PREFIX)),
+            ..echo_task()
+        };
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |terminal_panel, cx| {
+                    terminal_panel.add_terminal_task(
+                        attach_task,
+                        RevealStrategy::Always,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("Failed to update the window")
+            .await
+            .expect("Failed to spawn the attach terminal");
+        cx.run_until_parked();
+
+        let item_id = terminal_panel.read_with(cx, |terminal_panel, cx| {
+            terminal_panel
+                .active_pane
+                .read(cx)
+                .items()
+                .next()
+                .expect("the attach terminal is in the panel")
+                .item_id()
+                .as_u64()
+        });
+        assert!(
+            db.get_reattach_task(item_id, workspace_id)
+                .expect("Failed to read the row")
+                .is_some(),
+            "precondition: the panel's attach terminal saved its task"
+        );
+
+        // `load_workspace` passes only the ids the center restored, never the panel's.
+        window_handle
+            .update(cx, |_, window, cx| {
+                <TerminalView as workspace::item::SerializableItem>::cleanup(
+                    workspace_id,
+                    Vec::new(),
+                    window,
+                    cx,
+                )
+            })
+            .expect("Failed to update the window")
+            .await
+            .expect("Failed to clean up");
+
+        let actual = db
+            .get_reattach_task(item_id, workspace_id)
+            .expect("Failed to read the row");
+        assert!(
+            actual.is_some(),
+            "cleanup must keep the row of a terminal alive in the terminal panel \
+             (actual: {actual:?}, expected: Some(task json))"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_keeps_rows_of_center_pane_terminals(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        let (window_handle, _terminal_panel, workspace, workspace_id) =
+            workspace_with_database_id(cx).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let db = cx.update(|cx| crate::persistence::TerminalDb::global(cx));
+
+        let attach_task = SpawnInTerminal {
+            id: TaskId(format!("{}tmux: work", crate::REATTACHABLE_TASK_ID_PREFIX)),
+            ..echo_task()
+        };
+        let terminal = project
+            .update(cx, |project, cx| project.create_terminal_task(attach_task, cx))
+            .await
+            .expect("Failed to create the attach terminal");
+        let item_id = window_handle
+            .update(cx, |_, window, cx| {
+                let view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace.downgrade(),
+                        Some(workspace_id),
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                });
+                let item_id = view.entity_id().as_u64();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+                });
+                item_id
+            })
+            .expect("Failed to add the attach terminal to the center");
+        cx.run_until_parked();
+        assert!(
+            db.get_reattach_task(item_id, workspace_id)
+                .expect("Failed to read the row")
+                .is_some(),
+            "precondition: the center's attach terminal saved its task"
+        );
+
+        // The terminal panel's restore passes only its own ids, never the center's.
+        window_handle
+            .update(cx, |_, window, cx| {
+                <TerminalView as workspace::item::SerializableItem>::cleanup(
+                    workspace_id,
+                    Vec::new(),
+                    window,
+                    cx,
+                )
+            })
+            .expect("Failed to update the window")
+            .await
+            .expect("Failed to clean up");
+
+        let actual = db
+            .get_reattach_task(item_id, workspace_id)
+            .expect("Failed to read the row");
+        assert!(
+            actual.is_some(),
+            "cleanup must keep the row of a terminal alive in a center pane \
+             (actual: {actual:?}, expected: Some(task json))"
+        );
+    }
 }

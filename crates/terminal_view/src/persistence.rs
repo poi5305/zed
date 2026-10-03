@@ -1,11 +1,14 @@
 use anyhow::Result;
 use async_recursion::async_recursion;
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use futures::future::join_all;
 use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use task::{
+    HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
+};
 use ui::{App, Context, Window};
 use util::ResultExt as _;
 
@@ -20,7 +23,7 @@ use workspace::{
 };
 
 use crate::{
-    TerminalView, default_working_directory,
+    TerminalView, default_working_directory, is_persisted_terminal, is_reattachable_task_id,
     terminal_panel::{TerminalPanel, new_terminal_pane},
 };
 
@@ -64,7 +67,7 @@ fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &mut App) -> Serialized
         .items()
         .filter_map(|item| {
             let terminal_view = item.act_as::<TerminalView>(cx)?;
-            if terminal_view.read(cx).terminal().read(cx).task().is_some() {
+            if !is_persisted_terminal(terminal_view.read(cx).terminal().read(cx)) {
                 None
             } else {
                 let id = item.item_id().as_u64();
@@ -450,6 +453,9 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN reattach_task TEXT;
+        ),
     ];
 }
 
@@ -540,5 +546,243 @@ impl TerminalDb {
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }
+    }
+
+    pub async fn save_reattach_task(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        reattach_task: Option<String>,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let query = "INSERT INTO terminals (item_id, workspace_id, reattach_task)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    reattach_task = excluded.reattach_task";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            statement.bind(&reattach_task, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        pub async fn delete_terminal(item_id: ItemId, workspace_id: WorkspaceId) -> Result<()> {
+            DELETE FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    query! {
+        fn get_reattach_task_column(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
+            SELECT reattach_task
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    /// A NULL column reads back as an empty string, and every plain shell's row has one.
+    pub fn get_reattach_task(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .get_reattach_task_column(item_id, workspace_id)?
+            .filter(|task| !task.is_empty()))
+    }
+}
+
+/// The task a re-attachable terminal was started with, as stored in the `terminals` table.
+///
+/// This is the task after `prepare_task_for_spawn` has wrapped its command in the shell,
+/// which is exactly what `Project::create_terminal_task` received the first time, so
+/// handing it back to `create_terminal_task` on restore wraps it in the shell once and,
+/// for a remote project, in the remote connection once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReattachableTask {
+    id: String,
+    full_label: String,
+    label: String,
+    command: Option<String>,
+    args: Vec<String>,
+    command_label: String,
+    cwd: Option<PathBuf>,
+    env: HashMap<String, String>,
+    use_new_terminal: bool,
+    allow_concurrent_runs: bool,
+    reveal: RevealStrategy,
+    reveal_target: RevealTarget,
+    hide: HideStrategy,
+    shell: Shell,
+    show_summary: bool,
+    show_command: bool,
+    show_rerun: bool,
+    save: SaveStrategy,
+}
+
+impl ReattachableTask {
+    pub(crate) fn from_spawned_task(spawned_task: &SpawnInTerminal) -> Option<Self> {
+        if !is_reattachable_task_id(&spawned_task.id) {
+            return None;
+        }
+        Some(Self {
+            id: spawned_task.id.0.clone(),
+            full_label: spawned_task.full_label.clone(),
+            label: spawned_task.label.clone(),
+            command: spawned_task.command.clone(),
+            args: spawned_task.args.clone(),
+            command_label: spawned_task.command_label.clone(),
+            cwd: spawned_task.cwd.clone(),
+            env: spawned_task.env.clone(),
+            use_new_terminal: spawned_task.use_new_terminal,
+            allow_concurrent_runs: spawned_task.allow_concurrent_runs,
+            reveal: spawned_task.reveal,
+            reveal_target: spawned_task.reveal_target,
+            hide: spawned_task.hide,
+            shell: spawned_task.shell.clone(),
+            show_summary: spawned_task.show_summary,
+            show_command: spawned_task.show_command,
+            show_rerun: spawned_task.show_rerun,
+            save: spawned_task.save,
+        })
+    }
+
+    pub(crate) fn into_spawned_task(self) -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId(self.id),
+            full_label: self.full_label,
+            label: self.label,
+            command: self.command,
+            args: self.args,
+            command_label: self.command_label,
+            cwd: self.cwd,
+            env: self.env,
+            use_new_terminal: self.use_new_terminal,
+            allow_concurrent_runs: self.allow_concurrent_runs,
+            reveal: self.reveal,
+            reveal_target: self.reveal_target,
+            hide: self.hide,
+            shell: self.shell,
+            show_summary: self.show_summary,
+            show_command: self.show_command,
+            show_rerun: self.show_rerun,
+            save: self.save,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::REATTACHABLE_TASK_ID_PREFIX;
+
+    #[test]
+    fn test_only_tmux_attach_tasks_are_reattachable() {
+        assert!(is_reattachable_task_id(&TaskId(format!(
+            "{REATTACHABLE_TASK_ID_PREFIX}tmux: work:2"
+        ))));
+        assert!(is_reattachable_task_id(&TaskId(
+            "tmux-attach-tmux: work".to_string()
+        )));
+        assert!(!is_reattachable_task_id(&TaskId(
+            "claude-session-claude attach agent-1".to_string()
+        )));
+        assert!(!is_reattachable_task_id(&TaskId(
+            "claude-session-tmux: work".to_string()
+        )));
+        assert!(!is_reattachable_task_id(&TaskId("cargo build".to_string())));
+        assert!(!is_reattachable_task_id(&TaskId::default()));
+    }
+
+    fn prepared_attach_task() -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId(format!("{REATTACHABLE_TASK_ID_PREFIX}tmux: work:2")),
+            full_label: "tmux: work:2".to_string(),
+            label: "tmux: work:2".to_string(),
+            command: Some("/bin/zsh".to_string()),
+            args: vec![
+                "-i".to_string(),
+                "-c".to_string(),
+                "tmux attach -t '=work:2'".to_string(),
+            ],
+            command_label: "/bin/zsh -i -c 'tmux attach -t '=work:2''".to_string(),
+            cwd: Some(PathBuf::from("/home/user/project")),
+            env: HashMap::from_iter([("TERM_PROGRAM".to_string(), "zed".to_string())]),
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::OnSuccess,
+            shell: Shell::Program("/bin/zsh".to_string()),
+            show_summary: false,
+            show_command: false,
+            show_rerun: true,
+            save: SaveStrategy::None,
+        }
+    }
+
+    #[test]
+    fn test_reattachable_task_round_trips_through_json() {
+        let spawned_task = prepared_attach_task();
+        let reattachable = ReattachableTask::from_spawned_task(&spawned_task)
+            .expect("a tmux attach task is re-attachable");
+        let json = serde_json::to_string(&reattachable).expect("the task encodes");
+        let decoded: ReattachableTask = serde_json::from_str(&json).expect("the task decodes");
+        assert_eq!(decoded.into_spawned_task(), spawned_task);
+
+        let ordinary_task = SpawnInTerminal {
+            id: TaskId("claude-session-claude attach agent-1".to_string()),
+            ..prepared_attach_task()
+        };
+        assert_eq!(ReattachableTask::from_spawned_task(&ordinary_task), None);
+    }
+
+    async fn test_db(name: &'static str) -> (TerminalDb, WorkspaceId) {
+        let db = TerminalDb(db::open_test_db::<(WorkspaceDb, TerminalDb)>(name).await);
+        let workspace_id = db
+            .write(|connection| {
+                connection
+                    .select_row::<WorkspaceId>(
+                        "INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id",
+                    )
+                    .unwrap()()
+                .unwrap()
+            })
+            .await
+            .unwrap();
+        (db, workspace_id)
+    }
+
+    #[gpui::test]
+    async fn test_reattach_task_column_round_trips() {
+        let (db, workspace_id) = test_db("test_reattach_task_column_round_trips").await;
+        let json = serde_json::to_string(
+            &ReattachableTask::from_spawned_task(&prepared_attach_task()).unwrap(),
+        )
+        .unwrap();
+
+        db.save_working_directory(1, workspace_id, PathBuf::from("/home/user/project"))
+            .await
+            .unwrap();
+        db.save_custom_title(1, workspace_id, None).await.unwrap();
+        db.save_reattach_task(1, workspace_id, Some(json.clone()))
+            .await
+            .unwrap();
+        assert_eq!(db.get_reattach_task(1, workspace_id).unwrap(), Some(json));
+        assert_eq!(
+            db.get_working_directory(1, workspace_id).unwrap(),
+            Some(PathBuf::from("/home/user/project")),
+            "saving the task must not clobber the rest of the row"
+        );
+
+        db.save_working_directory(2, workspace_id, PathBuf::from("/tmp"))
+            .await
+            .unwrap();
+        db.save_reattach_task(2, workspace_id, None).await.unwrap();
+        assert_eq!(db.get_reattach_task(2, workspace_id).unwrap(), None);
+        assert_eq!(db.get_reattach_task(3, workspace_id).unwrap(), None);
     }
 }

@@ -18,7 +18,7 @@ pub const DEFAULT_MESSAGE: &str = "ok";
 pub const ONE_HOUR_CACHE_MS: i64 = 3_600_000;
 /// How many pings in a row, each answered and none followed by a real answer, mean the user
 /// has left: after that many, a session set to compact is compacted and keep-alive turns off.
-pub const COMPACT_AFTER_PINGS: u32 = 3;
+pub const COMPACT_AFTER_PINGS: u32 = 2;
 /// How long an unanswered ping is waited for, on Zed's clock, before keep-alive pauses, and how long
 /// after a ping every newly observed answer still counts as part of its reply (see `observe_answer`).
 pub const PING_REPLY_WINDOW_MS: i64 = 600_000;

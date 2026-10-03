@@ -589,10 +589,10 @@ async fn two_zeds_with_keep_alive_on_send_one_ping(
     );
 }
 
-/// Spec item 5: after three answered pings in warm+compact, the next poll compacts once
+/// Spec item 5: after two answered pings in warm+compact, the next poll compacts once
 /// instead of pinging, and keep-alive is off from then on.
 #[gpui::test]
-async fn warm_and_compact_compacts_once_after_three_answered_pings(cx: &mut TestAppContext) {
+async fn warm_and_compact_compacts_once_after_two_answered_pings(cx: &mut TestAppContext) {
     let host = Arc::new(FakeHost::default());
     let now = now_millis();
     let machine = Machine::new(temporary_home("compact"), now - 59 * MINUTE_MS);
@@ -616,11 +616,7 @@ async fn warm_and_compact_compacts_once_after_three_answered_pings(cx: &mut Test
         initial.compact
     );
 
-    let replies = [
-        now - 58 * MINUTE_MS,
-        now - 57 * MINUTE_MS,
-        now - 56 * MINUTE_MS,
-    ];
+    let replies = [now - 58 * MINUTE_MS, now - 57 * MINUTE_MS];
     for (index, reply_at) in replies.iter().enumerate() {
         let expected_pings = index as u32 + 1;
         advance(cx, KEEP_ALIVE_POLL_INTERVAL);
@@ -641,7 +637,7 @@ async fn warm_and_compact_compacts_once_after_three_answered_pings(cx: &mut Test
         assert_eq!(
             machine.compacts(),
             0,
-            "nothing may be compacted before three pings are answered; got {} compacts \
+            "nothing may be compacted before two pings are answered; got {} compacts \
              after ping {expected_pings}, expected 0",
             machine.compacts()
         );
@@ -652,13 +648,13 @@ async fn warm_and_compact_compacts_once_after_three_answered_pings(cx: &mut Test
     assert_eq!(
         machine.compacts(),
         1,
-        "the poll after three answered pings must compact once; got {} compacts, expected 1",
+        "the poll after two answered pings must compact once; got {} compacts, expected 1",
         machine.compacts()
     );
     assert_eq!(
         machine.sends(),
-        3,
-        "the compacting poll must not also ping; got {} sends, expected 3",
+        2,
+        "the compacting poll must not also ping; got {} sends, expected 2",
         machine.sends()
     );
     let after_compact = state(cx);
@@ -676,9 +672,9 @@ async fn warm_and_compact_compacts_once_after_three_answered_pings(cx: &mut Test
     advance(cx, KEEP_ALIVE_SYNC_INTERVAL + Duration::from_secs(1));
     assert_eq!(
         (machine.sends(), machine.compacts()),
-        (3, 1),
+        (2, 1),
         "once off, nothing more is pinged or compacted; got (sends, compacts) = ({}, {}), \
-         expected (3, 1)",
+         expected (2, 1)",
         machine.sends(),
         machine.compacts()
     );
