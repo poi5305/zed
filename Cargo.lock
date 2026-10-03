@@ -3024,6 +3024,7 @@ dependencies = [
  "chrono",
  "collections",
  "fs",
+ "futures 0.3.32",
  "gpui",
  "markdown",
  "paths",

@@ -24,6 +24,8 @@ message ClaudeSession {
   optional int64 last_answer_at_ms = 13;
   // 0 unknown, 1 five minutes, 2 one hour.
   uint32 cache_ttl = 14;
+  // When the Claude process now running the session started, on the host's clock.
+  optional int64 started_at = 15;
 }
 
 // Request to list Claude Code sessions on the remote host.
@@ -211,6 +213,47 @@ message UninstallClaudeHooks {
 }
 
 message UninstallClaudeHooksResponse {}
+
+// The keep-alive state the host holds for sessions, shared by every Zed connected to it.
+message ReadClaudeKeepAlive {
+  uint64 project_id = 1;
+  repeated string session_ids = 2;
+}
+
+message ClaudeKeepAliveRecord {
+  string session_id = 1;
+  uint64 revision = 2;
+  string state_json = 3;
+}
+
+// Only the sessions that have a record are listed.
+message ReadClaudeKeepAliveResponse {
+  repeated ClaudeKeepAliveRecord records = 1;
+}
+
+// Replace a session's keep-alive state if its revision is still `expected_revision`
+// (0 when there is no record yet).
+message WriteClaudeKeepAlive {
+  uint64 project_id = 1;
+  string session_id = 2;
+  uint64 expected_revision = 3;
+  string state_json = 4;
+}
+
+// Applied: `record` is what was written. Not applied: `record` is what the host holds now,
+// absent when it holds nothing.
+message WriteClaudeKeepAliveResponse {
+  bool applied = 1;
+  optional ClaudeKeepAliveRecord record = 2;
+}
+
+// Type `/compact` into the tmux pane the session runs in.
+message CompactClaudeSession {
+  uint64 project_id = 1;
+  string session_id = 2;
+}
+
+message CompactClaudeSessionResponse {}
 
 message ClaudeHooksInstalled {
   uint64 project_id = 1;

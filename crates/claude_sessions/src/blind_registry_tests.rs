@@ -56,6 +56,7 @@ mod blind_registry_tests {
             updated_at: None,
             tmux_target: None,
             bridge_session_id: None,
+            started_at: None,
         }
     }
 

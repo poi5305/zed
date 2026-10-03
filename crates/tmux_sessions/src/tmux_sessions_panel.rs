@@ -487,7 +487,12 @@ impl TmuxSessionsPanel {
             .gap_0p5()
             .cursor_pointer()
             .tooltip(move |_, cx| {
-                Tooltip::with_meta("Keep prompt cache warm", None, tooltip.clone(), cx)
+                Tooltip::with_meta(
+                    "Keep prompt cache warm (click: off → warm → warm + compact)",
+                    None,
+                    tooltip.clone(),
+                    cx,
+                )
             })
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();

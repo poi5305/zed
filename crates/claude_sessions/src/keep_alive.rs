@@ -2,11 +2,11 @@
 //!
 //! No GPUI here. The store and the panels call these functions; they do not decide the rules.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use crate::session_registry::CacheTtl;
 
-pub const DEFAULT_INTERVAL_MINUTES: u32 = 50;
+pub const DEFAULT_INTERVAL_MINUTES: u32 = 55;
 pub const MIN_INTERVAL_MINUTES: u32 = 5;
 pub const MAX_INTERVAL_MINUTES: u32 = 55;
 pub const DEFAULT_MAX_HOURS: u32 = 12;
@@ -16,6 +16,9 @@ pub const MAX_MAX_HOURS: u32 = 48;
 /// the middle of a task, and telling Claude to stop there would derail it.
 pub const DEFAULT_MESSAGE: &str = "ok";
 pub const ONE_HOUR_CACHE_MS: i64 = 3_600_000;
+/// How many pings in a row, each answered and none followed by a real answer, mean the user
+/// has left: after that many, a session set to compact is compacted and keep-alive turns off.
+pub const COMPACT_AFTER_PINGS: u32 = 3;
 /// How long an unanswered ping is waited for, on Zed's clock, before keep-alive pauses, and how long
 /// after a ping every newly observed answer still counts as part of its reply (see `observe_answer`).
 pub const PING_REPLY_WINDOW_MS: i64 = 600_000;
@@ -62,9 +65,15 @@ impl Default for KeepAliveConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Serialized as the host's shared copy (see `session_registry::write_keep_alive_record`), so
+/// every field defaults: a copy written by an older Zed still reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeepAliveState {
     pub enabled: bool,
+    /// Compact the session and turn keep-alive off once `COMPACT_AFTER_PINGS` pings in a row
+    /// have been answered. Only meaningful while `enabled`.
+    pub compact: bool,
     /// Newest answer that was not the reply to a ping: the idle clock starts here.
     pub last_real_answer_ms: Option<i64>,
     /// Newest answer seen at all (a ping's reply included): the cache was last refreshed here.
@@ -100,6 +109,9 @@ pub enum KeepAliveStatus {
         cache_expires_ms: i64,
     },
     SendNow,
+    /// `COMPACT_AFTER_PINGS` pings were answered with no real answer between them, and the
+    /// session is set to compact: send `/compact` and turn keep-alive off.
+    CompactNow,
     AwaitingReply {
         sent_ms: i64,
     },
@@ -146,10 +158,11 @@ pub fn observe_answer(state: &mut KeepAliveState, last_answer_ms: Option<i64>, n
 
 /// Turns keep-alive on or off. Turning it on copies `last_seen_answer_ms` into `last_real_answer_ms`
 /// when a seen answer exists (always, including when the idle clock was already set), and clears
-/// `last_ping_ms`, `pings_sent`, and `ping_outstanding`. Turning off only sets enabled=false.
+/// `last_ping_ms`, `pings_sent`, and `ping_outstanding`. Turning off sets enabled=false and compact=false.
 pub fn set_enabled(state: &mut KeepAliveState, enabled: bool) {
     state.enabled = enabled;
     if !enabled {
+        state.compact = false;
         return;
     }
     if state.last_seen_answer_ms.is_some() {
@@ -158,6 +171,19 @@ pub fn set_enabled(state: &mut KeepAliveState, enabled: bool) {
     state.last_ping_ms = None;
     state.pings_sent = 0;
     state.ping_outstanding = false;
+}
+
+/// The next of the three modes a click moves through: off -> warm -> warm then compact -> off.
+/// Moving from warm to warm-then-compact keeps the pings already counted.
+pub fn cycle_mode(state: &mut KeepAliveState) {
+    if !state.enabled {
+        set_enabled(state, true);
+        state.compact = false;
+    } else if !state.compact {
+        state.compact = true;
+    } else {
+        set_enabled(state, false);
+    }
 }
 
 /// Records that a ping was just sent at `now_ms`: last_ping_ms = Some(now_ms), pings_sent += 1 (saturating),
@@ -203,6 +229,11 @@ pub fn status(
             return KeepAliveStatus::AwaitingReply { sent_ms: ping };
         }
         return KeepAliveStatus::Paused(PauseReason::PingUnanswered);
+    }
+    // Checked as soon as the last of those pings is answered, while the cache it refreshed is
+    // still warm: the compaction reads the whole context from it.
+    if state.compact && state.pings_sent >= COMPACT_AFTER_PINGS {
+        return KeepAliveStatus::CompactNow;
     }
     let expires = seen.saturating_add(ONE_HOUR_CACHE_MS);
     if now_ms >= expires {
@@ -271,6 +302,7 @@ mod tests {
     fn ready_state() -> KeepAliveState {
         KeepAliveState {
             enabled: true,
+            compact: false,
             last_real_answer_ms: Some(0),
             last_seen_answer_ms: Some(0),
             last_ping_ms: None,
@@ -483,6 +515,7 @@ mod tests {
     fn a_reply_seen_across_two_scans_does_not_restart_the_idle_clock() {
         let mut state = KeepAliveState {
             enabled: true,
+            compact: false,
             last_real_answer_ms: Some(1_000),
             last_seen_answer_ms: Some(1_000),
             last_ping_ms: Some(5_000),
@@ -515,6 +548,7 @@ mod tests {
     fn observe_answer_recognises_a_reply_timestamped_earlier_than_the_ping() {
         let mut state = KeepAliveState {
             enabled: true,
+            compact: false,
             last_real_answer_ms: Some(1_000),
             last_seen_answer_ms: Some(1_000),
             last_ping_ms: Some(5_000),
@@ -533,6 +567,7 @@ mod tests {
     fn turning_keep_alive_on_starts_the_idle_clock_at_the_newest_answer() {
         let mut state = KeepAliveState {
             enabled: false,
+            compact: false,
             last_real_answer_ms: None,
             last_seen_answer_ms: Some(40),
             last_ping_ms: Some(9),
@@ -577,7 +612,7 @@ mod tests {
     #[test]
     fn keep_alive_config_clamps_out_of_range_values_and_rejects_a_blank_message() {
         let defaults = KeepAliveConfig::new(None, None, None);
-        assert_eq!(defaults.interval_ms, 50 * MILLISECONDS_PER_MINUTE);
+        assert_eq!(defaults.interval_ms, 55 * MILLISECONDS_PER_MINUTE);
         assert_eq!(defaults.max_idle_ms, 12 * MILLISECONDS_PER_HOUR);
         assert_eq!(defaults.message, DEFAULT_MESSAGE);
         assert_eq!(defaults, KeepAliveConfig::default());
@@ -596,6 +631,76 @@ mod tests {
         assert_eq!(inside.interval_ms, 5 * MILLISECONDS_PER_MINUTE);
         assert_eq!(inside.max_idle_ms, 48 * MILLISECONDS_PER_HOUR);
         assert_eq!(inside.message, "ok");
+    }
+
+    #[test]
+    fn a_click_cycles_off_warm_compact_and_back_to_off() {
+        let mut state = KeepAliveState {
+            last_seen_answer_ms: Some(40),
+            ..KeepAliveState::default()
+        };
+        cycle_mode(&mut state);
+        assert!(state.enabled && !state.compact, "first click: warm");
+        assert_eq!(state.last_real_answer_ms, Some(40));
+
+        record_ping(&mut state, 100);
+        cycle_mode(&mut state);
+        assert!(
+            state.enabled && state.compact,
+            "second click: warm then compact"
+        );
+        assert_eq!(state.pings_sent, 1, "the pings already sent still count");
+
+        cycle_mode(&mut state);
+        assert!(!state.enabled && !state.compact, "third click: off");
+    }
+
+    #[test]
+    fn compaction_is_due_once_the_last_counted_ping_is_answered() {
+        let config = default_config();
+        let mut state = ready_state();
+        state.compact = true;
+        state.pings_sent = COMPACT_AFTER_PINGS;
+        state.last_ping_ms = Some(10);
+        state.ping_outstanding = true;
+        assert_eq!(
+            status(&state, hour_facts(), &config, 20),
+            KeepAliveStatus::AwaitingReply { sent_ms: 10 },
+            "not before the ping is answered"
+        );
+
+        state.ping_outstanding = false;
+        assert_eq!(
+            status(&state, hour_facts(), &config, 20),
+            KeepAliveStatus::CompactNow
+        );
+
+        state.compact = false;
+        assert_ne!(
+            status(&state, hour_facts(), &config, 20),
+            KeepAliveStatus::CompactNow,
+            "warm alone never compacts"
+        );
+
+        state.compact = true;
+        state.pings_sent = COMPACT_AFTER_PINGS - 1;
+        assert_ne!(
+            status(&state, hour_facts(), &config, 20),
+            KeepAliveStatus::CompactNow
+        );
+    }
+
+    #[test]
+    fn a_state_written_by_an_older_zed_still_reads() {
+        let state: KeepAliveState =
+            serde_json::from_str(r#"{"enabled":true,"pings_sent":2}"#).expect("parsing");
+        assert!(state.enabled);
+        assert!(!state.compact);
+        assert_eq!(state.pings_sent, 2);
+        let round_trip: KeepAliveState =
+            serde_json::from_str(&serde_json::to_string(&state).expect("encoding"))
+                .expect("parsing");
+        assert_eq!(round_trip, state);
     }
 
     #[test]

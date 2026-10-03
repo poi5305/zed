@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Global, SharedString, Task};
 use serde_json::Value;
@@ -23,15 +23,15 @@ use crate::{
     Turn,
     keep_alive::{
         CacheTtl, KeepAliveConfig, KeepAliveState, KeepAliveStatus, SessionFacts, observe_answer,
-        record_ping, status as keep_alive_status,
+        record_ping, set_enabled, status as keep_alive_status,
     },
     live_state::{
         ChannelInboxEvent, LiveState, StatusSnapshot, parse_channel_inbox_line, parse_hook_event,
         timestamp_ms,
     },
     session_registry::{
-        AgentListing, ChannelStatus, HookInstallOutcome, RegisteredSession, SubagentSummary,
-        TailProgress, TailState, TranscriptSpend, now_millis,
+        AgentListing, ChannelStatus, HookInstallOutcome, KeepAliveRecord, KeepAliveWrite,
+        RegisteredSession, SubagentSummary, TailProgress, TailState, TranscriptSpend, now_millis,
     },
     session_source::{SessionListing, SessionSource},
     transcript::{Transcript, TranscriptRecord, parse_record},
@@ -44,6 +44,11 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const HOOKS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CHANNEL_INBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const KEEP_ALIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the host's shared keep-alive is read: a change made on another Zed shows here
+/// within this.
+const KEEP_ALIVE_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a host that could not share keep-alive is left alone before it is asked again.
+const KEEP_ALIVE_UNSHARED_RETRY_MS: i64 = 10 * 60_000;
 const CHANNEL_STATUS_POLL_TICKS: u32 = 4;
 const CHANNEL_INBOX_EVENTS_CAP: usize = 200;
 /// How far apart the hook's `PermissionRequest` and the channel's `permission_request`
@@ -305,6 +310,9 @@ pub struct ClaudeSessionStore {
     _hooks_poll: Task<()>,
     _channel_poll: Task<()>,
     _keep_alive_poll: Task<()>,
+    _keep_alive_sync: Task<()>,
+    /// Until when keep-alive is kept on this Zed alone, because the host could not share it.
+    keep_alive_unshared_until_ms: Option<i64>,
     _outstanding_scan: Option<Task<()>>,
     _scan_watchdog: Option<Task<()>>,
 }
@@ -353,7 +361,71 @@ impl Global for KeepAliveRegistryGlobal {}
 pub struct KeepAliveRegistry {
     states: HashMap<String, KeepAliveState>,
     errors: HashMap<String, SharedString>,
+    /// The sessions whose state the machine they run on holds for every Zed connected to it,
+    /// and the revision of that copy this one was last in step with. A session missing here is
+    /// kept on this Zed alone: its host cannot share it, or has not been asked yet.
+    hosts: HashMap<String, KeepAliveHost>,
+    /// Sessions with a write to their host in flight. Reads of them are not adopted meanwhile:
+    /// the copy read predates the write, and adopting it would undo the change being written.
+    writing: HashSet<String>,
+    /// Sessions changed again while a write was in flight, written once it returns.
+    rewrite: HashSet<String>,
+    /// The mode a click on this Zed chose, kept until the host has taken it. A write that
+    /// conflicts — another Zed recorded an answer or a ping a moment earlier — applies the mode
+    /// to what the host holds and writes again, rather than dropping the click.
+    chosen_modes: HashMap<String, ChosenMode>,
     _tick: Task<()>,
+}
+
+const SHARE_ERROR_PREFIX: &str = "Could not share keep-alive with the host";
+
+/// How many times a click is written again over a host that keeps moving under it.
+const CHOSEN_MODE_RETRIES: u32 = 3;
+
+struct ChosenMode {
+    enabled: bool,
+    compact: bool,
+    retries_left: u32,
+}
+
+impl ChosenMode {
+    fn apply(&self, state: &mut KeepAliveState) {
+        if !self.enabled {
+            set_enabled(state, false);
+            return;
+        }
+        if !state.enabled {
+            set_enabled(state, true);
+        }
+        state.compact = self.compact;
+    }
+}
+
+struct KeepAliveHost {
+    source: Arc<dyn SessionSource>,
+    revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepAliveAction {
+    Ping,
+    Compact,
+}
+
+impl KeepAliveAction {
+    fn apply(self, state: &mut KeepAliveState, now_ms: i64) {
+        match self {
+            Self::Ping => record_ping(state, now_ms),
+            Self::Compact => set_enabled(state, false),
+        }
+    }
+}
+
+/// What a session is due, taken by this Zed. With a host, the claim still has to be written
+/// there before the action is sent; without one it is already recorded.
+struct KeepAliveClaim {
+    action: KeepAliveAction,
+    host: Option<(Arc<dyn SessionSource>, u64, KeepAliveState)>,
 }
 
 impl KeepAliveRegistry {
@@ -361,6 +433,10 @@ impl KeepAliveRegistry {
         Self {
             states: HashMap::default(),
             errors: HashMap::default(),
+            hosts: HashMap::default(),
+            writing: HashSet::default(),
+            rewrite: HashSet::default(),
+            chosen_modes: HashMap::default(),
             _tick: cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
@@ -397,10 +473,28 @@ impl KeepAliveRegistry {
         *state != before
     }
 
+    /// Moves the session to its next mode: off, warm, warm then compact, and off again.
     pub fn toggle(&mut self, session_id: &str) {
         let state = self.states.entry(session_id.to_string()).or_default();
-        let enabled = !state.enabled;
-        crate::keep_alive::set_enabled(state, enabled);
+        crate::keep_alive::cycle_mode(state);
+    }
+
+    /// [`Self::toggle`], then the change written to the host so every Zed sees it.
+    pub fn toggle_shared(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        self.toggle(session_id);
+        if self.hosts.contains_key(session_id) {
+            let state = self.state(session_id);
+            self.chosen_modes.insert(
+                session_id.to_string(),
+                ChosenMode {
+                    enabled: state.enabled,
+                    compact: state.compact,
+                    retries_left: CHOSEN_MODE_RETRIES,
+                },
+            );
+        }
+        self.push(session_id, cx);
+        cx.notify();
     }
 
     pub fn set_error(&mut self, session_id: &str, error: Option<String>) {
@@ -415,20 +509,248 @@ impl KeepAliveRegistry {
         }
     }
 
-    pub fn record_ping_if_send_now(
+    /// Takes in what the host holds for a session, as read through `source`. `None` is a
+    /// session the host holds nothing for yet: this copy stands until the next change writes it.
+    fn adopt_host_copy(
+        &mut self,
+        session_id: &str,
+        source: Arc<dyn SessionSource>,
+        record: Option<KeepAliveRecord>,
+    ) -> bool {
+        let known_revision = self.hosts.get(session_id).map(|host| host.revision);
+        self.hosts.insert(
+            session_id.to_string(),
+            KeepAliveHost {
+                source,
+                revision: known_revision.unwrap_or(0),
+            },
+        );
+        if self.writing.contains(session_id) {
+            return false;
+        }
+        self.adopt_record(session_id, record)
+    }
+
+    fn adopt_record(&mut self, session_id: &str, record: Option<KeepAliveRecord>) -> bool {
+        let Some(host) = self.hosts.get_mut(session_id) else {
+            return false;
+        };
+        let Some(record) = record else {
+            host.revision = 0;
+            return false;
+        };
+        // A read that left the host before a write this Zed has since seen applied.
+        if record.revision < host.revision {
+            return false;
+        }
+        // Taken even when the state cannot be read, so the next write from here replaces it
+        // instead of conflicting with it forever.
+        host.revision = record.revision;
+        let Some(state) = serde_json::from_str::<KeepAliveState>(&record.state_json)
+            .context("parsing the host's keep-alive state")
+            .log_err()
+        else {
+            return false;
+        };
+        let previous = self.states.insert(session_id.to_string(), state.clone());
+        previous.as_ref() != Some(&state)
+    }
+
+    /// Assumes the session's host shares keep-alive until a read says otherwise. Revision 0
+    /// until a read says which one the host is at.
+    fn link_host(&mut self, session_id: &str, source: Arc<dyn SessionSource>) {
+        self.hosts
+            .entry(session_id.to_string())
+            .or_insert(KeepAliveHost {
+                source,
+                revision: 0,
+            });
+    }
+
+    /// The host cannot share these sessions' state; it is kept on this Zed alone.
+    fn forget_hosts(&mut self, session_ids: &[String]) {
+        for session_id in session_ids {
+            self.hosts.remove(session_id);
+        }
+    }
+
+    /// Writes this copy of the session's state to its host, when it has one.
+    fn push(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.get(session_id) else {
+            return;
+        };
+        if !self.writing.insert(session_id.to_string()) {
+            self.rewrite.insert(session_id.to_string());
+            return;
+        }
+        let source = host.source.clone();
+        let expected_revision = host.revision;
+        let state = self.state(session_id);
+        let session_id = session_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = write_keep_alive_copy(
+                source.as_ref(),
+                session_id.clone(),
+                expected_revision,
+                &state,
+                cx,
+            )
+            .await;
+            this.update(cx, |registry, cx| {
+                registry.finish_write(&session_id, result, None, cx);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Settles a write that `push` or a claim started. `action` is the claim's, applied to this
+    /// copy once the host has taken it — to the copy as it is now, so that a change made while
+    /// the write was in flight is kept and written next. Reports whether the host took it.
+    fn finish_write(
+        &mut self,
+        session_id: &str,
+        result: Result<KeepAliveWrite>,
+        action: Option<(KeepAliveAction, i64)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.writing.remove(session_id);
+        let applied = match result {
+            Ok(KeepAliveWrite::Applied(record)) => {
+                if let Some(host) = self.hosts.get_mut(session_id) {
+                    host.revision = record.revision;
+                }
+                if self
+                    .errors
+                    .get(session_id)
+                    .is_some_and(|error| error.starts_with(SHARE_ERROR_PREFIX))
+                {
+                    self.errors.remove(session_id);
+                }
+                if let Some((action, now_ms)) = action {
+                    let state = self.states.entry(session_id.to_string()).or_default();
+                    action.apply(state, now_ms);
+                }
+                true
+            }
+            Ok(KeepAliveWrite::Conflict(record)) => {
+                // Another Zed changed it first, and what it wrote wins — except the mode a click
+                // here chose, which is laid over it and written again.
+                self.rewrite.remove(session_id);
+                self.adopt_record(session_id, record);
+                if let Some(chosen) = self.chosen_modes.get_mut(session_id)
+                    && chosen.retries_left > 0
+                {
+                    chosen.retries_left -= 1;
+                    let state = self.states.entry(session_id.to_string()).or_default();
+                    chosen.apply(state);
+                    self.rewrite.insert(session_id.to_string());
+                } else {
+                    self.chosen_modes.remove(session_id);
+                }
+                false
+            }
+            Err(error) => {
+                self.chosen_modes.remove(session_id);
+                self.set_error(session_id, Some(format!("{SHARE_ERROR_PREFIX}: {error:#}")));
+                false
+            }
+        };
+        if applied && !self.rewrite.contains(session_id) {
+            self.chosen_modes.remove(session_id);
+        }
+        if self.rewrite.remove(session_id) {
+            self.push(session_id, cx);
+        }
+        applied
+    }
+
+    /// Writes a claim taken by [`Self::claim`] to the host, reporting on the returned channel
+    /// whether the host took it. Run on the registry rather than by the store that asked, so
+    /// that the claim is settled — and the session's write slot freed — even when that store is
+    /// dropped while the write is in flight.
+    fn write_claim(
+        &mut self,
+        session_id: String,
+        action: KeepAliveAction,
+        now_ms: i64,
+        source: Arc<dyn SessionSource>,
+        expected_revision: u64,
+        next: KeepAliveState,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::oneshot::Receiver<bool> {
+        let (settled, receiver) = futures::channel::oneshot::channel();
+        cx.spawn(async move |this, cx| {
+            let result = write_keep_alive_copy(
+                source.as_ref(),
+                session_id.clone(),
+                expected_revision,
+                &next,
+                cx,
+            )
+            .await;
+            let applied = this
+                .update(cx, |registry, cx| {
+                    let applied =
+                        registry.finish_write(&session_id, result, Some((action, now_ms)), cx);
+                    cx.notify();
+                    applied
+                })
+                .unwrap_or(false);
+            // The store may be gone; the claim is settled either way.
+            settled.send(applied).ok();
+        })
+        .detach();
+        receiver
+    }
+
+    /// Takes the ping or compaction the session is due, if any, so that only this Zed sends it.
+    fn claim(
         &mut self,
         session_id: &str,
         facts: SessionFacts,
         config: &KeepAliveConfig,
         now_ms: i64,
-    ) -> bool {
-        let state = self.states.entry(session_id.to_string()).or_default();
-        if keep_alive_status(state, facts, config, now_ms) != KeepAliveStatus::SendNow {
-            return false;
+    ) -> Option<KeepAliveClaim> {
+        // Decided again by the next poll, from what that write leaves behind.
+        if self.writing.contains(session_id) {
+            return None;
         }
-        record_ping(state, now_ms);
-        true
+        let state = self.states.entry(session_id.to_string()).or_default();
+        let action = match keep_alive_status(state, facts, config, now_ms) {
+            KeepAliveStatus::SendNow => KeepAliveAction::Ping,
+            KeepAliveStatus::CompactNow => KeepAliveAction::Compact,
+            _ => return None,
+        };
+        let Some(host) = self.hosts.get(session_id) else {
+            action.apply(state, now_ms);
+            return Some(KeepAliveClaim { action, host: None });
+        };
+        let mut next = state.clone();
+        action.apply(&mut next, now_ms);
+        let host = (host.source.clone(), host.revision, next);
+        self.writing.insert(session_id.to_string());
+        Some(KeepAliveClaim {
+            action,
+            host: Some(host),
+        })
     }
+}
+
+async fn write_keep_alive_copy(
+    source: &dyn SessionSource,
+    session_id: String,
+    expected_revision: u64,
+    state: &KeepAliveState,
+    cx: &mut gpui::AsyncApp,
+) -> Result<KeepAliveWrite> {
+    let state_json = serde_json::to_string(state)?;
+    source
+        .write_keep_alive(session_id, expected_revision, state_json)
+        .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+        .await
+        .unwrap_or_else(|_| Err(anyhow!(timeout_message("sharing keep-alive with the host"))))
 }
 
 pub fn keep_alive_registry(cx: &mut App) -> Entity<KeepAliveRegistry> {
@@ -450,6 +772,7 @@ struct KeepAlivePing {
     process_id: u32,
     message: String,
     config: KeepAliveConfig,
+    action: KeepAliveAction,
     source: Arc<dyn SessionSource>,
 }
 
@@ -506,6 +829,8 @@ impl ClaudeSessionStore {
             _hooks_poll: Task::ready(()),
             _channel_poll: Task::ready(()),
             _keep_alive_poll: Task::ready(()),
+            _keep_alive_sync: Task::ready(()),
+            keep_alive_unshared_until_ms: None,
             _outstanding_scan: None,
             _scan_watchdog: None,
         };
@@ -516,6 +841,7 @@ impl ClaudeSessionStore {
         this._hooks_poll = this.spawn_hooks_poll(cx);
         this._channel_poll = this.spawn_channel_poll(cx);
         this._keep_alive_poll = this.spawn_keep_alive_poll(cx);
+        this._keep_alive_sync = this.spawn_keep_alive_sync(cx);
         keep_alive_registry(cx);
         this
     }
@@ -849,7 +1175,10 @@ impl ClaudeSessionStore {
     }
 
     fn observe_keep_alive_answers(&mut self, cx: &mut Context<Self>) {
-        let answers: Vec<(String, Option<i64>)> = self
+        let shared = self
+            .keep_alive_unshared_until_ms
+            .is_none_or(|until| now_millis() >= until);
+        let answers: Vec<(String, Option<i64>, bool)> = self
             .live_sessions
             .iter()
             .map(|live| {
@@ -857,14 +1186,27 @@ impl ClaudeSessionStore {
                     .session_spend
                     .get(&live.session.session_id)
                     .and_then(|spend| spend.last_answer_at_ms);
-                (live.session.session_id.clone(), answered_at)
+                let linkable = shared && !live.background && live.process_id != 0;
+                (live.session.session_id.clone(), answered_at, linkable)
             })
             .collect();
+        let source = self.source.clone();
         let registry = keep_alive_registry(cx);
         registry.update(cx, |registry, cx| {
             let mut changed = false;
-            for (session_id, answered_at) in answers {
+            for (session_id, answered_at, linkable) in answers {
+                // Linked before the first read, so that a click in that window is written to
+                // the host at once — as revision 0, which the host refuses if it already holds
+                // a record, and this copy then takes that record.
+                if linkable {
+                    registry.link_host(&session_id, source.clone());
+                }
                 if registry.observe(&session_id, answered_at) {
+                    // An answer only matters to another Zed once keep-alive is on; turning it on
+                    // starts the idle clock from the newest answer this Zed has seen.
+                    if registry.state(&session_id).enabled {
+                        registry.push(&session_id, cx);
+                    }
                     changed = true;
                 }
             }
@@ -885,6 +1227,91 @@ impl ClaudeSessionStore {
                 };
                 for ping in due {
                     Self::send_keep_alive(this.clone(), ping, cx).await;
+                }
+            }
+        })
+    }
+
+    /// Its own loop, faster than the one that sends pings, so a change made on another Zed
+    /// shows here soon, and so that the first read lands before the first ping is decided.
+    fn spawn_keep_alive_sync(&self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(KEEP_ALIVE_SYNC_INTERVAL)
+                    .await;
+                if Self::sync_keep_alive(this.clone(), cx).await.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Reads what the host holds for the sessions this store follows, so that a change one Zed
+    /// makes is what every other Zed connected to that machine shows and acts on. Errs only
+    /// once the store is gone.
+    async fn sync_keep_alive(this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp) -> Result<()> {
+        let request = this.update(cx, |store, _| {
+            let now_ms = now_millis();
+            if store
+                .keep_alive_unshared_until_ms
+                .is_some_and(|until| now_ms < until)
+            {
+                return None;
+            }
+            let session_ids: Vec<String> = store
+                .live_sessions
+                .iter()
+                .filter(|live| !live.background && live.process_id != 0)
+                .map(|live| live.session.session_id.clone())
+                .collect();
+            (!session_ids.is_empty()).then(|| (store.source.clone(), session_ids))
+        })?;
+        let Some((source, session_ids)) = request else {
+            return Ok(());
+        };
+        let read = source
+            .read_keep_alive(session_ids.clone())
+            .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+            .await
+            .unwrap_or_else(|_| Err(anyhow!(timeout_message("reading the shared keep-alive"))));
+        this.update(cx, |store, cx| {
+            let registry = keep_alive_registry(cx);
+            match read {
+                Ok(records) => {
+                    store.keep_alive_unshared_until_ms = None;
+                    let mut records: HashMap<String, KeepAliveRecord> = records
+                        .into_iter()
+                        .map(|record| (record.session_id.clone(), record))
+                        .collect();
+                    registry.update(cx, |registry, cx| {
+                        let mut changed = false;
+                        for session_id in &session_ids {
+                            let record = records.remove(session_id);
+                            let host_has_none = record.is_none();
+                            if registry.adopt_host_copy(session_id, source.clone(), record) {
+                                changed = true;
+                            }
+                            // Turned on here before the host was known to share it: written
+                            // now, or no other Zed would ever see it on.
+                            if host_has_none && registry.state(session_id).enabled {
+                                registry.push(session_id, cx);
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    });
+                }
+                Err(error) => {
+                    // An older remote server does not know the request; asking it again on
+                    // every poll would only wait out the same timeout each time.
+                    Err::<(), _>(error)
+                        .context("keep-alive is not shared through this host")
+                        .log_err();
+                    store.keep_alive_unshared_until_ms =
+                        Some(now_millis().saturating_add(KEEP_ALIVE_UNSHARED_RETRY_MS));
+                    registry.update(cx, |registry, _| registry.forget_hosts(&session_ids));
                 }
             }
         })
@@ -919,56 +1346,79 @@ impl ClaudeSessionStore {
                     .unwrap_or(CacheTtl::Unknown),
                 channel_live: true,
             };
-            if keep_alive_status(&state, facts, &config, now_ms) != KeepAliveStatus::SendNow {
-                continue;
-            }
+            let action = match keep_alive_status(&state, facts, &config, now_ms) {
+                KeepAliveStatus::SendNow => KeepAliveAction::Ping,
+                KeepAliveStatus::CompactNow => KeepAliveAction::Compact,
+                _ => continue,
+            };
             due.push(KeepAlivePing {
                 session_id: session_id.to_string(),
                 process_id: live.process_id,
                 message: config.message.clone(),
                 config: config.clone(),
+                action,
                 source: self.source.clone(),
             });
         }
         due
     }
 
-    fn claim_keep_alive_ping(
-        &mut self,
-        session_id: &str,
-        config: &KeepAliveConfig,
-        now_ms: i64,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let (background, process_id) = {
-            let Some(live) = self
-                .live_sessions
-                .iter()
-                .find(|live| live.session.session_id == session_id)
-            else {
-                return false;
-            };
-            (live.background, live.process_id)
+    /// Takes the session's due ping or compaction for this Zed, writing the claim to the host
+    /// first when the host shares keep-alive. Only the Zed whose write lands sends it.
+    async fn claim_keep_alive(
+        this: &gpui::WeakEntity<Self>,
+        ping: &KeepAlivePing,
+        cx: &mut gpui::AsyncApp,
+    ) -> Option<KeepAliveAction> {
+        let now_ms = now_millis();
+        let claim = this
+            .update(cx, |store, cx| {
+                let (background, process_id) = {
+                    let live = store
+                        .live_sessions
+                        .iter()
+                        .find(|live| live.session.session_id == ping.session_id)?;
+                    (live.background, live.process_id)
+                };
+                if background || process_id == 0 {
+                    return None;
+                }
+                let facts = SessionFacts {
+                    cache_ttl: store
+                        .session_spend
+                        .get(&ping.session_id)
+                        .map(|spend| spend.cache_ttl)
+                        .unwrap_or(CacheTtl::Unknown),
+                    channel_live: true,
+                };
+                let registry = keep_alive_registry(cx);
+                registry.update(cx, |registry, cx| {
+                    let claim = registry.claim(&ping.session_id, facts, &ping.config, now_ms);
+                    if claim.is_some() {
+                        cx.notify();
+                    }
+                    claim
+                })
+            })
+            .ok()??;
+        let Some((source, expected_revision, next)) = claim.host else {
+            return Some(claim.action);
         };
-        if background || process_id == 0 {
-            return false;
-        }
-        let facts = SessionFacts {
-            cache_ttl: self
-                .session_spend
-                .get(session_id)
-                .map(|spend| spend.cache_ttl)
-                .unwrap_or(CacheTtl::Unknown),
-            channel_live: true,
-        };
-        let registry = keep_alive_registry(cx);
-        registry.update(cx, |registry, cx| {
-            let claimed = registry.record_ping_if_send_now(session_id, facts, config, now_ms);
-            if claimed {
-                cx.notify();
-            }
-            claimed
-        })
+        let settled = cx.update(|cx| {
+            keep_alive_registry(cx).update(cx, |registry, cx| {
+                registry.write_claim(
+                    ping.session_id.clone(),
+                    claim.action,
+                    now_ms,
+                    source,
+                    expected_revision,
+                    next,
+                    cx,
+                )
+            })
+        });
+        let applied = settled.await.unwrap_or(false);
+        applied.then_some(claim.action)
     }
 
     fn set_keep_alive_error(
@@ -989,60 +1439,59 @@ impl ClaudeSessionStore {
         ping: KeepAlivePing,
         cx: &mut gpui::AsyncApp,
     ) {
-        // Bounded because the poll awaits each ping in turn: a host that never answers
-        // would otherwise stop keep-alive for every session this store follows.
-        let status = ping
-            .source
-            .channel_status(ping.process_id)
-            .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
-            .await
-            .unwrap_or_else(|_| Err(anyhow!(timeout_message("reading channel status"))));
-        let live = match &status {
-            Ok(status) => status.live,
-            Err(_) => false,
-        };
-        if !live {
-            let message = match status {
-                Err(error) => format!("{error:#}"),
-                Ok(_) => "Channel not loaded".to_string(),
+        if ping.action == KeepAliveAction::Ping {
+            // Bounded because the poll awaits each ping in turn: a host that never answers
+            // would otherwise stop keep-alive for every session this store follows.
+            let status = ping
+                .source
+                .channel_status(ping.process_id)
+                .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+                .await
+                .unwrap_or_else(|_| Err(anyhow!(timeout_message("reading channel status"))));
+            let live = match &status {
+                Ok(status) => status.live,
+                Err(_) => false,
             };
-            this.update(cx, |store, cx| {
-                store.set_keep_alive_error(&ping.session_id, Some(message), cx);
-            })
-            .log_err();
-            return;
-        }
-
-        let now_ms = now_millis();
-        let claimed = this.update(cx, |store, cx| {
-            store.claim_keep_alive_ping(&ping.session_id, &ping.config, now_ms, cx)
-        });
-        if !claimed.unwrap_or(false) {
-            return;
-        }
-
-        // The ping is already recorded, so a send that times out but did arrive is
-        // waited on as unanswered rather than sent again.
-        match ping
-            .source
-            .channel_send_message(ping.process_id, ping.message)
-            .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
-            .await
-            .unwrap_or_else(|_| Err(anyhow!(timeout_message("sending the keep-alive message"))))
-        {
-            Ok(_) => {
+            if !live {
+                let message = match status {
+                    Err(error) => format!("{error:#}"),
+                    Ok(_) => "Channel not loaded".to_string(),
+                };
                 this.update(cx, |store, cx| {
-                    store.set_keep_alive_error(&ping.session_id, None, cx);
+                    store.set_keep_alive_error(&ping.session_id, Some(message), cx);
                 })
                 .log_err();
-            }
-            Err(error) => {
-                this.update(cx, |store, cx| {
-                    store.set_keep_alive_error(&ping.session_id, Some(format!("{error:#}")), cx);
-                })
-                .log_err();
+                return;
             }
         }
+
+        let Some(action) = Self::claim_keep_alive(&this, &ping, cx).await else {
+            return;
+        };
+
+        // The claim is already recorded, so a send that times out but did arrive is waited
+        // on as unanswered rather than sent again.
+        let sent = match action {
+            KeepAliveAction::Ping => ping
+                .source
+                .channel_send_message(ping.process_id, ping.message)
+                .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+                .await
+                .unwrap_or_else(|_| Err(anyhow!(timeout_message("sending the keep-alive message"))))
+                .map(|_| ()),
+            KeepAliveAction::Compact => ping
+                .source
+                .compact_session(ping.session_id.clone())
+                .with_timeout(REGISTRY_SCAN_TIMEOUT, cx.background_executor())
+                .await
+                .unwrap_or_else(|_| Err(anyhow!(timeout_message("compacting the session"))))
+                .context("compacting after keep-alive"),
+        };
+        let error = sent.err().map(|error| format!("{error:#}"));
+        this.update(cx, |store, cx| {
+            store.set_keep_alive_error(&ping.session_id, error, cx);
+        })
+        .log_err();
     }
 
     pub fn can_interrupt(&self) -> bool {
@@ -1301,6 +1750,7 @@ impl ClaudeSessionStore {
                 updated_at: Some(ended.last_seen_ms),
                 tmux_target: ended.tmux.clone(),
                 bridge_session_id: ended.bridge_session_id.clone(),
+                started_at: None,
             },
             transcript_path,
         ))
@@ -2286,6 +2736,7 @@ impl ClaudeSessionStore {
                             updated_at: None,
                             tmux_target: None,
                             bridge_session_id: None,
+                            started_at: None,
                         },
                         background: true,
                         agent_id: listing.id.clone(),
@@ -2554,6 +3005,37 @@ mod tests {
             Ok(None) => {}
             other => panic!("a blank line should parse to no record, got {other:?}"),
         }
+    }
+
+    /// A host record this Zed cannot parse must still move it to that revision: otherwise
+    /// every later write expects the old one, conflicts, re-reads the same record, and the
+    /// session can never be changed from this Zed again.
+    #[gpui::test]
+    fn test_an_unreadable_host_state_still_advances_the_known_revision(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let home_directory = temporary_directory("keep-alive-unreadable-state");
+        let source: Arc<dyn SessionSource> =
+            Arc::new(FakeSource::new(home_directory.clone(), HashMap::default()));
+        let registry = cx.new(KeepAliveRegistry::new);
+        let known_revision = registry.update(cx, |registry, _| {
+            registry.adopt_host_copy(
+                "session-a",
+                source,
+                Some(KeepAliveRecord {
+                    session_id: "session-a".to_string(),
+                    revision: 3,
+                    state_json: r#"{"enabled":"yes"}"#.to_string(),
+                }),
+            );
+            registry.hosts.get("session-a").map(|host| host.revision)
+        });
+        assert_eq!(
+            known_revision,
+            Some(3),
+            "the next write must expect the revision the host is at"
+        );
+        std::fs::remove_dir_all(&home_directory).ok();
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

@@ -22,7 +22,7 @@ use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet};
 use futures::future::try_join;
 use gpui::BackgroundExecutor;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smol::io::AsyncReadExt as _;
 use util::ResultExt as _;
 
@@ -55,6 +55,9 @@ pub struct RegisteredSession {
     pub tmux_target: Option<String>,
     #[serde(rename = "bridgeSessionId", default)]
     pub bridge_session_id: Option<String>,
+    /// When the Claude process now running the session started, on the host's clock.
+    #[serde(rename = "startedAt", default)]
+    pub started_at: Option<i64>,
 }
 
 /// 解析單一註冊檔。未知欄位忽略，缺少必要欄位回 Err。
@@ -1125,6 +1128,245 @@ pub fn channel_send_message(home: &Path, claude_pid: u32, content: &str) -> Resu
             "meta": { "from": "zed" },
         }),
     )
+}
+
+/// The keep-alive state every Zed connected to this machine shares, one record per session.
+///
+/// Two Zeds following the same session would otherwise each keep it warm on their own clock and
+/// send twice the pings; and turning keep-alive off on one would leave the other still sending.
+/// Every change is a compare-and-swap on the record's revision, under an advisory lock, so the
+/// first Zed to claim a ping is the only one that sends it.
+const KEEP_ALIVE_STATE_FILE: &str = "zed-keep-alive.json";
+const KEEP_ALIVE_LOCK_FILE: &str = "zed-keep-alive.lock";
+/// The state is a handful of numbers; anything larger is not one.
+pub const KEEP_ALIVE_STATE_MAX_BYTES: usize = 4096;
+const KEEP_ALIVE_SESSION_ID_MAX_BYTES: usize = 128;
+/// Records nobody has written for this long belong to sessions long gone, and are dropped the
+/// next time any record is written so the file does not grow forever.
+const KEEP_ALIVE_RECORD_MAX_AGE_MS: i64 = 7 * 24 * 3_600_000;
+/// How long tmux is given to type into a pane.
+const TMUX_SEND_KEYS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Between typing `/compact` and pressing Enter: Claude Code's prompt reads a burst of
+/// keystrokes as a paste, and a paste ending in Enter is a newline rather than a submit.
+const COMPACT_ENTER_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeepAliveRecord {
+    pub session_id: String,
+    /// Starts at 1 and grows by one on every write. A session with no record is revision 0.
+    pub revision: u64,
+    /// A JSON object this module stores without reading.
+    pub state_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeepAliveWrite {
+    Applied(KeepAliveRecord),
+    /// The record had moved past the expected revision; this is what it holds now, `None` when
+    /// there is no record at all.
+    Conflict(Option<KeepAliveRecord>),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct KeepAliveFile {
+    #[serde(default)]
+    sessions: std::collections::BTreeMap<String, StoredKeepAlive>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredKeepAlive {
+    revision: u64,
+    state: serde_json::Value,
+    updated_at_ms: i64,
+}
+
+impl StoredKeepAlive {
+    fn record(&self, session_id: &str) -> KeepAliveRecord {
+        KeepAliveRecord {
+            session_id: session_id.to_string(),
+            revision: self.revision,
+            state_json: self.state.to_string(),
+        }
+    }
+}
+
+fn keep_alive_state_path(home: &Path) -> PathBuf {
+    home.join(".claude").join(KEEP_ALIVE_STATE_FILE)
+}
+
+/// A file that cannot be parsed is read as empty rather than as an error: every Zed would
+/// otherwise be unable to turn keep-alive on or off until someone deleted it by hand, and the
+/// next write replaces it.
+fn load_keep_alive_file(path: &Path) -> Result<KeepAliveFile> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(KeepAliveFile::default());
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let Some(value) = serde_json::from_slice::<serde_json::Value>(&contents)
+        .with_context(|| format!("parsing {}", path.display()))
+        .log_err()
+    else {
+        return Ok(KeepAliveFile::default());
+    };
+    // Each record is parsed on its own, so one that does not parse is dropped alone rather
+    // than taking every other session's record with it.
+    let sessions = value
+        .get("sessions")
+        .and_then(serde_json::Value::as_object)
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter_map(|(session_id, stored)| {
+                    let stored = serde_json::from_value::<StoredKeepAlive>(stored.clone())
+                        .with_context(|| format!("parsing the keep-alive record of {session_id}"))
+                        .log_err()?;
+                    Some((session_id.clone(), stored))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(KeepAliveFile { sessions })
+}
+
+/// The records of `session_ids` that exist. Read without the lock: a write replaces the file
+/// by renaming a complete copy over it, so a reader sees either the old file or the new one.
+pub fn read_keep_alive_records(
+    home: &Path,
+    session_ids: &[String],
+) -> Result<Vec<KeepAliveRecord>> {
+    let file = load_keep_alive_file(&keep_alive_state_path(home))?;
+    Ok(session_ids
+        .iter()
+        .filter_map(|session_id| {
+            file.sessions
+                .get(session_id)
+                .map(|stored| stored.record(session_id))
+        })
+        .collect())
+}
+
+/// Replaces the record of `session_id` with `state_json` if its revision is still
+/// `expected_revision` (0 for "no record yet"), and reports what it holds otherwise.
+pub fn write_keep_alive_record(
+    home: &Path,
+    session_id: &str,
+    expected_revision: u64,
+    state_json: &str,
+) -> Result<KeepAliveWrite> {
+    anyhow::ensure!(
+        !session_id.is_empty() && session_id.len() <= KEEP_ALIVE_SESSION_ID_MAX_BYTES,
+        "not a session id"
+    );
+    anyhow::ensure!(
+        state_json.len() <= KEEP_ALIVE_STATE_MAX_BYTES,
+        "keep-alive state exceeds {KEEP_ALIVE_STATE_MAX_BYTES} bytes"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(state_json).context("parsing keep-alive state")?;
+    anyhow::ensure!(state.is_object(), "keep-alive state must be a JSON object");
+
+    let claude_directory = home.join(".claude");
+    fs::create_dir_all(&claude_directory)
+        .with_context(|| format!("creating {}", claude_directory.display()))?;
+    let lock_path = claude_directory.join(KEEP_ALIVE_LOCK_FILE);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    // Held until `lock` is dropped at the end of this function, on every path out of it.
+    lock.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
+    let state_path = keep_alive_state_path(home);
+    let mut file = load_keep_alive_file(&state_path)?;
+    let current = file.sessions.get(session_id);
+    let current_revision = current.map_or(0, |stored| stored.revision);
+    if current_revision != expected_revision {
+        return Ok(KeepAliveWrite::Conflict(
+            current.map(|stored| stored.record(session_id)),
+        ));
+    }
+
+    let now_ms = now_millis();
+    file.sessions.retain(|other_session_id, stored| {
+        other_session_id == session_id
+            || now_ms.saturating_sub(stored.updated_at_ms) < KEEP_ALIVE_RECORD_MAX_AGE_MS
+    });
+    let stored = StoredKeepAlive {
+        revision: current_revision.saturating_add(1),
+        state,
+        updated_at_ms: now_ms,
+    };
+    let record = stored.record(session_id);
+    file.sessions.insert(session_id.to_string(), stored);
+
+    let encoded = serde_json::to_vec(&file).context("encoding keep-alive state")?;
+    let temporary_path = claude_directory.join(format!(
+        "{KEEP_ALIVE_STATE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    fs::write(&temporary_path, &encoded)
+        .with_context(|| format!("writing {}", temporary_path.display()))?;
+    if let Err(error) = fs::rename(&temporary_path, &state_path) {
+        fs::remove_file(&temporary_path).log_err();
+        return Err(error).with_context(|| format!("replacing {}", state_path.display()));
+    }
+    Ok(KeepAliveWrite::Applied(record))
+}
+
+/// Types `/compact` into the tmux pane the session runs in and submits it.
+///
+/// A slash command cannot be sent through the channel: what arrives that way is a message to
+/// Claude, not something typed at its prompt. The pane is read from the session's own
+/// registration on this machine, never taken from the request.
+pub async fn compact_session(
+    home: &Path,
+    session_id: &str,
+    executor: &BackgroundExecutor,
+) -> Result<()> {
+    let registry_directory = home.join(".claude").join("sessions");
+    // A resumed session leaves the registration of the process it replaced behind until that
+    // file is cleaned up; the newest one is the process running it now.
+    let registration = read_registrations(&registry_directory)?
+        .into_iter()
+        .filter(|registration| registration.session_id == session_id)
+        .max_by_key(|registration| registration.started_at.or(registration.updated_at))
+        .with_context(|| format!("no session is registered as {session_id}"))?;
+    let tmux_field = registration
+        .tmux_target
+        .as_deref()
+        .with_context(|| format!("session {session_id} is not running in tmux"))?;
+    let pane = pane_target(tmux_field)
+        .with_context(|| format!("session {session_id} names no tmux pane: {tmux_field}"))?;
+
+    send_tmux_keys(&["send-keys", "-t", &pane, "-l", "/compact"], executor).await?;
+    executor.timer(COMPACT_ENTER_DELAY).await;
+    send_tmux_keys(&["send-keys", "-t", &pane, "Enter"], executor).await
+}
+
+async fn send_tmux_keys(args: &[&str], executor: &BackgroundExecutor) -> Result<()> {
+    let mut command = smol::process::Command::new("tmux");
+    command.args(args);
+    let output = output_within(
+        &mut command,
+        "tmux send-keys",
+        TMUX_SEND_KEYS_TIMEOUT,
+        executor,
+    )
+    .await
+    .context("running tmux send-keys")?;
+    if !output.status.success() {
+        bail!(
+            "tmux send-keys failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// How long an interrupt reason may be. Counted in Unicode scalar values, matching the
@@ -8404,5 +8646,154 @@ mod session_lifecycle_tests {
         .expect("a 16-byte answer is inside the cap");
         assert!(output.status.success(), "got {output:?}");
         assert_eq!(output.stdout.len(), 16);
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_store_tests {
+    use super::*;
+
+    fn scratch_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "zed-keep-alive-{name}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&home).expect("creating a scratch home");
+        home
+    }
+
+    #[test]
+    fn a_write_lands_only_on_the_revision_it_expected() {
+        let home = scratch_home("cas");
+        let ids = vec!["session-a".to_string(), "session-b".to_string()];
+        assert_eq!(
+            read_keep_alive_records(&home, &ids).expect("reading"),
+            Vec::new()
+        );
+
+        let first = write_keep_alive_record(&home, "session-a", 0, r#"{"enabled":true}"#)
+            .expect("first write");
+        let KeepAliveWrite::Applied(first) = first else {
+            panic!("a first write expecting no record must land, got {first:?}");
+        };
+        assert_eq!(first.revision, 1);
+
+        // A second Zed that has not seen the first write expects no record and loses.
+        let stale = write_keep_alive_record(&home, "session-a", 0, r#"{"enabled":false}"#)
+            .expect("stale write");
+        assert_eq!(stale, KeepAliveWrite::Conflict(Some(first)));
+
+        let second = write_keep_alive_record(&home, "session-a", 1, r#"{"enabled":false}"#)
+            .expect("second write");
+        let KeepAliveWrite::Applied(second) = second else {
+            panic!("a write on the current revision must land, got {second:?}");
+        };
+        assert_eq!(second.revision, 2);
+        assert_eq!(
+            read_keep_alive_records(&home, &ids).expect("reading back"),
+            vec![second]
+        );
+        fs::remove_dir_all(&home).log_err();
+    }
+
+    #[test]
+    fn a_write_that_is_not_a_small_json_object_is_refused() {
+        let home = scratch_home("refuse");
+        for state_json in ["[]", "not json", "1"] {
+            assert!(
+                write_keep_alive_record(&home, "session-a", 0, state_json).is_err(),
+                "{state_json} is not a keep-alive state"
+            );
+        }
+        let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(KEEP_ALIVE_STATE_MAX_BYTES));
+        assert!(write_keep_alive_record(&home, "session-a", 0, &oversized).is_err());
+        assert!(write_keep_alive_record(&home, "", 0, "{}").is_err());
+        assert_eq!(
+            read_keep_alive_records(&home, &["session-a".to_string()]).expect("reading"),
+            Vec::new()
+        );
+        fs::remove_dir_all(&home).log_err();
+    }
+
+    #[test]
+    fn a_corrupt_file_reads_as_empty_and_the_next_write_replaces_it() {
+        let home = scratch_home("corrupt");
+        fs::create_dir_all(home.join(".claude")).expect("creating .claude");
+        fs::write(keep_alive_state_path(&home), b"{ not json").expect("writing garbage");
+        let ids = vec!["session-a".to_string()];
+        assert_eq!(
+            read_keep_alive_records(&home, &ids).expect("reading"),
+            Vec::new()
+        );
+        let write = write_keep_alive_record(&home, "session-a", 0, "{}").expect("writing");
+        assert!(matches!(write, KeepAliveWrite::Applied(ref record) if record.revision == 1));
+        fs::remove_dir_all(&home).log_err();
+    }
+
+    #[test]
+    fn a_malformed_record_does_not_hide_or_erase_the_other_sessions() {
+        let home = scratch_home("malformed-record");
+        fs::create_dir_all(home.join(".claude")).expect("creating .claude");
+        let now_ms = now_millis();
+        fs::write(
+            keep_alive_state_path(&home),
+            format!(
+                r#"{{"sessions":{{
+                    "session-a":{{"revision":4,"state":{{"enabled":true}},"updated_at_ms":{now_ms}}},
+                    "session-b":{{"revision":"7","state":{{}},"updated_at_ms":{now_ms}}}
+                }}}}"#
+            ),
+        )
+        .expect("writing the state file");
+        let session_a = KeepAliveRecord {
+            session_id: "session-a".to_string(),
+            revision: 4,
+            state_json: r#"{"enabled":true}"#.to_string(),
+        };
+
+        assert_eq!(
+            read_keep_alive_records(&home, &["session-a".to_string()]).expect("reading"),
+            vec![session_a.clone()],
+            "one malformed record must not hide another session's"
+        );
+
+        let write = write_keep_alive_record(&home, "session-c", 0, "{}").expect("writing");
+        assert!(matches!(write, KeepAliveWrite::Applied(_)), "got {write:?}");
+        assert_eq!(
+            read_keep_alive_records(&home, &["session-a".to_string()]).expect("reading back"),
+            vec![session_a],
+            "writing another session must not erase this one"
+        );
+        fs::remove_dir_all(&home).log_err();
+    }
+
+    #[test]
+    fn concurrent_writers_on_the_same_revision_land_exactly_once() {
+        let home = scratch_home("race");
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    write_keep_alive_record(
+                        &home,
+                        "session-a",
+                        0,
+                        &format!(r#"{{"writer":{index}}}"#),
+                    )
+                    .expect("writing")
+                })
+            })
+            .collect();
+        let applied = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("joining"))
+            .filter(|write| matches!(write, KeepAliveWrite::Applied(_)))
+            .count();
+        assert_eq!(
+            applied, 1,
+            "every writer expected revision 0; only one may land"
+        );
+        fs::remove_dir_all(&home).log_err();
     }
 }
