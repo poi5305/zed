@@ -10,6 +10,7 @@ use gpui::{
 use wasm_bindgen::prelude::*;
 
 use crate::ime_mirror::ImeMirror;
+use crate::policy;
 use crate::window::WebWindowInner;
 
 pub struct WebEventListeners {
@@ -181,7 +182,7 @@ impl WebWindowInner {
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
-        EventListenerHandle::add(self.canvas.as_ref(), event_name, handler)
+        EventListenerHandle::add(self.canvas.as_ref(), event_name, self.noting_input(handler))
     }
 
     fn listen_input(
@@ -189,7 +190,11 @@ impl WebWindowInner {
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
-        EventListenerHandle::add(self.ime_mirror.event_target(), event_name, handler)
+        EventListenerHandle::add(
+            self.ime_mirror.event_target(),
+            event_name,
+            self.noting_input(handler),
+        )
     }
 
     fn listen_non_passive(
@@ -197,7 +202,24 @@ impl WebWindowInner {
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
-        EventListenerHandle::add_non_passive(self.canvas.as_ref(), event_name, handler)
+        EventListenerHandle::add_non_passive(
+            self.canvas.as_ref(),
+            event_name,
+            self.noting_input(handler),
+        )
+    }
+
+    /// Wraps a user-input handler so the frame loop knows the user is active
+    /// (see `WebWindowInner::last_input_at`).
+    fn noting_input(
+        self: &Rc<Self>,
+        mut handler: impl FnMut(JsValue) + 'static,
+    ) -> impl FnMut(JsValue) + 'static {
+        let this = Rc::clone(self);
+        move |event: JsValue| {
+            this.last_input_at.set(js_sys::Date::now());
+            handler(event)
+        }
     }
 
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
@@ -220,9 +242,14 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
-            this.flush_deferred_copy();
-
             let pointer_type = event.pointer_type();
+            // A finger press is no user activation on a touch-only device, so
+            // the attempt would fail and still rewrite the IME element under
+            // every scroll or tap.
+            if pointer_type != "touch" || crate::ime_mirror::touch_device_has_fine_pointer() {
+                this.flush_deferred_copy();
+            }
+
             let position = pointer_position_in_element(&event);
             this.gesture_start_visual_viewport_height
                 .set(this.visual_viewport_height());
@@ -745,6 +772,10 @@ impl WebWindowInner {
                 }));
             }
 
+            if this.reattach_detached_ime(&event) {
+                return;
+            }
+
             // The IME owns keys it processes (keyCode 229), including the
             // first key of a macOS composition, which arrives with its
             // physical `key` and `isComposing == false` just before
@@ -893,10 +924,35 @@ impl WebWindowInner {
         }
     }
 
+    /// Recovers from an IME that iPadOS has detached from the hidden input
+    /// (e.g. after the page was reloaded in the background and focused
+    /// programmatically): its keys then arrive raw, with the script's
+    /// character as `key` instead of keyCode 229 and a composition. Such a
+    /// key is dropped and the input re-focused from this keydown, a user
+    /// activation, so the following keys compose again.
+    fn reattach_detached_ime(self: &Rc<Self>, event: &web_sys::KeyboardEvent) -> bool {
+        if event.ctrl_key()
+            || event.meta_key()
+            || is_ime_key_event(event, self.is_composing.get())
+            || !policy::is_detached_ime_key(&event.key(), event.alt_key())
+            || !crate::ime_mirror::touch_device_has_fine_pointer()
+        {
+            return false;
+        }
+        log::info!("reattaching the IME after a raw {:?} keydown", event.key());
+        event.prevent_default();
+        self.ime_mirror.set_read_only(false);
+        self.refocus_ime_mirror(true);
+        self.ime_focused_by_gesture
+            .set(self.ime_mirror.is_focused());
+        true
+    }
+
     fn flush_pending_paste_keystroke(self: &Rc<Self>) {
         if let Some(key_down) = self.pending_paste_keystroke.take() {
-            self.paste_keystroke_flushed_at
-                .set(Some(js_sys::Date::now()));
+            let clipboard_item = self.clipboard.borrow().clone();
+            self.paste_keystroke_flush
+                .set(Some((js_sys::Date::now(), clipboard_item)));
             self.dispatch_input(PlatformInput::KeyDown(key_down));
             self.schedule_ime_mirror_sync();
         }
@@ -927,11 +983,23 @@ impl WebWindowInner {
         // iPadOS can deliver a paste shortcut's `paste` event after the
         // keyup or timeout that already ran the keystroke against the in-app
         // clipboard. That late event belongs to the paste that already
-        // happened; pasting it again would insert the text twice.
-        let flushed_at = self.paste_keystroke_flushed_at.take();
+        // happened; pasting it again would insert the text twice. Only content
+        // the keystroke already pasted counts: content copied elsewhere in the
+        // meantime is what the keystroke missed, and dropping it would lose it.
+        let flush = self.paste_keystroke_flush.take();
         if key_down.is_none()
-            && flushed_at
-                .is_some_and(|flushed_at| js_sys::Date::now() - flushed_at < LATE_PASTE_EVENT_MS)
+            && flush.is_some_and(|(flushed_at, flushed_item)| {
+                policy::late_paste_repeats_keystroke(
+                    js_sys::Date::now() - flushed_at,
+                    LATE_PASTE_EVENT_MS,
+                    flushed_item
+                        .as_ref()
+                        .and_then(|flushed| flushed.text())
+                        .as_deref(),
+                    item.text().as_deref(),
+                    flushed_item.as_ref() == Some(&item),
+                )
+            })
         {
             return;
         }

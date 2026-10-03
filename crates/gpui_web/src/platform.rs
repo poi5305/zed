@@ -699,6 +699,7 @@ impl Platform for WebPlatform {
             &self.browser_window,
             &undelivered_text,
             self.deferred_copy_text.clone(),
+            self.clipboard.clone(),
         ) {
             log::info!(
                 "copy deferred to the next pointer or command key press: execCommand(\"copy\") returned {command_succeeded} and navigator.clipboard is unavailable"
@@ -868,6 +869,7 @@ fn write_text_with_async_clipboard(
     browser_window: &web_sys::Window,
     text: &str,
     deferred_copy_text: Rc<RefCell<Option<String>>>,
+    clipboard: Rc<RefCell<Option<ClipboardItem>>>,
 ) -> bool {
     let navigator = browser_window.navigator();
     let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
@@ -884,7 +886,16 @@ fn write_text_with_async_clipboard(
                     "copy deferred to the next pointer or command key press: {}",
                     js_error_message(&error)
                 );
-                *deferred_copy_text.borrow_mut() = Some(text);
+                // A newer copy that already replaced this one must not be
+                // overwritten by it when the next press delivers it.
+                let still_latest = clipboard
+                    .borrow()
+                    .as_ref()
+                    .and_then(|item| item.text())
+                    .is_some_and(|latest| latest == text);
+                if still_latest {
+                    *deferred_copy_text.borrow_mut() = Some(text);
+                }
             } else {
                 log::warn!(
                     "navigator.clipboard.writeText failed: {}",

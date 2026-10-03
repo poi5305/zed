@@ -4,6 +4,7 @@ use crate::events::{
 };
 use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
+use crate::policy;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
@@ -70,6 +71,11 @@ pub(crate) struct WebWindowInner {
     /// Whether a trackpad press on a touch-first device has focused the
     /// hidden input since its last blur (see `register_pointer_down`).
     pub(crate) ime_focused_by_gesture: Cell<bool>,
+    /// When the last user input event reached the page. While the user is
+    /// idle, frames are rate-limited (see `create_raf_closure`).
+    pub(crate) last_input_at: Cell<f64>,
+    last_frame_at: Cell<f64>,
+    idle_wake_pending: Cell<bool>,
     /// The visual viewport's width and greatest height seen at that width,
     /// in layout pixels. The keyboard-visibility probe compares the current
     /// height against this maximum; the width detects rotation, which must
@@ -98,8 +104,9 @@ pub(crate) struct WebWindowInner {
     /// event has refreshed `clipboard`. Whoever takes it dispatches it.
     pub(crate) pending_paste_keystroke: Cell<Option<KeyDownEvent>>,
     /// When a paste keystroke last ran without waiting for its `paste`
-    /// event (see `deliver_paste`).
-    pub(crate) paste_keystroke_flushed_at: Cell<Option<f64>>,
+    /// event, and the in-app clipboard it ran against (see
+    /// `deliver_paste`).
+    pub(crate) paste_keystroke_flush: Cell<Option<(f64, Option<ClipboardItem>)>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -229,13 +236,16 @@ impl WebWindow {
             is_composing: Cell::new(false),
             suppress_focus_status_events: Cell::new(false),
             ime_focused_by_gesture: Cell::new(false),
+            last_input_at: Cell::new(0.0),
+            last_frame_at: Cell::new(0.0),
+            idle_wake_pending: Cell::new(false),
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
             clipboard,
             deferred_copy_text,
             pending_paste_keystroke: Cell::new(None),
-            paste_keystroke_flushed_at: Cell::new(None),
+            paste_keystroke_flush: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -412,6 +422,20 @@ impl WebWindowInner {
             // (e.g. views invalidated during draw) schedule the next request
             // instead of being swallowed.
             this.raf_id.set(None);
+            // An idle page still requests a frame on every refresh for
+            // looping animations (a pulsing status dot), and each one redraws
+            // the whole canvas: on a tablet that is the GPU at full speed all
+            // day. Until the user acts again, run at most one frame per
+            // interval, waiting on a timer rather than on further animation
+            // frames, which would keep the browser compositing every refresh.
+            let now = js_sys::Date::now();
+            if let Some(delay_ms) =
+                policy::idle_frame_delay(now, this.last_input_at.get(), this.last_frame_at.get())
+            {
+                this.schedule_idle_wake(delay_ms);
+                return;
+            }
+            this.last_frame_at.set(now);
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -430,8 +454,43 @@ impl WebWindowInner {
         closure
     }
 
+    fn user_is_idle(&self, now: f64) -> bool {
+        policy::user_is_idle(now, self.last_input_at.get())
+    }
+
+    fn schedule_idle_wake(self: &Rc<Self>, delay_ms: f64) {
+        if self.idle_wake_pending.replace(true) {
+            return;
+        }
+        let callback = Closure::once_into_js({
+            let this = Rc::clone(self);
+            move || {
+                this.idle_wake_pending.set(false);
+                this.wake_frame_loop();
+            }
+        });
+        if let Err(error) = self
+            .browser_window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                delay_ms.ceil() as i32,
+            )
+        {
+            log::warn!("failed to schedule an idle frame: {error:?}");
+            self.idle_wake_pending.set(false);
+            // The frame that was just deferred would otherwise have neither a
+            // timer nor an animation frame behind it.
+            self.wake_frame_loop();
+        }
+    }
+
     pub(crate) fn wake_frame_loop(&self) {
         if self.raf_id.get().is_some() {
+            return;
+        }
+        // An idle wake already scheduled runs this frame; input since then
+        // ends the idle period and must not wait for it.
+        if self.idle_wake_pending.get() && self.user_is_idle(js_sys::Date::now()) {
             return;
         }
         let raf_function = self.raf_function.borrow();
