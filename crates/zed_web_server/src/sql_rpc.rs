@@ -136,6 +136,7 @@ fn open_connection(path: &Path, root: &Path) -> Result<Connection> {
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
     repair_orphaned_editor_items(&connection)?;
+    drop_superseded_claude_session_tabs(&connection)?;
     migrate_legacy_workspace_paths(&connection, root)?;
     Ok(connection)
 }
@@ -224,6 +225,34 @@ fn repair_orphaned_editor_items(connection: &Connection) -> Result<()> {
                      AND editors.workspace_id = items.workspace_id
                )",
             [],
+        )?;
+    }
+    Ok(())
+}
+
+/// An earlier build created `claude_session_tabs` under the `ClaudeSessionTabDb` domain
+/// with a different shape. `ClaudeSessionsDb` now owns that table name, and its first
+/// migration fails while the old table exists, which stops the browser from starting.
+fn drop_superseded_claude_session_tabs(connection: &Connection) -> Result<()> {
+    let has_migrations_table = connection.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'migrations'",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_migrations_table {
+        return Ok(());
+    }
+    let superseded = connection.query_row(
+        "SELECT COUNT(*) > 0 FROM migrations WHERE domain = 'ClaudeSessionTabDb'",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if superseded {
+        connection.execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS claude_session_tabs;
+             DELETE FROM migrations WHERE domain = 'ClaudeSessionTabDb';
+             COMMIT;",
         )?;
     }
     Ok(())
@@ -813,6 +842,66 @@ mod tests {
             }),
         )?;
         assert_eq!(table["rows"], json!([["nested_records"]]));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_drops_the_superseded_claude_session_tab_table() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database_dir = root.path().join(".zed");
+        std::fs::create_dir_all(&database_dir)?;
+        let path = database_dir.join("remote.sqlite");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE migrations (domain TEXT, step INTEGER, migration TEXT);
+            INSERT INTO migrations VALUES ('ClaudeSessionTabDb', 0, 'CREATE TABLE claude_session_tabs');
+            INSERT INTO migrations VALUES ('WorkspaceDb', 0, 'CREATE TABLE workspaces');
+            CREATE TABLE claude_session_tabs (
+                workspace_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, item_id)
+            );",
+        )?;
+        drop(connection);
+
+        let _sql = SqlRpc::new(root.path())?;
+        let connection = Connection::open(path)?;
+        let domains = connection
+            .prepare("SELECT domain FROM migrations ORDER BY domain")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(domains, vec!["WorkspaceDb".to_string()]);
+        let tables = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'claude_session_tabs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(tables, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_keeps_the_current_claude_session_tab_table() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database_dir = root.path().join(".zed");
+        std::fs::create_dir_all(&database_dir)?;
+        let path = database_dir.join("remote.sqlite");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE migrations (domain TEXT, step INTEGER, migration TEXT);
+            INSERT INTO migrations VALUES ('ClaudeSessionsDb', 0, 'CREATE TABLE claude_session_tabs');
+            CREATE TABLE claude_session_tabs (item_id INTEGER, workspace_id INTEGER);
+            INSERT INTO claude_session_tabs VALUES (1, 1);",
+        )?;
+        drop(connection);
+
+        let _sql = SqlRpc::new(root.path())?;
+        let connection = Connection::open(path)?;
+        let rows = connection.query_row("SELECT COUNT(*) FROM claude_session_tabs", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        assert_eq!(rows, 1);
         Ok(())
     }
 
