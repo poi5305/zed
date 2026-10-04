@@ -14053,6 +14053,7 @@ dependencies = [
  "collections",
  "gpui",
  "log",
+ "project_manager",
  "remote",
  "rpc",
  "task",

@@ -9,13 +9,16 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use fs::Fs;
 use gpui::{App, Context, Window, actions};
+#[cfg(not(target_family = "wasm"))]
 use recent_projects::open_remote_project;
 use remote::RemoteConnectionOptions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
+#[cfg(not(target_family = "wasm"))]
+use workspace::OpenOptions;
 use workspace::notifications::NotifyTaskExt as _;
-use workspace::{OpenMode, OpenOptions, Workspace};
+use workspace::{OpenMode, Workspace};
 
 pub use project_location::{
     ImportedPath, LaunchLocation, PUBLIC_KEY_HINT, ProjectLocation, SshCapabilities,
@@ -569,19 +572,43 @@ pub fn open_folder_in_new_window(
 
         match location {
             ProjectLocation::Local(open_paths) => {
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.open_workspace_for_paths(
-                            OpenMode::NewWindow,
-                            open_paths,
+                // A browser tab cannot hold a second GPUI window, so another project gets a
+                // tab of its own; one this tab already shows is switched to instead.
+                #[cfg(target_family = "wasm")]
+                let open_mode = {
+                    // Through the window rather than `workspace.update_in`: the check reads
+                    // every workspace in this window, this one included.
+                    let shown_here = cx.update(|window, cx| {
+                        crate::project_manager_panel::is_open_in_this_window(
+                            &open_paths,
                             window,
                             cx,
                         )
+                    })?;
+                    if !shown_here {
+                        return open_in_new_tab(&open_paths);
+                    }
+                    OpenMode::Activate
+                };
+                #[cfg(not(target_family = "wasm"))]
+                let open_mode = OpenMode::NewWindow;
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_workspace_for_paths(open_mode, open_paths, window, cx)
                     })?
                     .await?;
             }
             ProjectLocation::Remote { options, paths } => {
+                // This tab is already connected to the server, so a remote project gets a
+                // tab of its own whose address names it.
+                #[cfg(target_family = "wasm")]
+                {
+                    let capabilities = load_ssh_capabilities().await.log_err();
+                    let uris = remote_tab_paths(&options, &paths, capabilities.as_ref())?;
+                    open_in_new_tab(&uris)?;
+                }
                 // Without a requesting window `open_remote_project` opens a new one.
+                #[cfg(not(target_family = "wasm"))]
                 open_remote_project(options, paths, app_state, OpenOptions::default(), cx).await?;
             }
         }

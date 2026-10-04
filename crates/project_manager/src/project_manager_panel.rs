@@ -692,7 +692,7 @@ fn open_mode_for_window(new_window: bool) -> OpenMode {
 /// Whether any workspace in this window — the browser tab, whose sidebar can hold several
 /// — shows exactly `open_paths`.
 #[cfg(target_family = "wasm")]
-fn is_open_in_this_window(open_paths: &[PathBuf], window: &Window, cx: &App) -> bool {
+pub(crate) fn is_open_in_this_window(open_paths: &[PathBuf], window: &Window, cx: &App) -> bool {
     let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
         return false;
     };
