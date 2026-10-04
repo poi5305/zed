@@ -44,6 +44,76 @@ pub(crate) fn idle_frame_delay(now: f64, last_input_at: f64, last_frame_at: f64)
     }
 }
 
+/// What the frame loop does with an animation frame the browser delivered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AnimationFrameStep {
+    Render,
+    /// Defer the frame to an idle wake scheduled this many ms from now.
+    ScheduleIdleWake(f64),
+    /// Defer the frame to the idle wake that is already scheduled.
+    AwaitIdleWake,
+}
+
+/// The idle throttling state of the web frame loop. The browser handles (the
+/// pending animation frame, the idle timer) stay with the window.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameLoop {
+    last_input_at: f64,
+    last_frame_at: f64,
+    idle_wake_pending: bool,
+}
+
+impl FrameLoop {
+    pub(crate) fn new(now: f64) -> Self {
+        Self {
+            // A page that just loaded is being looked at; counting from the
+            // epoch would start it deeply idle.
+            last_input_at: now,
+            last_frame_at: 0.,
+            idle_wake_pending: false,
+        }
+    }
+
+    pub(crate) fn user_is_idle(&self, now: f64) -> bool {
+        user_is_idle(now, self.last_input_at)
+    }
+
+    /// Records user input, returning whether the frame loop must be woken.
+    pub(crate) fn note_input(&mut self, now: f64) -> bool {
+        self.last_input_at = now;
+        // gpui wakes the platform only when the window turns dirty. One that
+        // was already dirty while an idle wake was pending would leave this
+        // input's frame to that wake, up to a second away.
+        self.idle_wake_pending
+    }
+
+    /// Whether a wake with no animation frame pending should request one.
+    pub(crate) fn wake_requests_frame(&self, now: f64) -> bool {
+        // An idle wake already scheduled runs this frame; input since then
+        // ends the idle period and must not wait for it.
+        !(self.idle_wake_pending && self.user_is_idle(now))
+    }
+
+    pub(crate) fn on_animation_frame(&mut self, now: f64) -> AnimationFrameStep {
+        match idle_frame_delay(now, self.last_input_at, self.last_frame_at) {
+            Some(_) if self.idle_wake_pending => AnimationFrameStep::AwaitIdleWake,
+            Some(delay_ms) => {
+                self.idle_wake_pending = true;
+                AnimationFrameStep::ScheduleIdleWake(delay_ms)
+            }
+            None => {
+                self.last_frame_at = now;
+                AnimationFrameStep::Render
+            }
+        }
+    }
+
+    /// The scheduled idle wake fired, or could not be scheduled.
+    pub(crate) fn idle_wake_done(&mut self) {
+        self.idle_wake_pending = false;
+    }
+}
+
 /// Whether a keydown is a script key that only an IME produces, arriving raw
 /// because iPadOS detached the IME from the hidden input. Option
 /// combinations on an English layout type U+02D9 and U+02C7 directly, and the

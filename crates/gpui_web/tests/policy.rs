@@ -217,3 +217,58 @@ fn late_image_paste_matching_the_flushed_item_is_a_repeat() {
         true
     ));
 }
+
+#[test]
+fn input_during_a_pending_idle_wake_wakes_the_frame_loop() {
+    let start = 1_700_000_000_000.;
+    let mut frame_loop = FrameLoop::new(start);
+    frame_loop.note_input(start);
+    let idle = start + 60_000.;
+    assert_eq!(
+        frame_loop.on_animation_frame(idle),
+        AnimationFrameStep::Render
+    );
+    assert_eq!(
+        frame_loop.on_animation_frame(idle + 16.),
+        AnimationFrameStep::ScheduleIdleWake(984.)
+    );
+    // Something dirtied the window while the idle wake was pending: gpui wakes
+    // the platform once, on that transition, and the wake defers to the timer.
+    assert!(!frame_loop.wake_requests_frame(idle + 100.));
+    // The keystroke dirties an already dirty window, so gpui does not wake the
+    // platform again; only the input handler can arm a frame for it.
+    let must_wake = frame_loop.note_input(idle + 200.);
+    assert!(
+        must_wake,
+        "input at +200 ms left its frame to the idle wake due at +1000 ms: note_input returned {must_wake}, expected true"
+    );
+    assert!(frame_loop.wake_requests_frame(idle + 200.));
+    assert_eq!(
+        frame_loop.on_animation_frame(idle + 216.),
+        AnimationFrameStep::Render
+    );
+}
+
+#[test]
+fn a_freshly_loaded_page_is_not_idle() {
+    let load = 1_700_000_000_000.;
+    let mut frame_loop = FrameLoop::new(load);
+    assert_eq!(
+        frame_loop.on_animation_frame(load),
+        AnimationFrameStep::Render
+    );
+    assert_eq!(
+        frame_loop.on_animation_frame(load + 16.),
+        AnimationFrameStep::Render,
+        "the second frame after load was throttled"
+    );
+    let idle = load + IDLE_AFTER_INPUT_MS + 16.;
+    assert_eq!(
+        frame_loop.on_animation_frame(idle),
+        AnimationFrameStep::Render
+    );
+    assert_eq!(
+        frame_loop.on_animation_frame(idle + 16.),
+        AnimationFrameStep::ScheduleIdleWake(IDLE_FRAME_INTERVAL_MS - 16.)
+    );
+}

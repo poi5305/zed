@@ -71,11 +71,9 @@ pub(crate) struct WebWindowInner {
     /// Whether a trackpad press on a touch-first device has focused the
     /// hidden input since its last blur (see `register_pointer_down`).
     pub(crate) ime_focused_by_gesture: Cell<bool>,
-    /// When the last user input event reached the page. While the user is
-    /// idle, frames are rate-limited (see `create_raf_closure`).
-    pub(crate) last_input_at: Cell<f64>,
-    last_frame_at: Cell<f64>,
-    idle_wake_pending: Cell<bool>,
+    /// While the user is idle, frames are rate-limited (see
+    /// `create_raf_closure`).
+    frame_loop: Cell<policy::FrameLoop>,
     /// The visual viewport's width and greatest height seen at that width,
     /// in layout pixels. The keyboard-visibility probe compares the current
     /// height against this maximum; the width detects rotation, which must
@@ -236,9 +234,7 @@ impl WebWindow {
             is_composing: Cell::new(false),
             suppress_focus_status_events: Cell::new(false),
             ime_focused_by_gesture: Cell::new(false),
-            last_input_at: Cell::new(0.0),
-            last_frame_at: Cell::new(0.0),
-            idle_wake_pending: Cell::new(false),
+            frame_loop: Cell::new(policy::FrameLoop::new(js_sys::Date::now())),
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
@@ -429,13 +425,14 @@ impl WebWindowInner {
             // interval, waiting on a timer rather than on further animation
             // frames, which would keep the browser compositing every refresh.
             let now = js_sys::Date::now();
-            if let Some(delay_ms) =
-                policy::idle_frame_delay(now, this.last_input_at.get(), this.last_frame_at.get())
-            {
-                this.schedule_idle_wake(delay_ms);
-                return;
+            match this.update_frame_loop(|frame_loop| frame_loop.on_animation_frame(now)) {
+                policy::AnimationFrameStep::Render => {}
+                policy::AnimationFrameStep::ScheduleIdleWake(delay_ms) => {
+                    this.schedule_idle_wake(delay_ms);
+                    return;
+                }
+                policy::AnimationFrameStep::AwaitIdleWake => return,
             }
-            this.last_frame_at.set(now);
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -454,18 +451,25 @@ impl WebWindowInner {
         closure
     }
 
-    fn user_is_idle(&self, now: f64) -> bool {
-        policy::user_is_idle(now, self.last_input_at.get())
+    fn update_frame_loop<R>(&self, update: impl FnOnce(&mut policy::FrameLoop) -> R) -> R {
+        let mut frame_loop = self.frame_loop.get();
+        let result = update(&mut frame_loop);
+        self.frame_loop.set(frame_loop);
+        result
+    }
+
+    /// Records user input, returning whether the caller must wake the frame
+    /// loop once the input has been handled.
+    pub(crate) fn note_input(&self) -> bool {
+        let now = js_sys::Date::now();
+        self.update_frame_loop(|frame_loop| frame_loop.note_input(now))
     }
 
     fn schedule_idle_wake(self: &Rc<Self>, delay_ms: f64) {
-        if self.idle_wake_pending.replace(true) {
-            return;
-        }
         let callback = Closure::once_into_js({
             let this = Rc::clone(self);
             move || {
-                this.idle_wake_pending.set(false);
+                this.update_frame_loop(|frame_loop| frame_loop.idle_wake_done());
                 this.wake_frame_loop();
             }
         });
@@ -477,7 +481,7 @@ impl WebWindowInner {
             )
         {
             log::warn!("failed to schedule an idle frame: {error:?}");
-            self.idle_wake_pending.set(false);
+            self.update_frame_loop(|frame_loop| frame_loop.idle_wake_done());
             // The frame that was just deferred would otherwise have neither a
             // timer nor an animation frame behind it.
             self.wake_frame_loop();
@@ -488,9 +492,11 @@ impl WebWindowInner {
         if self.raf_id.get().is_some() {
             return;
         }
-        // An idle wake already scheduled runs this frame; input since then
-        // ends the idle period and must not wait for it.
-        if self.idle_wake_pending.get() && self.user_is_idle(js_sys::Date::now()) {
+        if !self
+            .frame_loop
+            .get()
+            .wake_requests_frame(js_sys::Date::now())
+        {
             return;
         }
         let raf_function = self.raf_function.borrow();

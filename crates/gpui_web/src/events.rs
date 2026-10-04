@@ -210,15 +210,18 @@ impl WebWindowInner {
     }
 
     /// Wraps a user-input handler so the frame loop knows the user is active
-    /// (see `WebWindowInner::last_input_at`).
+    /// (see `WebWindowInner::note_input`).
     fn noting_input(
         self: &Rc<Self>,
         mut handler: impl FnMut(JsValue) + 'static,
     ) -> impl FnMut(JsValue) + 'static {
         let this = Rc::clone(self);
         move |event: JsValue| {
-            this.last_input_at.set(js_sys::Date::now());
-            handler(event)
+            let wake_frame_loop = this.note_input();
+            handler(event);
+            if wake_frame_loop {
+                this.wake_frame_loop();
+            }
         }
     }
 
