@@ -488,36 +488,56 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                 }
                 (session.fs.clone(), session.sql.clone())
             };
-            let result = dispatch(fs, sql, method.clone(), params).await;
-            let succeeded = result.is_ok();
-            let response = match result {
-                Ok(result) => json!({"id": request_id, "result": result, "error": null}),
-                Err(error) => {
-                    tracing::warn!(?error, %method, "rpc request failed");
-                    json!({"id": request_id, "result": null, "error": error.to_string()})
+            // Sql stays inline: remote_sql relies on a write landing before any later read.
+            if method.starts_with("Sql::") {
+                let result = dispatch(fs, sql, method.clone(), params).await;
+                let response = match result {
+                    Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                    Err(error) => {
+                        tracing::warn!(?error, %method, "rpc request failed");
+                        json!({"id": request_id, "result": null, "error": error.to_string()})
+                    }
+                };
+                if outgoing.send(Message::Text(response.to_string())).is_err() {
+                    break;
                 }
-            };
-            if outgoing.send(Message::Text(response.to_string())).is_err() {
-                break;
+                continue;
             }
-            if succeeded
-                && matches!(
-                    method.as_str(),
-                    "Extensions::install"
-                        | "Extensions::uninstall"
-                        | "Extensions::install_dev"
-                        | "Extensions::rebuild_dev"
-                )
-                && state
-                    .events
-                    .send(json!({
-                        "method": "Host::extensions_changed",
-                        "params": {}
-                    }))
-                    .is_err()
-            {
-                tracing::debug!("no RPC clients subscribed to extension changes");
-            }
+            let outgoing = outgoing.clone();
+            let events = state.events.clone();
+            // Spawned: a slow Git or Process request must not hold up the replies behind it.
+            tokio::spawn(async move {
+                let result = dispatch(fs, sql, method.clone(), params).await;
+                let succeeded = result.is_ok();
+                let response = match result {
+                    Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                    Err(error) => {
+                        tracing::warn!(?error, %method, "rpc request failed");
+                        json!({"id": request_id, "result": null, "error": error.to_string()})
+                    }
+                };
+                if outgoing.send(Message::Text(response.to_string())).is_err() {
+                    tracing::debug!(%method, "RPC connection closed before response");
+                    return;
+                }
+                if succeeded
+                    && matches!(
+                        method.as_str(),
+                        "Extensions::install"
+                            | "Extensions::uninstall"
+                            | "Extensions::install_dev"
+                            | "Extensions::rebuild_dev"
+                    )
+                    && events
+                        .send(json!({
+                            "method": "Host::extensions_changed",
+                            "params": {}
+                        }))
+                        .is_err()
+                {
+                    tracing::debug!("no RPC clients subscribed to extension changes");
+                }
+            });
             continue;
         }
         if crate::agent_rpc::handles(&method) {
@@ -1956,5 +1976,84 @@ mod tests {
         );
         drop(session);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_stateless_request_does_not_delay_the_next_response() -> Result<()> {
+        use axum::{Router, extract::WebSocketUpgrade, routing::get};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let root = tempfile::tempdir()?;
+        let state = test_state(root.path())?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let app = Router::new().route(
+            "/rpc",
+            get(move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move { upgrade.on_upgrade(move |socket| serve(socket, state)) }
+            }),
+        );
+        let server = axum::Server::from_tcp(listener)?.serve(app.into_make_service());
+        tokio::spawn(async move {
+            if let Err(error) = server.await {
+                panic!("test server failed: {error}");
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let (mut client, _response) = connect_async(format!("ws://{address}/rpc")).await?;
+            let started = std::time::Instant::now();
+            client
+                .send(ClientMessage::Text(
+                    json!({
+                        "id": 1,
+                        "method": "Process::output",
+                        "params": {"program": "sleep", "args": ["3"]}
+                    })
+                    .to_string(),
+                ))
+                .await?;
+            client
+                .send(ClientMessage::Text(
+                    json!({
+                        "id": 2,
+                        "method": "Fs::metadata",
+                        "params": {"path": "/workspace"}
+                    })
+                    .to_string(),
+                ))
+                .await?;
+
+            let first_id = loop {
+                let message = client
+                    .next()
+                    .await
+                    .context("rpc socket closed before any response")??;
+                let ClientMessage::Text(text) = message else {
+                    continue;
+                };
+                let envelope: Value = serde_json::from_str(&text)?;
+                if let Some(id) = envelope.get("id").and_then(Value::as_u64) {
+                    break id;
+                }
+            };
+            let elapsed = started.elapsed();
+            assert_eq!(
+                first_id, 2,
+                "the fast Fs::metadata (id 2) should be answered before the 3 s Process::output (id 1), \
+                 but id {first_id} arrived first after {} ms",
+                elapsed.as_millis()
+            );
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "the fast Fs::metadata took {} ms, expected under 1500 ms",
+                elapsed.as_millis()
+            );
+            anyhow::Ok(())
+        })
+        .await
+        .context("no rpc response within 10 s")?
     }
 }
