@@ -2,13 +2,25 @@ use std::{
     ffi::OsStr,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use gpui::BackgroundExecutor;
 use serde_json::{Value, json};
 
 use crate::fs_rpc::FsRpc;
+
+/// The gpui executor `remote::claude_sessions::compact_session` times its tmux calls on.
+/// Requests are answered on tokio's blocking pool, which has none of its own.
+static BACKGROUND_EXECUTOR: OnceLock<BackgroundExecutor> = OnceLock::new();
+
+pub fn set_background_executor(executor: BackgroundExecutor) {
+    if BACKGROUND_EXECUTOR.set(executor).is_err() {
+        tracing::warn!("the Claude sessions RPC executor was already set");
+    }
+}
 
 pub fn handles(method: &str) -> bool {
     method.starts_with("ClaudeSessions::")
@@ -36,6 +48,9 @@ pub fn dispatch(fs_rpc: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "ClaudeSessions::channel_interrupt" => channel_interrupt(params),
         "ClaudeSessions::channel_answer_permission" => channel_answer_permission(params),
         "ClaudeSessions::read_channel_inbox_tail" => read_channel_inbox_tail(params),
+        "ClaudeSessions::read_keep_alive" => read_keep_alive(&home_directory(), params),
+        "ClaudeSessions::write_keep_alive" => write_keep_alive(&home_directory(), params),
+        "ClaudeSessions::compact_session" => compact_session(params),
         // SessionSource::read_file has no twin in remote::claude_sessions; the SSH
         // handler owns this boundary, so the JSON-RPC path copies that handler.
         "ClaudeSessions::read_file" => read_file(params),
@@ -78,6 +93,13 @@ fn u64_param(params: &Value, key: &str) -> u64 {
     params.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn required_u64(params: &Value, key: &str) -> Result<u64> {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("missing {key}"))
+}
+
 fn optional_base64(params: &Value, key: &str) -> Result<Vec<u8>> {
     let Some(encoded) = params.get(key).and_then(Value::as_str) else {
         return Ok(Vec::new());
@@ -110,6 +132,7 @@ fn session_json(summary: remote::claude_sessions::SessionSummary) -> Value {
         "name": summary.session.name,
         "status": summary.session.status,
         "updated_at": summary.session.updated_at,
+        "started_at": summary.session.started_at,
         "tmux_target": summary.session.tmux_target,
         "transcript_path": summary.transcript_path.as_deref().map(path_string),
         "context_tokens": summary.spend.map(|spend| spend.context_tokens).unwrap_or(0),
@@ -450,6 +473,68 @@ fn subagent_transcript_path(params: &Value) -> Result<Value> {
     ))
 }
 
+fn keep_alive_record_json(record: remote::claude_sessions::KeepAliveRecord) -> Value {
+    json!({
+        "session_id": record.session_id,
+        "revision": record.revision,
+        "state_json": record.state_json,
+    })
+}
+
+fn read_keep_alive(home_directory: &Path, params: &Value) -> Result<Value> {
+    let session_ids = params
+        .get("session_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing session_ids"))?
+        .iter()
+        .map(|session_id| {
+            session_id
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("session_ids must be strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let records = remote::claude_sessions::read_keep_alive_records(home_directory, &session_ids)?;
+    Ok(json!({
+        "records": records.into_iter().map(keep_alive_record_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn write_keep_alive(home_directory: &Path, params: &Value) -> Result<Value> {
+    let session_id = required_string(params, "session_id")?;
+    let expected_revision = required_u64(params, "expected_revision")?;
+    let state_json = required_string(params, "state_json")?;
+    let write = remote::claude_sessions::write_keep_alive_record(
+        home_directory,
+        &session_id,
+        expected_revision,
+        &state_json,
+    )?;
+    Ok(match write {
+        remote::claude_sessions::KeepAliveWrite::Applied(record) => json!({
+            "applied": true,
+            "record": keep_alive_record_json(record),
+        }),
+        remote::claude_sessions::KeepAliveWrite::Conflict(record) => json!({
+            "applied": false,
+            "record": record.map(keep_alive_record_json),
+        }),
+    })
+}
+
+fn compact_session(params: &Value) -> Result<Value> {
+    let session_id = required_string(params, "session_id")?;
+    let executor = BACKGROUND_EXECUTOR
+        .get()
+        .context("compacting a session needs the server's gpui executor, which is not running")?;
+    smol::block_on(remote::claude_sessions::compact_session(
+        &home_directory(),
+        &session_id,
+        executor,
+    ))?;
+    Ok(json!({}))
+}
+
 fn pane_target(params: &Value) -> Result<Value> {
     let tmux_field = required_string(params, "tmux_field")?;
     Ok(json!(remote::claude_sessions::pane_target(&tmux_field)))
@@ -661,6 +746,9 @@ mod tests {
         "ClaudeSessions::channel_answer_permission",
         "ClaudeSessions::read_channel_inbox_tail",
         "ClaudeSessions::read_file",
+        "ClaudeSessions::read_keep_alive",
+        "ClaudeSessions::write_keep_alive",
+        "ClaudeSessions::compact_session",
     ];
 
     #[test]
@@ -710,6 +798,112 @@ mod tests {
             skipped_bytes: 97,
         });
         assert_eq!(answer["skipped_bytes"], json!(97), "answer was {answer}");
+    }
+
+    #[test]
+    fn keep_alive_round_trips_through_the_json_rpc() {
+        let home = tempfile::tempdir().expect("temp home");
+        let state = r#"{"mode":"warm"}"#;
+
+        let first = write_keep_alive(
+            home.path(),
+            &json!({ "session_id": "session-a", "expected_revision": 0, "state_json": state }),
+        )
+        .expect("writing a new record");
+        assert_eq!(
+            first,
+            json!({
+                "applied": true,
+                "record": { "session_id": "session-a", "revision": 1, "state_json": state },
+            })
+        );
+
+        let stale = write_keep_alive(
+            home.path(),
+            &json!({ "session_id": "session-a", "expected_revision": 0, "state_json": r#"{"mode":"off"}"# }),
+        )
+        .expect("a stale write is answered, not failed");
+        assert_eq!(
+            stale,
+            json!({
+                "applied": false,
+                "record": { "session_id": "session-a", "revision": 1, "state_json": state },
+            }),
+            "a write at an old revision must report what the host holds instead of replacing it"
+        );
+
+        let read = read_keep_alive(
+            home.path(),
+            &json!({ "session_ids": ["session-a", "session-without-a-record"] }),
+        )
+        .expect("reading records");
+        assert_eq!(
+            read,
+            json!({
+                "records": [{ "session_id": "session-a", "revision": 1, "state_json": state }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_conflict_with_no_record_sends_a_null_record() {
+        let home = tempfile::tempdir().expect("temp home");
+        let answer = write_keep_alive(
+            home.path(),
+            &json!({ "session_id": "session-a", "expected_revision": 3, "state_json": "{}" }),
+        )
+        .expect("a stale write is answered, not failed");
+        assert_eq!(answer, json!({ "applied": false, "record": null }));
+    }
+
+    #[test]
+    fn keep_alive_params_are_required() {
+        let home = tempfile::tempdir().expect("temp home");
+        for (params, missing) in [
+            (
+                json!({ "expected_revision": 0, "state_json": "{}" }),
+                "session_id",
+            ),
+            (
+                json!({ "session_id": "a", "state_json": "{}" }),
+                "expected_revision",
+            ),
+            (
+                json!({ "session_id": "a", "expected_revision": 0 }),
+                "state_json",
+            ),
+        ] {
+            let error = write_keep_alive(home.path(), &params)
+                .expect_err("a write missing a parameter must fail");
+            assert_eq!(error.to_string(), format!("missing {missing}"));
+        }
+        let error = read_keep_alive(home.path(), &json!({ "session_ids": ["a", 1] }))
+            .expect_err("a non-string session id must fail");
+        assert_eq!(error.to_string(), "session_ids must be strings");
+        let error = read_keep_alive(home.path(), &json!({}))
+            .expect_err("a read without session ids must fail");
+        assert_eq!(error.to_string(), "missing session_ids");
+        assert!(
+            !home.path().join(".claude").exists(),
+            "a rejected request must not touch the host"
+        );
+    }
+
+    #[test]
+    fn a_listed_session_carries_when_its_process_started() {
+        let answer = session_json(remote::claude_sessions::SessionSummary {
+            session: remote::claude_sessions::parse_registered_session(
+                r#"{"pid":7,"sessionId":"session-a","cwd":"/work","procStart":"","version":"2","kind":"interactive","startedAt":1700000000000}"#,
+            )
+            .expect("parsing a registration"),
+            transcript_path: None,
+            spend: None,
+        });
+        assert_eq!(
+            answer["started_at"],
+            json!(1_700_000_000_000_i64),
+            "answer was {answer}"
+        );
     }
 
     /// Prints how large the first answer for a real session is. Run by hand with

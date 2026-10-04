@@ -181,6 +181,7 @@ pub fn run_with_gpui(runtime: tokio::runtime::Runtime) -> Result<()> {
         move |cx| {
             release_channel::init(web_app_version(), cx);
             gpui_tokio::init_from_handle(cx, tokio_handle);
+            crate::claude_sessions_rpc::set_background_executor(cx.background_executor().clone());
             let pool = install(commands_rx, cx);
             cx.spawn(async move |cx| {
                 let result = match server.await {

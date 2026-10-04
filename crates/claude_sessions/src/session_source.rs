@@ -1461,6 +1461,59 @@ impl SessionSource for WebSource {
     fn is_remote(&self) -> bool {
         true
     }
+
+    fn read_keep_alive(&self, session_ids: Vec<String>) -> Task<Result<Vec<KeepAliveRecord>>> {
+        let response = self.call::<ReadKeepAliveJson>(
+            "ClaudeSessions::read_keep_alive",
+            json!({ "session_ids": session_ids }),
+        );
+        self.executor.spawn(async move {
+            Ok(response
+                .await?
+                .records
+                .into_iter()
+                .map(KeepAliveRecord::from)
+                .collect())
+        })
+    }
+
+    fn write_keep_alive(
+        &self,
+        session_id: String,
+        expected_revision: u64,
+        state_json: String,
+    ) -> Task<Result<KeepAliveWrite>> {
+        let response = self.call::<WriteKeepAliveJson>(
+            "ClaudeSessions::write_keep_alive",
+            json!({
+                "session_id": session_id,
+                "expected_revision": expected_revision,
+                "state_json": state_json,
+            }),
+        );
+        self.executor.spawn(async move {
+            let response = response.await?;
+            let record = response.record.map(KeepAliveRecord::from);
+            if response.applied {
+                Ok(KeepAliveWrite::Applied(
+                    record.context("an applied keep-alive write named no record")?,
+                ))
+            } else {
+                Ok(KeepAliveWrite::Conflict(record))
+            }
+        })
+    }
+
+    fn compact_session(&self, session_id: String) -> Task<Result<()>> {
+        let response = self.call::<serde_json::Value>(
+            "ClaudeSessions::compact_session",
+            json!({ "session_id": session_id }),
+        );
+        self.executor.spawn(async move {
+            response.await?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -1481,6 +1534,7 @@ struct ClaudeSessionJson {
     name: Option<String>,
     status: Option<String>,
     updated_at: Option<i64>,
+    started_at: Option<i64>,
     tmux_target: Option<String>,
     transcript_path: Option<String>,
     context_tokens: u64,
@@ -1488,6 +1542,38 @@ struct ClaudeSessionJson {
     bridge_session_id: Option<String>,
     last_answer_at_ms: Option<i64>,
     cache_ttl: u32,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct KeepAliveRecordJson {
+    session_id: String,
+    revision: u64,
+    state_json: String,
+}
+
+#[cfg(target_family = "wasm")]
+impl From<KeepAliveRecordJson> for KeepAliveRecord {
+    fn from(record: KeepAliveRecordJson) -> Self {
+        Self {
+            session_id: record.session_id,
+            revision: record.revision,
+            state_json: record.state_json,
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct ReadKeepAliveJson {
+    records: Vec<KeepAliveRecordJson>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct WriteKeepAliveJson {
+    applied: bool,
+    record: Option<KeepAliveRecordJson>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1618,6 +1704,7 @@ fn session_listing_from_json(response: ListSessionsJson) -> SessionListing {
                 bridge_session_id: session.bridge_session_id,
                 last_answer_at_ms: session.last_answer_at_ms,
                 cache_ttl: session.cache_ttl,
+                started_at: session.started_at,
             })
             .collect(),
         home_directory: response.home_directory,
