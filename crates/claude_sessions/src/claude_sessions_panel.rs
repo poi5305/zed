@@ -249,6 +249,10 @@ const MAX_EDIT_DIFF_BYTES: usize = 128 * 1024;
 /// its own icons at.
 const PULSE_PERIOD: Duration = Duration::from_secs(1);
 
+/// The web build draws in-progress indicators steady: a looping pulse keeps the page
+/// rendering frames forever, which drains a tablet's battery.
+const PULSE_INDICATORS: bool = !cfg!(target_arch = "wasm32");
+
 /// How long a second click on Stop is accepted before the control disarms itself.
 const STOP_ARM_MS: i64 = 5_000;
 
@@ -4395,7 +4399,7 @@ impl ClaudeSessionsPanel {
                 Color::Hidden
             },
         ));
-        let indicator = if is_busy || is_waiting {
+        let indicator = if (is_busy || is_waiting) && PULSE_INDICATORS {
             indicator
                 .with_animation(
                     SharedString::from(format!("claude-session-indicator-{index}")),
@@ -5089,19 +5093,24 @@ impl ClaudeSessionsPanel {
 
         // Wrapped so that the pulse applies to the element: the icon itself carries a
         // colour rather than an opacity.
-        let indicator = div()
-            .child(
-                Icon::new(IconName::Indicator)
-                    .size(IconSize::XSmall)
-                    .color(Color::Success),
-            )
-            .with_animation(
-                SharedString::from(format!("claude-session-chip-pulse-{id}")),
-                Animation::new(PULSE_PERIOD)
-                    .repeat()
-                    .with_easing(pulsating_between(0.2, 0.8)),
-                |indicator, delta| indicator.opacity(delta),
-            );
+        let indicator = div().child(
+            Icon::new(IconName::Indicator)
+                .size(IconSize::XSmall)
+                .color(Color::Success),
+        );
+        let indicator = if PULSE_INDICATORS {
+            indicator
+                .with_animation(
+                    SharedString::from(format!("claude-session-chip-pulse-{id}")),
+                    Animation::new(PULSE_PERIOD)
+                        .repeat()
+                        .with_easing(pulsating_between(0.2, 0.8)),
+                    |indicator, delta| indicator.opacity(delta),
+                )
+                .into_any_element()
+        } else {
+            indicator.into_any_element()
+        };
 
         h_flex()
             .flex_none()
@@ -5424,20 +5433,22 @@ impl ClaudeSessionsPanel {
             );
         }
         if pulse {
-            header = header.child(
-                div()
-                    .w_1p5()
-                    .h_1p5()
-                    .rounded_full()
-                    .bg(cx.theme().colors().text_accent)
-                    .with_animation(
-                        "claude-session-now-row-dot",
-                        Animation::new(PULSE_PERIOD)
-                            .repeat()
-                            .with_easing(pulsating_between(0.2, 0.8)),
-                        |dot, delta| dot.opacity(delta),
-                    ),
-            );
+            let dot = div()
+                .w_1p5()
+                .h_1p5()
+                .rounded_full()
+                .bg(cx.theme().colors().text_accent);
+            header = if PULSE_INDICATORS {
+                header.child(dot.with_animation(
+                    "claude-session-now-row-dot",
+                    Animation::new(PULSE_PERIOD)
+                        .repeat()
+                        .with_easing(pulsating_between(0.2, 0.8)),
+                    |dot, delta| dot.opacity(delta),
+                ))
+            } else {
+                header.child(dot)
+            };
         }
 
         let mut column = v_flex().w_full().flex_none().child(header);

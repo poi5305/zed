@@ -902,7 +902,9 @@ fn claude_status_dot(activity: &ClaudeActivity, id: impl Into<ElementId>) -> Any
             .size(IconSize::XSmall)
             .color(color),
     );
-    if pulse {
+    // The web build draws the dot steady: a looping pulse keeps the page rendering
+    // frames forever, which drains a tablet's battery.
+    if pulse && !cfg!(target_arch = "wasm32") {
         dot.with_animation(
             id,
             Animation::new(Duration::from_secs(2))
