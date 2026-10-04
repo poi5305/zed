@@ -6,6 +6,7 @@ use gpui::{
 };
 use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::{REATTACHABLE_TASK_ID_PREFIX, terminal_panel::TerminalPanel};
@@ -246,6 +247,41 @@ impl TmuxSessionsPanel {
             }
         })
         .detach();
+    }
+
+    /// `None` when the host did not report the window's working directory, which is what
+    /// a remote server older than this panel answers with.
+    fn open_project_button(
+        tmux_window: &proto::TmuxWindow,
+        session_index: usize,
+        window_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<IconButton> {
+        if tmux_window.current_path.is_empty() {
+            return None;
+        }
+        let folder = PathBuf::from(&tmux_window.current_path);
+        Some(
+            IconButton::new(
+                SharedString::from(format!(
+                    "tmux-window-project-{session_index}-{window_index}"
+                )),
+                IconName::FolderOpen,
+            )
+            .icon_size(IconSize::XSmall)
+            .tooltip(Tooltip::text(format!(
+                "Open project for {} in a new window",
+                tmux_window.current_path
+            )))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let folder = folder.clone();
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        project_manager::open_folder_in_new_window(workspace, folder, window, cx)
+                    })
+                    .log_err();
+            })),
+        )
     }
 
     fn observe_claude_links(&mut self, cx: &mut Context<Self>) {
@@ -543,6 +579,9 @@ impl TmuxSessionsPanel {
         .spacing(ListItemSpacing::Sparse)
         .indent_level(1);
 
+        let open_project_button =
+            Self::open_project_button(tmux_window, session_index, window_index, cx);
+
         let Some(linked) = linked else {
             let session_name = session_name.to_string();
             return row
@@ -555,20 +594,22 @@ impl TmuxSessionsPanel {
                 ))
                 .child(identity)
                 .end_slot(
-                    IconButton::new(
-                        SharedString::from(format!(
-                            "tmux-window-terminal-{session_index}-{window_index}"
-                        )),
-                        IconName::Terminal,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Open window in terminal"))
-                    .on_click(cx.listener({
-                        let session_name = session_name.clone();
-                        move |this, _, window, cx| {
-                            this.attach(&session_name, Some(target_index), window, cx)
-                        }
-                    })),
+                    h_flex().gap_0p5().children(open_project_button).child(
+                        IconButton::new(
+                            SharedString::from(format!(
+                                "tmux-window-terminal-{session_index}-{window_index}"
+                            )),
+                            IconName::Terminal,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Open window in terminal"))
+                        .on_click(cx.listener({
+                            let session_name = session_name.clone();
+                            move |this, _, window, cx| {
+                                this.attach(&session_name, Some(target_index), window, cx)
+                            }
+                        })),
+                    ),
                 )
                 .tooltip(Tooltip::text(format!(
                     "Attach to {session_name}:{target_index}"
@@ -636,6 +677,7 @@ impl TmuxSessionsPanel {
         .end_slot(
             h_flex()
                 .gap_0p5()
+                .children(open_project_button)
                 .child(
                     IconButton::new(
                         SharedString::from(format!(
@@ -889,6 +931,7 @@ fn proto_session(session: remote::tmux_sessions::TmuxSession) -> proto::TmuxSess
                 name: window.name,
                 active: window.active,
                 id: window.id,
+                current_path: window.current_path,
             })
             .collect(),
     }

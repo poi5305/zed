@@ -2,15 +2,20 @@ mod project_location;
 mod project_manager_button;
 mod project_manager_panel;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
-use gpui::{App, actions};
+use gpui::{App, Context, Window, actions};
+use recent_projects::open_remote_project;
+use remote::RemoteConnectionOptions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use workspace::Workspace;
+use util::ResultExt as _;
+use workspace::notifications::NotifyTaskExt as _;
+use workspace::{OpenMode, OpenOptions, Workspace};
 
 pub use project_location::{
     ImportedPath, ProjectLocation, import_vscode_path, parse_project_location, remote_project_uri,
@@ -338,6 +343,178 @@ pub fn merge_imported_projects(
     merge
 }
 
+/// The enabled project that `folder` on the machine behind `connection` (this machine
+/// when `None`) belongs to: the one with a folder that is `folder` itself or, failing
+/// that, the deepest folder containing it, so that a shell sitting in a subdirectory of a
+/// project still finds it.
+pub fn project_for_folder(
+    projects: &[ProjectEntry],
+    connection: Option<&RemoteConnectionOptions>,
+    folder: &Path,
+) -> Option<usize> {
+    deepest_project_for_folder(projects, connection, folder, &HashMap::default())
+}
+
+/// [`project_for_folder`], with `resolved_folders` giving the symlink-free form of local
+/// project folders: tmux reports a working directory already resolved, so a project saved
+/// through a symlink only contains it in its resolved form.
+fn deepest_project_for_folder(
+    projects: &[ProjectEntry],
+    connection: Option<&RemoteConnectionOptions>,
+    folder: &Path,
+    resolved_folders: &HashMap<PathBuf, PathBuf>,
+) -> Option<usize> {
+    let wanted_machine = connection.map(machine_key);
+    let mut best: Option<(usize, usize)> = None;
+    for (index, project) in projects.iter().enumerate() {
+        if !project.enabled {
+            continue;
+        }
+        let Ok(location) = project.location() else {
+            continue;
+        };
+        let (machine, project_folders) = match location {
+            ProjectLocation::Local(folders) => (None, folders),
+            ProjectLocation::Remote { options, paths } => (Some(machine_key(&options)), paths),
+        };
+        if machine != wanted_machine {
+            continue;
+        }
+        for project_folder in &project_folders {
+            let resolved_folder = resolved_folders.get(project_folder);
+            for candidate in std::iter::once(project_folder).chain(resolved_folder) {
+                if !folder.starts_with(candidate) {
+                    continue;
+                }
+                let depth = candidate.components().count();
+                if best.is_none_or(|(_, best_depth)| depth > best_depth) {
+                    best = Some((index, depth));
+                }
+            }
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// What two connections share when they reach the same machine: the authority
+/// `projects.json` would record for them, as reading it back normalizes it. A live
+/// connection keeps its host as typed while one read from `projects.json` has it
+/// lowercased, so comparing the written form alone would tell them apart. A connection
+/// that cannot be written as a URI matches nothing but itself through its debug form.
+fn machine_key(options: &RemoteConnectionOptions) -> String {
+    let root = Path::new("/");
+    let Some(uri) = remote_project_uri(options, root) else {
+        return format!("{options:?}");
+    };
+    match parse_project_location(&uri, &[]) {
+        Ok(ProjectLocation::Remote { options, .. }) => {
+            remote_project_uri(&options, root).unwrap_or(uri)
+        }
+        _ => uri,
+    }
+}
+
+/// What `open_folder_in_new_window` opens for `folder`: the saved project it belongs to,
+/// or `folder` alone on the machine behind `connection`.
+pub async fn location_for_folder(
+    fs: &Arc<dyn Fs>,
+    projects: &[ProjectEntry],
+    connection: Option<RemoteConnectionOptions>,
+    folder: PathBuf,
+) -> ProjectLocation {
+    let mut resolved_folders = HashMap::default();
+    if connection.is_none() {
+        for project in projects.iter().filter(|project| project.enabled) {
+            let Ok(ProjectLocation::Local(project_folders)) = project.location() else {
+                continue;
+            };
+            for project_folder in project_folders {
+                // A saved folder that no longer exists cannot hold the working directory,
+                // so failing to resolve it leaves only its written form to match.
+                if let Ok(resolved_folder) = fs.canonicalize(&project_folder).await
+                    && resolved_folder != project_folder
+                {
+                    resolved_folders.insert(project_folder, resolved_folder);
+                }
+            }
+        }
+    }
+
+    let location =
+        deepest_project_for_folder(projects, connection.as_ref(), &folder, &resolved_folders)
+            .and_then(|index| projects.get(index))
+            .and_then(|project| project.location().log_err());
+    match (location, connection) {
+        // The project is on the machine this window is connected to, and the live
+        // connection carries what `projects.json` cannot: ssh args, nickname, port
+        // forwards, a Podman container.
+        (Some(ProjectLocation::Remote { paths, .. }), Some(options)) => {
+            ProjectLocation::Remote { options, paths }
+        }
+        (Some(location), _) => location,
+        (None, None) => ProjectLocation::Local(vec![folder]),
+        (None, Some(options)) => ProjectLocation::Remote {
+            options,
+            paths: vec![folder],
+        },
+    }
+}
+
+/// Opens, in a window of its own, the saved project that `folder` belongs to, or `folder`
+/// alone when no saved project holds it. `folder` is on the machine the workspace's
+/// project is on, and so is what gets opened.
+pub fn open_folder_in_new_window(
+    workspace: &mut Workspace,
+    folder: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let app_state = workspace.app_state().clone();
+    let fs = app_state.fs.clone();
+    let connection = workspace
+        .project()
+        .read(cx)
+        .remote_client()
+        .and_then(|client| client.read(cx).remote_connection())
+        .map(|connection| connection.connection_options());
+
+    let workspace_handle = workspace.weak_handle();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let projects = match load_projects(&fs, paths::projects_file()).await {
+            Ok(parsed) => parsed.projects,
+            Err(error) => {
+                log::warn!(
+                    "reading projects.json to open {}: {error:#}",
+                    folder.display()
+                );
+                Vec::new()
+            }
+        };
+        let location = location_for_folder(&fs, &projects, connection, folder).await;
+
+        match location {
+            ProjectLocation::Local(open_paths) => {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_workspace_for_paths(
+                            OpenMode::NewWindow,
+                            open_paths,
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+            }
+            ProjectLocation::Remote { options, paths } => {
+                // Without a requesting window `open_remote_project` opens a new one.
+                open_remote_project(options, paths, app_state, OpenOptions::default(), cx).await?;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .detach_and_notify_err(workspace_handle, window, cx);
+}
+
 pub fn serialize_projects(projects: &[ProjectEntry]) -> Result<String> {
     let mut contents =
         serde_json::to_string_pretty(projects).context("serializing projects.json")?;
@@ -371,6 +548,167 @@ pub async fn save_projects(fs: &Arc<dyn Fs>, path: &Path, projects: &[ProjectEnt
 mod tests {
     use super::*;
     use fs::FakeFs;
+
+    fn folder_projects() -> Vec<ProjectEntry> {
+        let mut disabled = ProjectEntry::new("disabled", "/work/zed/crates");
+        disabled.enabled = false;
+        vec![
+            ProjectEntry::new("work", "/work"),
+            ProjectEntry::new("zed", "/work/zed"),
+            ProjectEntry::new("remote zed", "ssh://me@box/work/zed"),
+            disabled,
+            ProjectEntry::new("other box", "ssh://me@other/srv/app"),
+        ]
+    }
+
+    fn ssh_connection(uri: &str) -> RemoteConnectionOptions {
+        match parse_project_location(uri, &[]) {
+            Ok(ProjectLocation::Remote { options, .. }) => options,
+            other => panic!("{uri} is not a remote location: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_folder_finds_the_deepest_enabled_project_on_its_own_machine() {
+        let projects = folder_projects();
+        let box_connection = ssh_connection("ssh://me@box/");
+
+        let found = |connection: Option<&RemoteConnectionOptions>, folder: &str| {
+            project_for_folder(&projects, connection, Path::new(folder))
+                .and_then(|index| projects.get(index))
+                .map(|project| project.name.as_str())
+        };
+
+        assert_eq!(found(None, "/work/zed"), Some("zed"));
+        assert_eq!(
+            found(None, "/work/zed/crates/gpui"),
+            Some("zed"),
+            "a subdirectory belongs to the deepest project containing it, and a disabled \
+             project is skipped"
+        );
+        assert_eq!(found(None, "/work/other"), Some("work"));
+        assert_eq!(
+            found(None, "/workspace"),
+            None,
+            "a sibling whose name merely starts with a project's is not inside it"
+        );
+        assert_eq!(
+            found(Some(&box_connection), "/work/zed/src"),
+            Some("remote zed"),
+            "on a remote machine only that machine's projects match"
+        );
+        assert_eq!(found(Some(&box_connection), "/srv/app"), None);
+    }
+
+    #[test]
+    fn a_live_host_with_capitals_finds_the_projects_saved_for_it() {
+        // Saving from a window connected to `MyBox` writes this URI, and reading it back
+        // lowercases the host.
+        let projects = vec![ProjectEntry::new("remote zed", "ssh://MyBox/work/zed")];
+        let live = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "MyBox".into(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            project_for_folder(&projects, Some(&live), Path::new("/work/zed/src")),
+            Some(0),
+            "the live host MyBox is the host projects.json records as ssh://MyBox"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_matched_remote_project_opens_through_the_live_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let projects = vec![ProjectEntry::new("remote zed", "ssh://box/work/zed")];
+        let live = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "box".into(),
+            nickname: Some("dev box".to_string()),
+            args: Some(vec!["-J".to_string(), "jump".to_string()]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            location_for_folder(
+                &fs,
+                &projects,
+                Some(live.clone()),
+                PathBuf::from("/work/zed/src")
+            )
+            .await,
+            ProjectLocation::Remote {
+                options: live,
+                paths: vec![PathBuf::from("/work/zed")],
+            },
+            "the project is on the machine this window is connected to, so it opens through \
+             the same connection settings rather than the bare authority in projects.json"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_project_saved_through_a_symlink_holds_the_resolved_directory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake_fs = FakeFs::new(cx.executor());
+        let fs: Arc<dyn Fs> = fake_fs.clone();
+        fs.create_dir(Path::new("/Volumes/data/code/zed/crates"))
+            .await
+            .expect("creating the real project folder");
+        fs.create_dir(Path::new("/home/me"))
+            .await
+            .expect("creating the home folder");
+        fake_fs
+            .insert_symlink("/home/me/code", PathBuf::from("/Volumes/data/code"))
+            .await;
+        let projects = vec![
+            ProjectEntry::new("all code", "/Volumes/data/code"),
+            ProjectEntry::new("zed", "/home/me/code/zed"),
+        ];
+
+        // tmux reports the directory resolved, never through the symlink.
+        assert_eq!(
+            location_for_folder(
+                &fs,
+                &projects,
+                None,
+                PathBuf::from("/Volumes/data/code/zed/crates")
+            )
+            .await,
+            ProjectLocation::Local(vec![PathBuf::from("/home/me/code/zed")]),
+            "/home/me/code/zed resolves to /Volumes/data/code/zed, the deepest project \
+             holding the shell's directory"
+        );
+    }
+
+    #[gpui::test]
+    async fn normalizing_machines_and_folders_keeps_the_distinctions_that_matter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let projects = vec![
+            ProjectEntry::new("lowercase container", "docker://app/work"),
+            ProjectEntry::new("gone", "/no/longer/here"),
+        ];
+        let capitalized_container =
+            RemoteConnectionOptions::Docker(remote::DockerConnectionOptions {
+                name: "App".to_string(),
+                container_id: "App".to_string(),
+                ..Default::default()
+            });
+
+        assert_eq!(
+            project_for_folder(&projects, Some(&capitalized_container), Path::new("/work")),
+            None,
+            "container names are case-sensitive, so App is not the container app"
+        );
+        assert_eq!(
+            location_for_folder(&fs, &projects, None, PathBuf::from("/no/longer/here/src")).await,
+            ProjectLocation::Local(vec![PathBuf::from("/no/longer/here")]),
+            "a saved folder that cannot be resolved still matches as written"
+        );
+    }
 
     /// The shape of a real export: local folders as plain paths, remote ones behind
     /// `vscode-remote://ssh-remote+<host>`, one of them a Coder workspace and one of them
