@@ -18,6 +18,7 @@ editor.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
+log.workspace = true
 paths.workspace = true
 percent-encoding.workspace = true
 recent_projects.workspace = true

@@ -1393,8 +1393,7 @@ impl HeadlessProject {
                     remote::claude_sessions::read_registrations(&registry_directory)
                         .log_err()
                         .unwrap_or_default();
-                let mut marker_of =
-                    |process_id: u32| connection_marker_of(&mut system, process_id);
+                let mut marker_of = |process_id: u32| connection_marker_of(&mut system, process_id);
                 let marker = connection_id.as_deref().map(|connection_id| {
                     remote::listening_ports::ConnectionMarker {
                         connection_id,
@@ -1462,6 +1461,7 @@ impl HeadlessProject {
                             name: window.name,
                             active: window.active,
                             id: window.id,
+                            current_path: window.current_path,
                         })
                         .collect(),
                 })

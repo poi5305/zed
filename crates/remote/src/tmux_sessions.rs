@@ -12,8 +12,7 @@ use crate::claude_sessions::is_zed_mirror_session;
 pub const LIST_SESSIONS_FORMAT: &str =
     "#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
 
-pub const LIST_WINDOWS_FORMAT: &str =
-    "#{session_name}\t#{window_index}\t#{window_name}\t#{?window_active,1,0}\t#{window_id}";
+pub const LIST_WINDOWS_FORMAT: &str = "#{session_name}\t#{window_index}\t#{window_name}\t#{?window_active,1,0}\t#{window_id}\t#{pane_current_path}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxWindow {
@@ -22,6 +21,9 @@ pub struct TmuxWindow {
     pub active: bool,
     /// Empty when the listing did not report one, or the value was not `@` and digits.
     pub id: String,
+    /// The working directory of the window's active pane. Empty when the listing did not
+    /// report one.
+    pub current_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,17 +84,24 @@ pub fn parse_tmux_sessions(list_sessions_stdout: &str) -> Vec<TmuxSession> {
 /// A row whose window index is not a number is dropped on its own; the rows
 /// after it are still parsed. Four columns is a server that does not report
 /// `#{window_id}`; the id is then empty. A fifth column that is not `@`
-/// followed by digits is stored as empty rather than dropping the window.
+/// followed by digits is stored as empty rather than dropping the window. The sixth
+/// column is the active pane's working directory; it is the last column so that a path
+/// containing a tab still belongs to it whole.
 pub fn parse_tmux_windows(list_windows_stdout: &str) -> Vec<(String, TmuxWindow)> {
     let mut windows = Vec::new();
     for line in list_windows_stdout.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let columns: Vec<&str> = line.split('\t').collect();
-        let (session_name, index, name, active, id) = match columns.as_slice() {
-            [session_name, index, name, active] => (*session_name, *index, *name, *active, ""),
-            [session_name, index, name, active, id] => (*session_name, *index, *name, *active, *id),
+        let columns: Vec<&str> = line.splitn(6, '\t').collect();
+        let (session_name, index, name, active, id, current_path) = match columns.as_slice() {
+            [session_name, index, name, active] => (*session_name, *index, *name, *active, "", ""),
+            [session_name, index, name, active, id] => {
+                (*session_name, *index, *name, *active, *id, "")
+            }
+            [session_name, index, name, active, id, current_path] => {
+                (*session_name, *index, *name, *active, *id, *current_path)
+            }
             _ => continue,
         };
         let Ok(index) = index.trim().parse::<u32>() else {
@@ -108,6 +117,7 @@ pub fn parse_tmux_windows(list_windows_stdout: &str) -> Vec<(String, TmuxWindow)
                 name: name.to_string(),
                 active: active == "1",
                 id: recorded_window_id(id),
+                current_path: current_path.to_string(),
             },
         ));
     }
@@ -275,6 +285,7 @@ mod tests {
                         name: "editor".to_string(),
                         active: true,
                         id: String::new(),
+                        current_path: String::new(),
                     }
                 ),
                 (
@@ -284,6 +295,7 @@ mod tests {
                         name: "server".to_string(),
                         active: false,
                         id: String::new(),
+                        current_path: String::new(),
                     }
                 ),
                 (
@@ -293,6 +305,7 @@ mod tests {
                         name: "shell".to_string(),
                         active: true,
                         id: String::new(),
+                        current_path: String::new(),
                     }
                 ),
             ]
@@ -335,8 +348,22 @@ mod tests {
                     name: "editor".to_string(),
                     active: true,
                     id: "@12".to_string(),
+                    current_path: String::new(),
                 }
             )]
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_windows_reads_a_six_column_row_with_a_path_containing_a_tab() {
+        let windows = parse_tmux_windows("work\t0\teditor\t1\t@12\t/home/me/odd\tdir\n");
+
+        assert_eq!(
+            windows
+                .first()
+                .map(|(_, window)| (window.id.as_str(), window.current_path.as_str())),
+            Some(("@12", "/home/me/odd\tdir")),
+            "the working directory is the last column, so a tab inside it stays part of it"
         );
     }
 

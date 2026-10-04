@@ -1725,6 +1725,7 @@ const SUBAGENT_TRANSCRIPT_SUFFIX: &str = ".jsonl";
 const WORKFLOW_RUN_ID_LABEL: &str = "Run ID:";
 const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
 const WORKFLOW_JOURNAL_RESULT_TYPE: &str = "result";
+const WORKFLOW_JOURNAL_FAILED_TYPE: &str = "failed";
 const WORKFLOW_JOURNAL_STARTED_TYPE: &str = "started";
 const EVENTS_DIRECTORY: &str = "zed-events";
 const STATUS_DIRECTORY: &str = "zed-status";
@@ -3081,7 +3082,10 @@ impl WorkflowJournal {
                 continue;
             };
             match entry.get("type").and_then(serde_json::Value::as_str) {
-                Some(WORKFLOW_JOURNAL_RESULT_TYPE) => {
+                // An agent that failed has returned as surely as one that answered: the run
+                // writes nothing further for it, so leaving it out would leave it running
+                // for good.
+                Some(WORKFLOW_JOURNAL_RESULT_TYPE | WORKFLOW_JOURNAL_FAILED_TYPE) => {
                     returned.insert(agent_id.to_string());
                 }
                 // A run that resumes writes a second `started` for an agent it is
@@ -6753,6 +6757,50 @@ mod tests {
             ],
             "the readable result still counts, the half-written one does not, and neither \
              agent was dropped from the listing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_journal_that_says_an_agent_failed_reports_it_as_returned() -> Result<()> {
+        let home_directory = temporary_directory("subagent-journal-failed");
+        let transcript_contents = "{\"type\":\"user\",\"isSidechain\":true}\n";
+
+        let failed = write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a1111e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_subagent(
+            &home_directory,
+            REAL_SESSION_ID,
+            Some(REAL_WORKFLOW_RUN_ID),
+            "a2222e203ec41bc73",
+            SUBAGENT_META_WORKFLOW,
+            transcript_contents,
+        );
+        write_file(
+            failed.with_file_name(WORKFLOW_JOURNAL_FILE),
+            "{\"type\":\"launched\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a1111e203ec41bc73\",\"label\":\"opus:WP8\"}\n\
+             {\"type\":\"started\",\"agentId\":\"a2222e203ec41bc73\",\"label\":\"sonnet:WP9\"}\n\
+             {\"type\":\"failed\",\"agentId\":\"a1111e203ec41bc73\"}\n",
+        );
+
+        let subagents = smol::block_on(list_subagents(&home_directory, REAL_SESSION_ID))?;
+        assert_eq!(
+            subagents
+                .iter()
+                .map(|subagent| (subagent.agent_id.as_str(), subagent.workflow_agent_finished))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a1111e203ec41bc73", Some(true)),
+                ("a2222e203ec41bc73", Some(false)),
+            ],
+            "the agent the run recorded as failed is over; the one with no entry is still working"
         );
         Ok(())
     }
