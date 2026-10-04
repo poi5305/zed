@@ -32,10 +32,105 @@ fn a_fling_tail_is_not_deferred() {
 #[test]
 fn idle_page_defers_a_frame_that_is_too_soon_and_renders_one_that_is_due() {
     let last_input = 0.;
-    let now = IDLE_AFTER_INPUT_MS * 10.;
-    assert_eq!(idle_frame_delay(now, last_input, now - 30.), Some(70.));
-    assert_eq!(idle_frame_delay(now, last_input, now - 100.), None);
+    let now = IDLE_AFTER_INPUT_MS * 2.;
+    assert_eq!(idle_frame_delay(now, last_input, now - 30.), Some(220.));
+    assert_eq!(idle_frame_delay(now, last_input, now - 250.), None);
     assert_eq!(idle_frame_delay(now, now - 10., now - 5.), None);
+}
+
+#[test]
+fn input_within_five_seconds_is_not_throttled() {
+    let now = 1_000_000.;
+    assert_eq!(idle_frame_delay(now, now, now), None);
+    assert_eq!(idle_frame_delay(now, now - 5_000., now - 1.), None);
+    assert!(!user_is_idle(now, now - 5_000.));
+    assert!(user_is_idle(now, now - 5_001.));
+}
+
+#[test]
+fn idle_between_five_and_thirty_seconds_runs_at_four_frames_per_second() {
+    let last_input = 1_000_000.;
+    for idle_for in [5_001., 10_000., 29_999., 30_000.] {
+        let now = last_input + idle_for;
+        assert_eq!(
+            idle_frame_delay(now, last_input, now),
+            Some(250.),
+            "idle for {idle_for} ms"
+        );
+        assert_eq!(
+            idle_frame_delay(now, last_input, now - 100.),
+            Some(150.),
+            "idle for {idle_for} ms"
+        );
+        assert_eq!(
+            idle_frame_delay(now, last_input, now - 250.),
+            None,
+            "idle for {idle_for} ms"
+        );
+    }
+}
+
+#[test]
+fn idle_beyond_thirty_seconds_runs_at_one_frame_per_second() {
+    let last_input = 1_000_000.;
+    for idle_for in [30_001., 60_000., 3_600_000.] {
+        let now = last_input + idle_for;
+        assert_eq!(
+            idle_frame_delay(now, last_input, now - 250.),
+            Some(750.),
+            "idle for {idle_for} ms"
+        );
+        assert_eq!(
+            idle_frame_delay(now, last_input, now - 999.),
+            Some(1.),
+            "idle for {idle_for} ms"
+        );
+        assert_eq!(
+            idle_frame_delay(now, last_input, now - 1_000.),
+            None,
+            "idle for {idle_for} ms"
+        );
+    }
+}
+
+#[test]
+fn crossing_into_the_deeper_tier_never_waits_longer_than_its_interval() {
+    let last_input = 1_000_000.;
+    for idle_for in [5_001., 20_000., 30_000., 30_001., 45_000.] {
+        let now = last_input + idle_for;
+        for since_frame in [0., 1., 100., 249., 250., 500., 999., 1_000., 5_000.] {
+            if let Some(delay) = idle_frame_delay(now, last_input, now - since_frame) {
+                assert!(
+                    delay > 0. && since_frame + delay <= 1_000.,
+                    "idle {idle_for} ms, last frame {since_frame} ms ago: waits {delay} ms, so the frame lands {} ms after the previous one",
+                    since_frame + delay
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_clock_that_moved_backwards_does_not_stall_deeply_idle_frames() {
+    let now = 1_000_000.;
+    let last_input = now - 60_000.;
+    assert_eq!(idle_frame_delay(now, last_input, now + 3_600_000.), None);
+    assert_eq!(idle_frame_delay(now, now + 3_600_000., now - 10.), None);
+}
+
+#[test]
+fn input_after_a_long_idle_restores_unthrottled_frames() {
+    let last_input = 1_000_000.;
+    let now = last_input + 120_000.;
+    assert_eq!(idle_frame_delay(now, last_input, now - 10.), Some(990.));
+    let input_at = now;
+    assert!(!user_is_idle(now + 16., input_at));
+    assert_eq!(idle_frame_delay(now + 16., input_at, now), None);
+    assert_eq!(idle_frame_delay(now + 5_000., input_at, now + 4_990.), None);
+    assert_eq!(
+        idle_frame_delay(now + 5_001., input_at, now + 5_000.),
+        Some(249.)
+    );
 }
 
 #[test]

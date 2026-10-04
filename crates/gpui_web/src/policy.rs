@@ -6,20 +6,39 @@
 /// about 3.5 s for a fast flick, so the page must not count as idle before
 /// that.
 pub(crate) const IDLE_AFTER_INPUT_MS: f64 = 5000.;
-/// The minimum time between frames while idle: 10 frames per second.
-pub(crate) const IDLE_FRAME_INTERVAL_MS: f64 = 100.;
+/// The minimum time between frames while idle: 4 frames per second.
+pub(crate) const IDLE_FRAME_INTERVAL_MS: f64 = 250.;
+/// How long after the last user input the page counts as deeply idle: nobody
+/// is looking at it, so only looping animations such as a status dot still run.
+pub(crate) const DEEP_IDLE_AFTER_INPUT_MS: f64 = 30_000.;
+/// The minimum time between frames while deeply idle: 1 frame per second.
+pub(crate) const DEEP_IDLE_FRAME_INTERVAL_MS: f64 = 1000.;
 
 pub(crate) fn user_is_idle(now: f64, last_input_at: f64) -> bool {
     now - last_input_at > IDLE_AFTER_INPUT_MS
 }
 
-/// How long to defer the frame that is due now, or `None` to render it.
+/// The minimum time between frames now, or `None` while the user is active.
+fn idle_frame_interval(now: f64, last_input_at: f64) -> Option<f64> {
+    if !user_is_idle(now, last_input_at) {
+        None
+    } else if now - last_input_at > DEEP_IDLE_AFTER_INPUT_MS {
+        Some(DEEP_IDLE_FRAME_INTERVAL_MS)
+    } else {
+        Some(IDLE_FRAME_INTERVAL_MS)
+    }
+}
+
+/// How long to defer the frame that is due now, or `None` to render it. The
+/// delay is measured from the last frame against the interval of the tier in
+/// force now, so a tier change never stretches the wait past the new interval.
 pub(crate) fn idle_frame_delay(now: f64, last_input_at: f64, last_frame_at: f64) -> Option<f64> {
+    let interval = idle_frame_interval(now, last_input_at)?;
     let since_frame = now - last_frame_at;
     // A negative interval means the wall clock stepped backwards; the frame is
     // overdue then, not due in an hour.
-    if user_is_idle(now, last_input_at) && (0.0..IDLE_FRAME_INTERVAL_MS).contains(&since_frame) {
-        Some(IDLE_FRAME_INTERVAL_MS - since_frame)
+    if (0.0..interval).contains(&since_frame) {
+        Some(interval - since_frame)
     } else {
         None
     }
