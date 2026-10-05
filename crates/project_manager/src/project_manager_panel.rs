@@ -24,9 +24,10 @@ use workspace::{
 };
 
 use crate::{
-    ImportMerge, ProjectEntry, ProjectGroup, ProjectLocation, ToggleFocus, filter_projects,
-    group_projects, import_vscode_projects, load_projects, merge_imported_projects,
-    project_entry_element_id, remote_project_uri, save_projects, vscode_project_files,
+    ImportMerge, OpenFolders, ProjectEntry, ProjectGroup, ProjectLocation, ToggleFocus,
+    filter_projects, group_projects, import_vscode_projects, load_projects, mark_open_project_row,
+    merge_imported_projects, project_entry_element_id, remote_project_uri, save_projects,
+    vscode_project_files,
 };
 
 const PROJECT_MANAGER_PANEL_KEY: &str = "ProjectManagerPanel";
@@ -42,6 +43,8 @@ pub struct ProjectManagerPanel {
     filter_editor: Entity<Editor>,
     projects: Vec<ProjectEntry>,
     project_rows: Vec<ProjectRow>,
+    /// Parsed alongside `project_rows`, for marking the projects this window has open.
+    project_locations: Vec<Option<ProjectLocation>>,
     load_error: Option<SharedString>,
     /// What the last import did, a line at a time. Kept apart from `load_error` because
     /// an import that reports something is not an import that failed.
@@ -112,6 +115,7 @@ impl ProjectManagerPanel {
                 filter_editor,
                 projects: Vec::new(),
                 project_rows: Vec::new(),
+                project_locations: Vec::new(),
                 load_error: None,
                 notice: Vec::new(),
                 position: DockPosition::Left,
@@ -150,6 +154,10 @@ impl ProjectManagerPanel {
 
     fn set_projects(&mut self, projects: Vec<ProjectEntry>) {
         self.project_rows = projects.iter().map(project_row).collect();
+        self.project_locations = projects
+            .iter()
+            .map(|project| project.location().ok())
+            .collect();
         self.projects = projects;
     }
 
@@ -481,9 +489,15 @@ impl ProjectManagerPanel {
         &self,
         group: &ProjectGroup,
         index: usize,
+        open_folders: &OpenFolders,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let project = self.projects.get(index)?;
+        let is_open = self
+            .project_locations
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|location| open_folders.contains_location(location));
         let row = self.project_rows.get(index)?;
         let name: SharedString = project.name.clone().into();
         let element_id = SharedString::from(project_entry_element_id(group, index));
@@ -494,39 +508,37 @@ impl ProjectManagerPanel {
         let tooltip = row.tooltip.clone();
         let color = row.color;
 
-        Some(
-            ListItem::new(element_id.clone())
-                .spacing(ListItemSpacing::Sparse)
-                .start_slot(Icon::new(icon).size(IconSize::Small).color(color))
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap_1p5()
-                        .child(Label::new(name).single_line().color(color))
-                        .when_some(host, |this, host| {
-                            this.child(
-                                Label::new(host)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            )
-                        }),
-                )
-                .tooltip(Tooltip::text(tooltip))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_project(index, CLICK_OPENS_A_NEW_WINDOW, window, cx);
-                }))
-                .end_slot(
-                    IconButton::new(this_window_id, IconName::Replace)
-                        .icon_size(IconSize::Small)
-                        .visible_on_hover(element_id)
-                        .tooltip(Tooltip::text("Open in This Window"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_project(index, false, window, cx);
-                        })),
-                )
-                .into_any_element(),
-        )
+        let row = ListItem::new(element_id.clone())
+            .spacing(ListItemSpacing::Sparse)
+            .start_slot(Icon::new(icon).size(IconSize::Small).color(color))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Label::new(name).single_line().color(color))
+                    .when_some(host, |this, host| {
+                        this.child(
+                            Label::new(host)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    }),
+            )
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_project(index, CLICK_OPENS_A_NEW_WINDOW, window, cx);
+            }))
+            .end_slot(
+                IconButton::new(this_window_id, IconName::Replace)
+                    .icon_size(IconSize::Small)
+                    .visible_on_hover(element_id)
+                    .tooltip(Tooltip::text("Open in This Window"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_project(index, false, window, cx);
+                    })),
+            );
+        Some(mark_open_project_row(row, is_open, cx))
     }
 }
 
@@ -690,6 +702,11 @@ impl Render for ProjectManagerPanel {
         let query = self.filter_query(cx);
         let matches = filter_projects(&self.projects, &query);
         let groups = group_projects(&self.projects, &matches);
+        let open_folders = self
+            .workspace
+            .upgrade()
+            .map(|workspace| OpenFolders::of_workspace(workspace.read(cx), cx))
+            .unwrap_or_default();
 
         v_flex()
             .key_context("ProjectManagerPanel")
@@ -745,7 +762,9 @@ impl Render for ProjectManagerPanel {
                         let rows: Vec<AnyElement> = group
                             .entry_indices
                             .iter()
-                            .filter_map(|&index| self.render_project(&group, index, cx))
+                            .filter_map(|&index| {
+                                self.render_project(&group, index, &open_folders, cx)
+                            })
                             .collect();
                         v_flex()
                             .child(

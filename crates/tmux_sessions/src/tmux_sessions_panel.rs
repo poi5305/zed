@@ -4,9 +4,10 @@ use gpui::{
     FocusHandle, Focusable, FutureExt as _, Render, Subscription, Task, WeakEntity,
     pulsating_between,
 };
+use project_manager::{OpenFolders, mark_open_project_row};
 use rpc::{AnyProtoClient, proto};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal_view::{REATTACHABLE_TASK_ID_PREFIX, terminal_panel::TerminalPanel};
@@ -365,9 +366,16 @@ impl TmuxSessionsPanel {
         &self,
         index: usize,
         links: &[LinkedClaudeSession],
+        open_folders: &OpenFolders,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let session = self.sessions.get(index)?;
+        let window_is_open: Vec<bool> = session
+            .windows
+            .iter()
+            .map(|tmux_window| open_folders.contains(Path::new(&tmux_window.current_path)))
+            .collect();
+        let any_window_open = window_is_open.iter().any(|is_open| *is_open);
         let name = session.name.clone();
         let expanded = !self.collapsed_sessions.contains(&name);
         let window_count = session.window_count;
@@ -477,21 +485,23 @@ impl TmuxSessionsPanel {
                 .iter()
                 .enumerate()
                 .map(|(window_index, tmux_window)| {
-                    self.render_window(
+                    let row = self.render_window(
                         index,
                         &name,
                         window_index,
                         tmux_window,
                         linked_claude_session(links, &tmux_window.id),
                         cx,
-                    )
+                    );
+                    let is_open = window_is_open.get(window_index).copied().unwrap_or(false);
+                    mark_open_project_row(row, is_open, cx)
                 })
                 .collect::<Vec<_>>()
         });
 
         Some(
             v_flex()
-                .child(header)
+                .child(mark_open_project_row(header, any_window_open, cx))
                 .children(windows.into_iter().flatten())
                 .into_any_element(),
         )
@@ -757,6 +767,11 @@ impl Render for TmuxSessionsPanel {
         self.observe_claude_links(cx);
         let links = self.current_claude_links(cx);
         let empty_message = self.empty_message();
+        let open_folders = self
+            .workspace
+            .upgrade()
+            .map(|workspace| OpenFolders::of_workspace(workspace.read(cx), cx))
+            .unwrap_or_default();
 
         v_flex()
             .key_context("TmuxSessionsPanel")
@@ -781,8 +796,9 @@ impl Render for TmuxSessionsPanel {
                         )
                     })
                     .children(
-                        (0..self.sessions.len())
-                            .filter_map(|index| self.render_session(index, &links, cx)),
+                        (0..self.sessions.len()).filter_map(|index| {
+                            self.render_session(index, &links, &open_folders, cx)
+                        }),
                     ),
             )
     }
