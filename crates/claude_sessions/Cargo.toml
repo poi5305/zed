@@ -23,6 +23,7 @@ gpui.workspace = true
 markdown.workspace = true
 paths.workspace = true
 project.workspace = true
+project_manager.workspace = true
 remote.workspace = true
 rpc.workspace = true
 serde.workspace = true
@@ -41,6 +42,7 @@ workspace.workspace = true
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+recent_projects = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 smol.workspace = true
 # `./script/clippy` passes `--all-features`, which turns on remote's `test-support`

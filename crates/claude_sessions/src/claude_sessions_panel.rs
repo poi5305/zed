@@ -34,6 +34,7 @@ use gpui::{
 };
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use project::Project;
+use project_manager::{OpenFolders, mark_open_project_row};
 use serde_json::Value;
 use settings::{DockSide, Settings as _};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
@@ -3961,6 +3962,11 @@ impl ClaudeSessionsPanel {
     }
 
     fn render_session_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open_folders = self
+            .workspace
+            .upgrade()
+            .map(|workspace| OpenFolders::of_workspace(workspace.read(cx), cx))
+            .unwrap_or_default();
         let store = self.store.read(cx);
         let rows = store.session_rows();
         let selected = store.selected().map(str::to_string);
@@ -4189,22 +4195,30 @@ impl ClaudeSessionsPanel {
                                 let agents_shown = (!agents.is_empty()).then(|| {
                                     !self.collapsed_session_agents.contains(&session_id)
                                 });
-                                v_flex()
-                                    .child(match row {
-                                        SessionRow::Live(live) => self.render_live_session_row(
+                                let (session_row, working_directory) = match row {
+                                    SessionRow::Live(live) => (
+                                        self.render_live_session_row(
                                             index,
                                             live,
                                             is_selected,
                                             agents_shown,
                                             cx,
                                         ),
-                                        SessionRow::Ended(ended) => self.render_ended_session_row(
+                                        live.session.working_directory.as_path(),
+                                    ),
+                                    SessionRow::Ended(ended) => (
+                                        self.render_ended_session_row(
                                             index,
                                             ended,
                                             is_selected,
                                             cx,
                                         ),
-                                    })
+                                        ended.cwd.as_path(),
+                                    ),
+                                };
+                                let is_open = open_folders.contains(working_directory);
+                                v_flex()
+                                    .child(mark_open_project_row(session_row, is_open, cx))
                                     .children(
                                         (agents_shown == Some(true))
                                             .then(|| {

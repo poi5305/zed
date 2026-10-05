@@ -3099,6 +3099,8 @@ dependencies = [
  "markdown",
  "paths",
  "project",
+ "project_manager",
+ "recent_projects",
  "remote",
  "rpc",
  "serde",

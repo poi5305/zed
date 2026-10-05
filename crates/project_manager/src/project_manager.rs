@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
-use gpui::{App, Context, Window, actions};
+use gpui::{AnyElement, App, Context, IntoElement, Window, actions, div, px};
 use recent_projects::open_remote_project;
 use remote::RemoteConnectionOptions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::notifications::NotifyTaskExt as _;
 use workspace::{OpenMode, OpenOptions, Workspace};
@@ -515,6 +516,80 @@ pub fn open_folder_in_new_window(
     .detach_and_notify_err(workspace_handle, window, cx);
 }
 
+/// The folders a window has open and the machine they are on, so that panels can mark
+/// the rows that belong to the project the reader is looking at.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenFolders {
+    machine: Option<String>,
+    roots: Vec<PathBuf>,
+}
+
+impl OpenFolders {
+    pub fn new(connection: Option<&RemoteConnectionOptions>, roots: Vec<PathBuf>) -> Self {
+        Self {
+            machine: connection.map(machine_key),
+            roots,
+        }
+    }
+
+    pub fn of_workspace(workspace: &Workspace, cx: &App) -> Self {
+        let project = workspace.project().read(cx);
+        let roots = project
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect();
+        let connection = project
+            .remote_client()
+            .and_then(|client| client.read(cx).remote_connection())
+            .map(|connection| connection.connection_options());
+        Self::new(connection.as_ref(), roots)
+    }
+
+    /// Whether `folder`, on this window's own machine, is one of its roots or inside one:
+    /// a shell or a Claude session started in a subfolder still works on this project.
+    pub fn contains(&self, folder: &Path) -> bool {
+        !folder.as_os_str().is_empty() && self.roots.iter().any(|root| folder.starts_with(root))
+    }
+
+    /// Whether a project at `location` opens one of the folders this window has open,
+    /// on the same machine.
+    pub fn contains_location(&self, location: &ProjectLocation) -> bool {
+        let (machine, folders) = match location {
+            ProjectLocation::Local(folders) => (None, folders),
+            ProjectLocation::Remote { options, paths } => (Some(machine_key(options)), paths),
+        };
+        machine == self.machine
+            && folders
+                .iter()
+                .any(|folder| self.roots.iter().any(|root| root == folder))
+    }
+}
+
+/// Draws `row` as belonging to the project this window has open: a tinted background
+/// with an accent bar at its left edge, which stays distinct from the selected row's
+/// background in every theme.
+pub fn mark_open_project_row(row: impl IntoElement, is_open: bool, cx: &App) -> AnyElement {
+    if !is_open {
+        return row.into_any_element();
+    }
+    let colors = cx.theme().colors();
+    div()
+        .relative()
+        .w_full()
+        .bg(colors.text.opacity(0.08))
+        .child(row)
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(2.))
+                .bg(colors.text_accent),
+        )
+        .into_any_element()
+}
+
 pub fn serialize_projects(projects: &[ProjectEntry]) -> Result<String> {
     let mut contents =
         serde_json::to_string_pretty(projects).context("serializing projects.json")?;
@@ -598,6 +673,50 @@ mod tests {
             "on a remote machine only that machine's projects match"
         );
         assert_eq!(found(Some(&box_connection), "/srv/app"), None);
+    }
+
+    #[test]
+    fn open_folders_mark_folders_inside_a_root_and_projects_on_the_same_machine() {
+        let local = OpenFolders::new(None, vec![PathBuf::from("/work/zed")]);
+        assert!(local.contains(Path::new("/work/zed")));
+        assert!(
+            local.contains(Path::new("/work/zed/crates/gpui")),
+            "a shell in a subfolder is still working on the open project"
+        );
+        assert!(
+            !local.contains(Path::new("/work/zed-fork")),
+            "a sibling whose name merely starts with the root's is not inside it"
+        );
+        assert!(!local.contains(Path::new("/work")));
+        assert!(
+            !local.contains(Path::new("")),
+            "a tmux window from an old host reports no path"
+        );
+        assert!(!OpenFolders::default().contains(Path::new("/work/zed")));
+
+        let location = |uri: &str| {
+            ProjectEntry::new("project", uri)
+                .location()
+                .unwrap_or_else(|error| panic!("{uri}: {error:#}"))
+        };
+        assert!(local.contains_location(&location("/work/zed")));
+        assert!(
+            !local.contains_location(&location("/work")),
+            "a project holding the open folder is a different project"
+        );
+        assert!(
+            !local.contains_location(&location("ssh://box/work/zed")),
+            "the same path on another machine is another folder"
+        );
+
+        let live = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "MyBox".into(),
+            ..Default::default()
+        });
+        let remote = OpenFolders::new(Some(&live), vec![PathBuf::from("/work/zed")]);
+        assert!(remote.contains_location(&location("ssh://MyBox/work/zed")));
+        assert!(!remote.contains_location(&location("ssh://other/work/zed")));
+        assert!(!remote.contains_location(&location("/work/zed")));
     }
 
     #[test]
