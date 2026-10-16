@@ -15,7 +15,7 @@ use std::{
         Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -3222,7 +3222,7 @@ pub async fn list_subagents_for_sessions(
         sort_subagents(subagents);
     }
 
-    prune_read_conversations();
+    prune_read_conversations(Instant::now());
 
     Ok(subagents_by_session)
 }
@@ -3286,50 +3286,49 @@ struct CachedConversation {
     length: u64,
     modified: Option<SystemTime>,
     conversation: SessionConversation,
+    last_read: Instant,
 }
 
 /// What the last read of a conversation found, kept so that the poll behind this does not
 /// read a multi-megabyte file every second for a session nothing has appended to.
 ///
 /// Keyed by path. On growth, only the appended bytes are folded in. On shrink or replace
-/// the entry is rebuilt. Entries whose session was not listed in the last scan are dropped.
+/// the entry is rebuilt. Entries no scan has read for [`READ_CONVERSATION_IDLE_EVICTION`]
+/// are dropped.
 static READ_CONVERSATIONS: Mutex<Option<HashMap<PathBuf, CachedConversation>>> = Mutex::new(None);
-static SCANNED_CONVERSATION_PATHS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
-fn note_conversation_path(path: &Path) {
-    if let Ok(mut paths) = SCANNED_CONVERSATION_PATHS.lock() {
-        paths
-            .get_or_insert_with(HashSet::default)
-            .insert(path.to_path_buf());
-    }
-}
+/// Eviction goes by idle time rather than by what the last scan listed: every open session
+/// tab polls its own sessions, so the last scan only ever saw one tab's share of them.
+/// Long enough to outlast the slowest poll: a store waits up to 20 s on the subagent scan and
+/// 20 s on `claude agents --json` before it sleeps, and a hidden panel polls less often still.
+const READ_CONVERSATION_IDLE_EVICTION: Duration = Duration::from_secs(300);
 
-fn prune_read_conversations() {
-    let keep = match SCANNED_CONVERSATION_PATHS.lock() {
-        Ok(mut paths) => paths.take().unwrap_or_default(),
-        Err(_) => return,
-    };
+fn prune_read_conversations(now: Instant) {
     if let Ok(mut cache) = READ_CONVERSATIONS.lock()
         && let Some(cache) = cache.as_mut()
     {
-        cache.retain(|path, _| keep.contains(path));
+        cache.retain(|_, cached| !read_conversation_is_idle(cached.last_read, now));
     }
+}
+
+fn read_conversation_is_idle(last_read: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_read) >= READ_CONVERSATION_IDLE_EVICTION
 }
 
 /// Reads the conversation at `transcript_path` for what it says about its own agents.
 fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversation> {
-    note_conversation_path(transcript_path);
     let metadata = fs::metadata(transcript_path)
         .with_context(|| format!("reading {}", transcript_path.display()))?;
     let length = metadata.len();
     let modified = metadata.modified().ok();
 
-    if let Ok(cache) = READ_CONVERSATIONS.lock()
-        && let Some(cache) = cache.as_ref()
-        && let Some(cached) = cache.get(transcript_path)
+    if let Ok(mut cache) = READ_CONVERSATIONS.lock()
+        && let Some(cache) = cache.as_mut()
+        && let Some(cached) = cache.get_mut(transcript_path)
         && cached.length == length
         && cached.modified == modified
     {
+        cached.last_read = Instant::now();
         return Ok(cached.conversation.clone());
     }
 
@@ -3339,7 +3338,7 @@ fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversati
         .and_then(|cache| cache.as_ref()?.get(transcript_path).cloned());
 
     let (mut conversation, mut offset_scanned) = match cached {
-        Some(cached) if length >= cached.length && cached.offset_scanned <= cached.length => {
+        Some(cached) if length >= cached.length && length >= cached.offset_scanned => {
             (cached.conversation, cached.offset_scanned)
         }
         _ => (SessionConversation::default(), 0),
@@ -3362,6 +3361,7 @@ fn read_session_conversation(transcript_path: &Path) -> Result<SessionConversati
                 length,
                 modified,
                 conversation: conversation.clone(),
+                last_read: Instant::now(),
             },
         );
     }
@@ -7077,6 +7077,86 @@ mod tests {
         Ok(())
     }
 
+    /// Every open Claude session tab owns a store that polls its own sessions' agents every
+    /// second, so scans for different sessions interleave on one host. One scan must not
+    /// evict what another just read, or each poll re-reads a 50 MB conversation from the top.
+    #[test]
+    fn a_scan_of_other_sessions_keeps_this_sessions_conversation_cached() -> Result<()> {
+        let home_directory = temporary_directory("interleaved-scans");
+        let first_session_id = "first-tab-session";
+        let second_session_id = "second-tab-session";
+        let project_directory = home_directory
+            .join(".claude")
+            .join("projects")
+            .join("-a-project");
+        for session_id in [first_session_id, second_session_id] {
+            write_subagent_in_project(
+                &home_directory,
+                "-a-project",
+                session_id,
+                None,
+                REAL_AGENT_ID,
+                SUBAGENT_META_FOREGROUND,
+                "{\"type\":\"user\",\"isSidechain\":true}\n",
+            );
+            write_file(
+                project_directory.join(format!("{session_id}.jsonl")),
+                &tool_result_line(SPAWNING_CALL_ID),
+            );
+        }
+        let first_conversation = project_directory.join(format!("{first_session_id}.jsonl"));
+        let first_length = std::fs::metadata(&first_conversation)?.len();
+
+        smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &[first_session_id.to_string()],
+        ))?;
+        smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &[second_session_id.to_string()],
+        ))?;
+
+        let cached_offset = READ_CONVERSATIONS
+            .lock()
+            .ok()
+            .and_then(|cache| Some(cache.as_ref()?.get(&first_conversation)?.offset_scanned));
+        assert_eq!(
+            cached_offset,
+            Some(first_length),
+            "the first tab's conversation must stay cached after the second tab's scan, so \
+             its next poll reads only appended bytes"
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    /// A hidden panel polls every five seconds, so a conversation read that recently is
+    /// still being followed; one no scan has touched for the eviction window is not.
+    #[test]
+    fn a_conversation_is_evicted_only_after_no_scan_reads_it_for_the_idle_window() {
+        let last_read = Instant::now();
+        assert!(
+            !read_conversation_is_idle(last_read, last_read + Duration::from_secs(5)),
+            "a conversation a hidden panel read 5 s ago must stay cached"
+        );
+        assert!(
+            !read_conversation_is_idle(
+                last_read,
+                last_read + READ_CONVERSATION_IDLE_EVICTION - Duration::from_millis(1)
+            ),
+            "a conversation read just inside the window must stay cached"
+        );
+        assert!(
+            read_conversation_is_idle(last_read, last_read + READ_CONVERSATION_IDLE_EVICTION),
+            "a conversation no scan has read for the whole window must be dropped"
+        );
+        assert!(
+            !read_conversation_is_idle(last_read, last_read - Duration::from_secs(1)),
+            "a scan that stamped the entry after this prune's clock read must not be dropped"
+        );
+    }
+
     /// The answer is cached against the conversation's length and modification time, so a
     /// conversation that has since answered the call must not be served the old answer.
     #[test]
@@ -8353,6 +8433,218 @@ mod session_lifecycle_tests {
             "the record finished between the two scans must be absorbed, so that the agent \
              it answers stops reading as unfinished; answered_calls is {:?}",
             conversation.answered_calls
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    fn tool_result_record(call_id: &str) -> String {
+        format!(
+            r#"{{"message":{{"content":[{{"type":"tool_result","tool_use_id":"{call_id}"}}]}}}}"#
+        )
+    }
+
+    fn seed_cached_conversation(
+        path: &Path,
+        offset_scanned: u64,
+        length: u64,
+        sentinel_call_id: &str,
+    ) {
+        let mut conversation = SessionConversation::default();
+        conversation
+            .answered_calls
+            .insert(sentinel_call_id.to_string());
+        READ_CONVERSATIONS
+            .lock()
+            .expect("locking the conversation cache")
+            .get_or_insert_with(HashMap::default)
+            .insert(
+                path.to_path_buf(),
+                CachedConversation {
+                    offset_scanned,
+                    length,
+                    modified: None,
+                    conversation,
+                    last_read: Instant::now(),
+                },
+            );
+    }
+
+    fn cached_offset_scanned(path: &Path) -> Option<u64> {
+        READ_CONVERSATIONS
+            .lock()
+            .ok()
+            .and_then(|cache| Some(cache.as_ref()?.get(path)?.offset_scanned))
+    }
+
+    /// A scan that runs while the session appends reads past the length it took before
+    /// reading, so the entry it caches has `offset_scanned > length`. The next poll must
+    /// resume from that offset: rebuilding from the top re-reads a 50 MB file every poll
+    /// for exactly the sessions that are being written to.
+    #[test]
+    fn a_scan_that_read_past_its_recorded_length_is_resumed_not_rebuilt() {
+        let directory = temporary_directory("resume-past-length");
+        let path = directory.join("conversation.jsonl");
+        std::fs::write(&path, format!("{}\n", tool_result_record("toolu_first")))
+            .expect("writing the first line");
+        let offset_scanned = std::fs::metadata(&path).expect("measuring the file").len();
+        seed_cached_conversation(
+            &path,
+            offset_scanned,
+            offset_scanned - 10,
+            "toolu_seeded_only",
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("opening the file to append");
+        std::io::Write::write_all(
+            &mut file,
+            format!("{}\n", tool_result_record("toolu_appended")).as_bytes(),
+        )
+        .expect("appending the second line");
+        let new_length = std::fs::metadata(&path).expect("measuring the file").len();
+
+        let conversation = read_session_conversation(&path).expect("the scan after the growth");
+        let expected: HashSet<String> = ["toolu_seeded_only", "toolu_appended"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            conversation.answered_calls, expected,
+            "the cached entry must be resumed (keeping the seeded id the file never held) and \
+             the appended line absorbed"
+        );
+        assert_eq!(
+            cached_offset_scanned(&path),
+            Some(new_length),
+            "the resumed scan must leave the offset at the file's new end"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The resume condition must not reject the exact boundary: a file as long as the
+    /// offset already scanned has nothing new, and is resumed rather than rebuilt.
+    #[test]
+    fn a_file_exactly_as_long_as_the_scanned_offset_is_resumed() {
+        let directory = temporary_directory("resume-at-offset");
+        let path = directory.join("conversation.jsonl");
+        std::fs::write(&path, format!("{}\n", tool_result_record("toolu_first")))
+            .expect("writing the line");
+        let offset_scanned = std::fs::metadata(&path).expect("measuring the file").len();
+        seed_cached_conversation(
+            &path,
+            offset_scanned,
+            offset_scanned - 10,
+            "toolu_seeded_only",
+        );
+
+        let conversation = read_session_conversation(&path).expect("the scan at the boundary");
+        assert!(
+            conversation.answered_calls.contains("toolu_seeded_only"),
+            "a file exactly as long as the scanned offset must be resumed; answered_calls is {:?}",
+            conversation.answered_calls
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A conversation that is shorter than what was scanned, or than the length recorded
+    /// with it, was truncated or replaced, so the cached ids are not its own any more.
+    #[test]
+    fn a_file_shorter_than_the_cached_scan_is_rebuilt_from_the_top() {
+        let directory = temporary_directory("rebuild-after-shrink");
+        let path = directory.join("conversation.jsonl");
+        std::fs::write(&path, format!("{}\n", tool_result_record("toolu_first")))
+            .expect("writing the line");
+        let file_length = std::fs::metadata(&path).expect("measuring the file").len();
+
+        for (offset_scanned, recorded_length, description) in [
+            (
+                file_length + 1,
+                file_length - 10,
+                "shorter than the scanned offset",
+            ),
+            (
+                file_length,
+                file_length + 1,
+                "shorter than the recorded length",
+            ),
+        ] {
+            seed_cached_conversation(&path, offset_scanned, recorded_length, "toolu_seeded_only");
+            let conversation = read_session_conversation(&path).expect("the scan after a shrink");
+            let expected: HashSet<String> = ["toolu_first"].into_iter().map(String::from).collect();
+            assert_eq!(
+                conversation.answered_calls, expected,
+                "a file {description} must be rebuilt from the top, dropping the cached ids"
+            );
+            assert_eq!(
+                cached_offset_scanned(&path),
+                Some(file_length),
+                "a file {description} must be rescanned in full"
+            );
+        }
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Pruning goes by how long ago a scan last read the entry, so a cache hit has to count
+    /// as a read: a conversation followed through unchanged polls must not be evicted.
+    #[test]
+    fn a_cache_hit_keeps_a_conversation_from_being_pruned() {
+        let directory = temporary_directory("hit-refreshes-last-read");
+        let path = directory.join("conversation.jsonl");
+        std::fs::write(&path, format!("{}\n", tool_result_record("toolu_first")))
+            .expect("writing the line");
+        read_session_conversation(&path).expect("the scan that populates the cache");
+        let Some(stale) =
+            Instant::now().checked_sub(READ_CONVERSATION_IDLE_EVICTION + Duration::from_secs(1))
+        else {
+            return;
+        };
+        if let Ok(mut cache) = READ_CONVERSATIONS.lock()
+            && let Some(cached) = cache.as_mut().and_then(|cache| cache.get_mut(&path))
+        {
+            cached.last_read = stale;
+        }
+
+        read_session_conversation(&path).expect("the unchanged scan that hits the cache");
+        prune_read_conversations(Instant::now());
+
+        assert!(
+            cached_offset_scanned(&path).is_some(),
+            "a conversation a scan just read from the cache must survive the next prune"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_conversation_no_scan_has_read_for_the_idle_window_is_pruned() {
+        let directory = temporary_directory("idle-entry-pruned");
+        let path = directory.join("conversation.jsonl");
+        std::fs::write(&path, format!("{}\n", tool_result_record("toolu_first")))
+            .expect("writing the line");
+        read_session_conversation(&path).expect("the scan that populates the cache");
+        let Some(stale) =
+            Instant::now().checked_sub(READ_CONVERSATION_IDLE_EVICTION + Duration::from_secs(1))
+        else {
+            return;
+        };
+        if let Ok(mut cache) = READ_CONVERSATIONS.lock()
+            && let Some(cached) = cache.as_mut().and_then(|cache| cache.get_mut(&path))
+        {
+            cached.last_read = stale;
+        }
+
+        prune_read_conversations(Instant::now());
+
+        assert_eq!(
+            cached_offset_scanned(&path),
+            None,
+            "a conversation no scan has read for the whole idle window must be pruned"
         );
 
         std::fs::remove_dir_all(&directory).ok();
