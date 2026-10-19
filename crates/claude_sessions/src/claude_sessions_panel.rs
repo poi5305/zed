@@ -8625,8 +8625,10 @@ impl Panel for ClaudeSessionsPanel {
         px(420.)
     }
 
+    // No dock button: the tmux panel shows these sessions now, but still reads them
+    // from this panel's store, so the panel itself has to stay registered.
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::AiClaude)
+        None
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

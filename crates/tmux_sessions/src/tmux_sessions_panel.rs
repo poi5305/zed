@@ -1,7 +1,7 @@
 use collections::HashSet;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AsyncWindowContext, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FutureExt as _, Render, Subscription, Task, WeakEntity,
+    FocusHandle, Focusable, FontWeight, FutureExt as _, Render, Subscription, Task, WeakEntity,
     pulsating_between,
 };
 use project_manager::{OpenFolders, mark_open_project_row};
@@ -425,7 +425,12 @@ impl TmuxSessionsPanel {
                 h_flex()
                     .gap_1()
                     .overflow_hidden()
-                    .child(Label::new(name.clone()).single_line())
+                    .child(
+                        Label::new(name.clone())
+                            .single_line()
+                            .color(Color::Accent)
+                            .weight(FontWeight::SEMIBOLD),
+                    )
                     .child(
                         Label::new(if window_count == 1 {
                             "1 window".to_string()
