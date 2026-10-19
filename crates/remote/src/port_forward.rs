@@ -26,7 +26,7 @@ use futures::{
 use gpui::{AsyncApp, Context, Entity, SharedString, Task};
 use parking_lot::Mutex;
 use rpc::{AnyProtoClient, TypedEnvelope, proto};
-use settings::SshPortForwardOption;
+use settings_content::SshPortForwardOption;
 use smol::net::{TcpListener, TcpStream};
 use std::sync::{
     Arc,
