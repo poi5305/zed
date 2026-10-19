@@ -786,7 +786,17 @@ pub fn read_transcript_tail(
         }
     };
 
-    read_appended_lines(path, state, start_offset, restarted)
+    read_appended_lines(path, state, start_offset, restarted).map(without_api_requests)
+}
+
+/// Claude Code records every API call's parameters in the conversation, including the
+/// auto-mode classifier's growing copy of it, so on a long session these records are most
+/// of the file. Nothing reading a transcript uses them, and the offset still covers them.
+fn without_api_requests(mut progress: TailProgress) -> TailProgress {
+    progress
+        .lines
+        .retain(|line| !line.starts_with("{\"type\":\"api-request\","));
+    progress
 }
 
 /// Follows one subagent's conversation, naming the file by the three ids on every read.
@@ -814,7 +824,7 @@ pub fn read_subagent_transcript_tail(
     };
 
     let start_offset = state.offset;
-    read_appended_lines(path, state, start_offset, false)
+    read_appended_lines(path, state, start_offset, false).map(without_api_requests)
 }
 
 /// The answer to a read whose file cannot be named at all: nothing was read, and anything
@@ -857,7 +867,8 @@ fn read_appended_lines(
             .with_context(|| format!("seeking in {}", path.display()))?;
 
         let mut appended = Vec::new();
-        file.read_to_end(&mut appended)
+        file.take(TAIL_READ_CHUNK_BYTES)
+            .read_to_end(&mut appended)
             .with_context(|| format!("reading {}", path.display()))?;
 
         state.offset = state.offset.saturating_add(appended.len() as u64);
@@ -1615,6 +1626,12 @@ fn cache_ttl_written(usage: &serde_json::Value) -> Option<CacheTtl> {
 /// How large the unfinished line of a tail may grow before it is dropped. A line that
 /// never ends would otherwise be held forever on both sides of the wire.
 pub const TAIL_PENDING_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a file one tail read takes. A caller that starts at offset 0 on a
+/// transcript of hundreds of megabytes would otherwise get it as one answer, which a slow
+/// link cannot deliver before the caller's timeout; the caller then asks again from 0
+/// and every unanswered copy stays queued in the server's memory.
+const TAIL_READ_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
 static PENDING_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -3135,7 +3152,9 @@ pub async fn list_subagents(
     };
     let mut subagents = Vec::new();
     read_subagents_for_session(&session_directory, &mut subagents)?;
-    resolve_task_agents(&session_transcript_path(&session_directory), &mut subagents);
+    if let Some(transcript_path) = find_session_transcript(home_directory, session_id) {
+        resolve_task_agents(&transcript_path, &mut subagents);
+    }
     sort_subagents(&mut subagents);
 
     Ok(subagents)
@@ -3179,6 +3198,11 @@ pub async fn list_subagents_for_sessions(
         }
     };
 
+    // A session that changed directory writes its later agents under the project
+    // directory of its new cwd, while its conversation stays under the one it started
+    // in, so the conversation is looked up across every project rather than beside
+    // each session directory.
+    let mut transcript_paths: HashMap<String, PathBuf> = HashMap::default();
     for project_entry in project_entries {
         let Some(project_entry) = project_entry.log_err() else {
             continue;
@@ -3199,26 +3223,34 @@ pub async fn list_subagents_for_sessions(
             let Some(session_entry) = session_entry.log_err() else {
                 continue;
             };
-            if !session_entry.path().is_dir() {
-                continue;
-            }
-            let Ok(session_id) = session_entry.file_name().into_string() else {
+            let Ok(entry_name) = session_entry.file_name().into_string() else {
                 continue;
             };
-            if !requested_session_ids.contains(session_id.as_str()) {
+            let session_path = session_entry.path();
+            if !session_path.is_dir() {
+                if let Some(session_id) = entry_name.strip_suffix(".jsonl")
+                    && requested_session_ids.contains(session_id)
+                {
+                    transcript_paths.insert(session_id.to_string(), session_path);
+                }
                 continue;
             }
-            if let Some(subagents) = subagents_by_session.get_mut(&session_id) {
+            if !requested_session_ids.contains(entry_name.as_str()) {
+                continue;
+            }
+            if let Some(subagents) = subagents_by_session.get_mut(&entry_name) {
                 // Same isolation as an unreadable project directory: one session whose
                 // `subagents` path cannot be listed must not hide every other session
                 // this walk already found, or has yet to find.
-                read_subagents_for_session(&session_entry.path(), subagents).log_err();
-                resolve_task_agents(&session_transcript_path(&session_entry.path()), subagents);
+                read_subagents_for_session(&session_path, subagents).log_err();
             }
         }
     }
 
-    for subagents in subagents_by_session.values_mut() {
+    for (session_id, subagents) in subagents_by_session.iter_mut() {
+        if let Some(transcript_path) = transcript_paths.get(session_id) {
+            resolve_task_agents(transcript_path, subagents);
+        }
         sort_subagents(subagents);
     }
 
@@ -3440,14 +3472,23 @@ const TOOL_RESULT_BLOCK_TYPE: &str = "tool_result";
 const TASK_ID_OPENING_TAG: &str = "<task-id>";
 const TASK_ID_CLOSING_TAG: &str = "</task-id>";
 
-/// A session's own conversation, which sits beside the directory holding its agents and
-/// is named after it.
-fn session_transcript_path(session_directory: &Path) -> PathBuf {
-    // Built by appending rather than by `with_extension`, which would cut a directory
-    // name at its last dot instead of adding to it.
-    let mut file_name = session_directory.as_os_str().to_os_string();
-    file_name.push(".jsonl");
-    PathBuf::from(file_name)
+/// A session's own conversation, which stays under the project it started in even after
+/// the session changes directory and writes its agents under another project.
+fn find_session_transcript(home_directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let projects_directory = home_directory.join(".claude").join("projects");
+    let file_name = format!("{}.jsonl", single_path_component(session_id)?);
+
+    for directory_entry in fs::read_dir(projects_directory).ok()? {
+        let Some(directory_entry) = directory_entry.log_err() else {
+            continue;
+        };
+        let candidate = directory_entry.path().join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn read_subagents_for_session(
@@ -5136,6 +5177,92 @@ mod tests {
             "only the appended line should be returned"
         );
         assert!(!second.restarted);
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_transcript_tail_skips_api_request_records() -> Result<()> {
+        let home_directory = temporary_directory("skip-api-requests");
+        let session_id = "session-api-requests";
+        let kept_blob = "{\"type\":\"api-request-blob\",\"id\":\"b\"}";
+        write_transcript(
+            &home_directory,
+            session_id,
+            &format!(
+                "{{\"type\":\"user\",\"uuid\":\"1\"}}\n\
+                 {{\"type\":\"api-request\",\"id\":\"r\",\"params\":{{}}}}\n\
+                 {kept_blob}\n\
+                 {{\"type\":\"assistant\",\"uuid\":\"2\"}}\n"
+            ),
+        );
+
+        let progress = read_transcript_tail(
+            &home_directory,
+            session_id,
+            TailState {
+                path: None,
+                offset: 0,
+                pending: Vec::new(),
+            },
+        )?;
+        assert_eq!(
+            progress.lines,
+            vec![
+                "{\"type\":\"user\",\"uuid\":\"1\"}".to_string(),
+                kept_blob.to_string(),
+                "{\"type\":\"assistant\",\"uuid\":\"2\"}".to_string(),
+            ],
+            "only the api-request record may be dropped"
+        );
+
+        std::fs::remove_dir_all(&home_directory).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_transcript_tail_reads_a_large_file_in_bounded_chunks() -> Result<()> {
+        let home_directory = temporary_directory("bounded-chunks");
+        let session_id = "session-large";
+        let expected_lines: Vec<String> = (0..60_000)
+            .map(|index| format!("{{\"type\":\"user\",\"uuid\":\"{index}\",\"pad\":\"{}\"}}", "x".repeat(80)))
+            .collect();
+        let mut contents = expected_lines.join("\n");
+        contents.push('\n');
+        let file_size = contents.len() as u64;
+        assert!(
+            file_size > 2 * TAIL_READ_CHUNK_BYTES,
+            "the fixture must span several chunks, but it is {file_size} bytes"
+        );
+        write_transcript(&home_directory, session_id, &contents);
+
+        let mut state = TailState {
+            path: None,
+            offset: 0,
+            pending: Vec::new(),
+        };
+        let mut lines = Vec::new();
+        let mut reads = 0;
+        while state.offset < file_size {
+            reads += 1;
+            assert!(reads <= 1_000, "the tail stopped advancing at offset {}", state.offset);
+            let progress = read_transcript_tail(&home_directory, session_id, state)?;
+            let read_bytes = progress.offset - progress.start_offset;
+            assert!(
+                read_bytes <= TAIL_READ_CHUNK_BYTES,
+                "one read took {read_bytes} bytes, more than the {TAIL_READ_CHUNK_BYTES} byte chunk"
+            );
+            lines.extend(progress.lines);
+            state = TailState {
+                path: progress.path,
+                offset: progress.offset,
+                pending: progress.pending,
+            };
+        }
+
+        assert_eq!(lines.len(), expected_lines.len(), "every line must arrive exactly once");
+        assert!(lines == expected_lines, "the lines must arrive whole and in order");
 
         std::fs::remove_dir_all(&home_directory).ok();
         Ok(())
@@ -7007,6 +7134,60 @@ mod tests {
                 .task_agent_finished,
             Some(true),
             "its session was notified that it stopped, which is the only record of that"
+        );
+
+        Ok(())
+    }
+
+    /// A session that changed directory writes its later agents under the new cwd's
+    /// project while its conversation stays under the project it started in.
+    #[test]
+    fn an_agent_spawned_after_its_session_changed_directory_reads_the_original_conversation()
+    -> Result<()> {
+        let home_directory = temporary_directory("agent-after-cd");
+        let session_id = "moved-session";
+        let agent_id = "a8fecd4de0ddace74";
+        write_subagent_in_project(
+            &home_directory,
+            "-moved-to-project",
+            session_id,
+            None,
+            agent_id,
+            SUBAGENT_META_BACKGROUND,
+            "{\"type\":\"user\",\"isSidechain\":true}\n",
+        );
+        write_file(
+            home_directory
+                .join(".claude")
+                .join("projects")
+                .join("-started-in-project")
+                .join(format!("{session_id}.jsonl")),
+            &format!(
+                "{}{}",
+                async_launch_result_line(BACKGROUND_CALL_ID, agent_id),
+                task_notification_line(agent_id, BACKGROUND_CALL_ID)
+            ),
+        );
+
+        let subagents_by_session = smol::block_on(list_subagents_for_sessions(
+            &home_directory,
+            &[session_id.to_string()],
+        ))?;
+        let finished = subagents_by_session
+            .get(session_id)
+            .context("the session has a result entry")?[0]
+            .task_agent_finished;
+        assert_eq!(
+            finished,
+            Some(true),
+            "the conversation under the starting project records the agent stopping"
+        );
+
+        let listed = smol::block_on(list_subagents(&home_directory, session_id))?;
+        assert_eq!(
+            listed[0].task_agent_finished,
+            Some(true),
+            "the single-session listing must find the same conversation"
         );
 
         Ok(())
