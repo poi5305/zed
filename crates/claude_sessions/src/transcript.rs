@@ -147,6 +147,9 @@ pub struct Transcript {
     last_bridge_session_index: Option<usize>,
     last_tokens_left_index: Option<usize>,
     last_auto_mode_index: Option<usize>,
+    /// Recomputed after every `absorb` because the panel reads it for each row it renders,
+    /// and walking a long session on every frame made the embedded terminal scroll slowly.
+    spend: Spend,
 }
 
 impl Transcript {
@@ -181,6 +184,7 @@ impl Transcript {
             last_bridge_session_index: None,
             last_tokens_left_index: None,
             last_auto_mode_index: None,
+            spend: Spend::default(),
         }
     }
 
@@ -237,16 +241,21 @@ impl Transcript {
                 }
             }
         }
+        self.spend = self.compute_spend();
     }
 
     /// What the session has spent and how it is configured, read from its own answers.
     ///
     /// Totalled over every answer in the file rather than over the conversation on
     /// screen: compaction shortens that, and a bill does not shrink because the history
-    /// behind it was summarised. Walked on each call rather than accumulated, because an
+    /// behind it was summarised. Walked after each `absorb` rather than accumulated, because an
     /// answer's record is rewritten as it streams — adding each one as it arrived would
     /// count the same answer many times.
     pub fn spend(&self) -> Spend {
+        self.spend.clone()
+    }
+
+    fn compute_spend(&self) -> Spend {
         // One API call is several records sharing a requestId. Earlier ones are snapshots
         // taken while the answer was still streaming: only output_tokens grows, and the
         // last record is what the call cost. A record with no requestId, or a blank one,
